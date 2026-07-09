@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+poly_data.sqlite3
+*.sqlite3
+*.db
+*.log
+*.xlsx
+.env
