@@ -1,0 +1,1 @@
+local_event_id,polymarket_event_id,polymarket_market_id,condition_id,event_slug,market_slug,title,question,event_url,start_time,end_time,yes_token_id,no_token_id,outcomes,outcome_prices,active,closed,enable_order_book,created_at_polymarket,discovered_at,last_seen_at,status,notes
