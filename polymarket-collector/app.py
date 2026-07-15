@@ -53,7 +53,7 @@ except ZoneInfoNotFoundError:
     LOCAL_TIMEZONE = timezone(timedelta(hours=3), name="Asia/Jerusalem")
 
 EVENT_CHECK_INTERVAL_SECONDS = 5
-BOOK_CHECK_INTERVAL_SECONDS = 10
+BOOK_CHECK_INTERVAL_SECONDS = 2
 
 active_market: Optional[dict[str, Any]] = None
 active_market_lock = asyncio.Lock()

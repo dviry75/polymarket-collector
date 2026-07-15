@@ -4,7 +4,7 @@ FastAPI collector for Polymarket BTC Up/Down 5m markets.
 
 It stores:
 - event/market metadata in SQLite
-- order book snapshots every 10 seconds
+- order book snapshots every 2 seconds
 - volume columns are kept for compatibility and written as zero until the new volume logic is added
 - Coinbase BTC-USD 5-minute candle cumulative volume every 30 seconds in `btc_volume_log`
 - downloadable Excel export at `/download.xlsx`
@@ -52,7 +52,18 @@ COINBASE_CANDLE_GRANULARITY_SECONDS=300
 COINBASE_VOLUME_POLL_INTERVAL_SECONDS=30
 COINBASE_REQUEST_TIMEOUT_SECONDS=10
 COINBASE_MAX_DELTA_GAP_SECONDS=90
+COINBASE_MISSING_CANDLE_RETRY_COUNT=2
+COINBASE_MISSING_CANDLE_RETRY_DELAY_SECONDS=2
 ```
+
+The candles request uses an explicit current-candle range:
+
+```text
+start=<current UTC 5-minute candle start>
+end=<current UTC time>
+```
+
+If the current candle is not returned, the collector performs up to 2 short retries. It still refuses to use the previous candle as a substitute.
 
 Automated tests:
 
