@@ -4,7 +4,7 @@ MVP מקומי בפייתון לאיסוף נתוני Polymarket BTC Up/Down 5m.
 
 הפרויקט שומר:
 - metadata של events/markets בקובץ `data/events.csv`
-- snapshots מאוחדים של Orderbook + Trades בקובץ `data/event_logs.csv`
+- snapshots של Orderbook בקובץ `data/event_logs.csv`
 - קובץ Excel בסוף כל ריצה תחת `output/polymarket_btc_run_<timestamp>.xlsx`
 
 אין Google Sheets, אין WebSocket, אין Database, אין Docker, ואין מסחר או auth מול Polymarket.
@@ -70,10 +70,5 @@ https://clob.polymarket.com/book?token_id=<UP_TOKEN>
 https://clob.polymarket.com/book?token_id=<DOWN_TOKEN>
 ```
 
-Trades לפי condition id:
-
-```text
-https://data-api.polymarket.com/trades?market=<CONDITION_ID>&limit=100
-```
-
-Volume חלוני מחושב רק מ-Trades API, לא מ-Gamma volume המצטבר.
+Volume collection מושבת כרגע בקוד.
+עמודות ה-volume הקיימות נשארות לצורך תאימות, ונכתבות כ-`0` עד להוספת הלוגיקה החדשה.

@@ -2,6 +2,7 @@ import asyncio
 import html
 import io
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,9 +24,29 @@ except ImportError:
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "poly_data.sqlite3"
 
+
+def env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 GAMMA_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book?token_id={token_id}"
-TRADES_URL = "https://data-api.polymarket.com/trades?market={condition_id}&limit=100"
+COINBASE_CANDLES_URL = os.getenv(
+    "COINBASE_CANDLES_URL",
+    "https://api.exchange.coinbase.com/products/{product_id}/candles",
+).strip()
+COINBASE_PRODUCT_ID = os.getenv("COINBASE_PRODUCT_ID", "BTC-USD").strip() or "BTC-USD"
+COINBASE_CANDLE_GRANULARITY_SECONDS = env_int("COINBASE_CANDLE_GRANULARITY_SECONDS", 300)
+COINBASE_VOLUME_POLL_INTERVAL_SECONDS = env_int("COINBASE_VOLUME_POLL_INTERVAL_SECONDS", 30)
+COINBASE_REQUEST_TIMEOUT_SECONDS = env_int("COINBASE_REQUEST_TIMEOUT_SECONDS", 10)
+COINBASE_MAX_DELTA_GAP_SECONDS = env_int("COINBASE_MAX_DELTA_GAP_SECONDS", 90)
+COINBASE_MISSING_CANDLE_RETRY_COUNT = env_int("COINBASE_MISSING_CANDLE_RETRY_COUNT", 2)
+COINBASE_MISSING_CANDLE_RETRY_DELAY_SECONDS = env_int("COINBASE_MISSING_CANDLE_RETRY_DELAY_SECONDS", 2)
+
 try:
     LOCAL_TIMEZONE = ZoneInfo("Asia/Jerusalem")
 except ZoneInfoNotFoundError:
@@ -36,7 +57,12 @@ BOOK_CHECK_INTERVAL_SECONDS = 10
 
 active_market: Optional[dict[str, Any]] = None
 active_market_lock = asyncio.Lock()
-last_trade_sample_at_by_condition_id: dict[str, datetime] = {}
+coinbase_volume_state: dict[str, Optional[str]] = {
+    "last_sample_at": None,
+    "last_success_at": None,
+    "status": "starting",
+    "last_error": None,
+}
 
 app = FastAPI(title="Polymarket BTC Collector")
 
@@ -82,26 +108,6 @@ def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
-
-
-def parse_trade_datetime(value: Any) -> Optional[datetime]:
-    if value is None:
-        return None
-
-    if isinstance(value, (int, float)):
-        timestamp = float(value)
-        if timestamp > 10_000_000_000:
-            timestamp = timestamp / 1000
-        return datetime.fromtimestamp(timestamp, timezone.utc)
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    if text.isdigit():
-        return parse_trade_datetime(int(text))
-
-    return parse_iso_datetime(text)
 
 
 def market_has_ended(market: Optional[dict[str, Any]]) -> bool:
@@ -191,6 +197,42 @@ def init_db() -> None:
         )
         """)
 
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS btc_volume_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sampled_at TEXT NOT NULL,
+            sample_bucket_at TEXT NOT NULL,
+            candle_start_at TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            granularity_seconds INTEGER NOT NULL,
+            volume_btc_cumulative REAL,
+            volume_btc_delta REAL,
+            seconds_since_previous_sample REAL,
+            event_slug TEXT,
+            condition_id TEXT,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error TEXT
+        )
+        """)
+
+        conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_volume_log_unique_bucket
+        ON btc_volume_log (product_id, candle_start_at, sample_bucket_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_sampled_at
+        ON btc_volume_log (sampled_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_candle_start_at
+        ON btc_volume_log (candle_start_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_event_slug
+        ON btc_volume_log (event_slug)
+        """)
+
         ensure_column(conn, "events", "start_time_local", "TEXT")
         ensure_column(conn, "events", "end_time_local", "TEXT")
         ensure_column(conn, "events", "created_at_poly_local", "TEXT")
@@ -209,6 +251,7 @@ def init_db() -> None:
         ensure_column(conn, "orderbook_log", "trades_error", "TEXT")
 
         conn.commit()
+    conn.close()
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
@@ -226,6 +269,25 @@ def get_conn() -> sqlite3.Connection:
 def floor_to_5m_epoch(dt: datetime) -> int:
     ts = int(dt.timestamp())
     return (ts // 300) * 300
+
+
+def floor_to_epoch(dt: datetime, seconds: int) -> int:
+    ts = int(dt.timestamp())
+    return (ts // seconds) * seconds
+
+
+def iso_from_epoch(epoch: int | float) -> str:
+    return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+
+
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def truncate_text(value: Optional[str], limit: int = 240) -> Optional[str]:
+    if not value:
+        return None
+    return value if len(value) <= limit else f"{value[:limit - 3]}..."
 
 
 def candidate_slugs() -> list[str]:
@@ -554,91 +616,343 @@ async def fetch_book(client: httpx.AsyncClient, token_id: str) -> tuple[Optional
         return None, str(e)
 
 
-async def fetch_trades(client: httpx.AsyncClient, condition_id: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+def coinbase_candles_url() -> str:
+    if "{product_id}" in COINBASE_CANDLES_URL:
+        return COINBASE_CANDLES_URL.format(product_id=COINBASE_PRODUCT_ID)
+    return COINBASE_CANDLES_URL
+
+
+def coinbase_candle_params(now_dt: datetime) -> dict[str, Any]:
+    bucket_epoch = floor_to_epoch(now_dt, COINBASE_CANDLE_GRANULARITY_SECONDS)
+    bucket_start = datetime.fromtimestamp(bucket_epoch, timezone.utc)
+    return {
+        "granularity": COINBASE_CANDLE_GRANULARITY_SECONDS,
+        "start": iso_z(bucket_start),
+        "end": iso_z(now_dt),
+    }
+
+
+async def fetch_coinbase_candles(
+    client: httpx.AsyncClient,
+    params: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[list[Any]], Optional[str]]:
+    retry_statuses = {429, 500, 502, 503, 504}
+    last_error = None
+    request_params = params or {"granularity": COINBASE_CANDLE_GRANULARITY_SECONDS}
+
+    for attempt in range(3):
+        try:
+            response = await client.get(
+                coinbase_candles_url(),
+                params=request_params,
+                headers={"User-Agent": "polymarket-btc-collector/1.0"},
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                if not isinstance(payload, list):
+                    return None, "Coinbase response is not a list"
+                return payload, None
+
+            last_error = f"Coinbase HTTP {response.status_code}: {response.text[:160]}"
+            if response.status_code not in retry_statuses:
+                break
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < 2:
+            await asyncio.sleep(1)
+
+    return None, last_error or "Coinbase request failed"
+
+
+async def fetch_current_coinbase_candle(
+    client: httpx.AsyncClient,
+) -> tuple[Optional[dict[str, Any]], datetime, Optional[str], int, dict[str, Any]]:
+    attempts = COINBASE_MISSING_CANDLE_RETRY_COUNT + 1
+    last_error = None
+    last_now = now_utc()
+    last_params = coinbase_candle_params(last_now)
+
+    for attempt in range(attempts):
+        last_now = now_utc()
+        last_params = coinbase_candle_params(last_now)
+        candles, fetch_error = await fetch_coinbase_candles(client, last_params)
+        if fetch_error or candles is None:
+            last_error = fetch_error or "Coinbase candles missing"
+        else:
+            candle, candle_error = select_current_coinbase_candle(candles, last_now)
+            if candle:
+                return candle, last_now, None, attempt + 1, last_params
+            last_error = candle_error or "Coinbase candle selection failed"
+
+        if last_error == "Current Coinbase candle not found" and attempt < attempts - 1:
+            await asyncio.sleep(COINBASE_MISSING_CANDLE_RETRY_DELAY_SECONDS)
+            continue
+        break
+
+    return None, last_now, last_error, min(attempts, attempt + 1), last_params
+
+
+def select_current_coinbase_candle(
+    candles: list[Any],
+    now_dt: datetime,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    current_bucket_epoch = floor_to_epoch(now_dt, COINBASE_CANDLE_GRANULARITY_SECONDS)
+
+    for candle in candles:
+        if not isinstance(candle, list) or len(candle) < 6:
+            continue
+
+        try:
+            candle_time = int(float(candle[0]))
+            volume = float(candle[5])
+        except (TypeError, ValueError):
+            continue
+
+        if volume < 0:
+            return None, "Coinbase candle volume is negative"
+
+        if candle_time == current_bucket_epoch:
+            return {
+                "candle_start_epoch": candle_time,
+                "candle_start_at": iso_from_epoch(candle_time),
+                "volume_btc_cumulative": volume,
+            }, None
+
+    return None, "Current Coinbase candle not found"
+
+
+def get_latest_valid_coinbase_sample(
+    conn: sqlite3.Connection,
+    product_id: str,
+) -> Optional[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute("""
+        SELECT
+            sampled_at,
+            candle_start_at,
+            volume_btc_cumulative,
+            status
+        FROM btc_volume_log
+        WHERE
+            product_id = ?
+            AND status IN ('success', 'baseline')
+            AND volume_btc_cumulative IS NOT NULL
+        ORDER BY sampled_at DESC
+        LIMIT 1
+    """, (product_id,)).fetchone()
+
+
+def calculate_coinbase_delta(
+    previous_sample: Optional[sqlite3.Row],
+    candle_start_at: str,
+    sampled_at_dt: datetime,
+    volume_btc_cumulative: float,
+) -> tuple[Optional[float], Optional[float], str, Optional[str]]:
+    if not previous_sample:
+        return None, None, "baseline", "no previous valid sample"
+
+    previous_sampled_at = parse_iso_datetime(previous_sample["sampled_at"])
+    previous_candle_start_at = previous_sample["candle_start_at"]
+    previous_volume = to_float(previous_sample["volume_btc_cumulative"])
+
+    if not previous_sampled_at or previous_volume is None:
+        return None, None, "baseline", "previous sample is incomplete"
+
+    seconds_since_previous = (sampled_at_dt - previous_sampled_at).total_seconds()
+
+    if previous_candle_start_at != candle_start_at:
+        return None, seconds_since_previous, "baseline", "new candle"
+
+    if seconds_since_previous > COINBASE_MAX_DELTA_GAP_SECONDS:
+        return None, seconds_since_previous, "baseline", "gap exceeded max delta threshold"
+
+    delta = volume_btc_cumulative - previous_volume
+    if delta < 0:
+        return None, seconds_since_previous, "baseline", "cumulative volume decreased within same candle"
+
+    return round(delta, 8), seconds_since_previous, "success", None
+
+
+def current_active_market_snapshot() -> tuple[Optional[str], Optional[str]]:
+    market = active_market
+    if not market:
+        return None, None
+    return market.get("event_slug"), market.get("condition_id")
+
+
+def insert_btc_volume_log(row: dict[str, Any]) -> bool:
+    inserted = False
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO btc_volume_log (
+                sampled_at,
+                sample_bucket_at,
+                candle_start_at,
+                product_id,
+                granularity_seconds,
+                volume_btc_cumulative,
+                volume_btc_delta,
+                seconds_since_previous_sample,
+                event_slug,
+                condition_id,
+                source,
+                status,
+                error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row.get("sampled_at"),
+            row.get("sample_bucket_at"),
+            row.get("candle_start_at"),
+            row.get("product_id"),
+            row.get("granularity_seconds"),
+            row.get("volume_btc_cumulative"),
+            row.get("volume_btc_delta"),
+            row.get("seconds_since_previous_sample"),
+            row.get("event_slug"),
+            row.get("condition_id"),
+            row.get("source"),
+            row.get("status"),
+            row.get("error"),
+        ))
+        inserted = cursor.rowcount > 0
+        cursor.close()
+        conn.commit()
+    conn.close()
+    return inserted
+
+
+def get_latest_coinbase_health() -> dict[str, Optional[str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        latest = conn.execute("""
+            SELECT sampled_at, status, error
+            FROM btc_volume_log
+            ORDER BY sampled_at DESC
+            LIMIT 1
+        """).fetchone()
+        latest_success = conn.execute("""
+            SELECT sampled_at
+            FROM btc_volume_log
+            WHERE status = 'success'
+            ORDER BY sampled_at DESC
+            LIMIT 1
+        """).fetchone()
+
+    if not latest:
+        return {
+            "last_sample_at": coinbase_volume_state.get("last_sample_at"),
+            "last_success_at": coinbase_volume_state.get("last_success_at"),
+            "status": coinbase_volume_state.get("status") or "starting",
+            "last_error": coinbase_volume_state.get("last_error"),
+        }
+
+    status = "ok" if latest["status"] in ("success", "baseline") else "degraded"
+    latest_dt = parse_iso_datetime(latest["sampled_at"])
+    if latest_dt and (now_utc() - latest_dt).total_seconds() > COINBASE_VOLUME_POLL_INTERVAL_SECONDS * 3:
+        status = "stale"
+
+    return {
+        "last_sample_at": latest["sampled_at"],
+        "last_success_at": latest_success["sampled_at"] if latest_success else None,
+        "status": status,
+        "last_error": truncate_text(latest["error"]),
+    }
+
+
+async def collect_coinbase_volume_sample(client: Optional[httpx.AsyncClient] = None) -> dict[str, Any]:
+    owns_client = client is None
+    event_slug, condition_id = current_active_market_snapshot()
+
+    def build_error_row(sampled_at_dt: datetime, error: str) -> dict[str, Any]:
+        sample_bucket_epoch = floor_to_epoch(sampled_at_dt, COINBASE_VOLUME_POLL_INTERVAL_SECONDS)
+        return {
+            "sampled_at": sampled_at_dt.isoformat(),
+            "sample_bucket_at": iso_from_epoch(sample_bucket_epoch),
+            "candle_start_at": iso_from_epoch(floor_to_epoch(sampled_at_dt, COINBASE_CANDLE_GRANULARITY_SECONDS)),
+            "product_id": COINBASE_PRODUCT_ID,
+            "granularity_seconds": COINBASE_CANDLE_GRANULARITY_SECONDS,
+            "volume_btc_cumulative": None,
+            "volume_btc_delta": None,
+            "seconds_since_previous_sample": None,
+            "event_slug": event_slug,
+            "condition_id": condition_id,
+            "source": "coinbase_exchange",
+            "status": "error",
+            "error": truncate_text(error),
+        }
+
     try:
-        response = await client.get(TRADES_URL.format(condition_id=condition_id))
-        if response.status_code != 200:
-            return [], f"HTTP {response.status_code}: {response.text[:300]}"
+        if owns_client:
+            client = httpx.AsyncClient(timeout=COINBASE_REQUEST_TIMEOUT_SECONDS)
 
-        payload = response.json()
-        if isinstance(payload, list):
-            return payload, None
-        if isinstance(payload, dict):
-            trades = payload.get("trades") or payload.get("data") or payload.get("results")
-            if isinstance(trades, list):
-                return trades, None
+        assert client is not None
+        candle, sampled_at_dt, fetch_error, attempts, request_params = await fetch_current_coinbase_candle(client)
+        sample_bucket_epoch = floor_to_epoch(sampled_at_dt, COINBASE_VOLUME_POLL_INTERVAL_SECONDS)
+        if fetch_error or candle is None:
+            row = build_error_row(sampled_at_dt, f"{fetch_error or 'Coinbase candle selection failed'}; attempts={attempts}")
+        else:
+            with sqlite3.connect(DB_PATH) as conn:
+                previous_sample = get_latest_valid_coinbase_sample(conn, COINBASE_PRODUCT_ID)
 
-        return [], "Unexpected trades response format"
-    except Exception as e:
-        return [], str(e)
+            delta, seconds_since_previous, status, delta_error = calculate_coinbase_delta(
+                previous_sample,
+                candle["candle_start_at"],
+                sampled_at_dt,
+                candle["volume_btc_cumulative"],
+            )
+
+            row = {
+                "sampled_at": sampled_at_dt.isoformat(),
+                "sample_bucket_at": iso_from_epoch(sample_bucket_epoch),
+                "candle_start_at": candle["candle_start_at"],
+                "product_id": COINBASE_PRODUCT_ID,
+                "granularity_seconds": COINBASE_CANDLE_GRANULARITY_SECONDS,
+                "volume_btc_cumulative": candle["volume_btc_cumulative"],
+                "volume_btc_delta": delta,
+                "seconds_since_previous_sample": seconds_since_previous,
+                "event_slug": event_slug,
+                "condition_id": condition_id,
+                "source": "coinbase_exchange",
+                "status": status,
+                "error": delta_error,
+            }
+
+        inserted = insert_btc_volume_log(row)
+        coinbase_volume_state["last_sample_at"] = row["sampled_at"]
+        coinbase_volume_state["status"] = "ok" if row["status"] in ("success", "baseline") else "degraded"
+        coinbase_volume_state["last_error"] = row.get("error")
+        if row["status"] == "success":
+            coinbase_volume_state["last_success_at"] = row["sampled_at"]
+
+        log_prefix = (
+            "Coinbase BTC volume sample saved"
+            if row["status"] == "success"
+            else "Coinbase BTC volume baseline saved"
+            if row["status"] == "baseline"
+            else "Coinbase BTC volume collection failed"
+        )
+        print(
+            f"{log_prefix}: candle_start={row['candle_start_at']} "
+            f"cumulative_volume={row['volume_btc_cumulative']} "
+            f"delta={row['volume_btc_delta']} event_slug={row['event_slug']} "
+            f"inserted={inserted}",
+            flush=True,
+        )
+        return row
+    finally:
+        if owns_client and client is not None:
+            await client.aclose()
 
 
-def trade_value(trade: dict[str, Any], field_names: list[str]) -> Any:
-    for field_name in field_names:
-        if field_name in trade:
-            return trade.get(field_name)
-    return None
-
-
-def trade_outcome(trade: dict[str, Any]) -> str:
-    value = trade_value(trade, ["outcome", "asset", "outcomeName", "tokenOutcome", "side"])
-    return str(value or "").strip().lower()
-
-
-def calculate_trade_volume(
-    trades: list[dict[str, Any]],
-    window_start: datetime,
-    window_end: datetime,
-) -> dict[str, Any]:
-    result = {
+def empty_volume_metrics() -> dict[str, Any]:
+    return {
         "up_volume_shares_10s": 0.0,
         "down_volume_shares_10s": 0.0,
         "up_volume_usdc_10s": 0.0,
         "down_volume_usdc_10s": 0.0,
         "trades_count_10s": 0,
     }
-
-    for trade in trades:
-        traded_at = parse_trade_datetime(
-            trade_value(trade, ["timestamp", "createdAt", "created_at", "time", "date"])
-        )
-        if not traded_at or not (window_start < traded_at <= window_end):
-            continue
-
-        outcome = trade_outcome(trade)
-        size = to_float(trade_value(trade, ["size", "amount", "shares", "quantity"]))
-        price = to_float(trade_value(trade, ["price", "avgPrice"]))
-        if size is None or price is None:
-            continue
-
-        if outcome == "up":
-            result["up_volume_shares_10s"] += size
-            result["up_volume_usdc_10s"] += size * price
-        elif outcome == "down":
-            result["down_volume_shares_10s"] += size
-            result["down_volume_usdc_10s"] += size * price
-        else:
-            continue
-
-        result["trades_count_10s"] += 1
-
-    for key in [
-        "up_volume_shares_10s",
-        "down_volume_shares_10s",
-        "up_volume_usdc_10s",
-        "down_volume_usdc_10s",
-    ]:
-        result[key] = round(result[key], 6)
-
-    return result
-
-
-def trade_sample_window(condition_id: str, window_end: datetime) -> tuple[datetime, datetime]:
-    window_start = last_trade_sample_at_by_condition_id.get(condition_id)
-    if not window_start:
-        window_start = window_end - timedelta(seconds=BOOK_CHECK_INTERVAL_SECONDS)
-    return window_start, window_end
-
 
 def insert_orderbook_log(row: dict[str, Any]) -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -756,27 +1070,22 @@ async def orderbook_collector_loop() -> None:
             up_token_id = market["yes_token_id"]
             down_token_id = market["no_token_id"]
             condition_id = market.get("condition_id")
-            trades_window_end_dt = now_utc()
-            trades_window_start_dt, trades_window_end_dt = trade_sample_window(condition_id, trades_window_end_dt)
 
             async with httpx.AsyncClient(timeout=10) as client:
                 up_book, up_error = await fetch_book(client, up_token_id)
                 down_book, down_error = await fetch_book(client, down_token_id)
-                trades, trades_error = await fetch_trades(client, condition_id)
 
             errors = []
             if up_error:
                 errors.append(f"up_error={up_error}")
             if down_error:
                 errors.append(f"down_error={down_error}")
-            if trades_error:
-                errors.append(f"trades_error={trades_error}")
 
             up_best_bid = best_bid(up_book) if up_book else None
             up_best_ask = best_ask(up_book) if up_book else None
             down_best_bid = best_bid(down_book) if down_book else None
             down_best_ask = best_ask(down_book) if down_book else None
-            trade_volume = calculate_trade_volume(trades, trades_window_start_dt, trades_window_end_dt)
+            volume_metrics = empty_volume_metrics()
 
             if not errors:
                 status = "success"
@@ -804,28 +1113,26 @@ async def orderbook_collector_loop() -> None:
                 "down_midpoint": calc_midpoint(down_best_ask, down_best_bid),
                 "raw_up_timestamp": str(up_book.get("timestamp")) if up_book else None,
                 "raw_down_timestamp": str(down_book.get("timestamp")) if down_book else None,
-                "up_volume_shares_10s": trade_volume["up_volume_shares_10s"],
-                "down_volume_shares_10s": trade_volume["down_volume_shares_10s"],
-                "up_volume_usdc_10s": trade_volume["up_volume_usdc_10s"],
-                "down_volume_usdc_10s": trade_volume["down_volume_usdc_10s"],
-                "trades_count_10s": trade_volume["trades_count_10s"],
-                "trades_window_start": trades_window_start_dt.isoformat(),
-                "trades_window_start_local": format_local_datetime(trades_window_start_dt),
-                "trades_window_end": trades_window_end_dt.isoformat(),
-                "trades_window_end_local": format_local_datetime(trades_window_end_dt),
-                "trades_error": trades_error,
+                "up_volume_shares_10s": volume_metrics["up_volume_shares_10s"],
+                "down_volume_shares_10s": volume_metrics["down_volume_shares_10s"],
+                "up_volume_usdc_10s": volume_metrics["up_volume_usdc_10s"],
+                "down_volume_usdc_10s": volume_metrics["down_volume_usdc_10s"],
+                "trades_count_10s": volume_metrics["trades_count_10s"],
+                "trades_window_start": None,
+                "trades_window_start_local": None,
+                "trades_window_end": None,
+                "trades_window_end_local": None,
+                "trades_error": None,
                 "status": status,
                 "error": " | ".join(errors) if errors else None,
             }
 
             insert_orderbook_log(row)
-            if not trades_error:
-                last_trade_sample_at_by_condition_id[condition_id] = trades_window_end_dt
 
             print(
                 f"[book] {row['event_slug']} status={status} "
                 f"up={up_best_bid}/{up_best_ask} down={down_best_bid}/{down_best_ask} "
-                f"vol_up={row['up_volume_shares_10s']} vol_down={row['down_volume_shares_10s']}",
+                "volume_collection=disabled",
                 flush=True,
             )
         except Exception as e:
@@ -835,11 +1142,26 @@ async def orderbook_collector_loop() -> None:
             await sleep_until_next_tick(BOOK_CHECK_INTERVAL_SECONDS, tick_started_at)
 
 
+async def coinbase_volume_collector_loop() -> None:
+    while True:
+        tick_started_at = asyncio.get_running_loop().time()
+
+        try:
+            await collect_coinbase_volume_sample()
+        except Exception as e:
+            coinbase_volume_state["status"] = "degraded"
+            coinbase_volume_state["last_error"] = truncate_text(f"{type(e).__name__}: {e}")
+            log_error("coinbase volume loop", e)
+        finally:
+            await sleep_until_next_tick(COINBASE_VOLUME_POLL_INTERVAL_SECONDS, tick_started_at)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     init_db()
     asyncio.create_task(event_collector_loop())
     asyncio.create_task(orderbook_collector_loop())
+    asyncio.create_task(coinbase_volume_collector_loop())
 
 
 def render_table(rows: list[sqlite3.Row]) -> str:
@@ -866,6 +1188,78 @@ def render_table(rows: list[sqlite3.Row]) -> str:
         <tbody>{body}</tbody>
       </table>
     </div>
+    """
+
+
+def display_value(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.8f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def render_btc_volume_table(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "<p>No Coinbase BTC volume data yet.</p>"
+
+    headers = [
+        "Sampled At",
+        "Candle Start",
+        "Product",
+        "Cumulative Volume BTC",
+        "Volume Delta BTC",
+        "Seconds Since Previous Sample",
+        "Event Slug",
+        "Status",
+        "Error",
+    ]
+    fields = [
+        "sampled_at",
+        "candle_start_at",
+        "product_id",
+        "volume_btc_cumulative",
+        "volume_btc_delta",
+        "seconds_since_previous_sample",
+        "event_slug",
+        "status",
+        "error",
+    ]
+
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = ""
+    for row in rows:
+        cells = ""
+        for field in fields:
+            value = display_value(row[field])
+            if field == "error" and len(value) > 140:
+                value = f"{value[:137]}..."
+            cells += f"<td>{html.escape(value)}</td>"
+        body += f"<tr>{cells}</tr>"
+
+    return f"""
+    <div class="table-wrap">
+      <table>
+        <thead><tr>{thead}</tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_btc_volume_summary(summary: Optional[sqlite3.Row], health_row: dict[str, Optional[str]]) -> str:
+    latest_cumulative = display_value(summary["volume_btc_cumulative"]) if summary else "-"
+    latest_delta = display_value(summary["volume_btc_delta"]) if summary else "-"
+    last_success = display_value(health_row.get("last_success_at"))
+    status = display_value(health_row.get("status"))
+
+    return f"""
+    <p class="muted">
+        Latest cumulative volume: {html.escape(latest_cumulative)} BTC |
+        Latest delta: {html.escape(latest_delta)} BTC |
+        Last successful sample: {html.escape(last_success)} |
+        Collector status: {html.escape(status)}
+    </p>
     """
 
 
@@ -945,6 +1339,34 @@ def dashboard() -> str:
             LIMIT 300
         """).fetchall()
 
+        btc_volume_rows = conn.execute("""
+            SELECT
+                sampled_at,
+                candle_start_at,
+                product_id,
+                volume_btc_cumulative,
+                volume_btc_delta,
+                seconds_since_previous_sample,
+                event_slug,
+                status,
+                error
+            FROM btc_volume_log
+            ORDER BY sampled_at DESC
+            LIMIT 50
+        """).fetchall()
+
+        btc_volume_summary = conn.execute("""
+            SELECT
+                volume_btc_cumulative,
+                volume_btc_delta
+            FROM btc_volume_log
+            WHERE status IN ('success', 'baseline')
+            ORDER BY sampled_at DESC
+            LIMIT 1
+        """).fetchone()
+
+    btc_health = get_latest_coinbase_health()
+
     return f"""
     <!doctype html>
     <html>
@@ -1021,6 +1443,12 @@ def dashboard() -> str:
         <div class="card">
             <h2>Events / Markets</h2>
             {render_table(events)}
+        </div>
+
+        <div class="card">
+            <h2>Coinbase BTC Volume</h2>
+            {render_btc_volume_summary(btc_volume_summary, btc_health)}
+            {render_btc_volume_table(btc_volume_rows)}
         </div>
 
         <div class="card">
@@ -1106,10 +1534,31 @@ def download_xlsx() -> StreamingResponse:
             ORDER BY id ASC
         """, conn)
 
+        btc_volume_df = pd.read_sql_query("""
+            SELECT
+                id,
+                sampled_at,
+                sample_bucket_at,
+                candle_start_at,
+                product_id,
+                granularity_seconds,
+                volume_btc_cumulative,
+                volume_btc_delta,
+                seconds_since_previous_sample,
+                event_slug,
+                condition_id,
+                source,
+                status,
+                error
+            FROM btc_volume_log
+            ORDER BY sampled_at ASC
+        """, conn)
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         events_df.to_excel(writer, sheet_name="events", index=False)
         logs_df.to_excel(writer, sheet_name="orderbook_log", index=False)
+        btc_volume_df.to_excel(writer, sheet_name="btc_volume_log", index=False)
 
     output.seek(0)
 
@@ -1126,9 +1575,14 @@ def download_xlsx() -> StreamingResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    coinbase_health = get_latest_coinbase_health()
     return {
         "ok": True,
         "time": now_iso(),
         "db": str(DB_PATH),
         "active_market": active_market.get("event_slug") if active_market else None,
+        "coinbase_volume_last_sample_at": coinbase_health.get("last_sample_at"),
+        "coinbase_volume_last_success_at": coinbase_health.get("last_success_at"),
+        "coinbase_volume_collector_status": coinbase_health.get("status"),
+        "coinbase_volume_last_error": coinbase_health.get("last_error"),
     }

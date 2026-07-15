@@ -11,7 +11,6 @@ import requests
 
 GAMMA_EVENT_BY_SLUG_URL = "https://gamma-api.polymarket.com/events/slug/{slug}"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
-TRADES_URL = "https://data-api.polymarket.com/trades"
 
 
 BTC_5M_TERMS = [
@@ -209,23 +208,6 @@ def fetch_orderbook(token_id: str) -> tuple[dict[str, Any] | None, str | None]:
         return None, str(exc)
 
 
-def fetch_trades(condition_id: str, limit: int = 100) -> tuple[list[dict[str, Any]], str | None]:
-    try:
-        response = requests.get(TRADES_URL, params={"market": condition_id, "limit": limit}, timeout=8)
-        if response.status_code != 200:
-            return [], f"trades HTTP {response.status_code}: {response.text[:200]}"
-        payload = response.json()
-        if isinstance(payload, list):
-            return payload, None
-        if isinstance(payload, dict):
-            trades = payload.get("trades") or payload.get("data") or payload.get("results")
-            if isinstance(trades, list):
-                return trades, None
-        return [], "unexpected trades response format"
-    except requests.RequestException as exc:
-        return [], str(exc)
-
-
 def to_float(value: Any) -> float | None:
     try:
         if value is None:
@@ -276,84 +258,6 @@ def orderbook_metrics(book: dict[str, Any] | None) -> dict[str, Any]:
         "last_trade_price": to_float((book or {}).get("last_trade_price")),
         "timestamp": (book or {}).get("timestamp"),
     }
-
-
-def trade_value(trade: dict[str, Any], field_names: list[str]) -> Any:
-    for field_name in field_names:
-        if field_name in trade:
-            return trade.get(field_name)
-    return None
-
-
-def trade_dedupe_key(trade: dict[str, Any]) -> str:
-    values = [
-        trade.get("transactionHash"),
-        trade.get("asset"),
-        trade.get("outcome"),
-        trade.get("price"),
-        trade.get("size"),
-        trade.get("timestamp"),
-    ]
-    return "|".join(str(value or "") for value in values)
-
-
-def calculate_trade_window(
-    trades: list[dict[str, Any]],
-    window_start: datetime,
-    window_end: datetime,
-    seen_trade_keys: set[str],
-) -> dict[str, Any]:
-    result = {
-        "up_trades_count_window": 0,
-        "down_trades_count_window": 0,
-        "up_volume_shares_window": 0.0,
-        "down_volume_shares_window": 0.0,
-        "up_volume_usdc_window": 0.0,
-        "down_volume_usdc_window": 0.0,
-    }
-
-    for trade in trades:
-        traded_at = parse_datetime(trade_value(trade, ["timestamp", "createdAt", "created_at", "time", "date"]))
-        if not traded_at or not (window_start < traded_at <= window_end):
-            continue
-
-        dedupe_key = trade_dedupe_key(trade)
-        if dedupe_key in seen_trade_keys:
-            continue
-
-        outcome = str(trade_value(trade, ["outcome", "asset", "outcomeName", "tokenOutcome"]) or "").strip().lower()
-        size = to_float(trade_value(trade, ["size", "amount", "shares", "quantity"]))
-        price = to_float(trade_value(trade, ["price", "avgPrice"]))
-        if size is None or price is None:
-            seen_trade_keys.add(dedupe_key)
-            continue
-
-        if outcome == "up":
-            result["up_trades_count_window"] += 1
-            result["up_volume_shares_window"] += size
-            result["up_volume_usdc_window"] += size * price
-        elif outcome == "down":
-            result["down_trades_count_window"] += 1
-            result["down_volume_shares_window"] += size
-            result["down_volume_usdc_window"] += size * price
-        else:
-            seen_trade_keys.add(dedupe_key)
-            continue
-
-        seen_trade_keys.add(dedupe_key)
-
-    result["up_volume_shares_window"] = round(result["up_volume_shares_window"], 6)
-    result["down_volume_shares_window"] = round(result["down_volume_shares_window"], 6)
-    result["up_volume_usdc_window"] = round(result["up_volume_usdc_window"], 6)
-    result["down_volume_usdc_window"] = round(result["down_volume_usdc_window"], 6)
-    result["total_trades_count_window"] = (
-        result["up_trades_count_window"] + result["down_trades_count_window"]
-    )
-    result["total_volume_usdc_window"] = round(
-        result["up_volume_usdc_window"] + result["down_volume_usdc_window"],
-        6,
-    )
-    return result
 
 
 def parse_jsonish_array(value: Any) -> list[Any]:

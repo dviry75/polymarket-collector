@@ -1,0 +1,2523 @@
+{
+  "started_at": "2026-07-15T22:07:53.615424+00:00",
+  "duration_seconds": 360,
+  "interval_seconds": 15,
+  "aggregate": {
+    "no_range": {
+      "checks": 23,
+      "current_present": 3,
+      "errors": 0,
+      "bucket_ages_when_missing": [
+        113,
+        129,
+        145,
+        160,
+        176,
+        192,
+        207,
+        223,
+        239,
+        1,
+        17,
+        33,
+        48,
+        64,
+        79,
+        95,
+        111,
+        126,
+        142,
+        158
+      ],
+      "orders": {
+        "descending": 23
+      },
+      "current_present_rate": 0.1304
+    },
+    "start_current_end_now": {
+      "checks": 23,
+      "current_present": 22,
+      "errors": 0,
+      "bucket_ages_when_missing": [
+        1
+      ],
+      "orders": {
+        "single_or_empty": 23
+      },
+      "current_present_rate": 0.9565
+    },
+    "start_current_end_candle_end": {
+      "checks": 23,
+      "current_present": 0,
+      "errors": 0,
+      "bucket_ages_when_missing": [
+        113,
+        129,
+        145,
+        160,
+        176,
+        192,
+        207,
+        223,
+        239,
+        254,
+        270,
+        286,
+        1,
+        17,
+        33,
+        48,
+        64,
+        79,
+        95,
+        111,
+        126,
+        142,
+        158
+      ],
+      "orders": {
+        "single_or_empty": 23
+      },
+      "current_present_rate": 0.0
+    },
+    "start_prev_end_now": {
+      "checks": 23,
+      "current_present": 22,
+      "errors": 0,
+      "bucket_ages_when_missing": [
+        1
+      ],
+      "orders": {
+        "descending": 22,
+        "single_or_empty": 1
+      },
+      "current_present_rate": 0.9565
+    },
+    "start_prev_end_candle_end": {
+      "checks": 23,
+      "current_present": 12,
+      "errors": 0,
+      "bucket_ages_when_missing": [
+        1,
+        17,
+        33,
+        48,
+        64,
+        79,
+        95,
+        111,
+        126,
+        142,
+        158
+      ],
+      "orders": {
+        "descending": 12,
+        "single_or_empty": 11
+      },
+      "current_present_rate": 0.5217
+    }
+  },
+  "results": [
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 113,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:01:53Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 7.19460401,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 113,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A01%3A53Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 113,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:01:53Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 7.19460401,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 113,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A01%3A53Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 113,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 129,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:02:09Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 7.32766523,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 129,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A02%3A09Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 129,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:02:09Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 7.32766523,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 129,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A02%3A09Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 129,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 145,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:02:25Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 14.17151501,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 145,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A02%3A25Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 145,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:02:25Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 14.17151501,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 145,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A02%3A25Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 145,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 160,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:02:40Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 14.96024305,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 160,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A02%3A40Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 160,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:02:40Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 14.96024305,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 160,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A02%3A40Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 160,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 176,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:02:56Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 16.42792521,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 176,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A02%3A56Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 176,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:02:56Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 16.42792521,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 176,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A02%3A56Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 176,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 192,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:03:12Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 19.59938204,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 192,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A03%3A12Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 192,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:03:12Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 19.59938204,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 192,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A03%3A12Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 192,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 207,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:03:27Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 19.95382099,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 207,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A03%3A27Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 207,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:03:27Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 19.95382099,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 207,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A03%3A27Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 207,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 223,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:03:43Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 21.65911913,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 223,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A03%3A43Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 223,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:03:43Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 21.65911913,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 223,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A03%3A43Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 223,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 239,
+      "order": "descending",
+      "times": [
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00",
+        "2026-07-15T21:20:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:03:59Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 22.10332158,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 239,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A03%3A59Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 239,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:03:59Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 22.41150473,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 239,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A03%3A59Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 239,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": true,
+      "current_volume": 23.03222397,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 254,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:04:14Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 23.03222397,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 254,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A04%3A14Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 254,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:04:14Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 23.03222397,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 254,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A04%3A14Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 254,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": true,
+      "current_volume": 23.03222397,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 270,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:04:30Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 24.44716715,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 270,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A04%3A30Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 270,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:04:30Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 24.44716715,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 270,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A04%3A30Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 270,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": true,
+      "current_volume": 23.03222397,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 286,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:04:46Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 25.3490464,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 286,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A04%3A46Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 286,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:04:46Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 25.3490464,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 286,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A04%3A46Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T21:55:00Z",
+        "end": "2026-07-15T22:05:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.3135478,
+      "bucket_epoch": 1784152800,
+      "bucket_age_seconds": 286,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T21%3A55%3A00Z&end=2026-07-15T22%3A05%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 1,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:05:01Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 1,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A05%3A01Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 1,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:01Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 1,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A01Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 1,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 17,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:05:17Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 1.69737744,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 17,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A05%3A17Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 17,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:17Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 1.69737744,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 17,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A17Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 17,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 33,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:05:33Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 2.62792139,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 33,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A05%3A33Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 33,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:33Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 2.62792139,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 33,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A33Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 33,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 48,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:05:48Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 2.99799187,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 48,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A05%3A48Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 48,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:05:48Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 2.99799187,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 48,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A05%3A48Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 48,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 64,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:06:04Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 3.82084766,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 64,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A06%3A04Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 64,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:06:04Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 3.82084766,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 64,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A06%3A04Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 64,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 79,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:06:19Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 4.78576502,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 79,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A06%3A19Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 79,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:06:19Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 4.78576502,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 79,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A06%3A19Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 79,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 95,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:06:35Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 5.06971218,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 95,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A06%3A35Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 95,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:06:35Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 5.06971218,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 95,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A06%3A35Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 95,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 111,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:06:51Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 5.96764086,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 111,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A06%3A51Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 111,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:06:51Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 5.96764086,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 111,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A06%3A51Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 111,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 126,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:07:06Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 5.99043967,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 126,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A07%3A06Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 126,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:07:06Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 5.99043967,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 126,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A07%3A06Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 126,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 142,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:07:22Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 6.98554054,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 142,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A07%3A22Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 142,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:07:22Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 6.98554054,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 142,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A07%3A22Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 142,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "no_range",
+      "params": {
+        "granularity": 300
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 350,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 158,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:00:00+00:00",
+        "2026-07-15T21:55:00+00:00",
+        "2026-07-15T21:50:00+00:00",
+        "2026-07-15T21:45:00+00:00",
+        "2026-07-15T21:40:00+00:00",
+        "2026-07-15T21:35:00+00:00",
+        "2026-07-15T21:30:00+00:00",
+        "2026-07-15T21:25:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+    },
+    {
+      "variant": "start_current_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:07:38Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": true,
+      "current_volume": 9.30792066,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 158,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:05:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A07%3A38Z"
+    },
+    {
+      "variant": "start_current_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:05:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 0,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 158,
+      "order": "single_or_empty",
+      "times": [],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A05%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    },
+    {
+      "variant": "start_prev_end_now",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:07:38Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 2,
+      "current_present": true,
+      "current_volume": 9.30792066,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 158,
+      "order": "descending",
+      "times": [
+        "2026-07-15T22:05:00+00:00",
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A07%3A38Z"
+    },
+    {
+      "variant": "start_prev_end_candle_end",
+      "params": {
+        "granularity": 300,
+        "start": "2026-07-15T22:00:00Z",
+        "end": "2026-07-15T22:10:00Z"
+      },
+      "error": null,
+      "response_is_list": true,
+      "count": 1,
+      "current_present": false,
+      "current_volume": null,
+      "bucket_epoch": 1784153100,
+      "bucket_age_seconds": 158,
+      "order": "single_or_empty",
+      "times": [
+        "2026-07-15T22:00:00+00:00"
+      ],
+      "url": "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300&start=2026-07-15T22%3A00%3A00Z&end=2026-07-15T22%3A10%3A00Z"
+    }
+  ]
+}

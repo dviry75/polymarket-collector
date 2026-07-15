@@ -1,5 +1,4 @@
 import time
-from datetime import timedelta
 from pathlib import Path
 
 from requests import HTTPError, RequestException
@@ -14,11 +13,9 @@ from src.csv_storage import (
     upsert_event_row,
 )
 from src.polymarket import (
-    calculate_trade_window,
     discover_current_btc_5m_market,
     fetch_active_events,
     fetch_orderbook,
-    fetch_trades,
     find_btc_up_down_5m_markets,
     orderbook_metrics,
     parse_datetime,
@@ -60,9 +57,7 @@ def main() -> None:
 
 def run_polling(config, csv_path: Path, event_logs_path: Path) -> None:
     started_monotonic = time.monotonic()
-    previous_sample_at = None
     active_market = None
-    seen_trade_keys_by_condition: dict[str, set[str]] = {}
 
     print(
         f"Polling every {config.poll_interval_seconds}s for {config.run_duration_seconds}s.",
@@ -75,7 +70,6 @@ def run_polling(config, csv_path: Path, event_logs_path: Path) -> None:
 
         if not active_market or market_has_ended(active_market, now):
             active_market = discover_current_btc_5m_market()
-            previous_sample_at = None
             if active_market:
                 upsert_event_row(csv_path, active_market, HEADERS)
                 print(f"Active market: {active_market['event_slug']}", flush=True)
@@ -85,16 +79,12 @@ def run_polling(config, csv_path: Path, event_logs_path: Path) -> None:
             sleep_remaining(config.poll_interval_seconds, tick_started)
             continue
 
-        window_start = previous_sample_at or (now - timedelta(seconds=config.poll_interval_seconds))
-        window_end = now
-        previous_sample_at = window_end
-
-        log_row = sample_market(active_market, window_start, window_end, seen_trade_keys_by_condition)
+        log_row = sample_market(active_market, now)
         append_row(event_logs_path, log_row, EVENT_LOG_HEADERS)
         print(
             f"sampled {log_row['event_slug']} status={log_row['status']} "
             f"up_ask={log_row['up_best_ask']} down_ask={log_row['down_best_ask']} "
-            f"trades={log_row['total_trades_count_window']}",
+            "volume_collection=disabled",
             flush=True,
         )
 
@@ -108,9 +98,7 @@ def market_has_ended(market: dict, now) -> bool:
 
 def sample_market(
     market: dict,
-    window_start,
-    window_end,
-    seen_trade_keys_by_condition: dict[str, set[str]],
+    sampled_at,
 ) -> dict:
     errors = []
     condition_id = market.get("condition_id")
@@ -119,25 +107,20 @@ def sample_market(
 
     up_book, up_error = fetch_orderbook(up_token_id)
     down_book, down_error = fetch_orderbook(down_token_id)
-    trades, trades_error = fetch_trades(condition_id)
 
     if up_error:
         errors.append(f"up_orderbook={up_error}")
     if down_error:
         errors.append(f"down_orderbook={down_error}")
-    if trades_error:
-        errors.append(f"trades={trades_error}")
 
     up_metrics = orderbook_metrics(up_book)
     down_metrics = orderbook_metrics(down_book)
-    seen_trade_keys = seen_trade_keys_by_condition.setdefault(str(condition_id), set())
-    trade_metrics = calculate_trade_window(trades, window_start, window_end, seen_trade_keys)
 
     orderbook_ok = up_book is not None and down_book is not None
     status = "ok" if orderbook_ok and not errors else ("partial_error" if orderbook_ok else "error")
 
     return {
-        "sampled_at": window_end.isoformat(),
+        "sampled_at": sampled_at.isoformat(),
         "event_slug": market.get("event_slug"),
         "event_id": market.get("polymarket_event_id"),
         "market_id": market.get("polymarket_market_id"),
@@ -158,9 +141,22 @@ def sample_market(
         "down_spread": down_metrics["spread"],
         "down_last_trade_price": down_metrics["last_trade_price"],
         "down_orderbook_timestamp": down_metrics["timestamp"],
-        **trade_metrics,
+        **empty_volume_metrics(),
         "status": status,
         "error": " | ".join(errors),
+    }
+
+
+def empty_volume_metrics() -> dict:
+    return {
+        "up_trades_count_window": 0,
+        "down_trades_count_window": 0,
+        "up_volume_shares_window": 0,
+        "down_volume_shares_window": 0,
+        "up_volume_usdc_window": 0,
+        "down_volume_usdc_window": 0,
+        "total_trades_count_window": 0,
+        "total_volume_usdc_window": 0,
     }
 
 
@@ -169,14 +165,7 @@ def empty_log_row(sampled_at: str, status: str, error: str) -> dict:
     row.update(
         {
             "sampled_at": sampled_at,
-            "up_trades_count_window": 0,
-            "down_trades_count_window": 0,
-            "up_volume_shares_window": 0,
-            "down_volume_shares_window": 0,
-            "up_volume_usdc_window": 0,
-            "down_volume_usdc_window": 0,
-            "total_trades_count_window": 0,
-            "total_volume_usdc_window": 0,
+            **empty_volume_metrics(),
             "status": status,
             "error": error,
         }

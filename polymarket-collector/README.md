@@ -5,7 +5,8 @@ FastAPI collector for Polymarket BTC Up/Down 5m markets.
 It stores:
 - event/market metadata in SQLite
 - order book snapshots every 10 seconds
-- executed trade volume per 10-second window from Polymarket Trades API
+- volume columns are kept for compatibility and written as zero until the new volume logic is added
+- Coinbase BTC-USD 5-minute candle cumulative volume every 30 seconds in `btc_volume_log`
 - downloadable Excel export at `/download.xlsx`
 
 ## Setup
@@ -27,6 +28,43 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 - `/` dashboard
 - `/health` health check
 - `/download.xlsx` Excel export
+
+## Coinbase BTC Volume
+
+The Coinbase collector uses the public Coinbase Exchange candles endpoint:
+
+```text
+https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300
+```
+
+It runs as an independent background task and writes to a separate SQLite table:
+
+```text
+btc_volume_log
+```
+
+Default environment variables:
+
+```text
+COINBASE_CANDLES_URL=https://api.exchange.coinbase.com/products/{product_id}/candles
+COINBASE_PRODUCT_ID=BTC-USD
+COINBASE_CANDLE_GRANULARITY_SECONDS=300
+COINBASE_VOLUME_POLL_INTERVAL_SECONDS=30
+COINBASE_REQUEST_TIMEOUT_SECONDS=10
+COINBASE_MAX_DELTA_GAP_SECONDS=90
+```
+
+Automated tests:
+
+```bash
+python -m unittest discover -s polymarket-collector/tests
+```
+
+Bounded integration test:
+
+```bash
+python polymarket-collector/scripts/run_coinbase_volume_integration_test.py --duration-seconds 600
+```
 
 ## Data
 
