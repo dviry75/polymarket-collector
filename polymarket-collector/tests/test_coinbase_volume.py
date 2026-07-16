@@ -3,8 +3,12 @@ import sys
 import tempfile
 import unittest
 import asyncio
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -197,6 +201,79 @@ class CoinbaseVolumeTests(unittest.TestCase):
                 self.assertIn("idx_btc_volume_log_unique_bucket", indexes)
         finally:
             app.DB_PATH = original_db_path
+
+    def test_write_xlsx_export_creates_three_sheets(self):
+        original_db_path = app.DB_PATH
+        original_export_dir = app.EXPORT_DIR
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                app.DB_PATH = temp_path / "test.sqlite3"
+                app.EXPORT_DIR = temp_path / "output"
+                app.init_db()
+
+                export_path, row_counts = app.write_xlsx_export()
+
+                workbook = load_workbook(export_path, read_only=True)
+                try:
+                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log"])
+                    self.assertEqual(row_counts, {
+                        "events": 0,
+                        "orderbook_log": 0,
+                        "btc_volume_log": 0,
+                    })
+                finally:
+                    workbook.close()
+        finally:
+            app.DB_PATH = original_db_path
+            app.EXPORT_DIR = original_export_dir
+
+    def test_download_xlsx_serves_latest_generated_file(self):
+        original_db_path = app.DB_PATH
+        original_export_dir = app.EXPORT_DIR
+        original_export_state = dict(app.export_state)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                app.DB_PATH = temp_path / "test.sqlite3"
+                app.EXPORT_DIR = temp_path / "output"
+                app.export_state.update({
+                    "status": "idle",
+                    "started_at": None,
+                    "finished_at": None,
+                    "filename": None,
+                    "path": None,
+                    "error": None,
+                    "row_counts": None,
+                })
+                app.init_db()
+                client = TestClient(app.app)
+
+                missing_response = client.get("/download.xlsx")
+                self.assertEqual(missing_response.status_code, 404)
+
+                export_path, _ = app.write_xlsx_export()
+                app.export_state.update({
+                    "status": "ready",
+                    "filename": export_path.name,
+                    "path": str(export_path),
+                })
+
+                response = client.get("/download.xlsx")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.headers["content-type"],
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                workbook = load_workbook(BytesIO(response.content), read_only=True)
+                try:
+                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log"])
+                finally:
+                    workbook.close()
+        finally:
+            app.DB_PATH = original_db_path
+            app.EXPORT_DIR = original_export_dir
+            app.export_state.update(original_export_state)
 
     def test_fetch_current_coinbase_candle_retry_succeeds_second_attempt(self):
         original_retry_count = app.COINBASE_MISSING_CANDLE_RETRY_COUNT

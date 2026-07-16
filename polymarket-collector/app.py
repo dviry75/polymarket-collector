@@ -1,18 +1,18 @@
 import asyncio
 import html
-import io
 import json
 import os
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-import pandas as pd
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from openpyxl import Workbook
 
 try:
     import truststore
@@ -23,6 +23,9 @@ except ImportError:
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "poly_data.sqlite3"
+EXPORT_DIR = APP_DIR / "output"
+EXPORT_FILE_PREFIX = "polymarket_data_"
+EXPORT_FILE_SUFFIX = ".xlsx"
 
 
 def env_int(name: str, default: int) -> int:
@@ -63,6 +66,195 @@ coinbase_volume_state: dict[str, Optional[str]] = {
     "status": "starting",
     "last_error": None,
 }
+export_state_lock = threading.Lock()
+export_state: dict[str, Optional[str]] = {
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "filename": None,
+    "path": None,
+    "error": None,
+    "row_counts": None,
+}
+
+EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
+    (
+        "events",
+        [
+            "local_event_id",
+            "polymarket_event_id",
+            "polymarket_market_id",
+            "condition_id",
+            "event_slug",
+            "market_slug",
+            "title",
+            "question",
+            "event_url",
+            "start_time",
+            "start_time_local",
+            "end_time",
+            "end_time_local",
+            "yes_token_id",
+            "no_token_id",
+            "outcomes",
+            "outcome_prices",
+            "active",
+            "closed",
+            "enable_order_book",
+            "accepting_orders",
+            "created_at_poly",
+            "created_at_poly_local",
+            "discovered_at",
+            "discovered_at_local",
+            "last_seen_at",
+            "last_seen_at_local",
+            "status",
+            "notes",
+        ],
+        """
+        SELECT
+            local_event_id,
+            polymarket_event_id,
+            polymarket_market_id,
+            condition_id,
+            event_slug,
+            market_slug,
+            title,
+            question,
+            event_url,
+            start_time,
+            start_time_local,
+            end_time,
+            end_time_local,
+            yes_token_id,
+            no_token_id,
+            outcomes,
+            outcome_prices,
+            active,
+            closed,
+            enable_order_book,
+            accepting_orders,
+            created_at_poly,
+            created_at_poly_local,
+            discovered_at,
+            discovered_at_local,
+            last_seen_at,
+            last_seen_at_local,
+            status,
+            notes
+        FROM events
+        ORDER BY local_event_id ASC
+        """,
+    ),
+    (
+        "orderbook_log",
+        [
+            "sampled_at",
+            "sampled_at_local",
+            "event_slug",
+            "condition_id",
+            "up_token_id",
+            "down_token_id",
+            "up_best_ask",
+            "up_best_bid",
+            "down_best_ask",
+            "down_best_bid",
+            "up_last_trade_price",
+            "down_last_trade_price",
+            "up_spread",
+            "down_spread",
+            "up_midpoint",
+            "down_midpoint",
+            "raw_up_timestamp",
+            "raw_down_timestamp",
+            "up_volume_shares_10s",
+            "down_volume_shares_10s",
+            "up_volume_usdc_10s",
+            "down_volume_usdc_10s",
+            "trades_count_10s",
+            "trades_window_start",
+            "trades_window_start_local",
+            "trades_window_end",
+            "trades_window_end_local",
+            "trades_error",
+            "status",
+            "error",
+        ],
+        """
+        SELECT
+            sampled_at,
+            sampled_at_local,
+            event_slug,
+            condition_id,
+            up_token_id,
+            down_token_id,
+            up_best_ask,
+            up_best_bid,
+            down_best_ask,
+            down_best_bid,
+            up_last_trade_price,
+            down_last_trade_price,
+            up_spread,
+            down_spread,
+            up_midpoint,
+            down_midpoint,
+            raw_up_timestamp,
+            raw_down_timestamp,
+            up_volume_shares_10s,
+            down_volume_shares_10s,
+            up_volume_usdc_10s,
+            down_volume_usdc_10s,
+            trades_count_10s,
+            trades_window_start,
+            trades_window_start_local,
+            trades_window_end,
+            trades_window_end_local,
+            trades_error,
+            status,
+            error
+        FROM orderbook_log
+        ORDER BY id ASC
+        """,
+    ),
+    (
+        "btc_volume_log",
+        [
+            "id",
+            "sampled_at",
+            "sample_bucket_at",
+            "candle_start_at",
+            "product_id",
+            "granularity_seconds",
+            "volume_btc_cumulative",
+            "volume_btc_delta",
+            "seconds_since_previous_sample",
+            "event_slug",
+            "condition_id",
+            "source",
+            "status",
+            "error",
+        ],
+        """
+        SELECT
+            id,
+            sampled_at,
+            sample_bucket_at,
+            candle_start_at,
+            product_id,
+            granularity_seconds,
+            volume_btc_cumulative,
+            volume_btc_delta,
+            seconds_since_previous_sample,
+            event_slug,
+            condition_id,
+            source,
+            status,
+            error
+        FROM btc_volume_log
+        ORDER BY sampled_at ASC
+        """,
+    ),
+]
 
 app = FastAPI(title="Polymarket BTC Collector")
 
@@ -1276,6 +1468,119 @@ def render_btc_volume_summary(summary: Optional[sqlite3.Row], health_row: dict[s
     """
 
 
+def latest_export_path() -> Optional[Path]:
+    state_path = export_state.get("path")
+    if state_path:
+        path = Path(state_path)
+        if path.exists():
+            return path
+
+    if not EXPORT_DIR.exists():
+        return None
+
+    exports = sorted(
+        EXPORT_DIR.glob(f"{EXPORT_FILE_PREFIX}*{EXPORT_FILE_SUFFIX}"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    return exports[0] if exports else None
+
+
+def write_xlsx_export() -> tuple[Path, dict[str, int]]:
+    init_db()
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
+    final_path = EXPORT_DIR / f"{EXPORT_FILE_PREFIX}{timestamp}{EXPORT_FILE_SUFFIX}"
+    temp_path = EXPORT_DIR / f".{final_path.stem}.tmp{EXPORT_FILE_SUFFIX}"
+    row_counts: dict[str, int] = {}
+
+    workbook = Workbook(write_only=True)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        for sheet_name, headers, query in EXPORT_SHEETS:
+            worksheet = workbook.create_sheet(sheet_name)
+            worksheet.append(headers)
+            cursor = conn.execute(query)
+            try:
+                count = 0
+                while True:
+                    rows = cursor.fetchmany(1000)
+                    if not rows:
+                        break
+                    for row in rows:
+                        worksheet.append(list(row))
+                    count += len(rows)
+                row_counts[sheet_name] = count
+            finally:
+                cursor.close()
+    finally:
+        conn.close()
+
+    workbook.save(temp_path)
+    temp_path.replace(final_path)
+    return final_path, row_counts
+
+
+def run_xlsx_export() -> None:
+    try:
+        export_path, row_counts = write_xlsx_export()
+        with export_state_lock:
+            export_state.update({
+                "status": "ready",
+                "finished_at": now_iso(),
+                "filename": export_path.name,
+                "path": str(export_path),
+                "error": None,
+                "row_counts": json.dumps(row_counts, ensure_ascii=False),
+            })
+        print(f"[export] Excel ready: {export_path} rows={row_counts}", flush=True)
+    except Exception as e:
+        with export_state_lock:
+            export_state.update({
+                "status": "error",
+                "finished_at": now_iso(),
+                "error": truncate_text(f"{type(e).__name__}: {e}", 500),
+            })
+        log_error("excel export", e)
+
+
+def render_export_actions() -> str:
+    with export_state_lock:
+        state = dict(export_state)
+
+    latest_path = latest_export_path()
+    status = state.get("status") or "idle"
+    started_at = display_value(state.get("started_at"))
+    finished_at = display_value(state.get("finished_at"))
+    filename = state.get("filename") or (latest_path.name if latest_path else None)
+    error = state.get("error")
+    row_counts = state.get("row_counts")
+    generate_disabled = " disabled" if status == "running" else ""
+    download_disabled = "" if latest_path else " disabled"
+    download_href = "/download.xlsx" if latest_path else "#"
+    summary_parts = [f"Status: {status}"]
+    if status == "running":
+        summary_parts.append(f"Started: {started_at}")
+    if status == "ready":
+        summary_parts.append(f"Ready: {finished_at}")
+    if filename:
+        summary_parts.append(f"File: {filename}")
+    if row_counts:
+        summary_parts.append(f"Rows: {row_counts}")
+    if error:
+        summary_parts.append(f"Error: {error}")
+    summary = " | ".join(summary_parts)
+
+    return f"""
+    <form method="post" action="/generate.xlsx" class="inline-form">
+        <button class="button" type="submit"{generate_disabled}>Generate Excel</button>
+    </form>
+    <a class="button{download_disabled}" href="{download_href}">Download Excel</a>
+    <div class="muted export-status">{html.escape(summary)}</div>
+    """
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     with get_conn() as conn:
@@ -1408,13 +1713,28 @@ def dashboard() -> str:
             .actions {{
                 margin: 12px 0 20px 0;
             }}
-            a.button {{
+            .inline-form {{
+                display: inline-block;
+                margin: 0 8px 8px 0;
+            }}
+            a.button, button.button {{
                 display: inline-block;
                 padding: 10px 14px;
                 background: #111;
                 color: white;
                 text-decoration: none;
                 border-radius: 6px;
+                border: 0;
+                cursor: pointer;
+                font: inherit;
+            }}
+            a.button.disabled, button.button:disabled {{
+                background: #888;
+                pointer-events: none;
+                cursor: default;
+            }}
+            .export-status {{
+                margin-top: 4px;
             }}
             .table-wrap {{
                 overflow-x: auto;
@@ -1450,7 +1770,7 @@ def dashboard() -> str:
         <div class="muted">Auto refresh every 10 seconds. Server time: {html.escape(now_iso())}</div>
 
         <div class="actions">
-            <a class="button" href="/download.xlsx">Download Excel</a>
+            {render_export_actions()}
         </div>
 
         <div class="card">
@@ -1473,116 +1793,35 @@ def dashboard() -> str:
     """
 
 
+@app.post("/generate.xlsx")
+def generate_xlsx(background_tasks: BackgroundTasks) -> RedirectResponse:
+    with export_state_lock:
+        if export_state.get("status") != "running":
+            export_state.update({
+                "status": "running",
+                "started_at": now_iso(),
+                "finished_at": None,
+                "error": None,
+                "row_counts": None,
+            })
+            background_tasks.add_task(run_xlsx_export)
+
+    return RedirectResponse("/", status_code=303)
+
+
 @app.get("/download.xlsx")
-def download_xlsx() -> StreamingResponse:
-    with sqlite3.connect(DB_PATH) as conn:
-        events_df = pd.read_sql_query("""
-            SELECT
-                local_event_id,
-                polymarket_event_id,
-                polymarket_market_id,
-                condition_id,
-                event_slug,
-                market_slug,
-                title,
-                question,
-                event_url,
-                start_time,
-                start_time_local,
-                end_time,
-                end_time_local,
-                yes_token_id,
-                no_token_id,
-                outcomes,
-                outcome_prices,
-                active,
-                closed,
-                enable_order_book,
-                accepting_orders,
-                created_at_poly,
-                created_at_poly_local,
-                discovered_at,
-                discovered_at_local,
-                last_seen_at,
-                last_seen_at_local,
-                status,
-                notes
-            FROM events
-            ORDER BY local_event_id ASC
-        """, conn)
+def download_xlsx():
+    export_path = latest_export_path()
+    if not export_path:
+        return HTMLResponse(
+            "<p>No Excel export is ready yet. Generate one first.</p>",
+            status_code=404,
+        )
 
-        logs_df = pd.read_sql_query("""
-            SELECT
-                sampled_at,
-                sampled_at_local,
-                event_slug,
-                condition_id,
-                up_token_id,
-                down_token_id,
-                up_best_ask,
-                up_best_bid,
-                down_best_ask,
-                down_best_bid,
-                up_last_trade_price,
-                down_last_trade_price,
-                up_spread,
-                down_spread,
-                up_midpoint,
-                down_midpoint,
-                raw_up_timestamp,
-                raw_down_timestamp,
-                up_volume_shares_10s,
-                down_volume_shares_10s,
-                up_volume_usdc_10s,
-                down_volume_usdc_10s,
-                trades_count_10s,
-                trades_window_start,
-                trades_window_start_local,
-                trades_window_end,
-                trades_window_end_local,
-                trades_error,
-                status,
-                error
-            FROM orderbook_log
-            ORDER BY id ASC
-        """, conn)
-
-        btc_volume_df = pd.read_sql_query("""
-            SELECT
-                id,
-                sampled_at,
-                sample_bucket_at,
-                candle_start_at,
-                product_id,
-                granularity_seconds,
-                volume_btc_cumulative,
-                volume_btc_delta,
-                seconds_since_previous_sample,
-                event_slug,
-                condition_id,
-                source,
-                status,
-                error
-            FROM btc_volume_log
-            ORDER BY sampled_at ASC
-        """, conn)
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        events_df.to_excel(writer, sheet_name="events", index=False)
-        logs_df.to_excel(writer, sheet_name="orderbook_log", index=False)
-        btc_volume_df.to_excel(writer, sheet_name="btc_volume_log", index=False)
-
-    output.seek(0)
-
-    filename = f"polymarket_data_{now_utc().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-    return StreamingResponse(
-        output,
+    return FileResponse(
+        export_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        },
+        filename=export_path.name,
     )
 
 
