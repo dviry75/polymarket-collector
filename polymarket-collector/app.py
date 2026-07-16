@@ -216,23 +216,6 @@ def init_db() -> None:
         )
         """)
 
-        conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_volume_log_unique_bucket
-        ON btc_volume_log (product_id, candle_start_at, sample_bucket_at)
-        """)
-        conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_sampled_at
-        ON btc_volume_log (sampled_at)
-        """)
-        conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_candle_start_at
-        ON btc_volume_log (candle_start_at)
-        """)
-        conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_event_slug
-        ON btc_volume_log (event_slug)
-        """)
-
         ensure_column(conn, "events", "start_time_local", "TEXT")
         ensure_column(conn, "events", "end_time_local", "TEXT")
         ensure_column(conn, "events", "created_at_poly_local", "TEXT")
@@ -249,6 +232,36 @@ def init_db() -> None:
         ensure_column(conn, "orderbook_log", "trades_window_end", "TEXT")
         ensure_column(conn, "orderbook_log", "trades_window_end_local", "TEXT")
         ensure_column(conn, "orderbook_log", "trades_error", "TEXT")
+        ensure_column(conn, "btc_volume_log", "sampled_at", "TEXT")
+        ensure_column(conn, "btc_volume_log", "sample_bucket_at", "TEXT")
+        ensure_column(conn, "btc_volume_log", "candle_start_at", "TEXT")
+        ensure_column(conn, "btc_volume_log", "product_id", "TEXT")
+        ensure_column(conn, "btc_volume_log", "granularity_seconds", "INTEGER")
+        ensure_column(conn, "btc_volume_log", "volume_btc_cumulative", "REAL")
+        ensure_column(conn, "btc_volume_log", "volume_btc_delta", "REAL")
+        ensure_column(conn, "btc_volume_log", "seconds_since_previous_sample", "REAL")
+        ensure_column(conn, "btc_volume_log", "event_slug", "TEXT")
+        ensure_column(conn, "btc_volume_log", "condition_id", "TEXT")
+        ensure_column(conn, "btc_volume_log", "source", "TEXT")
+        ensure_column(conn, "btc_volume_log", "status", "TEXT")
+        ensure_column(conn, "btc_volume_log", "error", "TEXT")
+
+        conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_volume_log_unique_bucket
+        ON btc_volume_log (product_id, candle_start_at, sample_bucket_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_sampled_at
+        ON btc_volume_log (sampled_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_candle_start_at
+        ON btc_volume_log (candle_start_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_btc_volume_log_event_slug
+        ON btc_volume_log (event_slug)
+        """)
 
         conn.commit()
     conn.close()
