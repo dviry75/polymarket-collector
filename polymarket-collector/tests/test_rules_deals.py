@@ -306,6 +306,13 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("<h2>Rules</h2>", html)
         self.assertIn("<h2>Deals</h2>", html)
         self.assertIn("Create Rule", html)
+        self.assertNotIn('http-equiv="refresh"', html)
+        self.assertIn("refreshDashboardContent", html)
+
+        dashboard_content = client.get("/dashboard-content")
+        self.assertEqual(dashboard_content.status_code, 200)
+        self.assertIn("<h2>Rules</h2>", dashboard_content.text)
+        self.assertIn("<h2>Deals</h2>", dashboard_content.text)
 
         app.export_state.update({"status": "ready", "filename": export_path.name, "path": str(export_path)})
         download = client.get("/download.xlsx")

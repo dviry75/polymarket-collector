@@ -2261,6 +2261,40 @@ def render_rule_actions() -> str:
 def render_dashboard_scripts() -> str:
     return """
     <script>
+      let dashboardRefreshInFlight = false;
+
+      function modalIsOpen() {
+        return !document.getElementById("rule-modal").hidden ||
+          !document.getElementById("deactivate-modal").hidden;
+      }
+
+      function userIsEditing() {
+        const element = document.activeElement;
+        if (!element) {
+          return false;
+        }
+        return ["INPUT", "SELECT", "TEXTAREA"].includes(element.tagName);
+      }
+
+      function autoRefreshIsPaused() {
+        return modalIsOpen() || userIsEditing();
+      }
+
+      async function refreshDashboardContent(force = false) {
+        if (dashboardRefreshInFlight || (!force && autoRefreshIsPaused())) {
+          return;
+        }
+        dashboardRefreshInFlight = true;
+        try {
+          const response = await fetch("/dashboard-content", {headers: {"X-Requested-With": "fetch"}});
+          if (response.ok) {
+            document.getElementById("dashboard-content").innerHTML = await response.text();
+          }
+        } finally {
+          dashboardRefreshInFlight = false;
+        }
+      }
+
       function openRuleModal() {
         document.getElementById("rule-error").textContent = "";
         document.getElementById("rule-modal").hidden = false;
@@ -2296,7 +2330,7 @@ def render_dashboard_scripts() -> str:
           return;
         }
         closeRuleModal();
-        window.location.reload();
+        await refreshDashboardContent(true);
       }
       async function submitDeactivate() {
         const ruleId = document.getElementById("deactivate-rule-id").value;
@@ -2307,14 +2341,23 @@ def render_dashboard_scripts() -> str:
           return;
         }
         closeDeactivateModal();
-        window.location.reload();
+        await refreshDashboardContent(true);
       }
+
+      window.setInterval(() => refreshDashboardContent(false), 10000);
     </script>
     """
 
 
-@app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
+def load_dashboard_rows() -> tuple[
+    list[sqlite3.Row],
+    list[sqlite3.Row],
+    list[sqlite3.Row],
+    Optional[sqlite3.Row],
+    list[sqlite3.Row],
+    list[sqlite3.Row],
+    dict[str, Optional[str]],
+]:
     with get_conn() as conn:
         events = conn.execute("""
             SELECT
@@ -2455,13 +2498,59 @@ def dashboard() -> str:
         """).fetchall()
 
     btc_health = get_latest_coinbase_health()
+    return events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health
 
+
+def render_dashboard_content() -> str:
+    events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
+    return f"""
+        <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}</div>
+
+        <div class="actions">
+            {render_export_actions()}
+            {render_rule_actions()}
+        </div>
+
+        <div class="card">
+            <h2>Events / Markets</h2>
+            {render_table(events)}
+        </div>
+
+        <div class="card">
+            <h2>Coinbase BTC Volume</h2>
+            {render_btc_volume_summary(btc_volume_summary, btc_health)}
+            {render_btc_volume_table(btc_volume_rows)}
+        </div>
+
+        <div class="card">
+            <h2>Rules</h2>
+            {render_table(rules)}
+        </div>
+
+        <div class="card">
+            <h2>Deals</h2>
+            {render_table(deals)}
+        </div>
+
+        <div class="card">
+            <h2>Orderbook Log</h2>
+            {render_table(logs)}
+        </div>
+    """
+
+
+@app.get("/dashboard-content", response_class=HTMLResponse)
+def dashboard_content() -> str:
+    return render_dashboard_content()
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> str:
     return f"""
     <!doctype html>
     <html>
     <head>
         <meta charset="utf-8">
-        <meta http-equiv="refresh" content="10">
         <title>Polymarket BTC Collector</title>
         <style>
             body {{
@@ -2585,37 +2674,8 @@ def dashboard() -> str:
     </head>
     <body>
         <h1>Polymarket BTC Collector</h1>
-        <div class="muted">Auto refresh every 10 seconds. Server time: {html.escape(now_iso())}</div>
-
-        <div class="actions">
-            {render_export_actions()}
-            {render_rule_actions()}
-        </div>
-
-        <div class="card">
-            <h2>Events / Markets</h2>
-            {render_table(events)}
-        </div>
-
-        <div class="card">
-            <h2>Coinbase BTC Volume</h2>
-            {render_btc_volume_summary(btc_volume_summary, btc_health)}
-            {render_btc_volume_table(btc_volume_rows)}
-        </div>
-
-        <div class="card">
-            <h2>Rules</h2>
-            {render_table(rules)}
-        </div>
-
-        <div class="card">
-            <h2>Deals</h2>
-            {render_table(deals)}
-        </div>
-
-        <div class="card">
-            <h2>Orderbook Log</h2>
-            {render_table(logs)}
+        <div id="dashboard-content">
+            {render_dashboard_content()}
         </div>
         {render_dashboard_scripts()}
     </body>
