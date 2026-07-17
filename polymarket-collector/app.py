@@ -4,13 +4,14 @@ import json
 import os
 import sqlite3
 import threading
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from openpyxl import Workbook
 
@@ -254,9 +255,98 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
         ORDER BY sampled_at ASC
         """,
     ),
+    (
+        "rules",
+        [
+            "id",
+            "name",
+            "created_at",
+            "updated_at",
+            "entry_price",
+            "stop_loss_price",
+            "take_profit_price",
+            "max_yes_entries_per_event",
+            "max_no_entries_per_event",
+            "status",
+            "eligible_after_event_id",
+        ],
+        """
+        SELECT
+            id,
+            name,
+            created_at,
+            updated_at,
+            entry_price,
+            stop_loss_price,
+            take_profit_price,
+            max_yes_entries_per_event,
+            max_no_entries_per_event,
+            status,
+            eligible_after_event_id
+        FROM rules
+        ORDER BY id ASC
+        """,
+    ),
+    (
+        "deals",
+        [
+            "id",
+            "rule_id",
+            "rule_name",
+            "event_id",
+            "side",
+            "result",
+            "entry_at",
+            "entry_price",
+            "entry_orderbook_log_id",
+            "exit_at",
+            "exit_price",
+            "exit_orderbook_log_id",
+            "exit_reason",
+            "market_result",
+            "price_change_points",
+            "return_percent",
+            "created_at",
+            "updated_at",
+        ],
+        """
+        SELECT
+            id,
+            rule_id,
+            rule_name,
+            event_id,
+            side,
+            result,
+            entry_at,
+            entry_price,
+            entry_orderbook_log_id,
+            exit_at,
+            exit_price,
+            exit_orderbook_log_id,
+            exit_reason,
+            market_result,
+            price_change_points,
+            return_percent,
+            created_at,
+            updated_at
+        FROM deals
+        ORDER BY id ASC
+        """,
+    ),
 ]
 
 app = FastAPI(title="Polymarket BTC Collector")
+
+
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        result = super().__exit__(exc_type, exc_value, traceback)
+        self.close()
+        return result
+
+
+def connect_db() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH, factory=ClosingConnection)
 
 
 def now_utc() -> datetime:
@@ -317,7 +407,7 @@ async def sleep_until_next_tick(interval_seconds: int, started_at: float) -> Non
 
 
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             local_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -408,6 +498,48 @@ def init_db() -> None:
         )
         """)
 
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_loss_price REAL NOT NULL,
+            take_profit_price REAL NOT NULL,
+            max_yes_entries_per_event INTEGER NOT NULL,
+            max_no_entries_per_event INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+            eligible_after_event_id TEXT
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER NOT NULL,
+            rule_name TEXT,
+            event_id TEXT NOT NULL,
+            side TEXT NOT NULL CHECK (side IN ('yes', 'no')),
+            result TEXT NOT NULL CHECK (result IN ('open', 'win', 'loss')),
+            entry_at TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            entry_orderbook_log_id INTEGER NOT NULL,
+            exit_at TEXT,
+            exit_price REAL,
+            exit_orderbook_log_id INTEGER,
+            exit_reason TEXT CHECK (exit_reason IS NULL OR exit_reason IN ('take_profit', 'stop_loss', 'event_resolution')),
+            market_result TEXT,
+            price_change_points REAL,
+            return_percent REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (rule_id) REFERENCES rules(id),
+            FOREIGN KEY (entry_orderbook_log_id) REFERENCES orderbook_log(id),
+            FOREIGN KEY (exit_orderbook_log_id) REFERENCES orderbook_log(id)
+        )
+        """)
+
         ensure_column(conn, "events", "start_time_local", "TEXT")
         ensure_column(conn, "events", "end_time_local", "TEXT")
         ensure_column(conn, "events", "created_at_poly_local", "TEXT")
@@ -437,6 +569,8 @@ def init_db() -> None:
         ensure_column(conn, "btc_volume_log", "source", "TEXT")
         ensure_column(conn, "btc_volume_log", "status", "TEXT")
         ensure_column(conn, "btc_volume_log", "error", "TEXT")
+        ensure_column(conn, "rules", "eligible_after_event_id", "TEXT")
+        ensure_column(conn, "deals", "rule_name", "TEXT")
 
         conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_volume_log_unique_bucket
@@ -454,6 +588,35 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_btc_volume_log_event_slug
         ON btc_volume_log (event_slug)
         """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_rules_status
+        ON rules (status)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_rule_id
+        ON deals (rule_id)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_event_id
+        ON deals (event_id)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_result
+        ON deals (result)
+        """)
+        conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_deals_one_open_per_rule
+        ON deals (rule_id)
+        WHERE result = 'open'
+        """)
+        conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_deals_unique_entry_sample
+        ON deals (rule_id, event_id, side, entry_orderbook_log_id)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_rule_event_side
+        ON deals (rule_id, event_id, side)
+        """)
 
         conn.commit()
     conn.close()
@@ -466,9 +629,272 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def decimal_price(value: Any, field_name: str) -> Decimal:
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{field_name} must be a numeric price")
+
+    if not price.is_finite():
+        raise ValueError(f"{field_name} must be a finite numeric price")
+    if price <= Decimal("0"):
+        raise ValueError(f"{field_name} must be positive")
+    if price >= Decimal("1"):
+        raise ValueError(f"{field_name} must be below 1")
+    return price.quantize(Decimal("0.000001"))
+
+
+def decimal_from_db(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.000001"))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def prices_equal(left: Any, right: Any) -> bool:
+    left_price = decimal_from_db(left)
+    right_price = decimal_from_db(right)
+    return left_price is not None and right_price is not None and left_price == right_price
+
+
+def validate_rule_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise ValueError("name must not be empty")
+
+    entry_price = decimal_price(payload.get("entry_price"), "entry_price")
+    stop_loss_price = decimal_price(payload.get("stop_loss_price"), "stop_loss_price")
+    take_profit_price = decimal_price(payload.get("take_profit_price"), "take_profit_price")
+
+    if entry_price == Decimal("0.500000"):
+        raise ValueError("entry_price must not be 0.5")
+    if stop_loss_price >= entry_price:
+        raise ValueError("stop_loss_price must be below entry_price")
+    if take_profit_price <= entry_price:
+        raise ValueError("take_profit_price must be above entry_price")
+
+    try:
+        max_yes = int(payload.get("max_yes_entries_per_event"))
+        max_no = int(payload.get("max_no_entries_per_event"))
+    except (TypeError, ValueError):
+        raise ValueError("entry limits must be non-negative integers")
+
+    if max_yes < 0:
+        raise ValueError("max_yes_entries_per_event must be non-negative")
+    if max_no < 0:
+        raise ValueError("max_no_entries_per_event must be non-negative")
+
+    status = str(payload.get("status", "active")).strip().lower()
+    if status not in {"active", "inactive"}:
+        raise ValueError("status must be active or inactive")
+
+    return {
+        "name": name,
+        "entry_price": float(entry_price),
+        "stop_loss_price": float(stop_loss_price),
+        "take_profit_price": float(take_profit_price),
+        "max_yes_entries_per_event": max_yes,
+        "max_no_entries_per_event": max_no,
+        "status": status,
+    }
+
+
+def active_event_id_for_rule_gate() -> Optional[str]:
+    event_slug, _ = current_active_market_snapshot()
+    return event_slug
+
+
+def create_rule(payload: dict[str, Any]) -> sqlite3.Row:
+    values = validate_rule_payload(payload)
+    created_at = now_iso()
+    eligible_after_event_id = active_event_id_for_rule_gate() if values["status"] == "active" else None
+
+    try:
+        with get_conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO rules (
+                    name,
+                    created_at,
+                    updated_at,
+                    entry_price,
+                    stop_loss_price,
+                    take_profit_price,
+                    max_yes_entries_per_event,
+                    max_no_entries_per_event,
+                    status,
+                    eligible_after_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                values["name"],
+                created_at,
+                created_at,
+                values["entry_price"],
+                values["stop_loss_price"],
+                values["take_profit_price"],
+                values["max_yes_entries_per_event"],
+                values["max_no_entries_per_event"],
+                values["status"],
+                eligible_after_event_id,
+            ))
+            rule_id = cursor.lastrowid
+            conn.commit()
+            row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    except sqlite3.Error as exc:
+        log_error("create rule db", exc)
+        raise
+
+    print(
+        f"[rules] created id={rule_id} name={values['name']} status={values['status']} "
+        f"eligible_after_event_id={eligible_after_event_id}",
+        flush=True,
+    )
+    if eligible_after_event_id:
+        print(f"[rules] rule id={rule_id} waits for next event after {eligible_after_event_id}", flush=True)
+    return row
+
+
+def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def deactivate_rule(rule_id: int) -> tuple[sqlite3.Row, str]:
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Rule {rule_id} does not exist")
+            if row["status"] == "inactive":
+                print(f"[rules] deactivate requested for already inactive id={rule_id}", flush=True)
+                return row, "Rule is already inactive"
+
+            updated_at = now_iso()
+            conn.execute(
+                "UPDATE rules SET status = 'inactive', updated_at = ? WHERE id = ?",
+                (updated_at, rule_id),
+            )
+            conn.commit()
+            updated = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    except sqlite3.Error as exc:
+        log_error("deactivate rule db", exc)
+        raise
+
+    print(f"[rules] deactivated id={rule_id}", flush=True)
+    return updated, "Rule deactivated"
+
+
+def calculate_deal_metrics(entry_price: Any, exit_price: Any) -> tuple[float, float]:
+    entry = Decimal(str(entry_price))
+    exit_value = Decimal(str(exit_price))
+    points = abs(exit_value - entry) * Decimal("100")
+    return_percent = ((exit_value - entry) / entry) * Decimal("100")
+    return float(points), float(return_percent)
+
+
+def close_deal(
+    conn: sqlite3.Connection,
+    deal: sqlite3.Row,
+    result: str,
+    exit_reason: str,
+    exit_price: Any,
+    exit_at: str,
+    exit_orderbook_log_id: Optional[int],
+    market_result: Optional[str] = None,
+) -> None:
+    price_change_points, return_percent = calculate_deal_metrics(deal["entry_price"], exit_price)
+    conn.execute("""
+        UPDATE deals SET
+            result = ?,
+            exit_at = ?,
+            exit_price = ?,
+            exit_orderbook_log_id = ?,
+            exit_reason = ?,
+            market_result = ?,
+            price_change_points = ?,
+            return_percent = ?,
+            updated_at = ?
+        WHERE id = ? AND result = 'open'
+    """, (
+        result,
+        exit_at,
+        float(Decimal(str(exit_price))),
+        exit_orderbook_log_id,
+        exit_reason,
+        market_result,
+        price_change_points,
+        return_percent,
+        now_iso(),
+        deal["id"],
+    ))
+
+
+def resolve_market_result(event_row: sqlite3.Row) -> Optional[str]:
+    if int(event_row["closed"] or 0) != 1 and event_row["status"] != "closed":
+        return None
+
+    prices = safe_json_loads(event_row["outcome_prices"])
+    if len(prices) < 2:
+        return None
+
+    parsed: list[Decimal] = []
+    for value in prices[:2]:
+        try:
+            parsed.append(Decimal(str(value)))
+        except (InvalidOperation, ValueError):
+            return None
+
+    if parsed[0] == Decimal("1") and parsed[1] == Decimal("0"):
+        return "yes"
+    if parsed[1] == Decimal("1") and parsed[0] == Decimal("0"):
+        return "no"
+    return None
+
+
+def close_deals_for_event_resolution(conn: sqlite3.Connection, event_id: str) -> None:
+    conn.row_factory = sqlite3.Row
+    event_row = conn.execute("""
+        SELECT *
+        FROM events
+        WHERE event_slug = ?
+        LIMIT 1
+    """, (event_id,)).fetchone()
+    if not event_row:
+        return
+
+    market_result = resolve_market_result(event_row)
+    if not market_result:
+        return
+
+    open_deals = conn.execute("""
+        SELECT *
+        FROM deals
+        WHERE event_id = ? AND result = 'open'
+    """, (event_id,)).fetchall()
+
+    for deal in open_deals:
+        result = "win" if deal["side"] == market_result else "loss"
+        exit_price = 1 if result == "win" else 0
+        close_deal(
+            conn,
+            deal,
+            result,
+            "event_resolution",
+            exit_price,
+            now_iso(),
+            None,
+            market_result,
+        )
+        print(
+            f"[deals] closed id={deal['id']} rule_id={deal['rule_id']} "
+            f"reason=event_resolution market_result={market_result} result={result}",
+            flush=True,
+        )
 
 
 def floor_to_5m_epoch(dt: datetime) -> int:
@@ -600,7 +1026,7 @@ def upsert_event(market_row: dict[str, Any]) -> None:
     last_seen_at = now_iso()
     last_seen_at_local = now_local_display()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         existing = conn.execute(
             "SELECT local_event_id, discovered_at FROM events WHERE event_slug = ?",
             (market_row["event_slug"],),
@@ -730,6 +1156,7 @@ def upsert_event(market_row: dict[str, Any]) -> None:
                 market_row["raw_json"],
             ))
 
+        close_deals_for_event_resolution(conn, market_row["event_slug"])
         conn.commit()
 
 
@@ -988,7 +1415,7 @@ def current_active_market_snapshot() -> tuple[Optional[str], Optional[str]]:
 
 def insert_btc_volume_log(row: dict[str, Any]) -> bool:
     inserted = False
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         cursor = conn.execute("""
             INSERT OR IGNORE INTO btc_volume_log (
                 sampled_at,
@@ -1028,7 +1455,7 @@ def insert_btc_volume_log(row: dict[str, Any]) -> bool:
 
 
 def get_latest_coinbase_health() -> dict[str, Optional[str]]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.row_factory = sqlite3.Row
         latest = conn.execute("""
             SELECT sampled_at, status, error
@@ -1097,7 +1524,7 @@ async def collect_coinbase_volume_sample(client: Optional[httpx.AsyncClient] = N
         if fetch_error or candle is None:
             row = build_error_row(sampled_at_dt, f"{fetch_error or 'Coinbase candle selection failed'}; attempts={attempts}")
         else:
-            with sqlite3.connect(DB_PATH) as conn:
+            with connect_db() as conn:
                 previous_sample = get_latest_valid_coinbase_sample(conn, COINBASE_PRODUCT_ID)
 
             delta, seconds_since_previous, status, delta_error = calculate_coinbase_delta(
@@ -1159,9 +1586,214 @@ def empty_volume_metrics() -> dict[str, Any]:
         "trades_count_10s": 0,
     }
 
-def insert_orderbook_log(row: dict[str, Any]) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
+
+def side_ask(row: dict[str, Any] | sqlite3.Row, side: str) -> Any:
+    return row["up_best_ask"] if side == "yes" else row["down_best_ask"]
+
+
+def side_bid(row: dict[str, Any] | sqlite3.Row, side: str) -> Any:
+    return row["up_best_bid"] if side == "yes" else row["down_best_bid"]
+
+
+def count_entries(conn: sqlite3.Connection, rule_id: int, event_id: str, side: str) -> int:
+    return int(conn.execute("""
+        SELECT COUNT(*)
+        FROM deals
+        WHERE rule_id = ? AND event_id = ? AND side = ?
+    """, (rule_id, event_id, side)).fetchone()[0])
+
+
+def has_open_deal(conn: sqlite3.Connection, rule_id: int) -> bool:
+    row = conn.execute("""
+        SELECT id
+        FROM deals
+        WHERE rule_id = ? AND result = 'open'
+        LIMIT 1
+    """, (rule_id,)).fetchone()
+    return row is not None
+
+
+def process_demo_exits(
+    conn: sqlite3.Connection,
+    orderbook_row: dict[str, Any],
+    orderbook_log_id: int,
+) -> set[int]:
+    closed_rule_ids: set[int] = set()
+    open_deals = conn.execute("""
+        SELECT
+            deals.*,
+            rules.stop_loss_price,
+            rules.take_profit_price
+        FROM deals
+        JOIN rules ON rules.id = deals.rule_id
+        WHERE deals.result = 'open'
+    """).fetchall()
+
+    for deal in open_deals:
+        bid = side_bid(orderbook_row, deal["side"])
+        bid_price = decimal_from_db(bid)
+        if bid_price is None:
+            continue
+
+        stop_loss = decimal_from_db(deal["stop_loss_price"])
+        take_profit = decimal_from_db(deal["take_profit_price"])
+        if stop_loss is None or take_profit is None:
+            continue
+
+        # Stop loss wins if both thresholds are considered hit in the same processing pass.
+        if bid_price <= stop_loss:
+            close_deal(
+                conn,
+                deal,
+                "loss",
+                "stop_loss",
+                stop_loss,
+                orderbook_row["sampled_at"],
+                orderbook_log_id,
+            )
+            closed_rule_ids.add(int(deal["rule_id"]))
+            print(
+                f"[deals] closed id={deal['id']} rule_id={deal['rule_id']} "
+                f"reason=stop_loss bid={bid} exit_price={stop_loss}",
+                flush=True,
+            )
+            continue
+
+        if bid_price >= take_profit:
+            close_deal(
+                conn,
+                deal,
+                "win",
+                "take_profit",
+                take_profit,
+                orderbook_row["sampled_at"],
+                orderbook_log_id,
+            )
+            closed_rule_ids.add(int(deal["rule_id"]))
+            print(
+                f"[deals] closed id={deal['id']} rule_id={deal['rule_id']} "
+                f"reason=take_profit bid={bid} exit_price={take_profit}",
+                flush=True,
+            )
+
+    return closed_rule_ids
+
+
+def process_demo_entries(
+    conn: sqlite3.Connection,
+    orderbook_row: dict[str, Any],
+    orderbook_log_id: int,
+    closed_rule_ids: set[int],
+) -> None:
+    event_id = orderbook_row.get("event_slug")
+    if not event_id:
+        return
+
+    rules = conn.execute("""
+        SELECT *
+        FROM rules
+        WHERE status = 'active'
+        ORDER BY id ASC
+    """).fetchall()
+
+    for rule in rules:
+        rule_id = int(rule["id"])
+        if rule_id in closed_rule_ids:
+            continue
+
+        if rule["eligible_after_event_id"] and rule["eligible_after_event_id"] == event_id:
+            print(f"[rules] rule id={rule_id} waits for next event after {event_id}", flush=True)
+            continue
+
+        yes_match = prices_equal(side_ask(orderbook_row, "yes"), rule["entry_price"])
+        no_match = prices_equal(side_ask(orderbook_row, "no"), rule["entry_price"])
+
+        if yes_match and no_match:
+            print(
+                f"[deals] both sides match entry price; no deal opened "
+                f"rule_id={rule_id} event_id={event_id} orderbook_log_id={orderbook_log_id}",
+                flush=True,
+            )
+            continue
+
+        side = "yes" if yes_match else "no" if no_match else None
+        if side is None:
+            continue
+
+        if has_open_deal(conn, rule_id):
+            print(f"[deals] open deal already exists for rule_id={rule_id}; entry skipped", flush=True)
+            continue
+
+        max_entries = (
+            int(rule["max_yes_entries_per_event"])
+            if side == "yes"
+            else int(rule["max_no_entries_per_event"])
+        )
+        current_entries = count_entries(conn, rule_id, event_id, side)
+        if current_entries >= max_entries:
+            print(
+                f"[deals] entry quota reached rule_id={rule_id} event_id={event_id} "
+                f"side={side} quota={max_entries}",
+                flush=True,
+            )
+            continue
+
+        created_at = now_iso()
+        try:
+            cursor = conn.execute("""
+                INSERT INTO deals (
+                    rule_id,
+                    rule_name,
+                    event_id,
+                    side,
+                    result,
+                    entry_at,
+                    entry_price,
+                    entry_orderbook_log_id,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+            """, (
+                rule_id,
+                rule["name"],
+                event_id,
+                side,
+                orderbook_row["sampled_at"],
+                rule["entry_price"],
+                orderbook_log_id,
+                created_at,
+                created_at,
+            ))
+        except sqlite3.IntegrityError as exc:
+            print(
+                f"[deals] duplicate or concurrent entry prevented rule_id={rule_id} "
+                f"event_id={event_id} side={side} orderbook_log_id={orderbook_log_id}: {exc}",
+                flush=True,
+            )
+            continue
+
+        print(
+            f"[deals] opened id={cursor.lastrowid} rule_id={rule_id} "
+            f"event_id={event_id} side={side} entry_price={rule['entry_price']} "
+            f"orderbook_log_id={orderbook_log_id}",
+            flush=True,
+        )
+
+
+def process_demo_trading_for_orderbook(
+    conn: sqlite3.Connection,
+    orderbook_row: dict[str, Any],
+    orderbook_log_id: int,
+) -> None:
+    closed_rule_ids = process_demo_exits(conn, orderbook_row, orderbook_log_id)
+    process_demo_entries(conn, orderbook_row, orderbook_log_id, closed_rule_ids)
+
+
+def insert_orderbook_log(row: dict[str, Any]) -> int:
+    with connect_db() as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute("""
             INSERT INTO orderbook_log (
                 sampled_at,
                 sampled_at_local,
@@ -1226,7 +1858,10 @@ def insert_orderbook_log(row: dict[str, Any]) -> None:
             row.get("status"),
             row.get("error"),
         ))
+        orderbook_log_id = int(cursor.lastrowid)
+        process_demo_trading_for_orderbook(conn, row, orderbook_log_id)
         conn.commit()
+        return orderbook_log_id
 
 
 async def event_collector_loop() -> None:
@@ -1496,7 +2131,7 @@ def write_xlsx_export() -> tuple[Path, dict[str, int]]:
     row_counts: dict[str, int] = {}
 
     workbook = Workbook(write_only=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect_db()
     try:
         for sheet_name, headers, query in EXPORT_SHEETS:
             worksheet = workbook.create_sheet(sheet_name)
@@ -1578,6 +2213,103 @@ def render_export_actions() -> str:
     </form>
     <a class="button{download_disabled}" href="{download_href}">Download Excel</a>
     <div class="muted export-status">{html.escape(summary)}</div>
+    """
+
+
+def render_rule_actions() -> str:
+    return """
+    <button class="button" type="button" onclick="openRuleModal()">Create Rule / יצירת חוק</button>
+    <button class="button secondary" type="button" onclick="openDeactivateModal()">Deactivate Rule / השבתת חוק</button>
+
+    <div id="rule-modal" class="modal" hidden>
+      <div class="modal-panel">
+        <h2>Create Rule / יצירת חוק</h2>
+        <label>Name <input id="rule-name" type="text"></label>
+        <label>Entry price <input id="rule-entry" type="number" step="0.01" min="0.01" max="0.99"></label>
+        <label>Stop loss <input id="rule-stop" type="number" step="0.01" min="0.01" max="0.99"></label>
+        <label>Take profit <input id="rule-take" type="number" step="0.01" min="0.01" max="0.99"></label>
+        <label>Max YES entries <input id="rule-max-yes" type="number" step="1" min="0" value="1"></label>
+        <label>Max NO entries <input id="rule-max-no" type="number" step="1" min="0" value="1"></label>
+        <label>Status
+          <select id="rule-status">
+            <option value="active">active</option>
+            <option value="inactive">inactive</option>
+          </select>
+        </label>
+        <div id="rule-error" class="error"></div>
+        <div class="modal-actions">
+          <button class="button" type="button" onclick="submitRule()">Save</button>
+          <button class="button secondary" type="button" onclick="closeRuleModal()">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="deactivate-modal" class="modal" hidden>
+      <div class="modal-panel small">
+        <h2>Deactivate Rule / השבתת חוק</h2>
+        <label>Rule ID <input id="deactivate-rule-id" type="number" step="1" min="1"></label>
+        <div id="deactivate-error" class="error"></div>
+        <div class="modal-actions">
+          <button class="button" type="button" onclick="submitDeactivate()">Deactivate</button>
+          <button class="button secondary" type="button" onclick="closeDeactivateModal()">Cancel</button>
+        </div>
+      </div>
+    </div>
+    """
+
+
+def render_dashboard_scripts() -> str:
+    return """
+    <script>
+      function openRuleModal() {
+        document.getElementById("rule-error").textContent = "";
+        document.getElementById("rule-modal").hidden = false;
+      }
+      function closeRuleModal() {
+        document.getElementById("rule-modal").hidden = true;
+      }
+      function openDeactivateModal() {
+        document.getElementById("deactivate-error").textContent = "";
+        document.getElementById("deactivate-modal").hidden = false;
+      }
+      function closeDeactivateModal() {
+        document.getElementById("deactivate-modal").hidden = true;
+      }
+      async function submitRule() {
+        const payload = {
+          name: document.getElementById("rule-name").value,
+          entry_price: document.getElementById("rule-entry").value,
+          stop_loss_price: document.getElementById("rule-stop").value,
+          take_profit_price: document.getElementById("rule-take").value,
+          max_yes_entries_per_event: document.getElementById("rule-max-yes").value,
+          max_no_entries_per_event: document.getElementById("rule-max-no").value,
+          status: document.getElementById("rule-status").value
+        };
+        const response = await fetch("/rules", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          document.getElementById("rule-error").textContent = data.detail || "Rule creation failed";
+          return;
+        }
+        closeRuleModal();
+        window.location.reload();
+      }
+      async function submitDeactivate() {
+        const ruleId = document.getElementById("deactivate-rule-id").value;
+        const response = await fetch(`/rules/${ruleId}/deactivate`, {method: "POST"});
+        const data = await response.json();
+        if (!response.ok) {
+          document.getElementById("deactivate-error").textContent = data.detail || "Deactivate failed";
+          return;
+        }
+        closeDeactivateModal();
+        window.location.reload();
+      }
+    </script>
     """
 
 
@@ -1683,6 +2415,45 @@ def dashboard() -> str:
             LIMIT 1
         """).fetchone()
 
+        rules = conn.execute("""
+            SELECT
+                id,
+                name,
+                entry_price,
+                stop_loss_price,
+                take_profit_price,
+                max_yes_entries_per_event,
+                max_no_entries_per_event,
+                status,
+                eligible_after_event_id,
+                created_at,
+                updated_at
+            FROM rules
+            ORDER BY id DESC
+            LIMIT 100
+        """).fetchall()
+
+        deals = conn.execute("""
+            SELECT
+                id AS deal_id,
+                rule_id,
+                rule_name,
+                event_id,
+                side,
+                result,
+                entry_at,
+                entry_price,
+                exit_at,
+                exit_price,
+                exit_reason,
+                market_result,
+                price_change_points,
+                return_percent
+            FROM deals
+            ORDER BY id DESC
+            LIMIT 200
+        """).fetchall()
+
     btc_health = get_latest_coinbase_health()
 
     return f"""
@@ -1733,8 +2504,55 @@ def dashboard() -> str:
                 pointer-events: none;
                 cursor: default;
             }}
+            button.secondary, a.secondary {{
+                background: #555;
+            }}
             .export-status {{
                 margin-top: 4px;
+            }}
+            .modal[hidden] {{
+                display: none;
+            }}
+            .modal {{
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.45);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10;
+            }}
+            .modal-panel {{
+                background: white;
+                border-radius: 8px;
+                padding: 18px;
+                width: min(520px, calc(100vw - 32px));
+                box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+            }}
+            .modal-panel.small {{
+                width: min(360px, calc(100vw - 32px));
+            }}
+            label {{
+                display: block;
+                margin: 10px 0;
+                font-size: 13px;
+            }}
+            input, select {{
+                box-sizing: border-box;
+                width: 100%;
+                margin-top: 4px;
+                padding: 8px;
+                border: 1px solid #ccc;
+                border-radius: 6px;
+                font: inherit;
+            }}
+            .modal-actions {{
+                margin-top: 14px;
+            }}
+            .error {{
+                color: #9b1c1c;
+                min-height: 20px;
+                font-size: 13px;
             }}
             .table-wrap {{
                 overflow-x: auto;
@@ -1771,6 +2589,7 @@ def dashboard() -> str:
 
         <div class="actions">
             {render_export_actions()}
+            {render_rule_actions()}
         </div>
 
         <div class="card">
@@ -1785,12 +2604,73 @@ def dashboard() -> str:
         </div>
 
         <div class="card">
+            <h2>Rules</h2>
+            {render_table(rules)}
+        </div>
+
+        <div class="card">
+            <h2>Deals</h2>
+            {render_table(deals)}
+        </div>
+
+        <div class="card">
             <h2>Orderbook Log</h2>
             {render_table(logs)}
         </div>
+        {render_dashboard_scripts()}
     </body>
     </html>
     """
+
+
+@app.post("/rules")
+def api_create_rule(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        row = create_rule(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Database error while creating rule")
+    return row_to_dict(row)
+
+
+@app.get("/rules")
+def api_get_rules() -> list[dict[str, Any]]:
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM rules
+                ORDER BY id DESC
+            """).fetchall()
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Database error while loading rules")
+    return [row_to_dict(row) for row in rows]
+
+
+@app.post("/rules/{rule_id}/deactivate")
+def api_deactivate_rule(rule_id: int) -> dict[str, Any]:
+    try:
+        row, message = deactivate_rule(rule_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Rule {rule_id} does not exist")
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Database error while deactivating rule")
+    return {"message": message, "rule": row_to_dict(row)}
+
+
+@app.get("/deals")
+def api_get_deals() -> list[dict[str, Any]]:
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM deals
+                ORDER BY id DESC
+            """).fetchall()
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Database error while loading deals")
+    return [row_to_dict(row) for row in rows]
 
 
 @app.post("/generate.xlsx")

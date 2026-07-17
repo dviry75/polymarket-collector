@@ -202,7 +202,7 @@ class CoinbaseVolumeTests(unittest.TestCase):
         finally:
             app.DB_PATH = original_db_path
 
-    def test_write_xlsx_export_creates_three_sheets(self):
+    def test_write_xlsx_export_creates_five_sheets(self):
         original_db_path = app.DB_PATH
         original_export_dir = app.EXPORT_DIR
         try:
@@ -216,11 +216,13 @@ class CoinbaseVolumeTests(unittest.TestCase):
 
                 workbook = load_workbook(export_path, read_only=True)
                 try:
-                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log"])
+                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals"])
                     self.assertEqual(row_counts, {
                         "events": 0,
                         "orderbook_log": 0,
                         "btc_volume_log": 0,
+                        "rules": 0,
+                        "deals": 0,
                     })
                 finally:
                     workbook.close()
@@ -267,7 +269,7 @@ class CoinbaseVolumeTests(unittest.TestCase):
                 )
                 workbook = load_workbook(BytesIO(response.content), read_only=True)
                 try:
-                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log"])
+                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals"])
                 finally:
                     workbook.close()
         finally:
