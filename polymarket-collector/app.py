@@ -2,6 +2,7 @@ import asyncio
 import html
 import json
 import os
+import shutil
 import sqlite3
 import threading
 from decimal import Decimal, InvalidOperation
@@ -2039,6 +2040,24 @@ def display_value(value: Any) -> str:
     return str(value)
 
 
+def format_storage_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def render_storage_status() -> str:
+    usage = shutil.disk_usage(APP_DIR)
+    used_percent = (usage.used / usage.total * 100) if usage.total else 0
+    return (
+        f"Storage: {format_storage_size(usage.free)} free of "
+        f"{format_storage_size(usage.total)} ({used_percent:.1f}% used)"
+    )
+
+
 def render_btc_volume_table(rows: list[sqlite3.Row]) -> str:
     if not rows:
         return "<p>No Coinbase BTC volume data yet.</p>"
@@ -2504,6 +2523,7 @@ def load_dashboard_rows() -> tuple[
 def render_dashboard_content() -> str:
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
+        <div class="storage-status">{html.escape(render_storage_status())}</div>
         <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}</div>
 
         <div class="actions">
@@ -2598,6 +2618,11 @@ def dashboard() -> str:
             }}
             .export-status {{
                 margin-top: 4px;
+            }}
+            .storage-status {{
+                margin: 0 0 6px 0;
+                font-size: 14px;
+                font-weight: 700;
             }}
             .modal[hidden] {{
                 display: none;
