@@ -2287,6 +2287,349 @@ def load_dashboard_overview(investment_usd: Any = 1) -> dict[str, Any]:
     }
 
 
+def load_rules_performance(investment_usd: Any = 1) -> list[dict[str, Any]]:
+    investment = normalize_investment_usd(investment_usd)
+    with get_conn() as conn:
+        rules = conn.execute("""
+            SELECT
+                id,
+                name,
+                status,
+                entry_price,
+                stop_loss_price,
+                take_profit_price
+            FROM rules
+            ORDER BY id ASC
+        """).fetchall()
+        deals = conn.execute("""
+            SELECT
+                id,
+                rule_id,
+                result,
+                entry_price,
+                exit_price,
+                exit_at
+            FROM deals
+            ORDER BY rule_id ASC, exit_at ASC, id ASC
+        """).fetchall()
+
+    performance: dict[int, dict[str, Any]] = {}
+    for rule in rules:
+        rule_id = int(rule["id"])
+        performance[rule_id] = {
+            "rule_id": rule_id,
+            "rule_name": rule["name"],
+            "status": rule["status"],
+            "entry_price": rule["entry_price"],
+            "stop_loss_price": rule["stop_loss_price"],
+            "take_profit_price": rule["take_profit_price"],
+            "closed_deals": 0,
+            "open_deals": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_pnl_usd": 0.0,
+            "avg_pnl_usd": None,
+            "avg_roi_percent": None,
+            "win_rate": None,
+            "profit_factor": None,
+            "profit_factor_infinite": False,
+            "max_drawdown_usd": 0.0,
+            "expectancy_usd": None,
+            "_pnl_values": [],
+            "_roi_values": [],
+        }
+
+    for deal in deals:
+        rule_id = int(deal["rule_id"])
+        row = performance.get(rule_id)
+        if row is None:
+            row = {
+                "rule_id": rule_id,
+                "rule_name": f"Missing rule {rule_id}",
+                "status": "missing",
+                "entry_price": None,
+                "stop_loss_price": None,
+                "take_profit_price": None,
+                "closed_deals": 0,
+                "open_deals": 0,
+                "wins": 0,
+                "losses": 0,
+                "net_pnl_usd": 0.0,
+                "avg_pnl_usd": None,
+                "avg_roi_percent": None,
+                "win_rate": None,
+                "profit_factor": None,
+                "profit_factor_infinite": False,
+                "max_drawdown_usd": 0.0,
+                "expectancy_usd": None,
+                "_pnl_values": [],
+                "_roi_values": [],
+            }
+            performance[rule_id] = row
+
+        if deal["result"] == "open":
+            row["open_deals"] += 1
+            continue
+
+        if deal["result"] not in ("win", "loss") or deal["exit_price"] is None:
+            continue
+
+        try:
+            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
+                deal["entry_price"],
+                deal["exit_price"],
+                investment,
+            )
+        except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+            continue
+
+        row["closed_deals"] += 1
+        row["wins"] += 1 if deal["result"] == "win" else 0
+        row["losses"] += 1 if deal["result"] == "loss" else 0
+        row["net_pnl_usd"] += pnl_usd
+        row["_pnl_values"].append(pnl_usd)
+        row["_roi_values"].append(roi_percent)
+
+    rows = list(performance.values())
+    for row in rows:
+        closed_deals = row["closed_deals"]
+        pnl_values = row.pop("_pnl_values")
+        roi_values = row.pop("_roi_values")
+        gross_profit = sum(value for value in pnl_values if value > 0)
+        gross_loss_abs = abs(sum(value for value in pnl_values if value < 0))
+
+        if closed_deals:
+            row["win_rate"] = row["wins"] / closed_deals * 100
+            row["avg_pnl_usd"] = row["net_pnl_usd"] / closed_deals
+            row["avg_roi_percent"] = sum(roi_values) / closed_deals
+            row["expectancy_usd"] = row["avg_pnl_usd"]
+            row["max_drawdown_usd"] = max_drawdown(pnl_values)
+
+        if gross_loss_abs == 0:
+            row["profit_factor_infinite"] = gross_profit > 0
+            row["profit_factor"] = None
+        else:
+            row["profit_factor"] = gross_profit / gross_loss_abs
+
+    rows.sort(key=lambda item: (item["net_pnl_usd"], item["closed_deals"], -item["rule_id"]), reverse=True)
+    return rows
+
+
+def load_risk_snapshot(investment_usd: Any = 1) -> dict[str, Any]:
+    investment = normalize_investment_usd(investment_usd)
+    with get_conn() as conn:
+        closed_deals = conn.execute("""
+            SELECT
+                id,
+                rule_id,
+                rule_name,
+                event_id,
+                side,
+                result,
+                entry_price,
+                exit_price,
+                exit_at,
+                exit_reason
+            FROM deals
+            WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+            ORDER BY exit_at ASC, id ASC
+        """).fetchall()
+
+    equity = 0.0
+    peak = 0.0
+    worst_drawdown = 0.0
+    worst_drawdown_after = None
+    best_deal = None
+    worst_deal = None
+    pnl_values: list[float] = []
+    results: list[str] = []
+    exit_reasons: dict[str, dict[str, Any]] = {}
+
+    for deal in closed_deals:
+        try:
+            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
+                deal["entry_price"],
+                deal["exit_price"],
+                investment,
+            )
+        except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+            continue
+
+        pnl_values.append(pnl_usd)
+        results.append(str(deal["result"]))
+        equity += pnl_usd
+        peak = max(peak, equity)
+        drawdown = peak - equity
+        if drawdown > worst_drawdown:
+            worst_drawdown = drawdown
+            worst_drawdown_after = deal["exit_at"]
+
+        deal_summary = {
+            "deal_id": deal["id"],
+            "rule_name": deal["rule_name"] or f"Rule {deal['rule_id']}",
+            "event_id": deal["event_id"],
+            "side": deal["side"],
+            "result": deal["result"],
+            "exit_reason": deal["exit_reason"] or "unknown",
+            "exit_at": deal["exit_at"],
+            "pnl_usd": pnl_usd,
+            "roi_percent": roi_percent,
+        }
+        if best_deal is None or pnl_usd > best_deal["pnl_usd"]:
+            best_deal = deal_summary
+        if worst_deal is None or pnl_usd < worst_deal["pnl_usd"]:
+            worst_deal = deal_summary
+
+        reason = deal_summary["exit_reason"]
+        reason_summary = exit_reasons.setdefault(reason, {
+            "exit_reason": reason,
+            "deals": 0,
+            "wins": 0,
+            "losses": 0,
+            "pnl_usd": 0.0,
+        })
+        reason_summary["deals"] += 1
+        reason_summary["wins"] += 1 if deal["result"] == "win" else 0
+        reason_summary["losses"] += 1 if deal["result"] == "loss" else 0
+        reason_summary["pnl_usd"] += pnl_usd
+
+    closed_count = len(pnl_values)
+    negative_deals = [value for value in pnl_values if value < 0]
+    positive_deals = [value for value in pnl_values if value > 0]
+    exit_reason_rows = sorted(
+        exit_reasons.values(),
+        key=lambda item: (item["deals"], item["pnl_usd"]),
+        reverse=True,
+    )
+    for row in exit_reason_rows:
+        row["win_rate"] = (row["wins"] / row["deals"] * 100) if row["deals"] else None
+
+    return {
+        "closed_deals": closed_count,
+        "ending_equity_usd": equity,
+        "peak_equity_usd": peak,
+        "max_drawdown_usd": worst_drawdown,
+        "max_drawdown_after": worst_drawdown_after,
+        "longest_loss_streak": longest_result_streak(results, "loss"),
+        "longest_win_streak": longest_result_streak(results, "win"),
+        "best_deal": best_deal,
+        "worst_deal": worst_deal,
+        "avg_loss_usd": (sum(negative_deals) / len(negative_deals)) if negative_deals else None,
+        "avg_win_usd": (sum(positive_deals) / len(positive_deals)) if positive_deals else None,
+        "loss_deals": len(negative_deals),
+        "win_deals": len(positive_deals),
+        "exit_reasons": exit_reason_rows,
+    }
+
+
+def price_bucket_label(entry_price: Any) -> str:
+    price = decimal_from_db(entry_price)
+    if price is None:
+        return "unknown"
+    if price < Decimal("0.60"):
+        return "< 0.60"
+    if price < Decimal("0.70"):
+        return "0.60-0.69"
+    if price < Decimal("0.80"):
+        return "0.70-0.79"
+    if price < Decimal("0.90"):
+        return "0.80-0.89"
+    return "0.90+"
+
+
+def add_condition_result(group: dict[str, Any], result: str, pnl_usd: float, roi_percent: float) -> None:
+    group["closed_deals"] += 1
+    group["wins"] += 1 if result == "win" else 0
+    group["losses"] += 1 if result == "loss" else 0
+    group["net_pnl_usd"] += pnl_usd
+    group["_roi_values"].append(roi_percent)
+
+
+def finalize_condition_group(group: dict[str, Any]) -> dict[str, Any]:
+    closed_deals = group["closed_deals"]
+    roi_values = group.pop("_roi_values")
+    group["win_rate"] = (group["wins"] / closed_deals * 100) if closed_deals else None
+    group["avg_roi_percent"] = (sum(roi_values) / closed_deals) if closed_deals else None
+    group["avg_pnl_usd"] = (group["net_pnl_usd"] / closed_deals) if closed_deals else None
+    return group
+
+
+def load_market_conditions(investment_usd: Any = 1) -> dict[str, list[dict[str, Any]]]:
+    investment = normalize_investment_usd(investment_usd)
+    with get_conn() as conn:
+        closed_deals = conn.execute("""
+            SELECT
+                id,
+                side,
+                result,
+                entry_price,
+                exit_price
+            FROM deals
+            WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+            ORDER BY id ASC
+        """).fetchall()
+
+    side_groups: dict[str, dict[str, Any]] = {}
+    price_groups: dict[str, dict[str, Any]] = {}
+
+    for deal in closed_deals:
+        try:
+            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
+                deal["entry_price"],
+                deal["exit_price"],
+                investment,
+            )
+        except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+            continue
+
+        side = str(deal["side"] or "unknown").upper()
+        side_group = side_groups.setdefault(side, {
+            "label": side,
+            "closed_deals": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": None,
+            "net_pnl_usd": 0.0,
+            "avg_pnl_usd": None,
+            "avg_roi_percent": None,
+            "_roi_values": [],
+        })
+        add_condition_result(side_group, str(deal["result"]), pnl_usd, roi_percent)
+
+        bucket = price_bucket_label(deal["entry_price"])
+        price_group = price_groups.setdefault(bucket, {
+            "label": bucket,
+            "closed_deals": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": None,
+            "net_pnl_usd": 0.0,
+            "avg_pnl_usd": None,
+            "avg_roi_percent": None,
+            "_roi_values": [],
+        })
+        add_condition_result(price_group, str(deal["result"]), pnl_usd, roi_percent)
+
+    price_order = {
+        "< 0.60": 0,
+        "0.60-0.69": 1,
+        "0.70-0.79": 2,
+        "0.80-0.89": 3,
+        "0.90+": 4,
+        "unknown": 5,
+    }
+    return {
+        "by_side": sorted(
+            [finalize_condition_group(group) for group in side_groups.values()],
+            key=lambda item: item["label"],
+        ),
+        "by_entry_price": sorted(
+            [finalize_condition_group(group) for group in price_groups.values()],
+            key=lambda item: price_order.get(item["label"], 99),
+        ),
+    }
+
+
 def render_metric(label: str, value: str, note: str = "") -> str:
     note_html = f"<div class=\"metric-note\">{html.escape(note)}</div>" if note else ""
     return f"""
@@ -2345,6 +2688,177 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
             Longest loss streak: {overview['longest_loss_streak']} |
             Weakest rule: {html.escape(worst_rule_label)}
         </p>
+    </div>
+    """
+
+
+def render_rules_performance(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return """
+        <div class="card">
+            <h2>Rules Performance</h2>
+            <p>No rules yet.</p>
+        </div>
+        """
+
+    headers = [
+        "Rule",
+        "Status",
+        "Closed",
+        "Open",
+        "Wins",
+        "Losses",
+        "Win Rate",
+        "Net P&L",
+        "Avg ROI",
+        "Profit Factor",
+        "Expectancy",
+        "Max Drawdown",
+        "Entry / SL / TP",
+    ]
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = ""
+    for row in rows:
+        price_summary = (
+            f"{display_value(row['entry_price'])} / "
+            f"{display_value(row['stop_loss_price'])} / "
+            f"{display_value(row['take_profit_price'])}"
+        )
+        values = [
+            row["rule_name"],
+            row["status"],
+            row["closed_deals"],
+            row["open_deals"],
+            row["wins"],
+            row["losses"],
+            format_percent(row["win_rate"]),
+            format_money(row["net_pnl_usd"]),
+            format_percent(row["avg_roi_percent"]),
+            format_factor(row["profit_factor"], row["profit_factor_infinite"]),
+            format_money(row["expectancy_usd"]),
+            format_money(row["max_drawdown_usd"]),
+            price_summary,
+        ]
+        cells = "".join(f"<td>{html.escape(str(value))}</td>" for value in values)
+        body += f"<tr>{cells}</tr>"
+
+    return f"""
+    <div class="card">
+        <h2>Rules Performance</h2>
+        <p class="muted">Ranked by closed-deal Net P&L. Investment is a display filter only.</p>
+        <div class="table-wrap compact-table">
+          <table>
+            <thead><tr>{thead}</tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+        </div>
+    </div>
+    """
+
+
+def render_deal_summary(deal: Optional[dict[str, Any]]) -> str:
+    if not deal:
+        return "-"
+    return (
+        f"#{deal['deal_id']} {deal['rule_name']} "
+        f"{format_money(deal['pnl_usd'])} / {format_percent(deal['roi_percent'])}"
+    )
+
+
+def render_exit_reason_breakdown(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "<p>No closed deals yet.</p>"
+
+    headers = ["Exit Reason", "Deals", "Wins", "Losses", "Win Rate", "Net P&L"]
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = ""
+    for row in rows:
+        values = [
+            row["exit_reason"],
+            row["deals"],
+            row["wins"],
+            row["losses"],
+            format_percent(row["win_rate"]),
+            format_money(row["pnl_usd"]),
+        ]
+        cells = "".join(f"<td>{html.escape(str(value))}</td>" for value in values)
+        body += f"<tr>{cells}</tr>"
+
+    return f"""
+    <div class="table-wrap risk-table">
+      <table>
+        <thead><tr>{thead}</tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_risk_snapshot(risk: dict[str, Any]) -> str:
+    metrics = [
+        render_metric("Ending Equity", format_money(risk["ending_equity_usd"]), "closed-deal P&L sum"),
+        render_metric("Peak Equity", format_money(risk["peak_equity_usd"]), "highest closed-deal equity"),
+        render_metric("Max Drawdown", format_money(risk["max_drawdown_usd"]), f"after: {display_value(risk['max_drawdown_after'])}"),
+        render_metric("Loss Streak", str(risk["longest_loss_streak"]), f"{risk['loss_deals']} losing deals"),
+        render_metric("Avg Win", format_money(risk["avg_win_usd"]), f"{risk['win_deals']} winning deals"),
+        render_metric("Avg Loss", format_money(risk["avg_loss_usd"]), "average losing deal"),
+        render_metric("Best Deal", render_deal_summary(risk["best_deal"])),
+        render_metric("Worst Deal", render_deal_summary(risk["worst_deal"])),
+    ]
+
+    return f"""
+    <div class="card">
+        <h2>Risk Snapshot</h2>
+        <p class="muted">Risk metrics use closed deals only and the current investment display filter.</p>
+        <div class="metric-grid">
+            {''.join(metrics)}
+        </div>
+        <h3>Exit Reasons</h3>
+        {render_exit_reason_breakdown(risk["exit_reasons"])}
+    </div>
+    """
+
+
+def render_condition_table(rows: list[dict[str, Any]], empty_text: str) -> str:
+    if not rows:
+        return f"<p>{html.escape(empty_text)}</p>"
+
+    headers = ["Group", "Closed", "Wins", "Losses", "Win Rate", "Net P&L", "Avg P&L", "Avg ROI"]
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = ""
+    for row in rows:
+        values = [
+            row["label"],
+            row["closed_deals"],
+            row["wins"],
+            row["losses"],
+            format_percent(row["win_rate"]),
+            format_money(row["net_pnl_usd"]),
+            format_money(row["avg_pnl_usd"]),
+            format_percent(row["avg_roi_percent"]),
+        ]
+        cells = "".join(f"<td>{html.escape(str(value))}</td>" for value in values)
+        body += f"<tr>{cells}</tr>"
+
+    return f"""
+    <div class="table-wrap condition-table">
+      <table>
+        <thead><tr>{thead}</tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+    """
+
+
+def render_market_conditions(conditions: dict[str, list[dict[str, Any]]]) -> str:
+    return f"""
+    <div class="card">
+        <h2>Market Conditions</h2>
+        <p class="muted">Closed deals only. Current phase uses reliable deal fields: side and entry price bucket.</p>
+        <h3>Performance by Side</h3>
+        {render_condition_table(conditions["by_side"], "No closed deals by side yet.")}
+        <h3>Performance by Entry Price</h3>
+        {render_condition_table(conditions["by_entry_price"], "No closed deals by entry price yet.")}
     </div>
     """
 
@@ -2749,12 +3263,18 @@ def load_dashboard_rows() -> tuple[
 
 def render_dashboard_content(investment_usd: Any = 1) -> str:
     overview = load_dashboard_overview(investment_usd)
+    rules_performance = load_rules_performance(investment_usd)
+    risk_snapshot = load_risk_snapshot(investment_usd)
+    market_conditions = load_market_conditions(investment_usd)
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
         <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}</div>
 
         {render_dashboard_overview(overview)}
+        {render_rules_performance(rules_performance)}
+        {render_risk_snapshot(risk_snapshot)}
+        {render_market_conditions(market_conditions)}
 
         <div class="actions">
             {render_export_actions()}
@@ -2954,6 +3474,18 @@ def dashboard(investment_usd: float = 1.0) -> str:
                 width: 100%;
                 min-width: 1600px;
                 font-size: 13px;
+            }}
+            .compact-table table {{
+                min-width: 1050px;
+            }}
+            .risk-table table {{
+                min-width: 720px;
+            }}
+            .condition-table table {{
+                min-width: 760px;
+            }}
+            h3 {{
+                margin: 16px 0 8px 0;
             }}
             th, td {{
                 border: 1px solid #ddd;
