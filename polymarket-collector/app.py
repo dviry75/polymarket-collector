@@ -2630,6 +2630,62 @@ def load_market_conditions(investment_usd: Any = 1) -> dict[str, list[dict[str, 
     }
 
 
+def load_system_health_snapshot() -> dict[str, Any]:
+    with get_conn() as conn:
+        events_count = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+        orderbook_count = int(conn.execute("SELECT COUNT(*) FROM orderbook_log").fetchone()[0])
+        btc_volume_count = int(conn.execute("SELECT COUNT(*) FROM btc_volume_log").fetchone()[0])
+        rules_count = int(conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0])
+        active_rules = int(conn.execute("SELECT COUNT(*) FROM rules WHERE status = 'active'").fetchone()[0])
+        deals_count = int(conn.execute("SELECT COUNT(*) FROM deals").fetchone()[0])
+        open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
+        latest_event = conn.execute("SELECT MAX(last_seen_at) FROM events").fetchone()[0]
+        latest_orderbook = conn.execute("SELECT MAX(sampled_at) FROM orderbook_log").fetchone()[0]
+        latest_btc_volume = conn.execute("SELECT MAX(sampled_at) FROM btc_volume_log").fetchone()[0]
+        orderbook_issues = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM orderbook_log
+            WHERE status IS NOT NULL AND status != 'success'
+        """).fetchone()[0])
+        btc_volume_issues = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM btc_volume_log
+            WHERE status = 'error'
+        """).fetchone()[0])
+
+    db_exists = DB_PATH.exists()
+    db_size_bytes = DB_PATH.stat().st_size if db_exists else 0
+    coinbase_health = get_latest_coinbase_health()
+    issue_count = orderbook_issues + btc_volume_issues
+    status = "ok"
+    if issue_count:
+        status = "degraded"
+    if not db_exists:
+        status = "db_missing"
+
+    return {
+        "status": status,
+        "db_path": str(DB_PATH),
+        "db_exists": db_exists,
+        "db_size": format_storage_size(db_size_bytes),
+        "events_count": events_count,
+        "orderbook_count": orderbook_count,
+        "btc_volume_count": btc_volume_count,
+        "rules_count": rules_count,
+        "active_rules": active_rules,
+        "deals_count": deals_count,
+        "open_deals": open_deals,
+        "latest_event": latest_event,
+        "latest_orderbook": latest_orderbook,
+        "latest_btc_volume": latest_btc_volume,
+        "orderbook_issues": orderbook_issues,
+        "btc_volume_issues": btc_volume_issues,
+        "coinbase_status": coinbase_health.get("status"),
+        "coinbase_last_success": coinbase_health.get("last_success_at"),
+        "coinbase_last_error": coinbase_health.get("last_error"),
+    }
+
+
 def render_metric(label: str, value: str, note: str = "") -> str:
     note_html = f"<div class=\"metric-note\">{html.escape(note)}</div>" if note else ""
     return f"""
@@ -2859,6 +2915,48 @@ def render_market_conditions(conditions: dict[str, list[dict[str, Any]]]) -> str
         {render_condition_table(conditions["by_side"], "No closed deals by side yet.")}
         <h3>Performance by Entry Price</h3>
         {render_condition_table(conditions["by_entry_price"], "No closed deals by entry price yet.")}
+    </div>
+    """
+
+
+def render_system_health(health: dict[str, Any]) -> str:
+    metrics = [
+        render_metric("System Status", display_value(health["status"]), f"DB size: {health['db_size']}"),
+        render_metric("Latest Event", display_value(health["latest_event"])),
+        render_metric("Latest Orderbook", display_value(health["latest_orderbook"]), f"{health['orderbook_issues']} issues"),
+        render_metric("Latest BTC Volume", display_value(health["latest_btc_volume"]), f"{health['btc_volume_issues']} errors"),
+        render_metric("Coinbase Collector", display_value(health["coinbase_status"]), f"success: {display_value(health['coinbase_last_success'])}"),
+        render_metric("Open Deals", str(health["open_deals"]), f"{health['deals_count']} total deals"),
+    ]
+
+    rows = [
+        ("Events", health["events_count"]),
+        ("Orderbook Samples", health["orderbook_count"]),
+        ("BTC Volume Samples", health["btc_volume_count"]),
+        ("Rules", health["rules_count"]),
+        ("Active Rules", health["active_rules"]),
+        ("Deals", health["deals_count"]),
+    ]
+    body = "".join(
+        f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in rows
+    )
+    last_error = display_value(health["coinbase_last_error"])
+
+    return f"""
+    <div class="card">
+        <h2>System Health</h2>
+        <p class="muted">Operational snapshot for the local FastAPI/SQLite collector.</p>
+        <div class="metric-grid">
+            {''.join(metrics)}
+        </div>
+        <div class="table-wrap health-table">
+          <table>
+            <thead><tr><th>Entity</th><th>Count</th></tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+        </div>
+        <p class="muted">DB: {html.escape(health["db_path"])} | Coinbase last error: {html.escape(last_error)}</p>
     </div>
     """
 
@@ -3266,6 +3364,7 @@ def render_dashboard_content(investment_usd: Any = 1) -> str:
     rules_performance = load_rules_performance(investment_usd)
     risk_snapshot = load_risk_snapshot(investment_usd)
     market_conditions = load_market_conditions(investment_usd)
+    system_health = load_system_health_snapshot()
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
@@ -3275,6 +3374,7 @@ def render_dashboard_content(investment_usd: Any = 1) -> str:
         {render_rules_performance(rules_performance)}
         {render_risk_snapshot(risk_snapshot)}
         {render_market_conditions(market_conditions)}
+        {render_system_health(system_health)}
 
         <div class="actions">
             {render_export_actions()}
@@ -3483,6 +3583,9 @@ def dashboard(investment_usd: float = 1.0) -> str:
             }}
             .condition-table table {{
                 min-width: 760px;
+            }}
+            .health-table table {{
+                min-width: 360px;
             }}
             h3 {{
                 margin: 16px 0 8px 0;

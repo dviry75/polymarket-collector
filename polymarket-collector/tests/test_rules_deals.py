@@ -330,6 +330,13 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(conditions["by_entry_price"][0]["label"], "0.70-0.79")
         self.assertEqual(conditions["by_entry_price"][0]["closed_deals"], 1)
 
+        health = app.load_system_health_snapshot()
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["rules_count"], 2)
+        self.assertEqual(health["deals_count"], 1)
+        self.assertEqual(health["open_deals"], 0)
+        self.assertEqual(health["orderbook_count"], 2)
+
         export_path, row_counts = app.write_xlsx_export()
         self.assertEqual(row_counts["rules"], 2)
         self.assertEqual(row_counts["deals"], 1)
@@ -347,6 +354,8 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("<h2>Rules Performance</h2>", html)
         self.assertIn("<h2>Risk Snapshot</h2>", html)
         self.assertIn("<h2>Market Conditions</h2>", html)
+        self.assertIn("<h2>System Health</h2>", html)
+        self.assertIn("Orderbook Samples", html)
         self.assertIn("Performance by Side", html)
         self.assertIn("0.70-0.79", html)
         self.assertIn("Exit Reasons", html)
@@ -365,6 +374,7 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("<h2>Rules Performance</h2>", dashboard_content.text)
         self.assertIn("<h2>Risk Snapshot</h2>", dashboard_content.text)
         self.assertIn("<h2>Market Conditions</h2>", dashboard_content.text)
+        self.assertIn("<h2>System Health</h2>", dashboard_content.text)
         self.assertIn("<h2>Rules</h2>", dashboard_content.text)
         self.assertIn("<h2>Deals</h2>", dashboard_content.text)
 
