@@ -283,12 +283,28 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(points, 77.0)
         self.assertAlmostEqual(percent, ((0 - 0.77) / 0.77) * 100)
 
+        pnl, roi, shares = app.calculate_deal_pnl_usd(0.77, 0.90, 1)
+        self.assertAlmostEqual(shares, 1 / 0.77)
+        self.assertAlmostEqual(pnl, (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(roi, ((0.90 - 0.77) / 0.77) * 100)
+
+        pnl, roi, shares = app.calculate_deal_pnl_usd(0.74, 0.65, 1)
+        self.assertAlmostEqual(shares, 1 / 0.74)
+        self.assertAlmostEqual(pnl, (1 / 0.74) * 0.65 - 1)
+        self.assertAlmostEqual(roi, ((0.65 - 0.74) / 0.74) * 100)
+
     def test_excel_and_dashboard_include_rules_and_deals(self):
         active = app.create_rule(valid_rule(name="active"))
         app.create_rule(valid_rule(name="inactive", status="inactive"))
         app.insert_orderbook_log(orderbook("event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19))
         app.insert_orderbook_log(orderbook("event-a", yes_ask=0.2, yes_bid=0.93, no_ask=0.2, no_bid=0.19))
         app.deactivate_rule(active["id"])
+
+        overview = app.load_dashboard_overview(1)
+        self.assertEqual(overview["closed_deals"], 1)
+        self.assertEqual(overview["open_deals"], 0)
+        self.assertEqual(overview["wins"], 1)
+        self.assertAlmostEqual(overview["net_pnl_usd"], (1 / 0.77) * 0.90 - 1)
 
         export_path, row_counts = app.write_xlsx_export()
         self.assertEqual(row_counts["rules"], 2)
@@ -303,6 +319,9 @@ class RuleDealTests(unittest.TestCase):
         dashboard = client.get("/")
         self.assertEqual(dashboard.status_code, 200)
         html = dashboard.text
+        self.assertIn("<h2>Executive Overview</h2>", html)
+        self.assertIn("Net P&amp;L", html)
+        self.assertIn("$0.17", html)
         self.assertIn("<h2>Rules</h2>", html)
         self.assertIn("<h2>Deals</h2>", html)
         self.assertIn("Create Rule", html)
@@ -311,6 +330,7 @@ class RuleDealTests(unittest.TestCase):
 
         dashboard_content = client.get("/dashboard-content")
         self.assertEqual(dashboard_content.status_code, 200)
+        self.assertIn("<h2>Executive Overview</h2>", dashboard_content.text)
         self.assertIn("<h2>Rules</h2>", dashboard_content.text)
         self.assertIn("<h2>Deals</h2>", dashboard_content.text)
 

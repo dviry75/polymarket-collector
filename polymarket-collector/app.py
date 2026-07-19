@@ -798,6 +798,31 @@ def calculate_deal_metrics(entry_price: Any, exit_price: Any) -> tuple[float, fl
     return float(points), float(return_percent)
 
 
+def normalize_investment_usd(value: Any) -> Decimal:
+    try:
+        investment = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return Decimal("1")
+
+    if not investment.is_finite() or investment <= 0:
+        return Decimal("1")
+    return investment.quantize(Decimal("0.01"))
+
+
+def calculate_deal_pnl_usd(entry_price: Any, exit_price: Any, investment_usd: Any = 1) -> tuple[float, float, float]:
+    entry = Decimal(str(entry_price))
+    exit_value = Decimal(str(exit_price))
+    investment = normalize_investment_usd(investment_usd)
+
+    if entry <= 0:
+        raise ValueError("entry_price must be positive")
+
+    shares = investment / entry
+    pnl = shares * (exit_value - entry)
+    roi_percent = (pnl / investment) * Decimal("100")
+    return float(pnl), float(roi_percent), float(shares)
+
+
 def close_deal(
     conn: sqlite3.Connection,
     deal: sqlite3.Row,
@@ -2122,6 +2147,208 @@ def render_btc_volume_summary(summary: Optional[sqlite3.Row], health_row: dict[s
     """
 
 
+def format_money(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):.2f}"
+
+
+def format_percent(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}%"
+
+
+def format_factor(value: Optional[float], infinite: bool = False) -> str:
+    if infinite:
+        return "∞"
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
+
+
+def max_drawdown(values: list[float]) -> float:
+    peak = 0.0
+    worst = 0.0
+    equity = 0.0
+    for value in values:
+        equity += value
+        peak = max(peak, equity)
+        worst = max(worst, peak - equity)
+    return worst
+
+
+def longest_result_streak(results: list[str], target: str) -> int:
+    current = 0
+    longest = 0
+    for result in results:
+        if result == target:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def load_dashboard_overview(investment_usd: Any = 1) -> dict[str, Any]:
+    investment = normalize_investment_usd(investment_usd)
+    with get_conn() as conn:
+        total_deals = int(conn.execute("SELECT COUNT(*) FROM deals").fetchone()[0])
+        open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
+        active_rules = int(conn.execute("SELECT COUNT(*) FROM rules WHERE status = 'active'").fetchone()[0])
+        last_orderbook_sample = conn.execute("SELECT MAX(sampled_at) FROM orderbook_log").fetchone()[0]
+        orderbook_errors = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM orderbook_log
+            WHERE status IS NOT NULL AND status != 'success'
+        """).fetchone()[0])
+        closed_deals = conn.execute("""
+            SELECT
+                id,
+                rule_id,
+                rule_name,
+                event_id,
+                side,
+                result,
+                entry_price,
+                exit_price,
+                exit_at
+            FROM deals
+            WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+            ORDER BY exit_at ASC, id ASC
+        """).fetchall()
+
+    pnl_values: list[float] = []
+    roi_values: list[float] = []
+    results: list[str] = []
+    per_rule: dict[int, dict[str, Any]] = {}
+
+    for deal in closed_deals:
+        try:
+            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
+                deal["entry_price"],
+                deal["exit_price"],
+                investment,
+            )
+        except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+            continue
+
+        pnl_values.append(pnl_usd)
+        roi_values.append(roi_percent)
+        results.append(str(deal["result"]))
+
+        rule_id = int(deal["rule_id"])
+        rule_summary = per_rule.setdefault(rule_id, {
+            "rule_id": rule_id,
+            "rule_name": deal["rule_name"] or f"Rule {rule_id}",
+            "deals": 0,
+            "wins": 0,
+            "losses": 0,
+            "pnl_usd": 0.0,
+        })
+        rule_summary["deals"] += 1
+        rule_summary["wins"] += 1 if deal["result"] == "win" else 0
+        rule_summary["losses"] += 1 if deal["result"] == "loss" else 0
+        rule_summary["pnl_usd"] += pnl_usd
+
+    closed_count = len(pnl_values)
+    wins = results.count("win")
+    losses = results.count("loss")
+    net_pnl = sum(pnl_values)
+    gross_profit = sum(value for value in pnl_values if value > 0)
+    gross_loss_abs = abs(sum(value for value in pnl_values if value < 0))
+    profit_factor = None if gross_loss_abs == 0 else gross_profit / gross_loss_abs
+    profit_factor_infinite = gross_loss_abs == 0 and gross_profit > 0
+    best_rule = max(per_rule.values(), key=lambda item: item["pnl_usd"], default=None)
+    worst_rule = min(per_rule.values(), key=lambda item: item["pnl_usd"], default=None)
+
+    return {
+        "investment_usd": float(investment),
+        "total_deals": total_deals,
+        "closed_deals": closed_count,
+        "open_deals": open_deals,
+        "active_rules": active_rules,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (wins / closed_count * 100) if closed_count else None,
+        "net_pnl_usd": net_pnl,
+        "avg_pnl_usd": (net_pnl / closed_count) if closed_count else None,
+        "avg_roi_percent": (sum(roi_values) / closed_count) if closed_count else None,
+        "profit_factor": profit_factor,
+        "profit_factor_infinite": profit_factor_infinite,
+        "max_drawdown_usd": max_drawdown(pnl_values),
+        "longest_loss_streak": longest_result_streak(results, "loss"),
+        "longest_win_streak": longest_result_streak(results, "win"),
+        "best_rule": best_rule,
+        "worst_rule": worst_rule,
+        "last_orderbook_sample": last_orderbook_sample,
+        "orderbook_errors": orderbook_errors,
+    }
+
+
+def render_metric(label: str, value: str, note: str = "") -> str:
+    note_html = f"<div class=\"metric-note\">{html.escape(note)}</div>" if note else ""
+    return f"""
+    <div class="metric">
+        <div class="metric-label">{html.escape(label)}</div>
+        <div class="metric-value">{html.escape(value)}</div>
+        {note_html}
+    </div>
+    """
+
+
+def render_dashboard_overview(overview: dict[str, Any]) -> str:
+    best_rule = overview.get("best_rule")
+    worst_rule = overview.get("worst_rule")
+    best_rule_label = "-" if not best_rule else f"{best_rule['rule_name']} ({format_money(best_rule['pnl_usd'])})"
+    worst_rule_label = "-" if not worst_rule else f"{worst_rule['rule_name']} ({format_money(worst_rule['pnl_usd'])})"
+    data_health = "ok" if overview["orderbook_errors"] == 0 else f"{overview['orderbook_errors']} orderbook issues"
+
+    metrics = [
+        render_metric("Net P&L", format_money(overview["net_pnl_usd"]), "closed deals only"),
+        render_metric("Closed Deals", str(overview["closed_deals"]), f"{overview['open_deals']} open"),
+        render_metric("Win Rate", format_percent(overview["win_rate"]), f"{overview['wins']} wins / {overview['losses']} losses"),
+        render_metric("Avg ROI / Deal", format_percent(overview["avg_roi_percent"]), f"{format_money(overview['avg_pnl_usd'])} avg P&L"),
+        render_metric(
+            "Profit Factor",
+            format_factor(overview["profit_factor"], overview["profit_factor_infinite"]),
+            "gross profit / gross loss",
+        ),
+        render_metric("Max Drawdown", format_money(overview["max_drawdown_usd"]), "closed-deal equity curve"),
+        render_metric("Best Rule", best_rule_label),
+        render_metric("Data Health", data_health, f"last book: {display_value(overview['last_orderbook_sample'])}"),
+    ]
+
+    investment_value = display_value(overview["investment_usd"])
+    return f"""
+    <div class="card overview-card">
+        <div class="overview-header">
+            <div>
+                <h2>Executive Overview</h2>
+                <p class="muted">Financial KPIs use closed deals only. Investment is a display filter and does not change stored deals.</p>
+            </div>
+            <form method="get" action="/" class="investment-form">
+                <label>Investment per deal
+                    <input name="investment_usd" type="number" step="0.01" min="0.01" value="{html.escape(investment_value)}">
+                </label>
+                <button class="button" type="submit">Apply</button>
+            </form>
+        </div>
+        <div class="metric-grid">
+            {''.join(metrics)}
+        </div>
+        <p class="muted">
+            Active rules: {overview['active_rules']} |
+            Total deals: {overview['total_deals']} |
+            Longest win streak: {overview['longest_win_streak']} |
+            Longest loss streak: {overview['longest_loss_streak']} |
+            Weakest rule: {html.escape(worst_rule_label)}
+        </p>
+    </div>
+    """
+
+
 def latest_export_path() -> Optional[Path]:
     state_path = export_state.get("path")
     if state_path:
@@ -2305,7 +2532,7 @@ def render_dashboard_scripts() -> str:
         }
         dashboardRefreshInFlight = true;
         try {
-          const response = await fetch("/dashboard-content", {headers: {"X-Requested-With": "fetch"}});
+          const response = await fetch(`/dashboard-content${window.location.search}`, {headers: {"X-Requested-With": "fetch"}});
           if (response.ok) {
             document.getElementById("dashboard-content").innerHTML = await response.text();
           }
@@ -2520,11 +2747,14 @@ def load_dashboard_rows() -> tuple[
     return events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health
 
 
-def render_dashboard_content() -> str:
+def render_dashboard_content(investment_usd: Any = 1) -> str:
+    overview = load_dashboard_overview(investment_usd)
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
         <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}</div>
+
+        {render_dashboard_overview(overview)}
 
         <div class="actions">
             {render_export_actions()}
@@ -2560,12 +2790,12 @@ def render_dashboard_content() -> str:
 
 
 @app.get("/dashboard-content", response_class=HTMLResponse)
-def dashboard_content() -> str:
-    return render_dashboard_content()
+def dashboard_content(investment_usd: float = 1.0) -> str:
+    return render_dashboard_content(investment_usd)
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
+def dashboard(investment_usd: float = 1.0) -> str:
     return f"""
     <!doctype html>
     <html>
@@ -2589,6 +2819,52 @@ def dashboard() -> str:
                 padding: 16px;
                 margin-bottom: 24px;
                 box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            }}
+            .overview-header {{
+                display: flex;
+                gap: 16px;
+                align-items: flex-start;
+                justify-content: space-between;
+                flex-wrap: wrap;
+            }}
+            .investment-form {{
+                display: flex;
+                gap: 8px;
+                align-items: flex-end;
+                flex-wrap: wrap;
+            }}
+            .investment-form label {{
+                margin: 0;
+                min-width: 180px;
+            }}
+            .metric-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+                gap: 10px;
+                margin: 12px 0;
+            }}
+            .metric {{
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 12px;
+                background: #fafafa;
+                min-height: 78px;
+            }}
+            .metric-label {{
+                font-size: 12px;
+                color: #666;
+                margin-bottom: 6px;
+            }}
+            .metric-value {{
+                font-size: 22px;
+                font-weight: 700;
+                line-height: 1.2;
+                overflow-wrap: anywhere;
+            }}
+            .metric-note {{
+                margin-top: 6px;
+                font-size: 12px;
+                color: #777;
             }}
             .actions {{
                 margin: 12px 0 20px 0;
@@ -2700,7 +2976,7 @@ def dashboard() -> str:
     <body>
         <h1>Polymarket BTC Collector</h1>
         <div id="dashboard-content">
-            {render_dashboard_content()}
+            {render_dashboard_content(investment_usd)}
         </div>
         {render_dashboard_scripts()}
     </body>
