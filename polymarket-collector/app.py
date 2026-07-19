@@ -2191,10 +2191,60 @@ def longest_result_streak(results: list[str], target: str) -> int:
     return longest
 
 
-def load_dashboard_overview(investment_usd: Any = 1) -> dict[str, Any]:
+def normalize_dashboard_range(value: Any) -> str:
+    selected = str(value or "all").strip().lower()
+    return selected if selected in {"today", "7d", "30d", "all"} else "all"
+
+
+def dashboard_range_options() -> list[tuple[str, str]]:
+    return [
+        ("all", "All time"),
+        ("today", "Today"),
+        ("7d", "Last 7 days"),
+        ("30d", "Last 30 days"),
+    ]
+
+
+def dashboard_range_label(value: Any) -> str:
+    selected = normalize_dashboard_range(value)
+    return dict(dashboard_range_options()).get(selected, "All time")
+
+
+def dashboard_range_start(value: Any) -> Optional[str]:
+    selected = normalize_dashboard_range(value)
+    now = now_utc()
+    if selected == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    if selected == "7d":
+        return (now - timedelta(days=7)).isoformat()
+    if selected == "30d":
+        return (now - timedelta(days=30)).isoformat()
+    return None
+
+
+def time_filter_sql(column: str, dashboard_range: Any) -> tuple[str, tuple[Any, ...]]:
+    start = dashboard_range_start(dashboard_range)
+    if not start:
+        return "1 = 1", ()
+    return f"{column} >= ?", (start,)
+
+
+def deal_matches_range(deal: sqlite3.Row, dashboard_range: Any) -> bool:
+    start = dashboard_range_start(dashboard_range)
+    if not start:
+        return True
+    exit_at = deal["exit_at"] if "exit_at" in deal.keys() else None
+    exit_dt = parse_iso_datetime(exit_at)
+    start_dt = parse_iso_datetime(start)
+    return bool(exit_dt and start_dt and exit_dt >= start_dt)
+
+
+def load_dashboard_overview(investment_usd: Any = 1, dashboard_range: Any = "all") -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
+    entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
     with get_conn() as conn:
-        total_deals = int(conn.execute("SELECT COUNT(*) FROM deals").fetchone()[0])
+        total_deals = int(conn.execute(f"SELECT COUNT(*) FROM deals WHERE {entry_filter}", entry_params).fetchone()[0])
         open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
         active_rules = int(conn.execute("SELECT COUNT(*) FROM rules WHERE status = 'active'").fetchone()[0])
         last_orderbook_sample = conn.execute("SELECT MAX(sampled_at) FROM orderbook_log").fetchone()[0]
@@ -2216,8 +2266,9 @@ def load_dashboard_overview(investment_usd: Any = 1) -> dict[str, Any]:
                 exit_at
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+                AND """ + exit_filter + """
             ORDER BY exit_at ASC, id ASC
-        """).fetchall()
+        """, exit_params).fetchall()
 
     pnl_values: list[float] = []
     roi_values: list[float] = []
@@ -2265,6 +2316,8 @@ def load_dashboard_overview(investment_usd: Any = 1) -> dict[str, Any]:
 
     return {
         "investment_usd": float(investment),
+        "range": normalize_dashboard_range(dashboard_range),
+        "range_label": dashboard_range_label(dashboard_range),
         "total_deals": total_deals,
         "closed_deals": closed_count,
         "open_deals": open_deals,
@@ -2287,8 +2340,9 @@ def load_dashboard_overview(investment_usd: Any = 1) -> dict[str, Any]:
     }
 
 
-def load_rules_performance(investment_usd: Any = 1) -> list[dict[str, Any]]:
+def load_rules_performance(investment_usd: Any = 1, dashboard_range: Any = "all") -> list[dict[str, Any]]:
     investment = normalize_investment_usd(investment_usd)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
     with get_conn() as conn:
         rules = conn.execute("""
             SELECT
@@ -2310,8 +2364,9 @@ def load_rules_performance(investment_usd: Any = 1) -> list[dict[str, Any]]:
                 exit_price,
                 exit_at
             FROM deals
+            WHERE result = 'open' OR (result IN ('win', 'loss') AND exit_price IS NOT NULL AND """ + exit_filter + """)
             ORDER BY rule_id ASC, exit_at ASC, id ASC
-        """).fetchall()
+        """, exit_params).fetchall()
 
     performance: dict[int, dict[str, Any]] = {}
     for rule in rules:
@@ -2415,8 +2470,9 @@ def load_rules_performance(investment_usd: Any = 1) -> list[dict[str, Any]]:
     return rows
 
 
-def load_risk_snapshot(investment_usd: Any = 1) -> dict[str, Any]:
+def load_risk_snapshot(investment_usd: Any = 1, dashboard_range: Any = "all") -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT
@@ -2432,8 +2488,9 @@ def load_risk_snapshot(investment_usd: Any = 1) -> dict[str, Any]:
                 exit_reason
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+                AND """ + exit_filter + """
             ORDER BY exit_at ASC, id ASC
-        """).fetchall()
+        """, exit_params).fetchall()
 
     equity = 0.0
     peak = 0.0
@@ -2554,8 +2611,9 @@ def finalize_condition_group(group: dict[str, Any]) -> dict[str, Any]:
     return group
 
 
-def load_market_conditions(investment_usd: Any = 1) -> dict[str, list[dict[str, Any]]]:
+def load_market_conditions(investment_usd: Any = 1, dashboard_range: Any = "all") -> dict[str, list[dict[str, Any]]]:
     investment = normalize_investment_usd(investment_usd)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT
@@ -2566,8 +2624,9 @@ def load_market_conditions(investment_usd: Any = 1) -> dict[str, list[dict[str, 
                 exit_price
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+                AND """ + exit_filter + """
             ORDER BY id ASC
-        """).fetchall()
+        """, exit_params).fetchall()
 
     side_groups: dict[str, dict[str, Any]] = {}
     price_groups: dict[str, dict[str, Any]] = {}
@@ -2686,6 +2745,141 @@ def load_system_health_snapshot() -> dict[str, Any]:
     }
 
 
+def local_date_key(value: Any) -> str:
+    dt = parse_iso_datetime(str(value)) if value else None
+    if not dt:
+        return "unknown"
+    return dt.astimezone(LOCAL_TIMEZONE).strftime("%Y-%m-%d")
+
+
+def load_time_trends(investment_usd: Any = 1, dashboard_range: Any = "all") -> list[dict[str, Any]]:
+    investment = normalize_investment_usd(investment_usd)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
+    with get_conn() as conn:
+        closed_deals = conn.execute("""
+            SELECT
+                id,
+                result,
+                entry_price,
+                exit_price,
+                exit_at
+            FROM deals
+            WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
+                AND """ + exit_filter + """
+            ORDER BY exit_at ASC, id ASC
+        """, exit_params).fetchall()
+
+    by_day: dict[str, dict[str, Any]] = {}
+    for deal in closed_deals:
+        try:
+            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
+                deal["entry_price"],
+                deal["exit_price"],
+                investment,
+            )
+        except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+            continue
+
+        day = local_date_key(deal["exit_at"])
+        row = by_day.setdefault(day, {
+            "day": day,
+            "closed_deals": 0,
+            "wins": 0,
+            "losses": 0,
+            "net_pnl_usd": 0.0,
+            "avg_roi_percent": None,
+            "win_rate": None,
+            "_roi_values": [],
+        })
+        row["closed_deals"] += 1
+        row["wins"] += 1 if deal["result"] == "win" else 0
+        row["losses"] += 1 if deal["result"] == "loss" else 0
+        row["net_pnl_usd"] += pnl_usd
+        row["_roi_values"].append(roi_percent)
+
+    rows = sorted(by_day.values(), key=lambda item: item["day"])
+    for row in rows:
+        roi_values = row.pop("_roi_values")
+        row["win_rate"] = (row["wins"] / row["closed_deals"] * 100) if row["closed_deals"] else None
+        row["avg_roi_percent"] = (sum(roi_values) / len(roi_values)) if roi_values else None
+    return rows
+
+
+def load_data_quality_snapshot(dashboard_range: Any = "all") -> dict[str, Any]:
+    orderbook_filter, orderbook_params = time_filter_sql("sampled_at", dashboard_range)
+    btc_filter, btc_params = time_filter_sql("sampled_at", dashboard_range)
+    with get_conn() as conn:
+        missing_rule_deals = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM deals d
+            LEFT JOIN rules r ON r.id = d.rule_id
+            WHERE r.id IS NULL
+        """).fetchone()[0])
+        missing_event_deals = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM deals d
+            LEFT JOIN events e ON e.event_slug = d.event_id
+            WHERE d.event_id IS NOT NULL AND e.event_slug IS NULL
+        """).fetchone()[0])
+        stale_open_deals = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM deals
+            WHERE result = 'open' AND entry_at < ?
+        """, ((now_utc() - timedelta(minutes=30)).isoformat(),)).fetchone()[0])
+        event_status_mismatch = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM events
+            WHERE
+                (status = 'closed' AND COALESCE(closed, 0) = 0)
+                OR (status = 'open' AND COALESCE(closed, 0) = 1)
+        """).fetchone()[0])
+        orderbook_issues = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM orderbook_log
+            WHERE status IS NOT NULL AND status != 'success'
+                AND """ + orderbook_filter, orderbook_params).fetchone()[0])
+        invalid_orderbook_prices = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM orderbook_log
+            WHERE (
+                up_best_ask NOT BETWEEN 0 AND 1
+                OR up_best_bid NOT BETWEEN 0 AND 1
+                OR down_best_ask NOT BETWEEN 0 AND 1
+                OR down_best_bid NOT BETWEEN 0 AND 1
+            )
+            AND """ + orderbook_filter, orderbook_params).fetchone()[0])
+        btc_volume_errors = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM btc_volume_log
+            WHERE status = 'error'
+                AND """ + btc_filter, btc_params).fetchone()[0])
+        negative_btc_delta = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM btc_volume_log
+            WHERE volume_btc_delta < 0
+                AND """ + btc_filter, btc_params).fetchone()[0])
+
+    checks = [
+        ("Deals missing rule", missing_rule_deals, "error"),
+        ("Deals missing event", missing_event_deals, "warning"),
+        ("Open deals older than 30m", stale_open_deals, "warning"),
+        ("Event status mismatch", event_status_mismatch, "warning"),
+        ("Orderbook non-success samples", orderbook_issues, "warning"),
+        ("Invalid orderbook prices", invalid_orderbook_prices, "error"),
+        ("BTC volume errors", btc_volume_errors, "warning"),
+        ("Negative BTC volume delta", negative_btc_delta, "error"),
+    ]
+    issue_count = sum(count for _, count, _ in checks)
+    return {
+        "status": "ok" if issue_count == 0 else "needs_review",
+        "issue_count": issue_count,
+        "checks": [
+            {"name": name, "count": count, "severity": severity}
+            for name, count, severity in checks
+        ],
+    }
+
+
 def render_metric(label: str, value: str, note: str = "") -> str:
     note_html = f"<div class=\"metric-note\">{html.escape(note)}</div>" if note else ""
     return f"""
@@ -2720,16 +2914,24 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
     ]
 
     investment_value = display_value(overview["investment_usd"])
+    selected_range = normalize_dashboard_range(overview.get("range"))
+    range_options = "".join(
+        f"<option value=\"{html.escape(value)}\"{' selected' if value == selected_range else ''}>{html.escape(label)}</option>"
+        for value, label in dashboard_range_options()
+    )
     return f"""
     <div class="card overview-card">
         <div class="overview-header">
             <div>
                 <h2>Executive Overview</h2>
-                <p class="muted">Financial KPIs use closed deals only. Investment is a display filter and does not change stored deals.</p>
+                <p class="muted">Financial KPIs use closed deals only. Current range: {html.escape(overview['range_label'])}.</p>
             </div>
             <form method="get" action="/" class="investment-form">
                 <label>Investment per deal
                     <input name="investment_usd" type="number" step="0.01" min="0.01" value="{html.escape(investment_value)}">
+                </label>
+                <label>Date Range
+                    <select name="range_filter">{range_options}</select>
                 </label>
                 <button class="button" type="submit">Apply</button>
             </form>
@@ -2957,6 +3159,143 @@ def render_system_health(health: dict[str, Any]) -> str:
           </table>
         </div>
         <p class="muted">DB: {html.escape(health["db_path"])} | Coinbase last error: {html.escape(last_error)}</p>
+    </div>
+    """
+
+
+def chart_bar_width(value: Any, max_abs: float) -> int:
+    try:
+        numeric = abs(float(value))
+    except (TypeError, ValueError):
+        return 0
+    if max_abs <= 0:
+        return 0
+    return max(2, min(100, int(round(numeric / max_abs * 100))))
+
+
+def render_time_trends(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return """
+        <div class="card">
+            <h2>Time Trends</h2>
+            <p>No closed deals in the selected range.</p>
+        </div>
+        """
+
+    max_abs_pnl = max(abs(float(row["net_pnl_usd"])) for row in rows) or 1
+    headers = ["Day", "Closed", "Wins", "Losses", "Win Rate", "Net P&L", "Avg ROI", "P&L"]
+    thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = ""
+    for row in rows:
+        pnl = float(row["net_pnl_usd"])
+        bar_class = "positive" if pnl >= 0 else "negative"
+        bar_width = chart_bar_width(pnl, max_abs_pnl)
+        values = [
+            row["day"],
+            row["closed_deals"],
+            row["wins"],
+            row["losses"],
+            format_percent(row["win_rate"]),
+            format_money(pnl),
+            format_percent(row["avg_roi_percent"]),
+            f"<div class=\"bar-track\"><div class=\"bar {bar_class}\" style=\"width:{bar_width}%\"></div></div>",
+        ]
+        cells = "".join(
+            f"<td>{value}</td>" if str(value).startswith("<div") else f"<td>{html.escape(str(value))}</td>"
+            for value in values
+        )
+        body += f"<tr>{cells}</tr>"
+
+    return f"""
+    <div class="card">
+        <h2>Time Trends</h2>
+        <p class="muted">Closed-deal performance grouped by local date.</p>
+        <div class="table-wrap trends-table">
+          <table>
+            <thead><tr>{thead}</tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+        </div>
+    </div>
+    """
+
+
+def render_data_quality(quality: dict[str, Any]) -> str:
+    status_class = "ok" if quality["status"] == "ok" else "warning"
+    metrics = [
+        render_metric("Quality Status", display_value(quality["status"]), f"{quality['issue_count']} total issues"),
+    ]
+    rows = ""
+    for check in quality["checks"]:
+        badge_class = "ok" if check["count"] == 0 else check["severity"]
+        rows += (
+            "<tr>"
+            f"<td>{html.escape(check['name'])}</td>"
+            f"<td><span class=\"badge {badge_class}\">{html.escape(str(check['count']))}</span></td>"
+            f"<td>{html.escape(check['severity'])}</td>"
+            "</tr>"
+        )
+
+    return f"""
+    <div class="card quality-card {status_class}">
+        <h2>Data Quality</h2>
+        <p class="muted">Internal checks over deals, events, orderbook samples, and Coinbase volume logs.</p>
+        <div class="metric-grid">{''.join(metrics)}</div>
+        <div class="table-wrap quality-table">
+          <table>
+            <thead><tr><th>Check</th><th>Count</th><th>Severity</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>
+    </div>
+    """
+
+
+def render_dashboard_charts(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return """
+        <div class="card">
+            <h2>Charts</h2>
+            <p>No chart data in the selected range.</p>
+        </div>
+        """
+
+    max_abs_pnl = max(abs(float(row["net_pnl_usd"])) for row in rows) or 1
+    max_deals = max(int(row["closed_deals"]) for row in rows) or 1
+    pnl_items = ""
+    deal_items = ""
+    for row in rows[-30:]:
+        pnl = float(row["net_pnl_usd"])
+        pnl_class = "positive" if pnl >= 0 else "negative"
+        pnl_items += f"""
+            <div class="chart-row">
+                <div class="chart-label">{html.escape(row['day'])}</div>
+                <div class="bar-track"><div class="bar {pnl_class}" style="width:{chart_bar_width(pnl, max_abs_pnl)}%"></div></div>
+                <div class="chart-value">{html.escape(format_money(pnl))}</div>
+            </div>
+        """
+        deal_items += f"""
+            <div class="chart-row">
+                <div class="chart-label">{html.escape(row['day'])}</div>
+                <div class="bar-track"><div class="bar neutral" style="width:{chart_bar_width(row['closed_deals'], max_deals)}%"></div></div>
+                <div class="chart-value">{html.escape(str(row['closed_deals']))}</div>
+            </div>
+        """
+
+    return f"""
+    <div class="card">
+        <h2>Charts</h2>
+        <p class="muted">Last 30 grouped days in the selected range.</p>
+        <div class="charts-grid">
+            <section>
+                <h3>Daily Net P&L</h3>
+                {pnl_items}
+            </section>
+            <section>
+                <h3>Closed Deals Per Day</h3>
+                {deal_items}
+            </section>
+        </div>
     </div>
     """
 
@@ -3359,21 +3698,27 @@ def load_dashboard_rows() -> tuple[
     return events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health
 
 
-def render_dashboard_content(investment_usd: Any = 1) -> str:
-    overview = load_dashboard_overview(investment_usd)
-    rules_performance = load_rules_performance(investment_usd)
-    risk_snapshot = load_risk_snapshot(investment_usd)
-    market_conditions = load_market_conditions(investment_usd)
+def render_dashboard_content(investment_usd: Any = 1, dashboard_range: Any = "all") -> str:
+    dashboard_range = normalize_dashboard_range(dashboard_range)
+    overview = load_dashboard_overview(investment_usd, dashboard_range)
+    rules_performance = load_rules_performance(investment_usd, dashboard_range)
+    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range)
+    market_conditions = load_market_conditions(investment_usd, dashboard_range)
     system_health = load_system_health_snapshot()
+    time_trends = load_time_trends(investment_usd, dashboard_range)
+    data_quality = load_data_quality_snapshot(dashboard_range)
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
-        <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}</div>
+        <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}. Range: {html.escape(dashboard_range_label(dashboard_range))}</div>
 
         {render_dashboard_overview(overview)}
         {render_rules_performance(rules_performance)}
         {render_risk_snapshot(risk_snapshot)}
         {render_market_conditions(market_conditions)}
+        {render_time_trends(time_trends)}
+        {render_dashboard_charts(time_trends)}
+        {render_data_quality(data_quality)}
         {render_system_health(system_health)}
 
         <div class="actions">
@@ -3410,12 +3755,12 @@ def render_dashboard_content(investment_usd: Any = 1) -> str:
 
 
 @app.get("/dashboard-content", response_class=HTMLResponse)
-def dashboard_content(investment_usd: float = 1.0) -> str:
-    return render_dashboard_content(investment_usd)
+def dashboard_content(investment_usd: float = 1.0, range_filter: str = "all") -> str:
+    return render_dashboard_content(investment_usd, range_filter)
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(investment_usd: float = 1.0) -> str:
+def dashboard(investment_usd: float = 1.0, range_filter: str = "all") -> str:
     return f"""
     <!doctype html>
     <html>
@@ -3587,6 +3932,66 @@ def dashboard(investment_usd: float = 1.0) -> str:
             .health-table table {{
                 min-width: 360px;
             }}
+            .trends-table table {{
+                min-width: 780px;
+            }}
+            .quality-table table {{
+                min-width: 520px;
+            }}
+            .charts-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 18px;
+            }}
+            .chart-row {{
+                display: grid;
+                grid-template-columns: 92px 1fr 80px;
+                gap: 8px;
+                align-items: center;
+                margin: 8px 0;
+                font-size: 13px;
+            }}
+            .chart-label, .chart-value {{
+                overflow-wrap: anywhere;
+            }}
+            .bar-track {{
+                height: 12px;
+                background: #ececec;
+                border-radius: 6px;
+                overflow: hidden;
+                min-width: 90px;
+            }}
+            .bar {{
+                height: 100%;
+                border-radius: 6px;
+            }}
+            .bar.positive {{
+                background: #147a3f;
+            }}
+            .bar.negative {{
+                background: #b42318;
+            }}
+            .bar.neutral {{
+                background: #2f5f98;
+            }}
+            .badge {{
+                display: inline-block;
+                min-width: 26px;
+                padding: 3px 8px;
+                border-radius: 6px;
+                text-align: center;
+                color: white;
+                background: #555;
+            }}
+            .badge.ok {{
+                background: #147a3f;
+            }}
+            .badge.warning {{
+                background: #98690c;
+            }}
+            .badge.error {{
+                background: #b42318;
+            }}
             h3 {{
                 margin: 16px 0 8px 0;
             }}
@@ -3611,7 +4016,7 @@ def dashboard(investment_usd: float = 1.0) -> str:
     <body>
         <h1>Polymarket BTC Collector</h1>
         <div id="dashboard-content">
-            {render_dashboard_content(investment_usd)}
+            {render_dashboard_content(investment_usd, range_filter)}
         </div>
         {render_dashboard_scripts()}
     </body>
