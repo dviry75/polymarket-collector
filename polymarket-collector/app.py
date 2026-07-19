@@ -2198,16 +2198,16 @@ def normalize_dashboard_range(value: Any) -> str:
 
 def dashboard_range_options() -> list[tuple[str, str]]:
     return [
-        ("all", "All time"),
-        ("today", "Today"),
-        ("7d", "Last 7 days"),
-        ("30d", "Last 30 days"),
+        ("all", "כל התקופה"),
+        ("today", "היום"),
+        ("7d", "7 ימים אחרונים"),
+        ("30d", "30 ימים אחרונים"),
     ]
 
 
 def dashboard_range_label(value: Any) -> str:
     selected = normalize_dashboard_range(value)
-    return dict(dashboard_range_options()).get(selected, "All time")
+    return dict(dashboard_range_options()).get(selected, "כל התקופה")
 
 
 def dashboard_range_start(value: Any) -> Optional[str]:
@@ -2860,14 +2860,14 @@ def load_data_quality_snapshot(dashboard_range: Any = "all") -> dict[str, Any]:
                 AND """ + btc_filter, btc_params).fetchone()[0])
 
     checks = [
-        ("Deals missing rule", missing_rule_deals, "error"),
-        ("Deals missing event", missing_event_deals, "warning"),
-        ("Open deals older than 30m", stale_open_deals, "warning"),
-        ("Event status mismatch", event_status_mismatch, "warning"),
-        ("Orderbook non-success samples", orderbook_issues, "warning"),
-        ("Invalid orderbook prices", invalid_orderbook_prices, "error"),
-        ("BTC volume errors", btc_volume_errors, "warning"),
-        ("Negative BTC volume delta", negative_btc_delta, "error"),
+        ("עסקאות ללא חוק", missing_rule_deals, "error"),
+        ("עסקאות ללא אירוע", missing_event_deals, "warning"),
+        ("עסקאות פתוחות מעל 30 דקות", stale_open_deals, "warning"),
+        ("חוסר התאמה בסטטוס אירוע", event_status_mismatch, "warning"),
+        ("דגימות Orderbook לא תקינות", orderbook_issues, "warning"),
+        ("מחירי Orderbook לא תקינים", invalid_orderbook_prices, "error"),
+        ("שגיאות נפח BTC", btc_volume_errors, "warning"),
+        ("דלתא נפח BTC שלילית", negative_btc_delta, "error"),
     ]
     issue_count = sum(count for _, count, _ in checks)
     return {
@@ -2896,21 +2896,21 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
     worst_rule = overview.get("worst_rule")
     best_rule_label = "-" if not best_rule else f"{best_rule['rule_name']} ({format_money(best_rule['pnl_usd'])})"
     worst_rule_label = "-" if not worst_rule else f"{worst_rule['rule_name']} ({format_money(worst_rule['pnl_usd'])})"
-    data_health = "ok" if overview["orderbook_errors"] == 0 else f"{overview['orderbook_errors']} orderbook issues"
+    data_health = "תקין" if overview["orderbook_errors"] == 0 else f"{overview['orderbook_errors']} בעיות Orderbook"
 
     metrics = [
-        render_metric("Net P&L", format_money(overview["net_pnl_usd"]), "closed deals only"),
-        render_metric("Closed Deals", str(overview["closed_deals"]), f"{overview['open_deals']} open"),
-        render_metric("Win Rate", format_percent(overview["win_rate"]), f"{overview['wins']} wins / {overview['losses']} losses"),
-        render_metric("Avg ROI / Deal", format_percent(overview["avg_roi_percent"]), f"{format_money(overview['avg_pnl_usd'])} avg P&L"),
+        render_metric("רווח/הפסד נטו", format_money(overview["net_pnl_usd"]), "עסקאות סגורות בלבד"),
+        render_metric("עסקאות סגורות", str(overview["closed_deals"]), f"{overview['open_deals']} פתוחות"),
+        render_metric("אחוז הצלחה", format_percent(overview["win_rate"]), f"{overview['wins']} רווחיות / {overview['losses']} הפסדיות"),
+        render_metric("ROI ממוצע לעסקה", format_percent(overview["avg_roi_percent"]), f"{format_money(overview['avg_pnl_usd'])} רווח/הפסד ממוצע"),
         render_metric(
-            "Profit Factor",
+            "יחס רווח להפסד",
             format_factor(overview["profit_factor"], overview["profit_factor_infinite"]),
-            "gross profit / gross loss",
+            "רווח גולמי / הפסד גולמי",
         ),
-        render_metric("Max Drawdown", format_money(overview["max_drawdown_usd"]), "closed-deal equity curve"),
-        render_metric("Best Rule", best_rule_label),
-        render_metric("Data Health", data_health, f"last book: {display_value(overview['last_orderbook_sample'])}"),
+        render_metric("ירידה מקסימלית", format_money(overview["max_drawdown_usd"]), "עקומת הון של עסקאות סגורות"),
+        render_metric("החוק המוביל", best_rule_label),
+        render_metric("תקינות נתונים", data_health, f"דגימת Orderbook אחרונה: {display_value(overview['last_orderbook_sample'])}"),
     ]
 
     investment_value = display_value(overview["investment_usd"])
@@ -2923,28 +2923,28 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
     <div class="card overview-card">
         <div class="overview-header">
             <div>
-                <h2>Executive Overview</h2>
-                <p class="muted">Financial KPIs use closed deals only. Current range: {html.escape(overview['range_label'])}.</p>
+                <h2>סקירה ניהולית</h2>
+                <p class="muted">מדדים פיננסיים מחושבים מעסקאות סגורות בלבד. טווח נוכחי: {html.escape(overview['range_label'])}.</p>
             </div>
             <form method="get" action="/" class="investment-form">
-                <label>Investment per deal
+                <label>השקעה לעסקה
                     <input name="investment_usd" type="number" step="0.01" min="0.01" value="{html.escape(investment_value)}">
                 </label>
-                <label>Date Range
+                <label>טווח תאריכים
                     <select name="range_filter">{range_options}</select>
                 </label>
-                <button class="button" type="submit">Apply</button>
+                <button class="button" type="submit">החל</button>
             </form>
         </div>
         <div class="metric-grid">
             {''.join(metrics)}
         </div>
         <p class="muted">
-            Active rules: {overview['active_rules']} |
-            Total deals: {overview['total_deals']} |
-            Longest win streak: {overview['longest_win_streak']} |
-            Longest loss streak: {overview['longest_loss_streak']} |
-            Weakest rule: {html.escape(worst_rule_label)}
+            חוקים פעילים: {overview['active_rules']} |
+            סך עסקאות: {overview['total_deals']} |
+            רצף רווחים ארוך ביותר: {overview['longest_win_streak']} |
+            רצף הפסדים ארוך ביותר: {overview['longest_loss_streak']} |
+            החוק החלש ביותר: {html.escape(worst_rule_label)}
         </p>
     </div>
     """
@@ -2954,25 +2954,25 @@ def render_rules_performance(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return """
         <div class="card">
-            <h2>Rules Performance</h2>
-            <p>No rules yet.</p>
+            <h2>ביצועי חוקים</h2>
+            <p>אין חוקים עדיין.</p>
         </div>
         """
 
     headers = [
-        "Rule",
-        "Status",
-        "Closed",
-        "Open",
-        "Wins",
-        "Losses",
-        "Win Rate",
-        "Net P&L",
-        "Avg ROI",
-        "Profit Factor",
-        "Expectancy",
-        "Max Drawdown",
-        "Entry / SL / TP",
+        "חוק",
+        "סטטוס",
+        "סגורות",
+        "פתוחות",
+        "רווחיות",
+        "הפסדיות",
+        "אחוז הצלחה",
+        "רווח/הפסד נטו",
+        "ROI ממוצע",
+        "יחס רווח להפסד",
+        "תוחלת",
+        "ירידה מקסימלית",
+        "כניסה / סטופ / יעד",
     ]
     thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
     body = ""
@@ -3002,8 +3002,8 @@ def render_rules_performance(rows: list[dict[str, Any]]) -> str:
 
     return f"""
     <div class="card">
-        <h2>Rules Performance</h2>
-        <p class="muted">Ranked by closed-deal Net P&L. Investment is a display filter only.</p>
+        <h2>ביצועי חוקים</h2>
+        <p class="muted">מדורג לפי רווח/הפסד נטו בעסקאות סגורות. ההשקעה היא פילטר תצוגה בלבד.</p>
         <div class="table-wrap compact-table">
           <table>
             <thead><tr>{thead}</tr></thead>
@@ -3027,7 +3027,7 @@ def render_exit_reason_breakdown(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "<p>No closed deals yet.</p>"
 
-    headers = ["Exit Reason", "Deals", "Wins", "Losses", "Win Rate", "Net P&L"]
+    headers = ["סיבת יציאה", "עסקאות", "רווחיות", "הפסדיות", "אחוז הצלחה", "רווח/הפסד נטו"]
     thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
     body = ""
     for row in rows:
@@ -3054,24 +3054,24 @@ def render_exit_reason_breakdown(rows: list[dict[str, Any]]) -> str:
 
 def render_risk_snapshot(risk: dict[str, Any]) -> str:
     metrics = [
-        render_metric("Ending Equity", format_money(risk["ending_equity_usd"]), "closed-deal P&L sum"),
-        render_metric("Peak Equity", format_money(risk["peak_equity_usd"]), "highest closed-deal equity"),
-        render_metric("Max Drawdown", format_money(risk["max_drawdown_usd"]), f"after: {display_value(risk['max_drawdown_after'])}"),
-        render_metric("Loss Streak", str(risk["longest_loss_streak"]), f"{risk['loss_deals']} losing deals"),
-        render_metric("Avg Win", format_money(risk["avg_win_usd"]), f"{risk['win_deals']} winning deals"),
-        render_metric("Avg Loss", format_money(risk["avg_loss_usd"]), "average losing deal"),
-        render_metric("Best Deal", render_deal_summary(risk["best_deal"])),
-        render_metric("Worst Deal", render_deal_summary(risk["worst_deal"])),
+        render_metric("הון מסכם", format_money(risk["ending_equity_usd"]), "סכום רווח/הפסד מעסקאות סגורות"),
+        render_metric("שיא הון", format_money(risk["peak_equity_usd"]), "נקודת ההון הגבוהה ביותר"),
+        render_metric("ירידה מקסימלית", format_money(risk["max_drawdown_usd"]), f"אחרי: {display_value(risk['max_drawdown_after'])}"),
+        render_metric("רצף הפסדים", str(risk["longest_loss_streak"]), f"{risk['loss_deals']} עסקאות הפסדיות"),
+        render_metric("רווח ממוצע", format_money(risk["avg_win_usd"]), f"{risk['win_deals']} עסקאות רווחיות"),
+        render_metric("הפסד ממוצע", format_money(risk["avg_loss_usd"]), "ממוצע לעסקה הפסדית"),
+        render_metric("העסקה הטובה ביותר", render_deal_summary(risk["best_deal"])),
+        render_metric("העסקה החלשה ביותר", render_deal_summary(risk["worst_deal"])),
     ]
 
     return f"""
     <div class="card">
-        <h2>Risk Snapshot</h2>
-        <p class="muted">Risk metrics use closed deals only and the current investment display filter.</p>
+        <h2>תמונת סיכון</h2>
+        <p class="muted">מדדי הסיכון מחושבים מעסקאות סגורות בלבד ולפי פילטר ההשקעה הנוכחי.</p>
         <div class="metric-grid">
             {''.join(metrics)}
         </div>
-        <h3>Exit Reasons</h3>
+        <h3>סיבות יציאה</h3>
         {render_exit_reason_breakdown(risk["exit_reasons"])}
     </div>
     """
@@ -3081,7 +3081,7 @@ def render_condition_table(rows: list[dict[str, Any]], empty_text: str) -> str:
     if not rows:
         return f"<p>{html.escape(empty_text)}</p>"
 
-    headers = ["Group", "Closed", "Wins", "Losses", "Win Rate", "Net P&L", "Avg P&L", "Avg ROI"]
+    headers = ["קבוצה", "סגורות", "רווחיות", "הפסדיות", "אחוז הצלחה", "רווח/הפסד נטו", "רווח/הפסד ממוצע", "ROI ממוצע"]
     thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
     body = ""
     for row in rows:
@@ -3111,33 +3111,33 @@ def render_condition_table(rows: list[dict[str, Any]], empty_text: str) -> str:
 def render_market_conditions(conditions: dict[str, list[dict[str, Any]]]) -> str:
     return f"""
     <div class="card">
-        <h2>Market Conditions</h2>
-        <p class="muted">Closed deals only. Current phase uses reliable deal fields: side and entry price bucket.</p>
-        <h3>Performance by Side</h3>
-        {render_condition_table(conditions["by_side"], "No closed deals by side yet.")}
-        <h3>Performance by Entry Price</h3>
-        {render_condition_table(conditions["by_entry_price"], "No closed deals by entry price yet.")}
+        <h2>תנאי שוק</h2>
+        <p class="muted">עסקאות סגורות בלבד. בשלב הנוכחי משתמשים בשדות אמינים מהעסקה: צד וטווח מחיר כניסה.</p>
+        <h3>ביצועים לפי צד</h3>
+        {render_condition_table(conditions["by_side"], "אין עדיין עסקאות סגורות לפי צד.")}
+        <h3>ביצועים לפי מחיר כניסה</h3>
+        {render_condition_table(conditions["by_entry_price"], "אין עדיין עסקאות סגורות לפי מחיר כניסה.")}
     </div>
     """
 
 
 def render_system_health(health: dict[str, Any]) -> str:
     metrics = [
-        render_metric("System Status", display_value(health["status"]), f"DB size: {health['db_size']}"),
-        render_metric("Latest Event", display_value(health["latest_event"])),
-        render_metric("Latest Orderbook", display_value(health["latest_orderbook"]), f"{health['orderbook_issues']} issues"),
-        render_metric("Latest BTC Volume", display_value(health["latest_btc_volume"]), f"{health['btc_volume_issues']} errors"),
-        render_metric("Coinbase Collector", display_value(health["coinbase_status"]), f"success: {display_value(health['coinbase_last_success'])}"),
-        render_metric("Open Deals", str(health["open_deals"]), f"{health['deals_count']} total deals"),
+        render_metric("סטטוס מערכת", display_value(health["status"]), f"גודל DB: {health['db_size']}"),
+        render_metric("אירוע אחרון", display_value(health["latest_event"])),
+        render_metric("Orderbook אחרון", display_value(health["latest_orderbook"]), f"{health['orderbook_issues']} בעיות"),
+        render_metric("נפח BTC אחרון", display_value(health["latest_btc_volume"]), f"{health['btc_volume_issues']} שגיאות"),
+        render_metric("איסוף Coinbase", display_value(health["coinbase_status"]), f"הצלחה: {display_value(health['coinbase_last_success'])}"),
+        render_metric("עסקאות פתוחות", str(health["open_deals"]), f"{health['deals_count']} עסקאות בסך הכל"),
     ]
 
     rows = [
-        ("Events", health["events_count"]),
-        ("Orderbook Samples", health["orderbook_count"]),
-        ("BTC Volume Samples", health["btc_volume_count"]),
-        ("Rules", health["rules_count"]),
-        ("Active Rules", health["active_rules"]),
-        ("Deals", health["deals_count"]),
+        ("אירועים", health["events_count"]),
+        ("דגימות Orderbook", health["orderbook_count"]),
+        ("דגימות נפח BTC", health["btc_volume_count"]),
+        ("חוקים", health["rules_count"]),
+        ("חוקים פעילים", health["active_rules"]),
+        ("עסקאות", health["deals_count"]),
     ]
     body = "".join(
         f"<tr><td>{html.escape(label)}</td><td>{html.escape(str(value))}</td></tr>"
@@ -3147,18 +3147,18 @@ def render_system_health(health: dict[str, Any]) -> str:
 
     return f"""
     <div class="card">
-        <h2>System Health</h2>
-        <p class="muted">Operational snapshot for the local FastAPI/SQLite collector.</p>
+        <h2>בריאות מערכת</h2>
+        <p class="muted">תמונת מצב תפעולית של ה־collector המקומי ב־FastAPI/SQLite.</p>
         <div class="metric-grid">
             {''.join(metrics)}
         </div>
         <div class="table-wrap health-table">
           <table>
-            <thead><tr><th>Entity</th><th>Count</th></tr></thead>
+            <thead><tr><th>ישות</th><th>כמות</th></tr></thead>
             <tbody>{body}</tbody>
           </table>
         </div>
-        <p class="muted">DB: {html.escape(health["db_path"])} | Coinbase last error: {html.escape(last_error)}</p>
+        <p class="muted">DB: {html.escape(health["db_path"])} | שגיאת Coinbase אחרונה: {html.escape(last_error)}</p>
     </div>
     """
 
@@ -3177,13 +3177,13 @@ def render_time_trends(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return """
         <div class="card">
-            <h2>Time Trends</h2>
-            <p>No closed deals in the selected range.</p>
+            <h2>מגמות לאורך זמן</h2>
+            <p>אין עסקאות סגורות בטווח שנבחר.</p>
         </div>
         """
 
     max_abs_pnl = max(abs(float(row["net_pnl_usd"])) for row in rows) or 1
-    headers = ["Day", "Closed", "Wins", "Losses", "Win Rate", "Net P&L", "Avg ROI", "P&L"]
+    headers = ["יום", "סגורות", "רווחיות", "הפסדיות", "אחוז הצלחה", "רווח/הפסד נטו", "ROI ממוצע", "רווח/הפסד"]
     thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
     body = ""
     for row in rows:
@@ -3208,8 +3208,8 @@ def render_time_trends(rows: list[dict[str, Any]]) -> str:
 
     return f"""
     <div class="card">
-        <h2>Time Trends</h2>
-        <p class="muted">Closed-deal performance grouped by local date.</p>
+        <h2>מגמות לאורך זמן</h2>
+        <p class="muted">ביצועי עסקאות סגורות לפי תאריך מקומי.</p>
         <div class="table-wrap trends-table">
           <table>
             <thead><tr>{thead}</tr></thead>
@@ -3223,7 +3223,7 @@ def render_time_trends(rows: list[dict[str, Any]]) -> str:
 def render_data_quality(quality: dict[str, Any]) -> str:
     status_class = "ok" if quality["status"] == "ok" else "warning"
     metrics = [
-        render_metric("Quality Status", display_value(quality["status"]), f"{quality['issue_count']} total issues"),
+        render_metric("סטטוס איכות", display_value(quality["status"]), f"{quality['issue_count']} בעיות בסך הכל"),
     ]
     rows = ""
     for check in quality["checks"]:
@@ -3238,12 +3238,12 @@ def render_data_quality(quality: dict[str, Any]) -> str:
 
     return f"""
     <div class="card quality-card {status_class}">
-        <h2>Data Quality</h2>
-        <p class="muted">Internal checks over deals, events, orderbook samples, and Coinbase volume logs.</p>
+        <h2>איכות נתונים</h2>
+        <p class="muted">בדיקות פנימיות על עסקאות, אירועים, דגימות Orderbook ולוג נפח Coinbase.</p>
         <div class="metric-grid">{''.join(metrics)}</div>
         <div class="table-wrap quality-table">
           <table>
-            <thead><tr><th>Check</th><th>Count</th><th>Severity</th></tr></thead>
+            <thead><tr><th>בדיקה</th><th>כמות</th><th>חומרה</th></tr></thead>
             <tbody>{rows}</tbody>
           </table>
         </div>
@@ -3255,8 +3255,8 @@ def render_dashboard_charts(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return """
         <div class="card">
-            <h2>Charts</h2>
-            <p>No chart data in the selected range.</p>
+            <h2>גרפים</h2>
+            <p>אין נתונים לגרפים בטווח שנבחר.</p>
         </div>
         """
 
@@ -3284,15 +3284,15 @@ def render_dashboard_charts(rows: list[dict[str, Any]]) -> str:
 
     return f"""
     <div class="card">
-        <h2>Charts</h2>
-        <p class="muted">Last 30 grouped days in the selected range.</p>
+        <h2>גרפים</h2>
+        <p class="muted">עד 30 הימים האחרונים שקובצו בטווח שנבחר.</p>
         <div class="charts-grid">
             <section>
-                <h3>Daily Net P&L</h3>
+                <h3>רווח/הפסד יומי נטו</h3>
                 {pnl_items}
             </section>
             <section>
-                <h3>Closed Deals Per Day</h3>
+                <h3>עסקאות סגורות ליום</h3>
                 {deal_items}
             </section>
         </div>
@@ -3710,7 +3710,7 @@ def render_dashboard_content(investment_usd: Any = 1, dashboard_range: Any = "al
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
-        <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}. Range: {html.escape(dashboard_range_label(dashboard_range))}</div>
+        <div class="muted">רענון אוטומטי כל 10 שניות אלא אם טופס פתוח. זמן שרת: {html.escape(now_iso())}. טווח: {html.escape(dashboard_range_label(dashboard_range))}</div>
 
         {render_dashboard_overview(overview)}
         {render_rules_performance(rules_performance)}
