@@ -16,6 +16,8 @@ from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from openpyxl import Workbook
 
+from live.router import configure as configure_live, router as live_router
+
 try:
     import truststore
 
@@ -337,6 +339,7 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
 ]
 
 app = FastAPI(title="Polymarket BTC Collector")
+app.include_router(live_router)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -621,6 +624,7 @@ def init_db() -> None:
 
         conn.commit()
     conn.close()
+    configure_live(DB_PATH)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:

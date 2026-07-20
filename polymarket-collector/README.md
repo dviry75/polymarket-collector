@@ -10,6 +10,7 @@ It stores:
 - demo trading rules in `rules`
 - simulated rule-based deals in `deals`
 - downloadable Excel export at `/download.xlsx`
+- isolated LIVE readiness and mock-management area at `/live`
 
 ## Setup
 
@@ -35,6 +36,9 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 - `GET /deals` list demo deals
 - `POST /generate.xlsx` create a new Excel export
 - `/download.xlsx` Excel export
+- `/live` isolated LIVE dashboard
+- `/live/health` LIVE module health
+- `/live/export/download` LIVE-only Excel export
 
 ## Demo Trading Rules and Deals
 
@@ -74,6 +78,21 @@ Exit logic for open deals uses only the best bid for the deal side:
 Event resolution closes remaining open deals only when the event is already stored as closed and `outcome_prices` clearly indicates `1/0` or `0/1`. The winning side closes at `1`, the losing side closes at `0`, and `exit_orderbook_log_id` remains `NULL` when no exact order book sample represents resolution.
 
 Demo trading does not place real Polymarket orders and does not model fees, slippage, partial fills, or market depth beyond the relevant best ask and best bid.
+
+## LIVE Module
+
+The LIVE module is additive and separated from DEMO tables and routes. It is fail-closed by default:
+
+```text
+TRADING_MODE=DEMO
+LIVE_MODULE_ENABLED=false
+LIVE_TRADING_ENABLED=false
+LIVE_ORDER_SUBMISSION_ENABLED=false
+LIVE_ADAPTER=mock
+LIVE_KILL_SWITCH=true
+```
+
+Use `/live` only in mock/read-only mode until account details and explicit approval are provided in a future task. Real order submission is blocked in this build. See `LIVE_SYSTEM.md` and `.env.example`.
 
 Excel exports now contain five sheets:
 
