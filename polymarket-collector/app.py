@@ -2191,9 +2191,12 @@ def longest_result_streak(results: list[str], target: str) -> int:
     return longest
 
 
+CUSTOM_DATETIME_FORMAT = "%d/%m/%Y %H:%M"
+
+
 def normalize_dashboard_range(value: Any) -> str:
     selected = str(value or "all").strip().lower()
-    return selected if selected in {"today", "7d", "30d", "all"} else "all"
+    return selected if selected in {"today", "7d", "30d", "custom", "all"} else "all"
 
 
 def dashboard_range_options() -> list[tuple[str, str]]:
@@ -2202,47 +2205,111 @@ def dashboard_range_options() -> list[tuple[str, str]]:
         ("today", "היום"),
         ("7d", "7 ימים אחרונים"),
         ("30d", "30 ימים אחרונים"),
+        ("custom", "טווח מותאם"),
     ]
 
 
-def dashboard_range_label(value: Any) -> str:
+def parse_custom_dashboard_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.strptime(text, CUSTOM_DATETIME_FORMAT)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=LOCAL_TIMEZONE).astimezone(timezone.utc)
+
+
+def dashboard_datetime_input_value(value: Any) -> str:
+    parsed = parse_custom_dashboard_datetime(value)
+    if parsed:
+        return parsed.astimezone(LOCAL_TIMEZONE).strftime(CUSTOM_DATETIME_FORMAT)
+    return str(value or "").strip()
+
+
+def dashboard_range_label(value: Any, custom_from: Any = None, custom_to: Any = None) -> str:
     selected = normalize_dashboard_range(value)
+    if selected == "custom":
+        start_text = dashboard_datetime_input_value(custom_from)
+        end_text = dashboard_datetime_input_value(custom_to)
+        if start_text and end_text:
+            return f"{start_text} עד {end_text}"
+        if start_text:
+            return f"מ־{start_text}"
+        if end_text:
+            return f"עד {end_text}"
+        return "טווח מותאם"
     return dict(dashboard_range_options()).get(selected, "כל התקופה")
 
 
-def dashboard_range_start(value: Any) -> Optional[str]:
+def dashboard_range_bounds(value: Any, custom_from: Any = None, custom_to: Any = None) -> tuple[Optional[str], Optional[str]]:
     selected = normalize_dashboard_range(value)
     now = now_utc()
     if selected == "today":
-        return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(), None
     if selected == "7d":
-        return (now - timedelta(days=7)).isoformat()
+        return (now - timedelta(days=7)).isoformat(), None
     if selected == "30d":
-        return (now - timedelta(days=30)).isoformat()
-    return None
+        return (now - timedelta(days=30)).isoformat(), None
+    if selected == "custom":
+        start = parse_custom_dashboard_datetime(custom_from)
+        end = parse_custom_dashboard_datetime(custom_to)
+        return (
+            start.isoformat() if start else None,
+            end.isoformat() if end else None,
+        )
+    return None, None
 
 
-def time_filter_sql(column: str, dashboard_range: Any) -> tuple[str, tuple[Any, ...]]:
-    start = dashboard_range_start(dashboard_range)
-    if not start:
+def dashboard_range_start(value: Any, custom_from: Any = None) -> Optional[str]:
+    start, _ = dashboard_range_bounds(value, custom_from, None)
+    return start
+
+
+def time_filter_sql(
+    column: str,
+    dashboard_range: Any,
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> tuple[str, tuple[Any, ...]]:
+    start, end = dashboard_range_bounds(dashboard_range, custom_from, custom_to)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if start:
+        clauses.append(f"{column} >= ?")
+        params.append(start)
+    if end:
+        clauses.append(f"{column} <= ?")
+        params.append(end)
+    if not clauses:
         return "1 = 1", ()
-    return f"{column} >= ?", (start,)
+    return " AND ".join(clauses), tuple(params)
 
 
-def deal_matches_range(deal: sqlite3.Row, dashboard_range: Any) -> bool:
-    start = dashboard_range_start(dashboard_range)
-    if not start:
-        return True
+def deal_matches_range(deal: sqlite3.Row, dashboard_range: Any, custom_from: Any = None, custom_to: Any = None) -> bool:
+    start, end = dashboard_range_bounds(dashboard_range, custom_from, custom_to)
     exit_at = deal["exit_at"] if "exit_at" in deal.keys() else None
     exit_dt = parse_iso_datetime(exit_at)
     start_dt = parse_iso_datetime(start)
-    return bool(exit_dt and start_dt and exit_dt >= start_dt)
+    end_dt = parse_iso_datetime(end)
+    if not exit_dt:
+        return False
+    if start_dt and exit_dt < start_dt:
+        return False
+    if end_dt and exit_dt > end_dt:
+        return False
+    return True
 
 
-def load_dashboard_overview(investment_usd: Any = 1, dashboard_range: Any = "all") -> dict[str, Any]:
+def load_dashboard_overview(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
-    entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range)
-    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
+    entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range, custom_from, custom_to)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         total_deals = int(conn.execute(f"SELECT COUNT(*) FROM deals WHERE {entry_filter}", entry_params).fetchone()[0])
         open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
@@ -2317,7 +2384,9 @@ def load_dashboard_overview(investment_usd: Any = 1, dashboard_range: Any = "all
     return {
         "investment_usd": float(investment),
         "range": normalize_dashboard_range(dashboard_range),
-        "range_label": dashboard_range_label(dashboard_range),
+        "range_label": dashboard_range_label(dashboard_range, custom_from, custom_to),
+        "custom_from": dashboard_datetime_input_value(custom_from),
+        "custom_to": dashboard_datetime_input_value(custom_to),
         "total_deals": total_deals,
         "closed_deals": closed_count,
         "open_deals": open_deals,
@@ -2340,9 +2409,14 @@ def load_dashboard_overview(investment_usd: Any = 1, dashboard_range: Any = "all
     }
 
 
-def load_rules_performance(investment_usd: Any = 1, dashboard_range: Any = "all") -> list[dict[str, Any]]:
+def load_rules_performance(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> list[dict[str, Any]]:
     investment = normalize_investment_usd(investment_usd)
-    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         rules = conn.execute("""
             SELECT
@@ -2470,9 +2544,14 @@ def load_rules_performance(investment_usd: Any = 1, dashboard_range: Any = "all"
     return rows
 
 
-def load_risk_snapshot(investment_usd: Any = 1, dashboard_range: Any = "all") -> dict[str, Any]:
+def load_risk_snapshot(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
-    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT
@@ -2611,9 +2690,14 @@ def finalize_condition_group(group: dict[str, Any]) -> dict[str, Any]:
     return group
 
 
-def load_market_conditions(investment_usd: Any = 1, dashboard_range: Any = "all") -> dict[str, list[dict[str, Any]]]:
+def load_market_conditions(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> dict[str, list[dict[str, Any]]]:
     investment = normalize_investment_usd(investment_usd)
-    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT
@@ -2752,9 +2836,14 @@ def local_date_key(value: Any) -> str:
     return dt.astimezone(LOCAL_TIMEZONE).strftime("%Y-%m-%d")
 
 
-def load_time_trends(investment_usd: Any = 1, dashboard_range: Any = "all") -> list[dict[str, Any]]:
+def load_time_trends(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> list[dict[str, Any]]:
     investment = normalize_investment_usd(investment_usd)
-    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range)
+    exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT
@@ -2805,9 +2894,9 @@ def load_time_trends(investment_usd: Any = 1, dashboard_range: Any = "all") -> l
     return rows
 
 
-def load_data_quality_snapshot(dashboard_range: Any = "all") -> dict[str, Any]:
-    orderbook_filter, orderbook_params = time_filter_sql("sampled_at", dashboard_range)
-    btc_filter, btc_params = time_filter_sql("sampled_at", dashboard_range)
+def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = None, custom_to: Any = None) -> dict[str, Any]:
+    orderbook_filter, orderbook_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
+    btc_filter, btc_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         missing_rule_deals = int(conn.execute("""
             SELECT COUNT(*)
@@ -2915,6 +3004,8 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
 
     investment_value = display_value(overview["investment_usd"])
     selected_range = normalize_dashboard_range(overview.get("range"))
+    custom_from_value = html.escape(str(overview.get("custom_from") or ""))
+    custom_to_value = html.escape(str(overview.get("custom_to") or ""))
     range_options = "".join(
         f"<option value=\"{html.escape(value)}\"{' selected' if value == selected_range else ''}>{html.escape(label)}</option>"
         for value, label in dashboard_range_options()
@@ -2931,7 +3022,13 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
                     <input name="investment_usd" type="number" step="0.01" min="0.01" value="{html.escape(investment_value)}">
                 </label>
                 <label>טווח תאריכים
-                    <select name="range_filter">{range_options}</select>
+                    <select name="range_filter" id="range-filter" onchange="toggleCustomRangeInputs()">{range_options}</select>
+                </label>
+                <label class="custom-range-field">מתאריך ושעה
+                    <input name="custom_from" type="text" inputmode="numeric" placeholder="DD/MM/YYYY HH:mm" value="{custom_from_value}">
+                </label>
+                <label class="custom-range-field">עד תאריך ושעה
+                    <input name="custom_to" type="text" inputmode="numeric" placeholder="DD/MM/YYYY HH:mm" value="{custom_to_value}">
                 </label>
                 <button class="button" type="submit">החל</button>
             </form>
@@ -3477,6 +3574,14 @@ def render_dashboard_scripts() -> str:
         return modalIsOpen() || userIsEditing();
       }
 
+      function toggleCustomRangeInputs() {
+        const rangeFilter = document.getElementById("range-filter");
+        const visible = rangeFilter && rangeFilter.value === "custom";
+        document.querySelectorAll(".custom-range-field").forEach((element) => {
+          element.hidden = !visible;
+        });
+      }
+
       async function refreshDashboardContent(force = false) {
         if (dashboardRefreshInFlight || (!force && autoRefreshIsPaused())) {
           return;
@@ -3486,6 +3591,7 @@ def render_dashboard_scripts() -> str:
           const response = await fetch(`/dashboard-content${window.location.search}`, {headers: {"X-Requested-With": "fetch"}});
           if (response.ok) {
             document.getElementById("dashboard-content").innerHTML = await response.text();
+            toggleCustomRangeInputs();
           }
         } finally {
           dashboardRefreshInFlight = false;
@@ -3541,6 +3647,7 @@ def render_dashboard_scripts() -> str:
         await refreshDashboardContent(true);
       }
 
+      document.addEventListener("DOMContentLoaded", toggleCustomRangeInputs);
       window.setInterval(() => refreshDashboardContent(false), 10000);
     </script>
     """
@@ -3698,19 +3805,24 @@ def load_dashboard_rows() -> tuple[
     return events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health
 
 
-def render_dashboard_content(investment_usd: Any = 1, dashboard_range: Any = "all") -> str:
+def render_dashboard_content(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> str:
     dashboard_range = normalize_dashboard_range(dashboard_range)
-    overview = load_dashboard_overview(investment_usd, dashboard_range)
-    rules_performance = load_rules_performance(investment_usd, dashboard_range)
-    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range)
-    market_conditions = load_market_conditions(investment_usd, dashboard_range)
+    overview = load_dashboard_overview(investment_usd, dashboard_range, custom_from, custom_to)
+    rules_performance = load_rules_performance(investment_usd, dashboard_range, custom_from, custom_to)
+    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range, custom_from, custom_to)
+    market_conditions = load_market_conditions(investment_usd, dashboard_range, custom_from, custom_to)
     system_health = load_system_health_snapshot()
-    time_trends = load_time_trends(investment_usd, dashboard_range)
-    data_quality = load_data_quality_snapshot(dashboard_range)
+    time_trends = load_time_trends(investment_usd, dashboard_range, custom_from, custom_to)
+    data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to)
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
-        <div class="muted">רענון אוטומטי כל 10 שניות אלא אם טופס פתוח. זמן שרת: {html.escape(now_iso())}. טווח: {html.escape(dashboard_range_label(dashboard_range))}</div>
+        <div class="muted">רענון אוטומטי כל 10 שניות אלא אם טופס פתוח. זמן שרת: {html.escape(now_iso())}. טווח: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
 
         {render_dashboard_overview(overview)}
         {render_rules_performance(rules_performance)}
@@ -3755,12 +3867,22 @@ def render_dashboard_content(investment_usd: Any = 1, dashboard_range: Any = "al
 
 
 @app.get("/dashboard-content", response_class=HTMLResponse)
-def dashboard_content(investment_usd: float = 1.0, range_filter: str = "all") -> str:
-    return render_dashboard_content(investment_usd, range_filter)
+def dashboard_content(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(investment_usd: float = 1.0, range_filter: str = "all") -> str:
+def dashboard(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
     return f"""
     <!doctype html>
     <html>
@@ -4016,7 +4138,7 @@ def dashboard(investment_usd: float = 1.0, range_filter: str = "all") -> str:
     <body>
         <h1>Polymarket BTC Collector</h1>
         <div id="dashboard-content">
-            {render_dashboard_content(investment_usd, range_filter)}
+            {render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)}
         </div>
         {render_dashboard_scripts()}
     </body>

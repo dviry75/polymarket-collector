@@ -307,6 +307,15 @@ class RuleDealTests(unittest.TestCase):
         self.assertAlmostEqual(overview["net_pnl_usd"], (1 / 0.77) * 0.90 - 1)
         self.assertEqual(overview["range"], "all")
         self.assertEqual(app.normalize_dashboard_range("bad-value"), "all")
+        self.assertEqual(app.normalize_dashboard_range("custom"), "custom")
+
+        custom_overview = app.load_dashboard_overview(1, "custom", "17/07/2026 11:00", "17/07/2026 13:00")
+        self.assertEqual(custom_overview["closed_deals"], 1)
+        self.assertEqual(custom_overview["custom_from"], "17/07/2026 11:00")
+        self.assertEqual(custom_overview["custom_to"], "17/07/2026 13:00")
+
+        excluded_overview = app.load_dashboard_overview(1, "custom", "18/07/2026 00:00", "18/07/2026 01:00")
+        self.assertEqual(excluded_overview["closed_deals"], 0)
 
         rules_performance = app.load_rules_performance(1)
         self.assertEqual(len(rules_performance), 2)
@@ -371,6 +380,9 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("<h2>איכות נתונים</h2>", html)
         self.assertIn("<h2>בריאות מערכת</h2>", html)
         self.assertIn("טווח תאריכים", html)
+        self.assertIn("DD/MM/YYYY HH:mm", html)
+        self.assertIn("custom_from", html)
+        self.assertIn("custom_to", html)
         self.assertIn("דגימות Orderbook", html)
         self.assertIn("ביצועים לפי צד", html)
         self.assertIn("0.70-0.79", html)
@@ -400,6 +412,13 @@ class RuleDealTests(unittest.TestCase):
         filtered_content = client.get("/dashboard-content?investment_usd=2&range_filter=all")
         self.assertEqual(filtered_content.status_code, 200)
         self.assertIn("טווח: כל התקופה", filtered_content.text)
+
+        custom_content = client.get(
+            "/dashboard-content?investment_usd=2&range_filter=custom&custom_from=17/07/2026%2011:00&custom_to=17/07/2026%2013:00"
+        )
+        self.assertEqual(custom_content.status_code, 200)
+        self.assertIn("17/07/2026 11:00", custom_content.text)
+        self.assertIn("17/07/2026 13:00", custom_content.text)
 
         app.export_state.update({"status": "ready", "filename": export_path.name, "path": str(export_path)})
         download = client.get("/download.xlsx")
