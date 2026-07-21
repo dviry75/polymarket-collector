@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import LiveConfig
 from .repository import LiveRepository
@@ -61,6 +62,22 @@ class RiskManager:
             return RiskResult(False, "OPEN_ORDER_CAP", "Too many open LIVE orders")
         if counts["open_deals"] >= self.config.max_open_deals:
             return RiskResult(False, "OPEN_DEAL_CAP", "Too many open LIVE deals")
+        if counts.get("active_rules", 0) > self.config.max_active_rules:
+            return RiskResult(False, "ACTIVE_RULE_CAP", "Too many active LIVE rules")
+        if self.current_exposure_usd_decimal() + amount > self.config.max_total_exposure_usd:
+            return RiskResult(False, "EXPOSURE_CAP", "Requested order would exceed total LIVE exposure cap")
+
+        daily = self.repo.current_daily_limit(self._day_key(), "Asia/Jerusalem")
+        realized = _dec(daily.get("realized_pnl_usd"))
+        if realized <= -abs(self.config.max_daily_realized_loss_usd):
+            self.repo.set_state("kill_switch", "true", "risk_manager")
+            return RiskResult(False, "DAILY_LOSS_LIMIT", "Daily realized loss limit reached")
+        if int(daily.get("consecutive_failed_orders") or 0) >= self.config.max_consecutive_failed_orders:
+            self.repo.set_state("kill_switch", "true", "risk_manager")
+            return RiskResult(False, "CONSECUTIVE_FAILED_ORDERS", "Too many consecutive failed orders")
+        if int(daily.get("consecutive_losing_deals") or 0) >= self.config.max_consecutive_losing_deals:
+            self.repo.set_state("kill_switch", "true", "risk_manager")
+            return RiskResult(False, "CONSECUTIVE_LOSING_DEALS", "Too many consecutive losing deals")
 
         market = self.repo.latest_market(str(order.get("condition_id") or "")) if order.get("condition_id") else None
         if market:
@@ -88,6 +105,24 @@ class RiskManager:
             return RiskResult(False, "STALE_RECONCILIATION", "Reconciliation is stale or has never run")
         if self.repo.get_state("live_blocked_by_reconciliation", "false").lower() == "true":
             return RiskResult(False, "RECONCILIATION_GAP", "Unresolved reconciliation gap")
+        if self.config.live_adapter == "polymarket":
+            if self.repo.get_state("account_identity_status", "UNVERIFIED") != "VERIFIED":
+                return RiskResult(False, "ACCOUNT_IDENTITY_UNVERIFIED", "Account identity is not verified")
+            user_ws_age = _age_seconds(self.repo.get_state("user_ws_last_message_at", ""))
+            if user_ws_age is None or user_ws_age > self.config.max_user_state_age_seconds:
+                return RiskResult(False, "STALE_USER_STATE", "User state is stale or not configured")
 
         return RiskResult(True, "ALLOWED", "Order passed LIVE risk checks")
 
+    def current_exposure_usd_decimal(self) -> Decimal:
+        return self.repo.current_exposure_usd()
+
+    def current_exposure_usd(self) -> str:
+        return str(self.current_exposure_usd_decimal())
+
+    def _day_key(self) -> str:
+        try:
+            tz = ZoneInfo("Asia/Jerusalem")
+        except ZoneInfoNotFoundError:
+            tz = timezone.utc
+        return datetime.now(tz).date().isoformat()

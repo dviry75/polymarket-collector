@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import sqlite3
 import sys
@@ -31,6 +32,8 @@ class LiveSystemTests(unittest.TestCase):
             live_module_enabled=True,
             live_adapter="mock",
             operator_token="test-token",
+            login_password_hash="sha256:" + hashlib.sha256(b"pw").hexdigest(),
+            session_secret="test-session-secret",
             live_kill_switch_default=True,
             max_market_data_age_seconds=10_000,
             max_reconciliation_age_seconds=10_000,
@@ -43,6 +46,11 @@ class LiveSystemTests(unittest.TestCase):
 
     def client(self):
         return TestClient(app.app)
+
+    def login(self, client):
+        response = client.post("/live/login", json={"username": "operator", "password": "pw"})
+        self.assertEqual(response.status_code, 200)
+        return response
 
     def test_config_defaults_are_fail_closed(self):
         defaults = LiveConfig()
@@ -86,6 +94,9 @@ class LiveSystemTests(unittest.TestCase):
 
     def test_live_routes_health_and_auth_blocks_writes_without_token(self):
         client = self.client()
+        unauthenticated = client.get("/live/health")
+        self.assertEqual(unauthenticated.status_code, 401)
+        self.login(client)
         response = client.get("/live/health")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -102,6 +113,7 @@ class LiveSystemTests(unittest.TestCase):
 
     def test_mock_order_lifecycle_and_fills(self):
         client = self.client()
+        self.login(client)
         headers = {"X-Live-Operator-Token": "test-token"}
         client.post("/live/kill-switch/deactivate", headers=headers, follow_redirects=False)
         result = client.post(
@@ -137,6 +149,7 @@ class LiveSystemTests(unittest.TestCase):
 
     def test_risk_blocks_kill_switch_and_partial_fill_policy(self):
         client = self.client()
+        self.login(client)
         headers = {"X-Live-Operator-Token": "test-token"}
         blocked = client.post(
             "/live/orders/mock",
@@ -175,6 +188,7 @@ class LiveSystemTests(unittest.TestCase):
         metadata = asyncio.run(refresh_public_market_metadata("condition-1", use_mock=True))
         self.assertEqual(metadata["token_mapping_status"], "matched")
         client = self.client()
+        self.login(client)
         headers = {"X-Live-Operator-Token": "test-token"}
         message = {
             "event_type": "market_resolved",
@@ -193,6 +207,7 @@ class LiveSystemTests(unittest.TestCase):
 
     def test_user_websocket_fixture_reconciliation_and_export(self):
         client = self.client()
+        self.login(client)
         headers = {"X-Live-Operator-Token": "test-token"}
         user_msg = {"type": "trade", "condition_id": "condition-1", "trade_id": "trade-1", "status": "MATCHED"}
         self.assertTrue(client.post("/live/user-ws/fixture", headers=headers, json=user_msg).json()["stored"])
@@ -209,8 +224,42 @@ class LiveSystemTests(unittest.TestCase):
         try:
             self.assertIn("live_orders", workbook.sheetnames)
             self.assertIn("live_audit_log", workbook.sheetnames)
+            self.assertIn("live_dry_runs", workbook.sheetnames)
         finally:
             workbook.close()
+
+    def test_account_identity_secret_readiness_and_dry_run(self):
+        client = self.client()
+        self.login(client)
+        headers = {"X-Live-Operator-Token": "test-token"}
+        configure(self.db_path, LiveConfig(
+            live_module_enabled=True,
+            live_adapter="mock",
+            operator_token="test-token",
+            login_password_hash="sha256:" + hashlib.sha256(b"pw").hexdigest(),
+            session_secret="test-session-secret",
+            profile_address="0xcE075637152167517e1492FcF5ff2D131686ee38",
+            live_kill_switch_default=True,
+            max_market_data_age_seconds=10_000,
+            max_reconciliation_age_seconds=10_000,
+        ))
+        self.login(client)
+        identity = client.post("/live/account/public-refresh?use_mock=true", headers=headers)
+        self.assertEqual(identity.status_code, 200)
+        self.assertEqual(identity.json()["account_identity_status"], "UNVERIFIED")
+        self.assertNotIn("raw_public_payload", identity.json())
+
+        dry = client.post("/live/dry-run", headers=headers, json={
+            "idempotency_key": "dry-1",
+            "condition_id": "condition-1",
+            "token_id": "yes-token",
+            "requested_price": 0.50,
+            "requested_amount_usd": 1,
+            "purpose": "entry",
+        })
+        self.assertEqual(dry.status_code, 200)
+        self.assertEqual(dry.json()["final_decision"], "BLOCKED")
+        self.assertEqual(client.get("/live/secrets/readiness").status_code, 200)
 
     def test_demo_routes_still_work_with_live_module_enabled(self):
         client = self.client()

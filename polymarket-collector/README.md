@@ -94,6 +94,26 @@ LIVE_KILL_SWITCH=true
 
 Use `/live` only in mock/read-only mode until account details and explicit approval are provided in a future task. Real order submission is blocked in this build. See `LIVE_SYSTEM.md` and `.env.example`.
 
+Phase 2 adds:
+
+- Login protection for every `/live` route.
+- Public profile/account identity snapshots from keyless public APIs.
+- Bounded public Market WebSocket smoke support.
+- Google Secret Manager provider plumbing.
+- Dry-run previews for entry, take profit, stop loss, and manual exit intents.
+- Risk gates for `$1` trade cap, `$3` exposure, `$10` daily realized loss, open order/deal/rule caps, stale market data, stale user state, and reconciliation age.
+- Fail-closed Real adapter with write methods blocked.
+
+Future mock-only deployment flags:
+
+```text
+LIVE_MODULE_ENABLED=true
+LIVE_ADAPTER=mock
+LIVE_KILL_SWITCH=true
+LIVE_TRADING_ENABLED=false
+LIVE_ORDER_SUBMISSION_ENABLED=false
+```
+
 Excel exports now contain five sheets:
 
 - `events`

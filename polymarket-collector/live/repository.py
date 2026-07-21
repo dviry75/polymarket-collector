@@ -229,11 +229,40 @@ class LiveRepository:
                 CREATE TABLE IF NOT EXISTS live_account_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sampled_at TEXT NOT NULL,
+                    configured_profile_address TEXT,
+                    account_login_type TEXT,
+                    resolved_proxy_wallet TEXT,
+                    expected_funder_candidate TEXT,
+                    account_identity_status TEXT,
+                    public_positions_count INTEGER NOT NULL DEFAULT 0,
+                    public_positions_value REAL,
+                    public_closed_positions_count INTEGER NOT NULL DEFAULT 0,
+                    public_activity_count INTEGER NOT NULL DEFAULT 0,
                     balance_usd REAL,
                     allowance_usd REAL,
                     raw_payload TEXT,
                     status TEXT NOT NULL,
                     error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS live_dry_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    final_decision TEXT NOT NULL,
+                    reason_codes_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS live_daily_limits (
+                    day_key TEXT PRIMARY KEY,
+                    timezone TEXT NOT NULL,
+                    realized_pnl_usd REAL NOT NULL DEFAULT 0,
+                    consecutive_failed_orders INTEGER NOT NULL DEFAULT 0,
+                    consecutive_losing_deals INTEGER NOT NULL DEFAULT 0,
+                    kill_switch_triggered INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS live_reconciliation_runs (
@@ -269,6 +298,30 @@ class LiveRepository:
                     "INSERT INTO live_system_state (key, value, updated_at) VALUES ('kill_switch', ?, ?)",
                     ("true" if kill_switch_default else "false", now_iso()),
                 )
+            conn.commit()
+
+        self._ensure_live_columns()
+
+    def _ensure_live_columns(self) -> None:
+        additions = {
+            "live_account_snapshots": {
+                "configured_profile_address": "TEXT",
+                "account_login_type": "TEXT",
+                "resolved_proxy_wallet": "TEXT",
+                "expected_funder_candidate": "TEXT",
+                "account_identity_status": "TEXT",
+                "public_positions_count": "INTEGER NOT NULL DEFAULT 0",
+                "public_positions_value": "REAL",
+                "public_closed_positions_count": "INTEGER NOT NULL DEFAULT 0",
+                "public_activity_count": "INTEGER NOT NULL DEFAULT 0",
+            },
+        }
+        with self.connect() as conn:
+            for table, columns in additions.items():
+                existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                for column, column_type in columns.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             conn.commit()
 
     def audit(self, actor: str, action: str, status: str, reason: str = "", details: Optional[dict[str, Any]] = None) -> None:
@@ -639,17 +692,110 @@ class LiveRepository:
                 )
             conn.commit()
 
+    def store_account_snapshot(self, snapshot: dict[str, Any]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_account_snapshots (
+                    sampled_at, configured_profile_address, account_login_type,
+                    resolved_proxy_wallet, expected_funder_candidate, account_identity_status,
+                    public_positions_count, public_positions_value, public_closed_positions_count,
+                    public_activity_count, balance_usd, allowance_usd, raw_payload, status, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.get("sampled_at") or now_iso(),
+                    snapshot.get("configured_profile_address"),
+                    snapshot.get("account_login_type"),
+                    snapshot.get("resolved_proxy_wallet"),
+                    snapshot.get("expected_funder_candidate"),
+                    snapshot.get("account_identity_status") or snapshot.get("status"),
+                    snapshot.get("public_positions_count", 0),
+                    snapshot.get("public_positions_value"),
+                    snapshot.get("public_closed_positions_count", 0),
+                    snapshot.get("public_activity_count", 0),
+                    snapshot.get("balance_usd"),
+                    snapshot.get("allowance_usd"),
+                    json_dumps(snapshot.get("raw_public_payload") or snapshot.get("raw_payload") or {}),
+                    snapshot.get("status", "unknown"),
+                    snapshot.get("error", ""),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO live_system_state (key, value, updated_at)
+                VALUES ('account_identity_status', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (snapshot.get("account_identity_status") or snapshot.get("status", "unknown"), now_iso()),
+            )
+            conn.commit()
+
+    def latest_account_snapshot(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM live_account_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        return row_to_dict(row)
+
+    def store_dry_run(self, preview: dict[str, Any], actor: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_dry_runs (created_at, actor, intent_json, final_decision, reason_codes_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    preview.get("timestamp") or now_iso(),
+                    actor,
+                    json_dumps(preview),
+                    preview.get("final_decision", "BLOCKED"),
+                    json_dumps(preview.get("reason_codes") or []),
+                ),
+            )
+            conn.commit()
+
+    def current_daily_limit(self, day_key: str, tz_name: str) -> dict[str, Any]:
+        ts = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_daily_limits (day_key, timezone, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(day_key) DO NOTHING
+                """,
+                (day_key, tz_name, ts, ts),
+            )
+            row = conn.execute("SELECT * FROM live_daily_limits WHERE day_key = ?", (day_key,)).fetchone()
+            conn.commit()
+        return row_to_dict(row) or {}
+
+    def add_failed_order_counter(self, day_key: str, tz_name: str) -> dict[str, Any]:
+        self.current_daily_limit(day_key, tz_name)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE live_daily_limits
+                SET consecutive_failed_orders = consecutive_failed_orders + 1, updated_at = ?
+                WHERE day_key = ?
+                """,
+                (now_iso(), day_key),
+            )
+            row = conn.execute("SELECT * FROM live_daily_limits WHERE day_key = ?", (day_key,)).fetchone()
+            conn.commit()
+        return row_to_dict(row) or {}
+
     def list_table(self, table: str, limit: int = 100) -> list[dict[str, Any]]:
         allowed = {
             "live_markets", "live_rules", "live_deals", "live_orders", "live_order_fills",
             "live_positions", "live_account_snapshots", "live_reconciliation_runs",
-            "live_audit_log", "live_websocket_events",
+            "live_audit_log", "live_websocket_events", "live_dry_runs", "live_daily_limits",
         }
         if table not in allowed:
             raise ValueError(table)
         order_col = "id"
         if table == "live_orders":
             order_col = "local_order_id"
+        if table == "live_daily_limits":
+            order_col = "day_key"
         with self.connect() as conn:
             rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_col} DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(row) or {} for row in rows]
@@ -665,7 +811,26 @@ class LiveRepository:
                 ).fetchone()[0]),
                 "markets": int(conn.execute("SELECT COUNT(*) FROM live_markets").fetchone()[0]),
                 "rules": int(conn.execute("SELECT COUNT(*) FROM live_rules").fetchone()[0]),
+                "active_rules": int(conn.execute("SELECT COUNT(*) FROM live_rules WHERE status = 'active'").fetchone()[0]),
             }
+
+    def current_exposure_usd(self) -> Decimal:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(COALESCE(requested_amount_usd, 0)), 0)
+                FROM live_orders
+                WHERE status NOT IN ('filled','cancelled','unmatched','failed','blocked')
+                """
+            ).fetchone()
+            deals = conn.execute(
+                """
+                SELECT COALESCE(SUM(COALESCE(requested_amount_usd, 0)), 0)
+                FROM live_deals
+                WHERE status IN ('open','partially_open','exit_pending')
+                """
+            ).fetchone()
+        return Decimal(str(row[0] or 0)) + Decimal(str(deals[0] or 0))
 
     def latest_market(self, condition_id: Optional[str] = None) -> dict[str, Any] | None:
         with self.connect() as conn:
