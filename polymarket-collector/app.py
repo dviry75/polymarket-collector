@@ -4106,7 +4106,12 @@ def chart_json_payload(time_trends: list[dict[str, Any]], btc_volume_trends: lis
         "btcVolumeDelta": [round(float(row["volume_btc_delta"]), 8) for row in btc_volume_trends],
         "btcVolumeCumulative": [round(float(row["volume_btc_cumulative"]), 8) for row in btc_volume_trends],
     }
-    return html.escape(json.dumps(payload, ensure_ascii=False))
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
 
 
 def render_chartjs_charts(time_trends: list[dict[str, Any]], btc_volume_trends: list[dict[str, Any]]) -> str:

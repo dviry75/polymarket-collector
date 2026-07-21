@@ -563,6 +563,8 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("refreshDashboardContent", html)
         self.assertIn("renderDashboardCharts", html)
         self.assertIn("https://cdn.jsdelivr.net/npm/chart.js", html)
+        self.assertIn('"timeTrendLabels"', html)
+        self.assertNotIn("&quot;timeTrendLabels&quot;", html)
 
         dashboard_content = client.get("/dashboard-content")
         self.assertEqual(dashboard_content.status_code, 200)
