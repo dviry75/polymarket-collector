@@ -1,10 +1,33 @@
 # Polymarket LIVE System
 
-This project now includes an isolated `/live` area next to the existing DEMO collector. The LIVE module is built fail-closed and uses separate tables prefixed with `live_`.
+The project now has a standalone LIVE FastAPI entrypoint next to the existing DEMO collector. LIVE is fail-closed by default and uses a separate SQLite database containing only `live_*` tables.
+
+No deployment, allowance, redemption, Live Rule creation, or real order submission is part of this build.
+
+## Service Separation
+
+DEMO:
+
+```text
+entrypoint: app:app
+service: polymarket.service
+port: 8000
+database: /opt/polymarket-btc/poly_data.sqlite3
+```
+
+LIVE:
+
+```text
+entrypoint: live_app:app
+service: polymarket-live.service
+port: 8001
+database: /opt/polymarket-btc-live/poly_live.sqlite3
+domain: https://live-poly.dvirtechnologies.com
+```
+
+The DEMO `init_db()` does not run LIVE migrations by default. The LIVE entrypoint initializes only the LIVE DB schema. DEMO can still be run and tested without importing or configuring the LIVE runtime.
 
 ## Safe Defaults
-
-The default configuration is DEMO-only:
 
 ```text
 TRADING_MODE=DEMO
@@ -15,49 +38,61 @@ LIVE_ADAPTER=mock
 LIVE_KILL_SWITCH=true
 ```
 
-Real Polymarket order submission is not enabled in this build. `RealPolymarketTradingAdapter` returns `blocked` for write operations.
+Real Polymarket order submission remains blocked. `RealPolymarketTradingAdapter` returns `blocked` for write operations.
 
-Every `/live` route is protected by a server-side login session. Configure:
+## Login
+
+Single initial admin:
 
 ```text
-LIVE_LOGIN_USERNAME=operator
-LIVE_LOGIN_PASSWORD_HASH=sha256:<sha256-of-password>
-LIVE_SESSION_SECRET=<random server-only value>
+LIVE_LOGIN_USERNAME=Admin@system.com
+```
+
+Required server-side secrets:
+
+```text
+LIVE_LOGIN_PASSWORD_HASH=<argon2id hash from Google Secret Manager>
+LIVE_SESSION_SECRET=<64-byte random value from Google Secret Manager>
 LIVE_OPERATOR_TOKEN=<server-only action token>
 ```
 
-If login is not configured, `/live` fails closed.
+Every `/live` route requires login except `/live/login`. Public root health is separate and redacted. Sessions are persistent until manual logout, password/session-secret rotation, or `revoke all sessions`.
 
-## Running In Mock Mode
+Write actions require:
 
-Set only non-secret flags:
+- Login session
+- CSRF token
+- `X-Live-Operator-Token`
 
-```text
-LIVE_MODULE_ENABLED=true
-LIVE_ADAPTER=mock
-LIVE_KILL_SWITCH=true
-LIVE_TRADING_ENABLED=false
-LIVE_ORDER_SUBMISSION_ENABLED=false
-LIVE_OPERATOR_TOKEN=<operator token stored outside Git>
-```
+Critical actions also require password re-authentication, including Kill Switch deactivation and session revocation.
 
-Start the existing FastAPI app as usual:
+## Running Locally In Mock Mode
 
 ```bash
-uvicorn app:app --host 127.0.0.1 --port 8000
+uvicorn live_app:app --host 127.0.0.1 --port 8001
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:8000/live
+http://127.0.0.1:8001/live
 ```
 
-Operator POST actions require the `X-Live-Operator-Token` header. If `LIVE_OPERATOR_TOKEN` is not configured, write actions remain blocked.
+The future production URL is:
+
+```text
+https://live-poly.dvirtechnologies.com/live
+```
 
 ## Database
 
-`init_db()` now also runs an idempotent LIVE migration. It creates only additive tables:
+LIVE DB:
+
+```text
+/opt/polymarket-btc-live/poly_live.sqlite3
+```
+
+LIVE tables:
 
 - `live_markets`
 - `live_rules`
@@ -72,53 +107,88 @@ Operator POST actions require the `X-Live-Operator-Token` header. If `LIVE_OPERA
 - `live_system_state`
 - `live_dry_runs`
 - `live_daily_limits`
+- `live_backups`
 
-No DEMO tables are dropped or repurposed.
+There are no foreign keys or joins between DEMO and LIVE database files.
 
-Before any future deployment, back up the production SQLite DB:
+## Public Health
 
-```bash
-sqlite3 poly_data.sqlite3 ".backup 'poly_data.backup.sqlite3'"
+The standalone LIVE app exposes:
+
+```text
+GET /health
 ```
 
-## nginx/systemd
+It returns only:
 
-The `/live` path is served by the same FastAPI app and router. If nginx already proxies the domain to this service, no separate `location /live` is required beyond the existing proxy rule. Configure environment variables in a restricted systemd environment file; do not place secrets in the repository.
+```json
+{"status":"ok"}
+```
+
+or:
+
+```json
+{"status":"degraded"}
+```
+
+Detailed health is private at `/live/health`.
+
+## Maintenance
+
+The Maintenance tab implements a safe `DRAINING` state machine:
+
+1. Move to `DRAINING`.
+2. Block new entries/rules.
+3. Continue managing existing orders and positions.
+4. Wait for the current BTC 5-minute event and open exposure to clear.
+5. Run final reconciliation.
+6. Report `stop_ready=true` only when exposure is `0` and there are no non-final orders or open deals.
+
+The app never stops the process directly. Future systemd integration should use a constrained helper or `ExecStop` flow, not broad sudo.
+
+## Backups
+
+Backups use the SQLite backup API, temporary file plus atomic rename, gzip compression, SHA-256 checksum, audit rows, and cleanup by:
+
+- retention: 7 days
+- max total storage: 1GB
+- warning threshold: 80%
+
+Backups are stored under:
+
+```text
+/opt/polymarket-btc-live/backups
+```
+
+No real server backup is created unless an authenticated admin explicitly runs the protected backup action.
+
+## Deployment Artifacts
+
+Prepared but not applied:
+
+- `deploy/polymarket-live.service`
+- `deploy/nginx-live-poly.conf`
+- `deploy/live.env.example`
+- `deploy/DEPLOYMENT_CHECKLIST.md`
+
+nginx should route `https://live-poly.dvirtechnologies.com` to `127.0.0.1:8001` with WebSocket upgrade headers and HTTPS redirect.
+
+## Secrets
+
+Do not store secrets in Git, Markdown, logs, exports, or SQLite payloads.
+
+Google Secret Manager should hold:
+
+- Polymarket private key
+- Polymarket API key/secret/passphrase
+- `LIVE_LOGIN_PASSWORD_HASH`
+- `LIVE_SESSION_SECRET`
+- `LIVE_OPERATOR_TOKEN`
 
 ## Rollback
 
-1. Set `LIVE_MODULE_ENABLED=false`.
-2. Set `LIVE_KILL_SWITCH=true`.
-3. Restart the service.
-4. Keep the additive `live_` tables for audit unless an explicit archival plan is approved.
-
-## Future Account Connection
-
-Required before read-only account connection or trading:
-
-- public profile address (`POLYMARKET_PROFILE_ADDRESS`)
-- public wallet/profile/proxy address
-- account type
-- `signature_type`
-- `funder` address
-- server-side secret storage decision
-- whether automated signing on the server is allowed
-- external alerting channel
-
-Never paste private keys, API secrets, passphrases, or signing material into chat, Markdown, Git, logs, or the SQLite DB.
-
-## Phase 2 Readiness
-
-The LIVE module now includes public account identity snapshots, bounded public Market WebSocket smoke support, dry-run previews, Google Secret Manager provider plumbing, daily loss and failure counters, and fail-closed gates for stale market/user/reconciliation state.
-
-Future deployment starting point remains:
-
-```text
-LIVE_MODULE_ENABLED=true
-LIVE_ADAPTER=mock
-LIVE_KILL_SWITCH=true
-LIVE_TRADING_ENABLED=false
-LIVE_ORDER_SUBMISSION_ENABLED=false
-```
-
-No deployment, allowance, redemption, live rule creation, or real order submission is part of this phase.
+1. Request Maintenance drain and wait for `stop_ready=true`.
+2. Set `LIVE_MODULE_ENABLED=false`.
+3. Set `LIVE_KILL_SWITCH=true`.
+4. Stop or restart only `polymarket-live.service`.
+5. Keep `poly_live.sqlite3` and backups for audit unless an explicit archival plan is approved.

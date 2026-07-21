@@ -54,11 +54,17 @@ class LiveConfig:
     redemption_mode: str = "manual"
     adapter_scenario: str = "filled"
     operator_token: str = ""
-    login_username: str = "operator"
+    login_username: str = "Admin@system.com"
     login_password_hash: str = ""
     session_secret: str = ""
-    session_ttl_seconds: int = 3600
+    session_ttl_seconds: int = 0
     login_rate_limit_per_minute: int = 5
+    public_base_url: str = "https://live-poly.dvirtechnologies.com"
+    live_db_path: str = "/opt/polymarket-btc-live/poly_live.sqlite3"
+    backup_dir: str = "/opt/polymarket-btc-live/backups"
+    backup_retention_days: int = 7
+    backup_max_total_bytes: int = 1_073_741_824
+    backup_warning_threshold_percent: int = 80
     clob_host: str = "https://clob.polymarket.com"
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
@@ -100,11 +106,17 @@ class LiveConfig:
             redemption_mode=_env("LIVE_REDEMPTION_MODE", "manual").lower(),
             adapter_scenario=_env("LIVE_MOCK_SCENARIO", "filled").lower(),
             operator_token=_env("LIVE_OPERATOR_TOKEN", ""),
-            login_username=_env("LIVE_LOGIN_USERNAME", "operator"),
+            login_username=_env("LIVE_LOGIN_USERNAME", "Admin@system.com"),
             login_password_hash=_env("LIVE_LOGIN_PASSWORD_HASH", ""),
             session_secret=_env("LIVE_SESSION_SECRET", ""),
-            session_ttl_seconds=int(_env("LIVE_SESSION_TTL_SECONDS", "3600") or "3600"),
+            session_ttl_seconds=int(_env("LIVE_SESSION_TTL_SECONDS", "0") or "0"),
             login_rate_limit_per_minute=int(_env("LIVE_LOGIN_RATE_LIMIT_PER_MINUTE", "5") or "5"),
+            public_base_url=_env("LIVE_PUBLIC_BASE_URL", "https://live-poly.dvirtechnologies.com"),
+            live_db_path=_env("LIVE_DB_PATH", "/opt/polymarket-btc-live/poly_live.sqlite3"),
+            backup_dir=_env("LIVE_BACKUP_DIR", "/opt/polymarket-btc-live/backups"),
+            backup_retention_days=int(_env("LIVE_BACKUP_RETENTION_DAYS", "7") or "7"),
+            backup_max_total_bytes=int(_env("LIVE_BACKUP_MAX_TOTAL_BYTES", "1073741824") or "1073741824"),
+            backup_warning_threshold_percent=int(_env("LIVE_BACKUP_WARNING_THRESHOLD_PERCENT", "80") or "80"),
             clob_host=_env("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"),
             market_ws_url=_env("POLYMARKET_MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
             user_ws_url=_env("POLYMARKET_USER_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/user"),
@@ -177,6 +189,11 @@ class LiveConfig:
             "redemption_mode": self.redemption_mode,
             "operator_auth_configured": bool(self.operator_token),
             "login_configured": bool(self.login_password_hash and self.session_secret),
+            "login_username": self.login_username,
+            "session_persistent_until_logout": self.session_ttl_seconds <= 0,
+            "public_base_url": self.public_base_url,
+            "live_db_path_configured": bool(self.live_db_path),
+            "backup_dir_configured": bool(self.backup_dir),
             "profile_address_configured": bool(self.profile_address),
             "account_login_type": self.account_login_type,
             "real_submission_armed": self.real_submission_armed(),

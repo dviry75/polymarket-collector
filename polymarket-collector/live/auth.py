@@ -9,6 +9,13 @@ from typing import Any
 
 from .config import LiveConfig
 
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError, VerificationError
+except ImportError:  # pragma: no cover - dependency exists in production requirements
+    PasswordHasher = None
+    VerifyMismatchError = VerificationError = Exception
+
 
 COOKIE_NAME = "live_session"
 
@@ -19,9 +26,10 @@ class LoginAttempt:
 
 
 class LiveAuthManager:
-    def __init__(self, config: LiveConfig):
+    def __init__(self, config: LiveConfig, session_version_getter=None):
         self.config = config
         self._attempts: dict[str, LoginAttempt] = {}
+        self._session_version_getter = session_version_getter or (lambda: "1")
 
     def configured(self) -> bool:
         return bool(self.config.login_password_hash and self.config.session_secret)
@@ -30,6 +38,13 @@ class LiveAuthManager:
         expected = self.config.login_password_hash
         if not expected:
             return False
+        if expected.startswith("$argon2id$"):
+            if PasswordHasher is None:
+                return False
+            try:
+                return bool(PasswordHasher().verify(expected, password))
+            except (VerifyMismatchError, VerificationError, Exception):
+                return False
         if expected.startswith("sha256:"):
             digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
             return hmac.compare_digest(expected, f"sha256:{digest}")
@@ -47,7 +62,8 @@ class LiveAuthManager:
 
     def create_session(self, username: str) -> str:
         issued = int(time.time())
-        payload = f"{username}:{issued}"
+        version = str(self._session_version_getter())
+        payload = f"{username}:{issued}:{version}"
         signature = hmac.new(self.config.session_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
         return base64.urlsafe_b64encode(f"{payload}:{signature}".encode("utf-8")).decode("ascii")
 
@@ -56,22 +72,38 @@ class LiveAuthManager:
             return False
         try:
             decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-            username, issued_raw, signature = decoded.rsplit(":", 2)
+            username, issued_raw, version, signature = decoded.rsplit(":", 3)
             issued = int(issued_raw)
         except Exception:
             return False
         if username != self.config.login_username:
             return False
-        if time.time() - issued > self.config.session_ttl_seconds:
+        if self.config.session_ttl_seconds > 0 and time.time() - issued > self.config.session_ttl_seconds:
             return False
-        payload = f"{username}:{issued}"
+        if version != str(self._session_version_getter()):
+            return False
+        payload = f"{username}:{issued}:{version}"
         expected = hmac.new(self.config.session_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(signature, expected)
+
+    def csrf_token(self, session_token: str | None) -> str:
+        if not session_token or not self.config.session_secret:
+            return ""
+        return hmac.new(
+            self.config.session_secret.encode("utf-8"),
+            f"csrf:{session_token}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def verify_csrf(self, session_token: str | None, csrf_token: str | None) -> bool:
+        expected = self.csrf_token(session_token)
+        return bool(expected and csrf_token and hmac.compare_digest(expected, csrf_token))
 
     def public_status(self) -> dict[str, Any]:
         return {
             "configured": self.configured(),
             "username_configured": bool(self.config.login_username),
             "ttl_seconds": self.config.session_ttl_seconds,
+            "persistent_until_logout": self.config.session_ttl_seconds <= 0,
             "rate_limit_per_minute": self.config.login_rate_limit_per_minute,
         }

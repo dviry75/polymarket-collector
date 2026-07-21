@@ -290,6 +290,18 @@ class LiveRepository:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS live_backups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    error TEXT
+                );
                 """
             )
             existing = conn.execute("SELECT value FROM live_system_state WHERE key = 'kill_switch'").fetchone()
@@ -297,6 +309,12 @@ class LiveRepository:
                 conn.execute(
                     "INSERT INTO live_system_state (key, value, updated_at) VALUES ('kill_switch', ?, ?)",
                     ("true" if kill_switch_default else "false", now_iso()),
+                )
+            session_version = conn.execute("SELECT value FROM live_system_state WHERE key = 'session_version'").fetchone()
+            if session_version is None:
+                conn.execute(
+                    "INSERT INTO live_system_state (key, value, updated_at) VALUES ('session_version', '1', ?)",
+                    (now_iso(),),
                 )
             conn.commit()
 
@@ -788,6 +806,7 @@ class LiveRepository:
             "live_markets", "live_rules", "live_deals", "live_orders", "live_order_fills",
             "live_positions", "live_account_snapshots", "live_reconciliation_runs",
             "live_audit_log", "live_websocket_events", "live_dry_runs", "live_daily_limits",
+            "live_backups",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -796,6 +815,8 @@ class LiveRepository:
             order_col = "local_order_id"
         if table == "live_daily_limits":
             order_col = "day_key"
+        if table == "live_backups":
+            order_col = "id"
         with self.connect() as conn:
             rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_col} DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(row) or {} for row in rows]
@@ -813,6 +834,121 @@ class LiveRepository:
                 "rules": int(conn.execute("SELECT COUNT(*) FROM live_rules").fetchone()[0]),
                 "active_rules": int(conn.execute("SELECT COUNT(*) FROM live_rules WHERE status = 'active'").fetchone()[0]),
             }
+
+    def revoke_all_sessions(self, actor: str = "operator") -> str:
+        current = self.get_state("session_version", "1")
+        try:
+            next_version = str(int(current) + 1)
+        except ValueError:
+            next_version = "1"
+        self.set_state("session_version", next_version, actor)
+        self.audit(actor, "revoke_all_sessions", "ok")
+        return next_version
+
+    def maintenance_status(self) -> dict[str, Any]:
+        mode = self.get_state("maintenance_mode", "RUNNING")
+        requested_at = self.get_state("maintenance_requested_at", "")
+        reason = self.get_state("maintenance_delay_reason", "")
+        stop_ready = self.get_state("maintenance_stop_ready", "false").lower() == "true"
+        counts = self.counts()
+        exposure = self.current_exposure_usd()
+        return {
+            "mode": mode,
+            "requested_at": requested_at,
+            "phase": self.get_state("maintenance_phase", "running"),
+            "stop_ready": stop_ready,
+            "delay_reason": reason,
+            "estimated_wait": self.get_state("maintenance_estimated_wait", "not scheduled"),
+            "open_orders": counts["open_orders"],
+            "open_deals": counts["open_deals"],
+            "exposure_usd": str(exposure),
+        }
+
+    def request_maintenance_drain(self, actor: str = "operator") -> dict[str, Any]:
+        ts = now_iso()
+        with self.connect() as conn:
+            for key, value in {
+                "maintenance_mode": "DRAINING",
+                "maintenance_requested_at": ts,
+                "maintenance_phase": "draining_current_event",
+                "maintenance_stop_ready": "false",
+                "maintenance_delay_reason": "waiting for exposure/orders/deals to settle",
+                "maintenance_estimated_wait": "after current BTC 5-minute event and final reconciliation",
+            }.items():
+                conn.execute(
+                    """
+                    INSERT INTO live_system_state (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, value, ts),
+                )
+            conn.commit()
+        self.audit(actor, "maintenance_drain_requested", "ok")
+        return self.refresh_maintenance_readiness(actor)
+
+    def cancel_maintenance_drain(self, actor: str = "operator") -> dict[str, Any]:
+        with self.connect() as conn:
+            mode = self.get_state("maintenance_mode", "RUNNING")
+            stop_ready = self.get_state("maintenance_stop_ready", "false").lower() == "true"
+            if mode == "DRAINING" and not stop_ready:
+                for key, value in {
+                    "maintenance_mode": "RUNNING",
+                    "maintenance_phase": "running",
+                    "maintenance_stop_ready": "false",
+                    "maintenance_delay_reason": "cancelled by admin before stop-ready",
+                    "maintenance_estimated_wait": "not scheduled",
+                }.items():
+                    conn.execute(
+                        """
+                        INSERT INTO live_system_state (key, value, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                        """,
+                        (key, value, now_iso()),
+                    )
+                conn.commit()
+                self.audit(actor, "maintenance_drain_cancelled", "ok")
+            else:
+                self.audit(actor, "maintenance_drain_cancelled", "blocked", "already stop-ready or not draining")
+        return self.maintenance_status()
+
+    def refresh_maintenance_readiness(self, actor: str = "system") -> dict[str, Any]:
+        status = self.maintenance_status()
+        exposure = Decimal(str(status["exposure_usd"]))
+        ready = status["mode"] == "DRAINING" and exposure == 0 and status["open_orders"] == 0 and status["open_deals"] == 0
+        phase = "stop_ready" if ready else ("waiting_for_positions_or_orders" if status["mode"] == "DRAINING" else "running")
+        delay = "" if ready else "exposure, open orders, or open deals still exist"
+        with self.connect() as conn:
+            for key, value in {
+                "maintenance_stop_ready": "true" if ready else "false",
+                "maintenance_phase": phase,
+                "maintenance_delay_reason": delay,
+                "maintenance_estimated_wait": "ready for controlled service stop" if ready else status["estimated_wait"],
+            }.items():
+                conn.execute(
+                    """
+                    INSERT INTO live_system_state (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, value, now_iso()),
+                )
+            conn.commit()
+        self.audit(actor, "maintenance_readiness_checked", "ok" if ready else "blocked", delay)
+        return self.maintenance_status()
+
+    def record_backup(self, path: str, status: str, size_bytes: int = 0, checksum: str = "", reason: str = "", error: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_backups (created_at, finished_at, path, size_bytes, sha256, status, reason, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now_iso(), now_iso(), path, size_bytes, checksum, status, reason, error),
+            )
+            conn.commit()
+        self.audit("system", "backup_recorded", status, reason or error, {"path": path, "size_bytes": size_bytes})
 
     def current_exposure_usd(self) -> Decimal:
         with self.connect() as conn:

@@ -11,6 +11,7 @@ from openpyxl import Workbook
 from .adapters import MockTradingAdapter, RealPolymarketTradingAdapter, TradingAdapter
 from .account_identity import MockPublicAccountIdentityClient, PublicAccountIdentityClient
 from .auth import COOKIE_NAME, LiveAuthManager
+from .backup import LiveBackupManager
 from .config import LiveConfig, redact_mapping
 from .dry_run import DryRunService
 from .market_websocket import MarketWebSocketManager, UserWebSocketManager
@@ -51,7 +52,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _market_ws = MarketWebSocketManager(_repo, stale_after_seconds=_config.max_market_data_age_seconds)
     _user_ws = UserWebSocketManager(_repo, stale_after_seconds=_config.max_user_state_age_seconds)
     _engine = TradingEngine(_repo, _orders)
-    _auth = LiveAuthManager(_config)
+    _auth = LiveAuthManager(_config, session_version_getter=lambda: _repo.get_state("session_version", "1") if _repo else "1")
     _dry_run = DryRunService(_repo, _risk)
 
 
@@ -70,7 +71,15 @@ def require_live_session(request: Request) -> None:
         raise HTTPException(status_code=401, detail="LIVE login required")
 
 
-def require_operator(x_live_operator_token: Optional[str] = Header(default=None)) -> None:
+def require_csrf(request: Request, x_live_csrf_token: Optional[str] = Header(default=None)) -> None:
+    *_prefix, auth, _dry = services()
+    session_token = request.cookies.get(COOKIE_NAME)
+    if not auth.verify_csrf(session_token, x_live_csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+
+def require_operator(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> None:
+    require_csrf(request, x_live_csrf_token)
     config, repo, *_ = services()
     if not config.operator_token:
         repo.audit("anonymous", "operator_auth", "blocked", "LIVE_OPERATOR_TOKEN is not configured")
@@ -78,6 +87,13 @@ def require_operator(x_live_operator_token: Optional[str] = Header(default=None)
     if x_live_operator_token != config.operator_token:
         repo.audit("anonymous", "operator_auth", "blocked", "Invalid operator token")
         raise HTTPException(status_code=403, detail="Invalid LIVE operator token")
+
+
+def require_reauth(request: Request, x_live_reauth_password: Optional[str] = Header(default=None)) -> None:
+    _config, repo, *_rest, auth, _dry = services()
+    if not auth.verify_password(str(x_live_reauth_password or "")):
+        repo.audit("operator", "reauth", "blocked", "INVALID_REAUTH")
+        raise HTTPException(status_code=403, detail="Password re-authentication required")
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -105,18 +121,32 @@ def login(request: Request, payload: dict[str, Any] = Body(...)) -> JSONResponse
         repo.audit("anonymous", "live_login", "blocked", "INVALID_LOGIN")
         raise HTTPException(status_code=401, detail="Invalid login")
     token = auth.create_session(config.login_username)
+    csrf_token = auth.csrf_token(token)
     response = JSONResponse({"ok": True})
-    response.set_cookie(COOKIE_NAME, token, httponly=True, secure=False, samesite="strict", max_age=config.session_ttl_seconds)
+    response.set_cookie(COOKIE_NAME, token, httponly=True, secure=True, samesite="strict", max_age=config.session_ttl_seconds if config.session_ttl_seconds > 0 else None)
+    response.headers["X-Live-CSRF-Token"] = csrf_token
     repo.audit(config.login_username, "live_login", "ok")
     return response
 
 
 @router.post("/logout")
-def logout(request: Request) -> JSONResponse:
+def logout(request: Request, x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
     require_live_session(request)
+    require_csrf(request, x_live_csrf_token)
     response = JSONResponse({"ok": True})
     response.delete_cookie(COOKIE_NAME)
     services()[1].audit("operator", "live_logout", "ok")
+    return response
+
+
+@router.post("/sessions/revoke-all")
+def revoke_all_sessions(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None), x_live_reauth_password: Optional[str] = Header(default=None)) -> JSONResponse:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    require_reauth(request, x_live_reauth_password)
+    version = services()[1].revoke_all_sessions("operator")
+    response = JSONResponse({"ok": True, "session_version": version})
+    response.delete_cookie(COOKIE_NAME)
     return response
 
 
@@ -294,7 +324,7 @@ def dashboard_content(view: str = "overview") -> str:
     actions = """
     <div class="actions">
       <button data-live-action="/live/kill-switch/activate">Activate Kill Switch</button>
-      <button data-live-action="/live/kill-switch/deactivate">Deactivate Kill Switch</button>
+      <button data-live-action="/live/kill-switch/deactivate" data-reauth="true">Deactivate Kill Switch</button>
       <button data-live-action="/live/reconciliation/run">Run Reconciliation</button>
       <button data-live-action="/live/export/generate">Generate Export</button>
       <a class="button" href="/live/export/download">Download Export</a>
@@ -415,6 +445,26 @@ def dashboard_content(view: str = "overview") -> str:
           ]))}
           {panel("Outstanding Questions", '<p class="muted">See <code>POLYMARKET_LIVE_PRODUCT_QUESTIONS.md</code> in the workspace.</p>')}
         """,
+        "maintenance": f"""
+          {panel("Safe Maintenance", kv_table([
+              ("Mode", repo.maintenance_status().get("mode"), None),
+              ("Phase", repo.maintenance_status().get("phase"), None),
+              ("Stop Ready", repo.maintenance_status().get("stop_ready"), None),
+              ("Exposure", repo.maintenance_status().get("exposure_usd"), None),
+              ("Open Orders", repo.maintenance_status().get("open_orders"), None),
+              ("Open Deals", repo.maintenance_status().get("open_deals"), None),
+              ("Delay Reason", repo.maintenance_status().get("delay_reason"), None),
+              ("Estimated Wait", repo.maintenance_status().get("estimated_wait"), None),
+          ]))}
+          <div class="actions">
+            <button data-live-action="/live/maintenance/drain">Drain After Current Event</button>
+            <button data-live-action="/live/maintenance/cancel">Cancel Drain</button>
+            <button data-live-action="/live/maintenance/readiness">Refresh Readiness</button>
+            <button data-live-action="/live/backup/create">Create SQLite Backup</button>
+            <button data-live-action="/live/sessions/revoke-all" data-reauth="true">Revoke All Sessions</button>
+          </div>
+          {panel("Backups", compact_table(repo.list_table("live_backups", 50), ["id", "created_at", "path", "size_bytes", "sha256", "status", "reason", "error"], "No backups recorded"))}
+        """,
     }
     return screens.get(view, overview)
 
@@ -435,11 +485,14 @@ def live_dashboard(request: Request) -> str:
         ("reconciliation", "Reconciliation"),
         ("orders", "Orders"),
         ("deployment", "Deployment"),
+        ("maintenance", "Maintenance"),
     ]
     nav = "".join(
         f'<a class="nav-item {"active" if view == key else ""}" href="/live?view={_e(key)}">{_e(label)}</a>'
         for key, label in nav_items
     )
+    _config, _repo, *_rest, auth, _dry = services()
+    csrf_token = auth.csrf_token(request.cookies.get(COOKIE_NAME))
     return f"""
     <!doctype html>
     <html>
@@ -557,7 +610,7 @@ def live_dashboard(request: Request) -> str:
           <header class="topbar">
             <input class="search" placeholder="Search order, condition, token, reason..." />
             <a class="button" href="/live?view=overview">Refresh</a>
-            <form method="post" action="/live/logout"><button type="submit">Logout</button></form>
+            <button type="button" id="logout-button">Logout</button>
             <div class="top-status"><span><span class="dot"></span> Read-only shell</span><span class="mono">{_e(now_iso())}</span></div>
           </header>
           <main class="content">
@@ -567,10 +620,18 @@ def live_dashboard(request: Request) -> str:
         </div>
       </div>
       <script>
+        const liveCsrfToken = "{_e(csrf_token)}";
         async function postLiveAction(path) {{
           const token = window.prompt("LIVE operator token");
           if (!token) return;
-          const response = await fetch(path, {{method: "POST", headers: {{"X-Live-Operator-Token": token}}}});
+          const headers = {{"X-Live-Operator-Token": token, "X-Live-CSRF-Token": liveCsrfToken}};
+          const trigger = document.querySelector(`[data-live-action="${{path}}"]`);
+          if (trigger && trigger.getAttribute("data-reauth") === "true") {{
+            const password = window.prompt("Re-enter admin password");
+            if (!password) return;
+            headers["X-Live-Reauth-Password"] = password;
+          }}
+          const response = await fetch(path, {{method: "POST", headers}});
           if (!response.ok) {{
             const text = await response.text();
             window.alert(text);
@@ -588,8 +649,16 @@ def live_dashboard(request: Request) -> str:
             const payload = Object.fromEntries(form.entries());
             payload.requested_price = Number(payload.requested_price);
             payload.requested_amount_usd = Number(payload.requested_amount_usd);
-            const response = await fetch("/live/dry-run", {{method:"POST", headers:{{"Content-Type":"application/json","X-Live-Operator-Token":token}}, body:JSON.stringify(payload)}});
+            const response = await fetch("/live/dry-run", {{method:"POST", headers:{{"Content-Type":"application/json","X-Live-Operator-Token":token,"X-Live-CSRF-Token":liveCsrfToken}}, body:JSON.stringify(payload)}});
             document.getElementById("dry-run-result").textContent = JSON.stringify(await response.json(), null, 2);
+          }});
+        }}
+        const logoutButton = document.getElementById("logout-button");
+        if (logoutButton) {{
+          logoutButton.addEventListener("click", async () => {{
+            const response = await fetch("/live/logout", {{method:"POST", headers:{{"X-Live-CSRF-Token":liveCsrfToken}}}});
+            if (response.ok) location.href = "/live/login";
+            else window.alert(await response.text());
           }});
         }}
         document.querySelectorAll("[data-live-action]").forEach((button) => {{
@@ -670,33 +739,36 @@ def live_audit(request: Request) -> list[dict[str, Any]]:
 
 
 @router.post("/kill-switch/activate")
-def activate_kill_switch(request: Request, x_live_operator_token: Optional[str] = Header(default=None)) -> RedirectResponse:
+def activate_kill_switch(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     services()[1].set_state("kill_switch", "true", "operator")
     return RedirectResponse("/live", status_code=303)
 
 
 @router.post("/kill-switch/deactivate")
-def deactivate_kill_switch(request: Request, x_live_operator_token: Optional[str] = Header(default=None)) -> RedirectResponse:
+def deactivate_kill_switch(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None), x_live_reauth_password: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    require_reauth(request, x_live_reauth_password)
     services()[1].set_state("kill_switch", "false", "operator")
     return RedirectResponse("/live", status_code=303)
 
 
 @router.post("/reconciliation/run")
-async def run_reconciliation(request: Request, x_live_operator_token: Optional[str] = Header(default=None)) -> RedirectResponse:
+async def run_reconciliation(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     await services()[5].run_once(actor="operator")
     return RedirectResponse("/live", status_code=303)
 
 
 @router.post("/rules")
-def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None), x_live_reauth_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if str(payload.get("status") or "inactive").lower() == "active":
+        require_reauth(request, x_live_reauth_password)
     repo = services()[1]
     try:
         entry = float(payload.get("entry_price"))
@@ -723,9 +795,9 @@ def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_li
 
 
 @router.post("/orders/mock")
-async def create_mock_order(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+async def create_mock_order(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     config, repo, _adapter, _risk, _orders, reconciliation, _market_ws, _user_ws, engine, _auth, _dry = services()
     if config.live_adapter != "mock":
         raise HTTPException(status_code=403, detail="This endpoint is mock-only")
@@ -745,17 +817,17 @@ async def create_mock_order(request: Request, payload: dict[str, Any] = Body(...
 
 
 @router.post("/market-ws/fixture")
-def process_market_ws_fixture(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def process_market_ws_fixture(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     stored = services()[6].process_message(payload)
     return {"stored": stored, "status": services()[6].health()}
 
 
 @router.post("/user-ws/fixture")
-def process_user_ws_fixture(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def process_user_ws_fixture(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     stored = services()[7].process_message(payload)
     return {"stored": stored, "status": services()[7].health()}
 
@@ -796,9 +868,9 @@ def _run_export() -> None:
 
 
 @router.post("/export/generate")
-def generate_live_export(request: Request, background_tasks: BackgroundTasks, x_live_operator_token: Optional[str] = Header(default=None)) -> RedirectResponse:
+def generate_live_export(request: Request, background_tasks: BackgroundTasks, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     _export_state.update({"status": "running", "error": None})
     background_tasks.add_task(_run_export)
     return RedirectResponse("/live", status_code=303)
@@ -814,9 +886,9 @@ def download_live_export(request: Request):
 
 
 @router.post("/account/public-refresh")
-async def refresh_account_identity(request: Request, x_live_operator_token: Optional[str] = Header(default=None), use_mock: bool = False) -> dict[str, Any]:
+async def refresh_account_identity(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None), use_mock: bool = False) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     config, repo, *_ = services()
     client = MockPublicAccountIdentityClient() if use_mock else PublicAccountIdentityClient()
     result = await client.resolve(config.profile_address)
@@ -830,21 +902,58 @@ async def refresh_account_identity(request: Request, x_live_operator_token: Opti
 
 
 @router.post("/dry-run")
-def create_dry_run(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def create_dry_run(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     return services()[-1].preview(payload, actor="operator")
 
 
 @router.post("/market-ws/smoke")
-async def market_ws_smoke(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+async def market_ws_smoke(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
-    require_operator(x_live_operator_token)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
     config, _repo, _adapter, _risk, _orders, _recon, market_ws, _user_ws, _engine, _auth, _dry = services()
     asset_ids = [str(item) for item in payload.get("asset_ids") or []]
     if not asset_ids:
         raise HTTPException(status_code=400, detail="asset_ids are required for bounded public Market WS smoke test")
     return await market_ws.connect_for_messages(config.market_ws_url, asset_ids, max_messages=int(payload.get("max_messages", 1)), timeout_seconds=float(payload.get("timeout_seconds", 20)))
+
+
+@router.get("/maintenance/status")
+def maintenance_status(request: Request) -> dict[str, Any]:
+    require_live_session(request)
+    return services()[1].maintenance_status()
+
+
+@router.post("/maintenance/drain")
+def maintenance_drain(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    return JSONResponse(services()[1].request_maintenance_drain("operator"))
+
+
+@router.post("/maintenance/cancel")
+def maintenance_cancel(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    return JSONResponse(services()[1].cancel_maintenance_drain("operator"))
+
+
+@router.post("/maintenance/readiness")
+async def maintenance_readiness(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    await services()[5].run_once(actor="maintenance")
+    return JSONResponse(services()[1].refresh_maintenance_readiness("operator"))
+
+
+@router.post("/backup/create")
+def create_live_backup(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    config, repo, *_ = services()
+    result = LiveBackupManager(config, repo).create_backup("manual")
+    return result.__dict__
 
 
 @router.get("/secrets/readiness")

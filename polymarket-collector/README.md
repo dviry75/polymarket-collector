@@ -79,9 +79,9 @@ Event resolution closes remaining open deals only when the event is already stor
 
 Demo trading does not place real Polymarket orders and does not model fees, slippage, partial fills, or market depth beyond the relevant best ask and best bid.
 
-## LIVE Module
+## LIVE Standalone Service
 
-The LIVE module is additive and separated from DEMO tables and routes. It is fail-closed by default:
+LIVE now runs as a separate FastAPI entrypoint and Linux service target. DEMO remains `app:app` on port `8000`; LIVE is `live_app:app` on port `8001` with a separate SQLite DB.
 
 ```text
 TRADING_MODE=DEMO
@@ -92,17 +92,34 @@ LIVE_ADAPTER=mock
 LIVE_KILL_SWITCH=true
 ```
 
-Use `/live` only in mock/read-only mode until account details and explicit approval are provided in a future task. Real order submission is blocked in this build. See `LIVE_SYSTEM.md` and `.env.example`.
+Use `/live` only in mock/read-only mode until account details and explicit approval are provided in a future task. Real order submission is blocked in this build. See `LIVE_SYSTEM.md`, `.env.example`, and `deploy/`.
 
-Phase 2 adds:
+LIVE includes:
 
 - Login protection for every `/live` route.
+- Single initial admin: `Admin@system.com`.
+- CSRF protection for write actions.
+- Password re-authentication for critical actions.
+- Session revocation for all devices.
 - Public profile/account identity snapshots from keyless public APIs.
 - Bounded public Market WebSocket smoke support.
 - Google Secret Manager provider plumbing.
 - Dry-run previews for entry, take profit, stop loss, and manual exit intents.
 - Risk gates for `$1` trade cap, `$3` exposure, `$10` daily realized loss, open order/deal/rule caps, stale market data, stale user state, and reconciliation age.
+- Maintenance `DRAINING` state machine and backup infrastructure.
 - Fail-closed Real adapter with write methods blocked.
+
+Run LIVE locally:
+
+```bash
+uvicorn live_app:app --host 127.0.0.1 --port 8001
+```
+
+Future production route:
+
+```text
+https://live-poly.dvirtechnologies.com
+```
 
 Future mock-only deployment flags:
 

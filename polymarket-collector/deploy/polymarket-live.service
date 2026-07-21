@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket LIVE Control Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live
+EnvironmentFile=/etc/polymarket-live/live.env
+ExecStart=/opt/polymarket-btc-live/.venv/bin/uvicorn live_app:app --host 127.0.0.1 --port 8001
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/polymarket-btc-live
+
+[Install]
+WantedBy=multi-user.target
