@@ -19,7 +19,12 @@ Initial state:
 - Commits only on `master`: `b16a027`, `b82da1b`, `833812b`, `249ae54`, `c0f8147`, `667970f`, `c31f41f`, `775fbd5`
 - Commits only on `origin/main`: none
 
-Planned safe resolution: create/switch local `main` at the completed work tree, commit there, and push to `origin/main` without force.
+Safe resolution performed:
+
+- Created local `main` at the completed work tree.
+- Committed Phase 2 locally.
+- Attempted a normal non-force push to `origin/main`.
+- Push was blocked by the Codex approval reviewer because exporting code to the external GitHub remote was not verified as trusted.
 
 ## 3. Files Added Or Changed
 
@@ -395,5 +400,21 @@ Not approved in this task. Future checklist:
 
 ## 26. Push Status
 
-Push was pending at report creation time and should be updated after commit/push completes.
+Local commits:
 
+- `26ce88f Complete Polymarket live phase 2 readiness`
+- report status update commit follows this entry
+
+Push attempted:
+
+```text
+git push origin main
+```
+
+Result: not pushed. The push was rejected by the Codex approval reviewer because the remote `https://github.com/dviry75/polymarket-collector.git` is an external GitHub destination that was not verified as trusted by policy. No force push or workaround was attempted.
+
+Exact manual command, if the user chooses to run it locally:
+
+```bash
+git push origin main
+```
