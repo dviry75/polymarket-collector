@@ -218,7 +218,11 @@ Reviewed:
 
 ## 11. Git / Commit / Push Status
 
-Commit: pending at report creation time.
+Local commit created:
+
+```text
+5ff0e3a Separate live service architecture
+```
 
 Push target requested:
 
@@ -226,7 +230,15 @@ Push target requested:
 origin/main
 ```
 
-No force push is allowed. If push is blocked by remote/approval policy, the local commit remains ready for manual push.
+Push attempt:
+
+```text
+git push origin main
+```
+
+Result: blocked by Codex safety policy because `origin/main` points to an external GitHub remote that was not verified as trusted by the approval reviewer. No force push, workaround, or indirect push was attempted.
+
+The local commit remains ready. The owner can run a manual push from the trusted local environment after confirming the remote.
 
 ## 12. Remaining User Actions Before Deployment
 
