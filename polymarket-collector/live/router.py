@@ -131,6 +131,74 @@ def render_table(rows: list[dict[str, Any]], empty: str = "No rows") -> str:
     return f"<div class=\"table-wrap\"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
+def _e(value: Any) -> str:
+    return html.escape("" if value is None else str(value))
+
+
+def _tone_for_value(value: Any) -> str:
+    text = str(value).lower()
+    if text in {"ok", "online", "connected", "allowed", "pass", "false", "mock", "read only"}:
+        return "up"
+    if any(part in text for part in ["blocked", "killed", "failed", "error", "true", "unverified", "stale", "gap"]):
+        return "down"
+    if any(part in text for part in ["warn", "missing", "not_configured", "disabled", "never"]):
+        return "warn"
+    return "info"
+
+
+def chip(value: Any, tone: str | None = None) -> str:
+    actual_tone = tone or _tone_for_value(value)
+    return f'<span class="chip {actual_tone}">{_e(value)}</span>'
+
+
+def panel(title: str, body: str, right: str = "", class_name: str = "") -> str:
+    return f"""
+    <section class="panel {class_name}">
+      <div class="panel-head">
+        <div class="panel-title">{_e(title)}</div>
+        <div>{right}</div>
+      </div>
+      <div class="panel-body">{body}</div>
+    </section>
+    """
+
+
+def stat_card(label: str, value: Any, tone: str = "neutral", hint: Any = "") -> str:
+    return f"""
+    <div class="stat-card">
+      <div class="stat-label">{_e(label)}</div>
+      <div class="stat-value {tone}">{_e(value)}</div>
+      <div class="stat-hint">{_e(hint)}</div>
+    </div>
+    """
+
+
+def kv_table(rows: list[tuple[str, Any, str | None]]) -> str:
+    body = "".join(
+        f"<tr><th>{_e(label)}</th><td>{chip(value, tone) if tone else _e(value)}</td></tr>"
+        for label, value, tone in rows
+    )
+    return f'<table class="kv-table"><tbody>{body}</tbody></table>'
+
+
+def compact_table(rows: list[dict[str, Any]], columns: list[str] | None = None, empty: str = "No rows") -> str:
+    if not rows:
+        return f'<div class="empty">{_e(empty)}</div>'
+    headers = columns or list(rows[0].keys())
+    head = "".join(f"<th>{_e(key)}</th>" for key in headers)
+    body = ""
+    for row in rows:
+        body += "<tr>"
+        for key in headers:
+            value = row.get(key)
+            if key in {"status", "result", "final_decision", "account_identity_status"}:
+                body += f"<td>{chip(value)}</td>"
+            else:
+                body += f"<td>{_e(value)}</td>"
+        body += "</tr>"
+    return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
 def status_label(config: LiveConfig, repo: LiveRepository, market_ws: MarketWebSocketManager) -> str:
     if repo.kill_switch_active():
         return "KILLED"
@@ -145,62 +213,230 @@ def status_label(config: LiveConfig, repo: LiveRepository, market_ws: MarketWebS
     return "DEGRADED"
 
 
-def dashboard_content() -> str:
-    config, repo, _adapter, _risk, _orders, _recon, market_ws, user_ws, _engine, auth, _dry = services()
+def dashboard_model() -> dict[str, Any]:
+    config, repo, adapter, risk, orders, recon, market_ws, user_ws, engine, auth, dry = services()
     counts = repo.counts()
     latest_market = repo.latest_market()
+    daily_rows = repo.list_table("live_daily_limits", 1)
+    daily = daily_rows[0] if daily_rows else {}
+    account = repo.latest_account_snapshot() or {}
+    market_health = market_ws.health()
+    user_health = user_ws.health()
+    system_mode = status_label(config, repo, market_ws)
+    risk_gates = [
+        ("Kill Switch", "BLOCKED" if repo.kill_switch_active() else "PASS", "down" if repo.kill_switch_active() else "up"),
+        ("Real Submission", "ARMED" if config.real_submission_armed() else "DISABLED", "down" if config.real_submission_armed() else "up"),
+        ("Account Identity", repo.get_state("account_identity_status", "UNVERIFIED"), None),
+        ("Market WS", f'{market_health.get("status")} / stale={market_health.get("stale")}', None),
+        ("User WS", f'{user_health.get("status")} / stale={user_health.get("stale")}', None),
+        ("Reconciliation", repo.get_state("last_reconciliation_at", "never"), None),
+        ("Open Orders", f'{counts["open_orders"]}/{config.max_open_orders}', "up" if counts["open_orders"] < config.max_open_orders else "down"),
+        ("Open Deals", f'{counts["open_deals"]}/{config.max_open_deals}', "up" if counts["open_deals"] < config.max_open_deals else "down"),
+        ("Active Rules", f'{counts.get("active_rules", 0)}/{config.max_active_rules}', "up" if counts.get("active_rules", 0) <= config.max_active_rules else "down"),
+        ("Exposure", f'{risk.current_exposure_usd()}/{config.max_total_exposure_usd}', "up"),
+        ("Daily PnL", f'{daily.get("realized_pnl_usd", 0)}/-{config.max_daily_realized_loss_usd}', "up"),
+        ("Failed Orders Streak", f'{daily.get("consecutive_failed_orders", 0)}/{config.max_consecutive_failed_orders}', "up"),
+        ("Losing Deals Streak", f'{daily.get("consecutive_losing_deals", 0)}/{config.max_consecutive_losing_deals}', "up"),
+    ]
+    return {
+        "config": config,
+        "repo": repo,
+        "adapter": adapter,
+        "risk": risk,
+        "counts": counts,
+        "latest_market": latest_market,
+        "daily": daily,
+        "account": account,
+        "market_health": market_health,
+        "user_health": user_health,
+        "mode": system_mode,
+        "risk_gates": risk_gates,
+        "auth": auth,
+    }
+
+
+def dashboard_content(view: str = "overview") -> str:
+    model = dashboard_model()
+    config: LiveConfig = model["config"]
+    repo: LiveRepository = model["repo"]
+    risk: RiskManager = model["risk"]
+    counts = model["counts"]
+    latest_market = model["latest_market"]
+    daily = model["daily"]
+    account = model["account"]
+    market_health = model["market_health"]
+    user_health = model["user_health"]
     summary = {
-        "mode": status_label(config, repo, market_ws),
+        "mode": model["mode"],
         "adapter": config.live_adapter,
         "kill_switch": repo.kill_switch_active(),
-        "market_ws": market_ws.health()["status"],
-        "user_ws": user_ws.health()["status"],
+        "market_ws": market_health["status"],
+        "user_ws": user_health["status"],
         "reconciliation": repo.get_state("last_reconciliation_at", "never"),
         "account_identity": repo.get_state("account_identity_status", "UNVERIFIED"),
         "active_market": latest_market.get("condition_id") if latest_market else "-",
         "one_dollar_valid": latest_market.get("one_dollar_valid") if latest_market else "-",
         "open_orders": counts["open_orders"],
         "open_deals": counts["open_deals"],
-        "exposure_usd": _risk.current_exposure_usd(),
+        "exposure_usd": risk.current_exposure_usd(),
     }
-    return f"""
-      <section class="header">
-        <div>
-          <h1>POLYMARKET LIVE</h1>
-          <p class="warning">This isolated area is designed for future real-money trading. Real order submission is blocked by default in this build.</p>
-        </div>
-        <div class="mode">{html.escape(str(summary["mode"]))}</div>
-      </section>
-      <section class="cards">
-        {''.join(f'<div class="metric"><div class="metric-label">{html.escape(str(k))}</div><div class="metric-value">{html.escape(str(v))}</div></div>' for k, v in summary.items())}
-      </section>
-      <section class="actions">
-        <button data-live-action="/live/kill-switch/activate">Activate Kill Switch</button>
-        <button data-live-action="/live/kill-switch/deactivate">Deactivate Kill Switch</button>
-        <button data-live-action="/live/reconciliation/run">Run Reconciliation</button>
-        <button data-live-action="/live/export/generate">Generate LIVE Export</button>
-        <a class="button" href="/live/export/download">Download LIVE Export</a>
-      </section>
-      <section class="grid">
-        <div class="card"><h2>Account Identity</h2>{render_table(repo.list_table("live_account_snapshots", 10))}</div>
-        <div class="card"><h2>Dry Run History</h2>{render_table(repo.list_table("live_dry_runs", 25))}</div>
-        <div class="card"><h2>Daily Limits</h2>{render_table(repo.list_table("live_daily_limits", 25))}</div>
-        <div class="card"><h2>Live Markets</h2>{render_table(repo.list_table("live_markets", 25))}</div>
-        <div class="card"><h2>Live Rules</h2>{render_table(repo.list_table("live_rules", 25))}</div>
-        <div class="card"><h2>Live Deals / Positions</h2>{render_table(repo.list_table("live_deals", 25))}</div>
-        <div class="card"><h2>Live Orders</h2>{render_table(repo.list_table("live_orders", 50))}</div>
-        <div class="card"><h2>Order Fills</h2>{render_table(repo.list_table("live_order_fills", 50))}</div>
-        <div class="card"><h2>Reconciliation</h2>{render_table(repo.list_table("live_reconciliation_runs", 25))}</div>
-        <div class="card"><h2>Audit Log</h2>{render_table(repo.list_table("live_audit_log", 50))}</div>
-        <div class="card"><h2>WebSocket Events</h2>{render_table(repo.list_table("live_websocket_events", 50))}</div>
-      </section>
+    stats = "".join([
+        stat_card("System", summary["mode"], _tone_for_value(summary["mode"]), "real writes blocked"),
+        stat_card("Kill Switch", summary["kill_switch"], "down" if summary["kill_switch"] else "up", "must stay true before live"),
+        stat_card("Market WS", summary["market_ws"], _tone_for_value(summary["market_ws"]), f"stale={market_health.get('stale')}"),
+        stat_card("User WS", summary["user_ws"], _tone_for_value(summary["user_ws"]), f"stale={user_health.get('stale')}"),
+        stat_card("Exposure", summary["exposure_usd"], "info", f"cap ${config.max_total_exposure_usd}"),
+        stat_card("Daily PnL", daily.get("realized_pnl_usd", 0), "up", f"limit -${config.max_daily_realized_loss_usd}"),
+    ])
+    actions = """
+    <div class="actions">
+      <button data-live-action="/live/kill-switch/activate">Activate Kill Switch</button>
+      <button data-live-action="/live/kill-switch/deactivate">Deactivate Kill Switch</button>
+      <button data-live-action="/live/reconciliation/run">Run Reconciliation</button>
+      <button data-live-action="/live/export/generate">Generate Export</button>
+      <a class="button" href="/live/export/download">Download Export</a>
+    </div>
     """
+    overview = f"""
+      <div class="stats-grid">{stats}</div>
+      {actions}
+      <div class="two-col">
+        {panel("Operations", kv_table([
+            ("App Mode", summary["mode"], None),
+            ("Adapter", config.live_adapter, None),
+            ("Login Configured", model["auth"].configured(), None),
+            ("Operator Token", bool(config.operator_token), None),
+            ("Secret Provider", "Google Secret Manager" if config.google_project_id else "Environment", "info"),
+            ("Last Reconciliation", summary["reconciliation"], None),
+        ]))}
+        {panel("Account", kv_table([
+            ("Identity", repo.get_state("account_identity_status", "UNVERIFIED"), None),
+            ("Profile", account.get("configured_profile_address") or config.profile_address or "not configured", None),
+            ("Proxy Wallet", account.get("resolved_proxy_wallet") or "not resolved", None),
+            ("Positions", account.get("public_positions_count", 0), None),
+            ("Value", account.get("public_positions_value", 0), None),
+        ]))}
+      </div>
+      {panel("Risk Gates", kv_table(model["risk_gates"]))}
+      <div class="two-col">
+        {panel("Latest Market", kv_table([
+            ("Condition", latest_market.get("condition_id") if latest_market else "-", None),
+            ("YES Token", latest_market.get("yes_token_id") if latest_market else "-", None),
+            ("NO Token", latest_market.get("no_token_id") if latest_market else "-", None),
+            ("$1 Valid", latest_market.get("one_dollar_valid") if latest_market else "-", None),
+            ("Best Bid", latest_market.get("best_bid") if latest_market else "-", None),
+            ("Best Ask", latest_market.get("best_ask") if latest_market else "-", None),
+        ]))}
+        {panel("Deployment Readiness", kv_table([
+            ("DB Backup", "manual checklist", "warn"),
+            ("Secrets", "not configured" if not config.google_project_id else "provider configured", None),
+            ("Real Submission", "disabled", "up"),
+            ("Live Rule Exists", counts.get("active_rules", 0), "up" if counts.get("active_rules", 0) == 0 else "warn"),
+            ("Push Status", "local only", "warn"),
+        ]))}
+      </div>
+    """
+    screens = {
+        "overview": overview,
+        "operations": f"""
+          <div class="two-col">
+            {panel("Service Health", kv_table([
+                ("System", summary["mode"], None),
+                ("Market WS", market_health.get("status"), None),
+                ("Market WS Last", market_health.get("last_message_at") or "never", None),
+                ("User WS", user_health.get("status"), None),
+                ("User WS Last", user_health.get("last_message_at") or "never", None),
+                ("Reconciliation", summary["reconciliation"], None),
+                ("Export", _export_state.get("status"), None),
+            ]))}
+            {panel("Runtime Config", kv_table([
+                ("Trading Mode", config.trading_mode, None),
+                ("Live Module", config.live_module_enabled, None),
+                ("Live Trading", config.live_trading_enabled, None),
+                ("Order Submission", config.live_order_submission_enabled, None),
+                ("Adapter", config.live_adapter, None),
+                ("Redemption", config.redemption_mode, None),
+            ]))}
+          </div>
+          {panel("System State", compact_table(repo.list_table("live_daily_limits", 25)))}
+        """,
+        "risk": f"""
+          <div class="stats-grid">
+            {stat_card("Exposure", risk.current_exposure_usd(), "info", f"cap ${config.max_total_exposure_usd}")}
+            {stat_card("Open Orders", counts["open_orders"], "info", f"cap {config.max_open_orders}")}
+            {stat_card("Open Deals", counts["open_deals"], "info", f"cap {config.max_open_deals}")}
+            {stat_card("Active Rules", counts.get("active_rules", 0), "warn" if counts.get("active_rules", 0) else "up", f"cap {config.max_active_rules}")}
+          </div>
+          {panel("Risk Gates", kv_table(model["risk_gates"]))}
+          {panel("Daily Limits", compact_table(repo.list_table("live_daily_limits", 50)))}
+        """,
+        "logs": f"""
+          {panel("Audit Log", compact_table(repo.list_table("live_audit_log", 200), ["id", "occurred_at", "actor", "action", "status", "reason"]))}
+          {panel("Alert Center", compact_table([r for r in repo.list_table("live_audit_log", 200) if str(r.get("action", "")).startswith("alert:")], ["id", "occurred_at", "action", "status", "reason"], "No alerts"))}
+          {panel("WebSocket Events", compact_table(repo.list_table("live_websocket_events", 100), ["id", "channel", "event_type", "condition_id", "asset_id", "status", "received_at"]))}
+        """,
+        "market": f"""
+          {panel("Market Data", compact_table(repo.list_table("live_markets", 100), ["id", "condition_id", "yes_token_id", "no_token_id", "token_mapping_status", "min_order_size", "min_tick_size", "accepting_orders", "one_dollar_valid", "best_bid", "best_ask", "last_update_at"]))}
+          {panel("WebSocket Health", kv_table([
+              ("Market Status", market_health.get("status"), None),
+              ("Market Last Message", market_health.get("last_message_at") or "never", None),
+              ("Market Stale", market_health.get("stale"), None),
+              ("Reconnect Attempts", market_health.get("reconnect_attempts"), None),
+          ]))}
+        """,
+        "account": f"""
+          {panel("Account Identity", compact_table(repo.list_table("live_account_snapshots", 50), ["id", "sampled_at", "configured_profile_address", "resolved_proxy_wallet", "expected_funder_candidate", "account_identity_status", "public_positions_count", "public_positions_value", "status", "error"]))}
+          {panel("Positions", compact_table(repo.list_table("live_positions", 100), ["id", "condition_id", "token_id", "outcome", "size", "average_price", "status", "redeemable_at", "source"]))}
+        """,
+        "dry-run": f"""
+          {panel("Dry Run Studio", '<form id="dry-run-form" class="dry-form"><input name="condition_id" placeholder="condition_id" value="mock-condition"><input name="token_id" placeholder="token_id" value="yes-token"><select name="purpose"><option value="entry">Entry</option><option value="take_profit">Take Profit</option><option value="stop_loss">Stop Loss</option><option value="manual_exit">Manual Exit</option></select><select name="side"><option value="buy">Buy</option><option value="sell">Sell</option></select><input name="requested_price" placeholder="price" value="0.50"><input name="requested_amount_usd" placeholder="amount" value="1"><button type="submit">Preview Dry Run</button></form><pre id="dry-run-result" class="json-box">No preview yet.</pre>')}
+          {panel("Dry Run History", compact_table(repo.list_table("live_dry_runs", 100), ["id", "created_at", "actor", "final_decision", "reason_codes_json"]))}
+        """,
+        "reconciliation": f"""
+          {actions}
+          {panel("Reconciliation Runs", compact_table(repo.list_table("live_reconciliation_runs", 100), ["id", "started_at", "finished_at", "status", "gaps_count", "error"]))}
+        """,
+        "orders": f"""
+          {panel("Orders", compact_table(repo.list_table("live_orders", 200), ["local_order_id", "idempotency_key", "polymarket_order_id", "purpose", "side", "order_type", "requested_amount_usd", "filled_size", "remaining_size", "status", "failure_reason", "created_at"]))}
+          {panel("Fills", compact_table(repo.list_table("live_order_fills", 200), ["id", "live_order_id", "polymarket_trade_id", "price", "size", "fee", "status", "matched_at"]))}
+          {panel("Deals / Positions", compact_table(repo.list_table("live_deals", 100), ["id", "live_rule_id", "condition_id", "outcome", "side", "status", "requested_amount_usd", "filled_size", "remaining_size", "realized_pnl_usd", "exit_reason"]))}
+        """,
+        "deployment": f"""
+          {panel("Deployment Checklist", kv_table([
+              ("SQLite backup command", 'sqlite3 poly_data.sqlite3 ".backup \'poly_data.backup.sqlite3\'"', None),
+              ("Mock-only flags", "LIVE_MODULE_ENABLED=true / LIVE_ADAPTER=mock / LIVE_KILL_SWITCH=true", "info"),
+              ("Real trading flags", "false", "up"),
+              ("Secrets in Git", "prohibited", "down"),
+              ("Deployment Performed", "no", "up"),
+              ("Rollback", "set LIVE_MODULE_ENABLED=false and restart", "warn"),
+          ]))}
+          {panel("Outstanding Questions", '<p class="muted">See <code>POLYMARKET_LIVE_PRODUCT_QUESTIONS.md</code> in the workspace.</p>')}
+        """,
+    }
+    return screens.get(view, overview)
 
 
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 def live_dashboard(request: Request) -> str:
     require_live_session(request)
+    view = request.query_params.get("view", "overview")
+    nav_items = [
+        ("overview", "Overview"),
+        ("operations", "Operations"),
+        ("risk", "Risk"),
+        ("logs", "Logs"),
+        ("market", "Market Data"),
+        ("account", "Account"),
+        ("dry-run", "Dry Run"),
+        ("reconciliation", "Reconciliation"),
+        ("orders", "Orders"),
+        ("deployment", "Deployment"),
+    ]
+    nav = "".join(
+        f'<a class="nav-item {"active" if view == key else ""}" href="/live?view={_e(key)}">{_e(label)}</a>'
+        for key, label in nav_items
+    )
     return f"""
     <!doctype html>
     <html>
@@ -208,29 +444,83 @@ def live_dashboard(request: Request) -> str:
       <meta charset="utf-8">
       <title>Polymarket LIVE</title>
       <style>
-        body {{ font-family: Arial, sans-serif; margin: 24px; background: #f6f7f9; color: #111; }}
-        .header {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; border-bottom: 3px solid #111; padding-bottom: 12px; }}
-        h1 {{ margin: 0; letter-spacing: 0; }}
-        h2 {{ margin: 0 0 10px 0; }}
-        .warning {{ font-weight: 700; color: #8a1f11; max-width: 920px; }}
-        .mode {{ padding: 10px 14px; background: #111; color: white; font-weight: 700; }}
-        .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin: 18px 0; }}
-        .metric {{ border: 1px solid #d8dde6; background: white; padding: 12px; border-radius: 6px; min-height: 72px; }}
-        .metric-label {{ color: #5b6472; font-size: 12px; }}
-        .metric-value {{ font-size: 18px; font-weight: 700; overflow-wrap: anywhere; }}
-        .actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0; }}
-        button, .button {{ border: 0; background: #243b53; color: white; padding: 9px 12px; border-radius: 6px; text-decoration: none; font: inherit; cursor: pointer; }}
-        .grid {{ display: grid; grid-template-columns: 1fr; gap: 16px; }}
-        .card {{ background: white; border: 1px solid #d8dde6; border-radius: 6px; padding: 14px; }}
-        .table-wrap {{ overflow-x: auto; max-height: 420px; border: 1px solid #e2e6ee; }}
-        table {{ border-collapse: collapse; width: 100%; min-width: 980px; font-size: 12px; }}
-        th, td {{ border: 1px solid #e2e6ee; padding: 6px; white-space: nowrap; vertical-align: top; }}
-        th {{ background: #eef2f7; position: sticky; top: 0; }}
-        .muted {{ color: #667085; }}
+        :root {{ --bg:#151923; --panel:#1b202b; --panel2:#202737; --border:#303747; --muted:#9aa4b2; --fg:#f3f6fa; --up:#66d38e; --down:#ff6b6b; --warn:#f6c85f; --info:#78a6ff; --accent:#2a3243; }}
+        * {{ box-sizing: border-box; }}
+        body {{ margin:0; background:var(--bg); color:var(--fg); font-family: Inter, Arial, sans-serif; font-feature-settings:"cv02","cv03","cv04","cv11"; }}
+        code, .mono, table, .stat-value, .json-box {{ font-family:"JetBrains Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }}
+        .app {{ min-height:100vh; display:flex; }}
+        .sidebar {{ width:245px; flex-shrink:0; border-right:1px solid var(--border); background:var(--panel); display:flex; flex-direction:column; }}
+        .brand {{ height:58px; display:flex; align-items:center; gap:10px; padding:0 14px; border-bottom:1px solid var(--border); }}
+        .logo {{ width:32px; height:32px; border-radius:8px; display:grid; place-items:center; color:var(--info); background:rgba(120,166,255,.12); border:1px solid rgba(120,166,255,.35); }}
+        .brand-title {{ font-size:14px; font-weight:700; }}
+        .brand-sub {{ font-size:10px; color:var(--muted); letter-spacing:.12em; text-transform:uppercase; }}
+        .nav {{ padding:10px 8px; display:flex; flex-direction:column; gap:3px; }}
+        .nav-label {{ padding:10px 8px 4px; color:var(--muted); font-size:10px; letter-spacing:.12em; text-transform:uppercase; }}
+        .nav-item {{ color:var(--muted); text-decoration:none; padding:8px 10px; border-radius:8px; border:1px solid transparent; font-size:13px; }}
+        .nav-item:hover {{ color:var(--fg); background:var(--accent); }}
+        .nav-item.active {{ color:var(--fg); border-color:rgba(120,166,255,.35); background:rgba(120,166,255,.10); }}
+        .main {{ flex:1; min-width:0; display:flex; flex-direction:column; }}
+        .topbar {{ height:58px; display:flex; align-items:center; gap:10px; padding:0 16px; border-bottom:1px solid var(--border); background:rgba(27,32,43,.76); backdrop-filter:blur(10px); }}
+        .search {{ width:330px; max-width:42vw; height:34px; border:1px solid var(--border); background:#111721; color:var(--fg); border-radius:8px; padding:0 10px; }}
+        .top-status {{ margin-left:auto; display:flex; align-items:center; gap:14px; color:var(--muted); font-size:12px; }}
+        .dot {{ width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--up); box-shadow:0 0 14px var(--up); }}
+        .content {{ padding:18px; overflow:auto; }}
+        .page-head {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:14px; }}
+        h1 {{ margin:0; font-size:22px; letter-spacing:0; }}
+        .subtitle {{ color:var(--muted); margin-top:4px; font-size:13px; }}
+        .stats-grid {{ display:grid; grid-template-columns:repeat(6,minmax(130px,1fr)); gap:10px; margin-bottom:14px; }}
+        .stat-card {{ border:1px solid var(--border); background:var(--panel); border-radius:8px; padding:12px; min-height:78px; }}
+        .stat-label {{ color:var(--muted); text-transform:uppercase; letter-spacing:.12em; font-size:10px; }}
+        .stat-value {{ font-size:22px; font-weight:700; margin-top:4px; overflow-wrap:anywhere; }}
+        .stat-hint {{ color:var(--muted); font-size:11px; margin-top:2px; min-height:14px; }}
+        .up {{ color:var(--up); }} .down {{ color:var(--down); }} .warn {{ color:var(--warn); }} .info {{ color:var(--info); }} .neutral {{ color:var(--fg); }}
+        .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 14px; }}
+        button, .button {{ border:1px solid var(--border); background:#111721; color:var(--fg); padding:8px 11px; border-radius:8px; text-decoration:none; font:inherit; font-size:12px; cursor:pointer; }}
+        button:hover, .button:hover {{ background:var(--accent); }}
+        .two-col {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }}
+        .panel {{ border:1px solid var(--border); background:var(--panel); border-radius:8px; margin-bottom:14px; overflow:hidden; }}
+        .panel-head {{ height:42px; padding:0 13px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; background:var(--panel2); }}
+        .panel-title {{ color:var(--muted); text-transform:uppercase; letter-spacing:.10em; font-size:11px; font-weight:700; }}
+        .panel-body {{ padding:12px; }}
+        .table-wrap {{ overflow:auto; max-height:520px; border:1px solid var(--border); border-radius:6px; }}
+        table {{ width:100%; min-width:980px; border-collapse:collapse; font-size:12px; }}
+        th, td {{ border-bottom:1px solid var(--border); padding:7px 9px; white-space:nowrap; text-align:left; vertical-align:top; }}
+        thead th {{ position:sticky; top:0; z-index:1; color:var(--muted); background:var(--panel2); text-transform:uppercase; letter-spacing:.08em; font-size:10px; font-weight:600; }}
+        .kv-table {{ min-width:0; }}
+        .kv-table th {{ width:230px; color:var(--muted); background:transparent; text-transform:none; letter-spacing:0; font-size:12px; }}
+        .chip {{ display:inline-flex; align-items:center; border:1px solid var(--border); border-radius:5px; padding:2px 6px; font-size:10px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; }}
+        .chip.up {{ color:var(--up); border-color:rgba(102,211,142,.35); background:rgba(102,211,142,.08); }}
+        .chip.down {{ color:var(--down); border-color:rgba(255,107,107,.35); background:rgba(255,107,107,.08); }}
+        .chip.warn {{ color:var(--warn); border-color:rgba(246,200,95,.35); background:rgba(246,200,95,.08); }}
+        .chip.info {{ color:var(--info); border-color:rgba(120,166,255,.35); background:rgba(120,166,255,.08); }}
+        .empty, .muted {{ color:var(--muted); }}
+        .dry-form {{ display:grid; grid-template-columns:repeat(7, minmax(120px,1fr)); gap:8px; align-items:center; }}
+        .dry-form input, .dry-form select {{ height:34px; border:1px solid var(--border); background:#111721; color:var(--fg); border-radius:8px; padding:0 9px; }}
+        .json-box {{ margin-top:10px; background:#111721; border:1px solid var(--border); border-radius:8px; padding:10px; color:var(--muted); overflow:auto; max-height:260px; }}
+        @media (max-width: 1100px) {{ .sidebar {{ width:210px; }} .stats-grid {{ grid-template-columns:repeat(2,1fr); }} .two-col {{ grid-template-columns:1fr; }} .dry-form {{ grid-template-columns:1fr 1fr; }} }}
       </style>
     </head>
     <body>
-      {dashboard_content()}
+      <div class="app">
+        <aside class="sidebar">
+          <div class="brand"><div class="logo">◎</div><div><div class="brand-title">Polymarket LIVE</div><div class="brand-sub">Control Center</div></div></div>
+          <nav class="nav"><div class="nav-label">Workspace</div>{nav}</nav>
+          <div class="nav-label">Safety</div>
+          <div class="nav"><span class="nav-item">Real submission: disabled</span><span class="nav-item">Rules: not seeded</span></div>
+        </aside>
+        <div class="main">
+          <header class="topbar">
+            <input class="search" placeholder="Search order, condition, token, reason..." />
+            <a class="button" href="/live?view=overview">Refresh</a>
+            <form method="post" action="/live/logout"><button type="submit">Logout</button></form>
+            <div class="top-status"><span><span class="dot"></span> Read-only shell</span><span class="mono">{_e(now_iso())}</span></div>
+          </header>
+          <main class="content">
+            <div class="page-head"><div><h1>{_e(dict(nav_items).get(view, "Overview"))}</h1><div class="subtitle">Operational dashboard inspired by Market Event Radar · real writes remain blocked</div></div>{chip(dashboard_model()["mode"])}</div>
+            {dashboard_content(view)}
+          </main>
+        </div>
+      </div>
       <script>
         async function postLiveAction(path) {{
           const token = window.prompt("LIVE operator token");
@@ -242,6 +532,20 @@ def live_dashboard(request: Request) -> str:
             return;
           }}
           window.location.reload();
+        }}
+        const dryRunForm = document.getElementById("dry-run-form");
+        if (dryRunForm) {{
+          dryRunForm.addEventListener("submit", async (event) => {{
+            event.preventDefault();
+            const token = window.prompt("LIVE operator token");
+            if (!token) return;
+            const form = new FormData(dryRunForm);
+            const payload = Object.fromEntries(form.entries());
+            payload.requested_price = Number(payload.requested_price);
+            payload.requested_amount_usd = Number(payload.requested_amount_usd);
+            const response = await fetch("/live/dry-run", {{method:"POST", headers:{{"Content-Type":"application/json","X-Live-Operator-Token":token}}, body:JSON.stringify(payload)}});
+            document.getElementById("dry-run-result").textContent = JSON.stringify(await response.json(), null, 2);
+          }});
         }}
         document.querySelectorAll("[data-live-action]").forEach((button) => {{
           button.addEventListener("click", () => postLiveAction(button.getAttribute("data-live-action")));
@@ -255,7 +559,7 @@ def live_dashboard(request: Request) -> str:
 @router.get("/content", response_class=HTMLResponse)
 def live_content(request: Request) -> str:
     require_live_session(request)
-    return dashboard_content()
+    return dashboard_content(request.query_params.get("view", "overview"))
 
 
 @router.get("/health")

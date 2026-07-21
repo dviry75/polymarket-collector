@@ -278,6 +278,18 @@ class LiveSystemTests(unittest.TestCase):
         self.assertEqual(client.get("/health").status_code, 200)
         self.assertIn("Polymarket BTC Collector", client.get("/").text)
 
+    def test_live_product_ui_screens_render(self):
+        client = self.client()
+        self.login(client)
+        views = ["overview", "operations", "risk", "logs", "market", "account", "dry-run", "reconciliation", "orders", "deployment"]
+        for view in views:
+            response = client.get(f"/live?view={view}")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Polymarket LIVE", response.text)
+            self.assertIn("Control Center", response.text)
+        self.assertIn("Dry Run Studio", client.get("/live?view=dry-run").text)
+        self.assertIn("Deployment Checklist", client.get("/live?view=deployment").text)
+
 
 if __name__ == "__main__":
     unittest.main()
