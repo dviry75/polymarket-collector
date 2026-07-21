@@ -65,6 +65,8 @@ DEMO_INVESTMENT_USD = Decimal("1.00")
 DEMO_FEE_CALCULATION_VERSION = "polymarket-platform-fee-v2-2026-07-21"
 DEMO_FEE_SOURCE_MARKET = "MARKET_SNAPSHOT"
 DEMO_FEE_SOURCE_FALLBACK = "SIMULATED_CRYPTO_DEFAULT"
+DEMO_FEE_SOURCE_BACKFILL = "SIMULATED_BACKFILL"
+CLOB_FEE_SOURCE = "CLOB_MARKET_INFO"
 DEMO_ENTRY_LIQUIDITY_ROLE = "TAKER"
 DEMO_EXIT_LIQUIDITY_ROLE_BY_REASON = {
     "stop_loss": "TAKER",
@@ -345,6 +347,11 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             "net_pnl_usd",
             "gross_roi_percent",
             "net_roi_percent",
+            "entry_btc_volume_log_id",
+            "entry_btc_volume_sampled_at",
+            "entry_btc_volume_btc_cumulative",
+            "entry_btc_volume_btc_delta",
+            "entry_btc_volume_status",
             "fee_calculation_source",
             "fee_calculation_version",
             "created_at",
@@ -383,6 +390,11 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             net_pnl_usd,
             gross_roi_percent,
             net_roi_percent,
+            entry_btc_volume_log_id,
+            entry_btc_volume_sampled_at,
+            entry_btc_volume_btc_cumulative,
+            entry_btc_volume_btc_delta,
+            entry_btc_volume_status,
             fee_calculation_source,
             fee_calculation_version,
             created_at,
@@ -610,13 +622,19 @@ def init_db() -> None:
             net_pnl_usd REAL,
             gross_roi_percent REAL,
             net_roi_percent REAL,
+            entry_btc_volume_log_id INTEGER,
+            entry_btc_volume_sampled_at TEXT,
+            entry_btc_volume_btc_cumulative REAL,
+            entry_btc_volume_btc_delta REAL,
+            entry_btc_volume_status TEXT,
             fee_calculation_source TEXT,
             fee_calculation_version TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (rule_id) REFERENCES rules(id),
             FOREIGN KEY (entry_orderbook_log_id) REFERENCES orderbook_log(id),
-            FOREIGN KEY (exit_orderbook_log_id) REFERENCES orderbook_log(id)
+            FOREIGN KEY (exit_orderbook_log_id) REFERENCES orderbook_log(id),
+            FOREIGN KEY (entry_btc_volume_log_id) REFERENCES btc_volume_log(id)
         )
         """)
 
@@ -670,6 +688,11 @@ def init_db() -> None:
         ensure_column(conn, "deals", "net_pnl_usd", "REAL")
         ensure_column(conn, "deals", "gross_roi_percent", "REAL")
         ensure_column(conn, "deals", "net_roi_percent", "REAL")
+        ensure_column(conn, "deals", "entry_btc_volume_log_id", "INTEGER")
+        ensure_column(conn, "deals", "entry_btc_volume_sampled_at", "TEXT")
+        ensure_column(conn, "deals", "entry_btc_volume_btc_cumulative", "REAL")
+        ensure_column(conn, "deals", "entry_btc_volume_btc_delta", "REAL")
+        ensure_column(conn, "deals", "entry_btc_volume_status", "TEXT")
         ensure_column(conn, "deals", "fee_calculation_source", "TEXT")
         ensure_column(conn, "deals", "fee_calculation_version", "TEXT")
 
@@ -718,6 +741,12 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_deals_rule_event_side
         ON deals (rule_id, event_id, side)
         """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_entry_btc_volume_delta
+        ON deals (entry_btc_volume_btc_delta)
+        """)
+
+        backfill_demo_fee_snapshots(conn)
 
         conn.commit()
     conn.close()
@@ -734,6 +763,82 @@ def get_conn() -> sqlite3.Connection:
     conn = connect_db()
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def find_entry_btc_volume_snapshot(
+    conn: sqlite3.Connection,
+    entry_at: Any,
+    event_id: Optional[str] = None,
+) -> Optional[sqlite3.Row]:
+    if not entry_at:
+        return None
+
+    params: tuple[Any, ...]
+    if event_id:
+        row = conn.execute("""
+            SELECT
+                id,
+                sampled_at,
+                volume_btc_cumulative,
+                volume_btc_delta,
+                status
+            FROM btc_volume_log
+            WHERE sampled_at <= ?
+              AND event_slug = ?
+              AND status IN ('success', 'baseline')
+            ORDER BY sampled_at DESC, id DESC
+            LIMIT 1
+        """, (entry_at, event_id)).fetchone()
+        if row:
+            return row
+
+    params = (entry_at,)
+    return conn.execute("""
+        SELECT
+            id,
+            sampled_at,
+            volume_btc_cumulative,
+            volume_btc_delta,
+            status
+        FROM btc_volume_log
+        WHERE sampled_at <= ?
+          AND status IN ('success', 'baseline')
+        ORDER BY sampled_at DESC, id DESC
+        LIMIT 1
+    """, params).fetchone()
+
+
+def backfill_deal_btc_volume_snapshots(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    deals = conn.execute("""
+        SELECT id, event_id, entry_at
+        FROM deals
+        WHERE entry_btc_volume_log_id IS NULL
+          AND entry_at IS NOT NULL
+    """).fetchall()
+
+    for deal in deals:
+        snapshot = find_entry_btc_volume_snapshot(conn, deal["entry_at"], deal["event_id"])
+        if not snapshot:
+            continue
+        conn.execute("""
+            UPDATE deals SET
+                entry_btc_volume_log_id = ?,
+                entry_btc_volume_sampled_at = ?,
+                entry_btc_volume_btc_cumulative = ?,
+                entry_btc_volume_btc_delta = ?,
+                entry_btc_volume_status = ?,
+                updated_at = COALESCE(updated_at, ?)
+            WHERE id = ?
+        """, (
+            snapshot["id"],
+            snapshot["sampled_at"],
+            snapshot["volume_btc_cumulative"],
+            snapshot["volume_btc_delta"],
+            snapshot["status"],
+            now_iso(),
+            deal["id"],
+        ))
 
 
 def decimal_price(value: Any, field_name: str) -> Decimal:
@@ -988,18 +1093,19 @@ def extract_event_fee_snapshot(event_id: Optional[str], conn: Optional[sqlite3.C
 
     fees_enabled = row["fees_enabled"]
     fee_rate = normalize_fee_rate(row["fee_rate"])
-    if fees_enabled is not None and int(fees_enabled) == 0:
+    source = row["fee_calculation_source"] or DEMO_FEE_SOURCE_FALLBACK
+    if fees_enabled is not None and int(fees_enabled) == 0 and source == CLOB_FEE_SOURCE:
         return {
             "fees_enabled": False,
             "fee_rate": Decimal("0"),
-            "fee_calculation_source": row["fee_calculation_source"] or DEMO_FEE_SOURCE_MARKET,
+            "fee_calculation_source": source,
             "fee_calculation_version": row["fee_calculation_version"] or DEMO_FEE_CALCULATION_VERSION,
         }
-    if fee_rate is not None:
+    if fee_rate is not None and (fee_rate > 0 or source == CLOB_FEE_SOURCE):
         return {
             "fees_enabled": True,
             "fee_rate": fee_rate,
-            "fee_calculation_source": row["fee_calculation_source"] or DEMO_FEE_SOURCE_MARKET,
+            "fee_calculation_source": source,
             "fee_calculation_version": row["fee_calculation_version"] or DEMO_FEE_CALCULATION_VERSION,
         }
     return snapshot
@@ -1081,6 +1187,91 @@ def deal_financials_from_row(deal: sqlite3.Row, investment_usd: Any = 1) -> dict
         "exit_fee_usd": 0.0,
         "shares": shares,
     }
+
+
+def backfill_demo_fee_snapshots(conn: sqlite3.Connection) -> int:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT *
+        FROM deals
+        WHERE result IN ('win', 'loss')
+          AND exit_price IS NOT NULL
+          AND (
+            fee_calculation_source IS NULL
+            OR total_fees_usd IS NULL
+            OR (
+                COALESCE(total_fees_usd, 0) = 0
+                AND COALESCE(entry_fee_rate, 0) = 0
+                AND COALESCE(exit_fee_rate, 0) = 0
+            )
+          )
+        ORDER BY id ASC
+    """).fetchall()
+
+    updated = 0
+    for deal in rows:
+        exit_role = DEMO_EXIT_LIQUIDITY_ROLE_BY_REASON.get(deal["exit_reason"] or "", "TAKER")
+        try:
+            financials = calculate_demo_deal_financials(
+                deal["entry_price"],
+                deal["exit_price"],
+                deal["investment_usd"] if deal["investment_usd"] is not None else DEMO_INVESTMENT_USD,
+                deal["entry_liquidity_role"] or DEMO_ENTRY_LIQUIDITY_ROLE,
+                deal["exit_liquidity_role"] or exit_role,
+                POLYMARKET_CRYPTO_TAKER_FEE_RATE,
+                DEMO_FEE_SOURCE_BACKFILL,
+                DEMO_FEE_CALCULATION_VERSION,
+            )
+        except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
+            continue
+
+        conn.execute("""
+            UPDATE deals SET
+                investment_usd = ?,
+                shares = ?,
+                entry_gross_value_usd = ?,
+                entry_liquidity_role = ?,
+                entry_fee_rate = ?,
+                entry_fee_usd = ?,
+                exit_gross_value_usd = ?,
+                exit_liquidity_role = ?,
+                exit_fee_rate = ?,
+                exit_fee_usd = ?,
+                total_fees_usd = ?,
+                gross_pnl_usd = ?,
+                net_pnl_usd = ?,
+                gross_roi_percent = ?,
+                net_roi_percent = ?,
+                fee_calculation_source = ?,
+                fee_calculation_version = ?,
+                updated_at = ?
+            WHERE id = ?
+        """, (
+            decimal_to_float(financials["investment_usd"]),
+            decimal_to_float(financials["shares"]),
+            decimal_to_float(financials["entry_gross_value_usd"]),
+            financials["entry_liquidity_role"],
+            decimal_to_float(financials["entry_fee_rate"]),
+            decimal_to_float(financials["entry_fee_usd"]),
+            decimal_to_float(financials["exit_gross_value_usd"]),
+            financials["exit_liquidity_role"],
+            decimal_to_float(financials["exit_fee_rate"]),
+            decimal_to_float(financials["exit_fee_usd"]),
+            decimal_to_float(financials["total_fees_usd"]),
+            decimal_to_float(financials["gross_pnl_usd"]),
+            decimal_to_float(financials["net_pnl_usd"]),
+            decimal_to_float(financials["gross_roi_percent"]),
+            decimal_to_float(financials["net_roi_percent"]),
+            financials["fee_calculation_source"],
+            financials["fee_calculation_version"],
+            now_iso(),
+            deal["id"],
+        ))
+        updated += 1
+
+    if updated:
+        print(f"[fees] simulated backfill updated {updated} closed deals", flush=True)
+    return updated
 
 
 def close_deal(
@@ -1321,13 +1512,6 @@ def extract_market_fee_config(event_data: dict[str, Any], market: dict[str, Any]
     )
     fee_rate = normalize_fee_rate(raw_rate)
 
-    if raw_enabled is False:
-        return {
-            "fees_enabled": 0,
-            "fee_rate": 0.0,
-            "fee_calculation_source": DEMO_FEE_SOURCE_MARKET,
-            "fee_calculation_version": DEMO_FEE_CALCULATION_VERSION,
-        }
     if raw_enabled is True and fee_rate is not None:
         return {
             "fees_enabled": 1,
@@ -2141,6 +2325,7 @@ def process_demo_entries(
 
         created_at = now_iso()
         fee_snapshot = extract_event_fee_snapshot(event_id, conn)
+        volume_snapshot = find_entry_btc_volume_snapshot(conn, orderbook_row["sampled_at"], event_id)
         financials = calculate_demo_deal_financials(
             rule["entry_price"],
             None,
@@ -2168,11 +2353,16 @@ def process_demo_entries(
                     entry_liquidity_role,
                     entry_fee_rate,
                     entry_fee_usd,
+                    entry_btc_volume_log_id,
+                    entry_btc_volume_sampled_at,
+                    entry_btc_volume_btc_cumulative,
+                    entry_btc_volume_btc_delta,
+                    entry_btc_volume_status,
                     fee_calculation_source,
                     fee_calculation_version,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 rule_id,
                 rule["name"],
@@ -2187,6 +2377,11 @@ def process_demo_entries(
                 financials["entry_liquidity_role"],
                 decimal_to_float(financials["entry_fee_rate"]),
                 decimal_to_float(financials["entry_fee_usd"]),
+                volume_snapshot["id"] if volume_snapshot else None,
+                volume_snapshot["sampled_at"] if volume_snapshot else None,
+                volume_snapshot["volume_btc_cumulative"] if volume_snapshot else None,
+                volume_snapshot["volume_btc_delta"] if volume_snapshot else None,
+                volume_snapshot["status"] if volume_snapshot else None,
                 financials["fee_calculation_source"],
                 financials["fee_calculation_version"],
                 created_at,
@@ -2715,6 +2910,18 @@ def load_dashboard_overview(
     with get_conn() as conn:
         total_deals = int(conn.execute(f"SELECT COUNT(*) FROM deals WHERE {entry_filter}", entry_params).fetchone()[0])
         open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
+        btc_volume_gt_6_deals = int(conn.execute(f"""
+            SELECT COUNT(*)
+            FROM deals
+            WHERE entry_btc_volume_btc_delta > 6
+              AND {entry_filter}
+        """, entry_params).fetchone()[0])
+        missing_btc_volume_snapshot_deals = int(conn.execute(f"""
+            SELECT COUNT(*)
+            FROM deals
+            WHERE entry_btc_volume_log_id IS NULL
+              AND {entry_filter}
+        """, entry_params).fetchone()[0])
         active_rules = int(conn.execute("SELECT COUNT(*) FROM rules WHERE status = 'active'").fetchone()[0])
         last_orderbook_sample = conn.execute("SELECT MAX(sampled_at) FROM orderbook_log").fetchone()[0]
         orderbook_errors = int(conn.execute("""
@@ -2798,6 +3005,8 @@ def load_dashboard_overview(
         "total_deals": total_deals,
         "closed_deals": closed_count,
         "open_deals": open_deals,
+        "btc_volume_gt_6_deals": btc_volume_gt_6_deals,
+        "missing_btc_volume_snapshot_deals": missing_btc_volume_snapshot_deals,
         "active_rules": active_rules,
         "wins": wins,
         "losses": losses,
@@ -3228,6 +3437,13 @@ def local_date_key(value: Any) -> str:
     return dt.astimezone(LOCAL_TIMEZONE).strftime("%Y-%m-%d")
 
 
+def local_time_label(value: Any) -> str:
+    dt = parse_iso_datetime(str(value)) if value else None
+    if not dt:
+        return "unknown"
+    return dt.astimezone(LOCAL_TIMEZONE).strftime("%d/%m %H:%M")
+
+
 def load_time_trends(
     investment_usd: Any = 1,
     dashboard_range: Any = "all",
@@ -3279,6 +3495,81 @@ def load_time_trends(
     return rows
 
 
+def load_btc_volume_trends(
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+    limit: int = 120,
+) -> list[dict[str, Any]]:
+    btc_filter, btc_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT
+                sampled_at,
+                volume_btc_cumulative,
+                volume_btc_delta,
+                event_slug,
+                status
+            FROM btc_volume_log
+            WHERE status IN ('success', 'baseline')
+              AND """ + btc_filter + """
+            ORDER BY sampled_at DESC, id DESC
+            LIMIT ?
+        """, (*btc_params, limit)).fetchall()
+
+    result = []
+    for row in reversed(rows):
+        result.append({
+            "sampled_at": row["sampled_at"],
+            "label": local_time_label(row["sampled_at"]),
+            "volume_btc_cumulative": float(row["volume_btc_cumulative"] or 0),
+            "volume_btc_delta": float(row["volume_btc_delta"] or 0),
+            "event_slug": row["event_slug"],
+            "status": row["status"],
+        })
+    return result
+
+
+def load_btc_volume_deal_snapshot(dashboard_range: Any = "all", custom_from: Any = None, custom_to: Any = None) -> dict[str, Any]:
+    entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range, custom_from, custom_to)
+    with get_conn() as conn:
+        summary = conn.execute("""
+            SELECT
+                COUNT(*) AS total_deals,
+                SUM(CASE WHEN entry_btc_volume_btc_delta > 6 THEN 1 ELSE 0 END) AS deals_over_6_delta,
+                SUM(CASE WHEN entry_btc_volume_log_id IS NULL THEN 1 ELSE 0 END) AS missing_snapshot_deals,
+                AVG(entry_btc_volume_btc_delta) AS avg_delta,
+                MAX(entry_btc_volume_btc_delta) AS max_delta
+            FROM deals
+            WHERE """ + entry_filter, entry_params).fetchone()
+        rows = conn.execute("""
+            SELECT
+                id,
+                rule_name,
+                event_id,
+                side,
+                result,
+                entry_at,
+                entry_btc_volume_sampled_at,
+                entry_btc_volume_btc_cumulative,
+                entry_btc_volume_btc_delta
+            FROM deals
+            WHERE entry_btc_volume_btc_delta > 6
+              AND """ + entry_filter + """
+            ORDER BY entry_btc_volume_btc_delta DESC, entry_at DESC
+            LIMIT 25
+        """, entry_params).fetchall()
+
+    return {
+        "total_deals": int(summary["total_deals"] or 0),
+        "deals_over_6_delta": int(summary["deals_over_6_delta"] or 0),
+        "missing_snapshot_deals": int(summary["missing_snapshot_deals"] or 0),
+        "avg_delta": summary["avg_delta"],
+        "max_delta": summary["max_delta"],
+        "rows_over_6": [row_to_dict(row) for row in rows],
+    }
+
+
 def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = None, custom_to: Any = None) -> dict[str, Any]:
     orderbook_filter, orderbook_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
     btc_filter, btc_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
@@ -3306,6 +3597,11 @@ def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = 
             WHERE result IN ('win', 'loss')
               AND exit_price IS NOT NULL
               AND (fee_calculation_source IS NULL OR net_pnl_usd IS NULL)
+        """).fetchone()[0])
+        deals_missing_btc_volume_snapshot = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM deals
+            WHERE entry_btc_volume_log_id IS NULL
         """).fetchone()[0])
         event_status_mismatch = int(conn.execute("""
             SELECT COUNT(*)
@@ -3351,6 +3647,7 @@ def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = 
         ("דלתא נפח BTC שלילית", negative_btc_delta, "error"),
     ]
     checks.append(("Closed deals missing fee snapshot", closed_deals_missing_fee_snapshot, "warning"))
+    checks.append(("Deals missing BTC volume snapshot", deals_missing_btc_volume_snapshot, "warning"))
     issue_count = sum(count for _, count, _ in checks)
     return {
         "status": "ok" if issue_count == 0 else "needs_review",
@@ -3384,6 +3681,7 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
         render_metric("רווח/הפסד נטו", format_money(overview["net_pnl_usd"]), "עסקאות סגורות בלבד"),
         render_metric("Gross P&L", format_money(overview["gross_pnl_usd"]), "לפני עמלות"),
         render_metric("Total fees", format_money(overview["total_fees_usd"]), f"Entry {format_money(overview['entry_fees_usd'])} / Exit {format_money(overview['exit_fees_usd'])}"),
+        render_metric("Deals volume > 6 BTC", str(overview["btc_volume_gt_6_deals"]), f"{overview['missing_btc_volume_snapshot_deals']} without BTC snapshot"),
         render_metric("עסקאות סגורות", str(overview["closed_deals"]), f"{overview['open_deals']} פתוחות"),
         render_metric("Avg fee / deal", format_money(overview["avg_fee_usd"]), f"{format_percent(overview['fees_to_investment_percent'])} מההשקעה"),
         render_metric("אחוז הצלחה", format_percent(overview["win_rate"]), f"{overview['wins']} רווחיות / {overview['losses']} הפסדיות"),
@@ -3799,6 +4097,105 @@ def render_dashboard_charts(rows: list[dict[str, Any]]) -> str:
     """
 
 
+def chart_json_payload(time_trends: list[dict[str, Any]], btc_volume_trends: list[dict[str, Any]]) -> str:
+    payload = {
+        "timeTrendLabels": [row["day"] for row in time_trends[-30:]],
+        "dailyPnl": [round(float(row["net_pnl_usd"]), 8) for row in time_trends[-30:]],
+        "dailyDeals": [int(row["closed_deals"]) for row in time_trends[-30:]],
+        "btcVolumeLabels": [row["label"] for row in btc_volume_trends],
+        "btcVolumeDelta": [round(float(row["volume_btc_delta"]), 8) for row in btc_volume_trends],
+        "btcVolumeCumulative": [round(float(row["volume_btc_cumulative"]), 8) for row in btc_volume_trends],
+    }
+    return html.escape(json.dumps(payload, ensure_ascii=False))
+
+
+def render_chartjs_charts(time_trends: list[dict[str, Any]], btc_volume_trends: list[dict[str, Any]]) -> str:
+    if not time_trends and not btc_volume_trends:
+        return """
+        <div class="card chartjs-card">
+            <h2>Interactive charts</h2>
+            <p>No chart data yet.</p>
+        </div>
+        """
+
+    return f"""
+    <div class="card chartjs-card">
+        <h2>Interactive charts</h2>
+        <p class="muted">Line trend, bar chart, and BTC volume over time from the local SQLite data.</p>
+        <script type="application/json" id="dashboard-chart-data">{chart_json_payload(time_trends, btc_volume_trends)}</script>
+        <div class="canvas-grid">
+            <section class="canvas-panel">
+                <h3>Net P&L trend</h3>
+                <canvas id="pnlTrendChart" height="220"></canvas>
+            </section>
+            <section class="canvas-panel">
+                <h3>Closed deals by day</h3>
+                <canvas id="dealsBarChart" height="220"></canvas>
+            </section>
+            <section class="canvas-panel wide">
+                <h3>BTC volume vs time</h3>
+                <canvas id="btcVolumeChart" height="240"></canvas>
+            </section>
+        </div>
+    </div>
+    """
+
+
+def render_btc_volume_deal_snapshot(snapshot: dict[str, Any]) -> str:
+    metrics = [
+        render_metric("Deals volume > 6 BTC", str(snapshot["deals_over_6_delta"]), "entry volume_btc_delta threshold"),
+        render_metric("Avg entry BTC delta", display_value(snapshot["avg_delta"]), f"{snapshot['total_deals']} deals in range"),
+        render_metric("Max entry BTC delta", display_value(snapshot["max_delta"]), f"{snapshot['missing_snapshot_deals']} without snapshot"),
+    ]
+
+    if snapshot["rows_over_6"]:
+        headers = [
+            "deal",
+            "rule",
+            "event",
+            "side",
+            "result",
+            "entry_at",
+            "volume_sampled_at",
+            "volume_delta",
+            "volume_cumulative",
+        ]
+        thead = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+        body = ""
+        for row in snapshot["rows_over_6"]:
+            values = [
+                row["id"],
+                row["rule_name"] or "-",
+                row["event_id"],
+                row["side"],
+                row["result"],
+                row["entry_at"],
+                row["entry_btc_volume_sampled_at"],
+                row["entry_btc_volume_btc_delta"],
+                row["entry_btc_volume_btc_cumulative"],
+            ]
+            body += "<tr>" + "".join(f"<td>{html.escape(str(display_value(value)))}</td>" for value in values) + "</tr>"
+        table = f"""
+        <div class="table-wrap btc-volume-deals-table">
+          <table>
+            <thead><tr>{thead}</tr></thead>
+            <tbody>{body}</tbody>
+          </table>
+        </div>
+        """
+    else:
+        table = "<p>No deals above 6 BTC volume delta in the selected range.</p>"
+
+    return f"""
+    <div class="card">
+        <h2>BTC volume on deals</h2>
+        <p class="muted">Each new deal stores the latest Coinbase BTC volume sample available at entry time. The threshold here is volume_btc_delta &gt; 6.</p>
+        <div class="metric-grid">{''.join(metrics)}</div>
+        {table}
+    </div>
+    """
+
+
 def latest_export_path() -> Optional[Path]:
     state_path = export_state.get("path")
     if state_path:
@@ -3980,6 +4377,7 @@ def render_dashboard_scripts() -> str:
     return """
     <script>
       let dashboardRefreshInFlight = false;
+      let dashboardChartInstances = [];
 
       function modalIsOpen() {
         return !document.getElementById("rule-modal").hidden ||
@@ -4006,6 +4404,108 @@ def render_dashboard_scripts() -> str:
         });
       }
 
+      function readDashboardChartData() {
+        const element = document.getElementById("dashboard-chart-data");
+        if (!element) {
+          return null;
+        }
+        try {
+          return JSON.parse(element.textContent || "{}");
+        } catch (error) {
+          console.warn("Chart data parse failed", error);
+          return null;
+        }
+      }
+
+      function resetDashboardCharts() {
+        dashboardChartInstances.forEach((chart) => chart.destroy());
+        dashboardChartInstances = [];
+      }
+
+      function createChart(canvasId, config) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !window.Chart) {
+          return;
+        }
+        dashboardChartInstances.push(new Chart(canvas, config));
+      }
+
+      function renderDashboardCharts() {
+        const data = readDashboardChartData();
+        resetDashboardCharts();
+        if (!data || !window.Chart) {
+          return;
+        }
+        const baseOptions = {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {legend: {position: "bottom"}},
+          scales: {x: {ticks: {maxRotation: 0, autoSkip: true}}, y: {beginAtZero: false}}
+        };
+        createChart("pnlTrendChart", {
+          type: "line",
+          data: {
+            labels: data.timeTrendLabels || [],
+            datasets: [{
+              label: "Net P&L",
+              data: data.dailyPnl || [],
+              borderColor: "#147a3f",
+              backgroundColor: "rgba(20, 122, 63, 0.12)",
+              tension: 0.25,
+              fill: true
+            }]
+          },
+          options: baseOptions
+        });
+        createChart("dealsBarChart", {
+          type: "bar",
+          data: {
+            labels: data.timeTrendLabels || [],
+            datasets: [{
+              label: "Closed deals",
+              data: data.dailyDeals || [],
+              backgroundColor: "#2f5f98"
+            }]
+          },
+          options: {...baseOptions, scales: {...baseOptions.scales, y: {beginAtZero: true, ticks: {precision: 0}}}}
+        });
+        createChart("btcVolumeChart", {
+          type: "bar",
+          data: {
+            labels: data.btcVolumeLabels || [],
+            datasets: [
+              {
+                type: "bar",
+                label: "BTC delta",
+                data: data.btcVolumeDelta || [],
+                backgroundColor: "rgba(47, 95, 152, 0.55)",
+                yAxisID: "y"
+              },
+              {
+                type: "line",
+                label: "BTC cumulative",
+                data: data.btcVolumeCumulative || [],
+                borderColor: "#b42318",
+                backgroundColor: "rgba(180, 35, 24, 0.12)",
+                tension: 0.2,
+                pointRadius: 1,
+                yAxisID: "y1"
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {legend: {position: "bottom"}},
+            scales: {
+              x: {ticks: {maxRotation: 0, autoSkip: true}},
+              y: {beginAtZero: true, position: "left"},
+              y1: {beginAtZero: true, position: "right", grid: {drawOnChartArea: false}}
+            }
+          }
+        });
+      }
+
       async function refreshDashboardContent(force = false) {
         if (dashboardRefreshInFlight || (!force && autoRefreshIsPaused())) {
           return;
@@ -4016,6 +4516,7 @@ def render_dashboard_scripts() -> str:
           if (response.ok) {
             document.getElementById("dashboard-content").innerHTML = await response.text();
             toggleCustomRangeInputs();
+            renderDashboardCharts();
           }
         } finally {
           dashboardRefreshInFlight = false;
@@ -4071,7 +4572,10 @@ def render_dashboard_scripts() -> str:
         await refreshDashboardContent(true);
       }
 
-      document.addEventListener("DOMContentLoaded", toggleCustomRangeInputs);
+      document.addEventListener("DOMContentLoaded", () => {
+        toggleCustomRangeInputs();
+        renderDashboardCharts();
+      });
       window.setInterval(() => refreshDashboardContent(false), 10000);
     </script>
     """
@@ -4233,6 +4737,9 @@ def load_dashboard_rows() -> tuple[
                 net_pnl_usd,
                 gross_roi_percent,
                 net_roi_percent,
+                entry_btc_volume_sampled_at,
+                entry_btc_volume_btc_cumulative,
+                entry_btc_volume_btc_delta,
                 entry_liquidity_role,
                 exit_liquidity_role,
                 fee_calculation_source
@@ -4258,6 +4765,8 @@ def render_dashboard_content(
     market_conditions = load_market_conditions(investment_usd, dashboard_range, custom_from, custom_to)
     system_health = load_system_health_snapshot()
     time_trends = load_time_trends(investment_usd, dashboard_range, custom_from, custom_to)
+    btc_volume_trends = load_btc_volume_trends(dashboard_range, custom_from, custom_to)
+    btc_volume_deal_snapshot = load_btc_volume_deal_snapshot(dashboard_range, custom_from, custom_to)
     data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to)
     events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
@@ -4269,7 +4778,9 @@ def render_dashboard_content(
         {render_risk_snapshot(risk_snapshot)}
         {render_market_conditions(market_conditions)}
         {render_time_trends(time_trends)}
+        {render_chartjs_charts(time_trends, btc_volume_trends)}
         {render_dashboard_charts(time_trends)}
+        {render_btc_volume_deal_snapshot(btc_volume_deal_snapshot)}
         {render_data_quality(data_quality)}
         {render_system_health(system_health)}
 
@@ -4329,6 +4840,7 @@ def dashboard(
     <head>
         <meta charset="utf-8">
         <title>Polymarket BTC Collector</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body {{
                 font-family: Arial, sans-serif;
@@ -4504,6 +5016,24 @@ def dashboard(
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
                 gap: 18px;
+            }}
+            .canvas-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 18px;
+            }}
+            .canvas-panel {{
+                min-height: 280px;
+            }}
+            .canvas-panel.wide {{
+                grid-column: 1 / -1;
+            }}
+            .canvas-panel canvas {{
+                width: 100% !important;
+                max-height: 260px;
+            }}
+            .btc-volume-deals-table table {{
+                min-width: 980px;
             }}
             .chart-row {{
                 display: grid;

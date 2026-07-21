@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
@@ -12,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import app
+from scripts import backfill_deal_btc_volume_snapshots
 
 
 def valid_rule(**overrides):
@@ -59,6 +61,24 @@ def orderbook(event_id, *, yes_ask=None, yes_bid=None, no_ask=None, no_bid=None,
         "trades_window_end_local": None,
         "trades_error": None,
         "status": "success",
+        "error": None,
+    }
+
+
+def btc_volume(sampled_at, *, event_id="event-a", cumulative=12.5, delta=6.7, status="success"):
+    return {
+        "sampled_at": sampled_at,
+        "sample_bucket_at": sampled_at,
+        "candle_start_at": "2026-07-17T08:55:00+00:00",
+        "product_id": "BTC-USD",
+        "granularity_seconds": 300,
+        "volume_btc_cumulative": cumulative,
+        "volume_btc_delta": delta,
+        "seconds_since_previous_sample": 30,
+        "event_slug": event_id,
+        "condition_id": f"condition-{event_id}",
+        "source": "coinbase",
+        "status": status,
         "error": None,
     }
 
@@ -147,6 +167,75 @@ class RuleDealTests(unittest.TestCase):
 
         app.insert_orderbook_log(orderbook("event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19))
         self.assertEqual(len(self.fetch_deals()), 1)
+
+    def test_deal_entry_stores_latest_btc_volume_snapshot(self):
+        app.create_rule(valid_rule())
+        app.insert_btc_volume_log(btc_volume("2026-07-17T08:59:30+00:00", cumulative=10.0, delta=5.5))
+        app.insert_btc_volume_log(btc_volume("2026-07-17T09:00:00+00:00", cumulative=16.0, delta=6.8))
+        app.insert_btc_volume_log(btc_volume("2026-07-17T09:00:30+00:00", cumulative=20.0, delta=3.2))
+
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-17T09:00:01+00:00",
+        ))
+
+        deal = self.fetch_deals()[0]
+        self.assertIsNotNone(deal["entry_btc_volume_log_id"])
+        self.assertEqual(deal["entry_btc_volume_sampled_at"], "2026-07-17T09:00:00+00:00")
+        self.assertAlmostEqual(deal["entry_btc_volume_btc_cumulative"], 16.0)
+        self.assertAlmostEqual(deal["entry_btc_volume_btc_delta"], 6.8)
+        self.assertEqual(deal["entry_btc_volume_status"], "success")
+
+        overview = app.load_dashboard_overview(1)
+        self.assertEqual(overview["btc_volume_gt_6_deals"], 1)
+        self.assertEqual(overview["missing_btc_volume_snapshot_deals"], 0)
+
+        snapshot = app.load_btc_volume_deal_snapshot()
+        self.assertEqual(snapshot["deals_over_6_delta"], 1)
+        self.assertEqual(snapshot["missing_snapshot_deals"], 0)
+        self.assertEqual(snapshot["rows_over_6"][0]["id"], deal["id"])
+
+        trends = app.load_btc_volume_trends()
+        self.assertEqual(len(trends), 3)
+        self.assertEqual(trends[-1]["label"], "17/07 12:00")
+        self.assertAlmostEqual(trends[1]["volume_btc_delta"], 6.8)
+
+    def test_backfill_script_updates_missing_btc_volume_snapshot(self):
+        app.insert_btc_volume_log(btc_volume("2026-07-17T09:00:00+00:00", cumulative=16.0, delta=6.8))
+        with app.get_conn() as conn:
+            now = app.now_iso()
+            cursor = conn.execute("""
+                INSERT INTO rules (
+                    name, created_at, updated_at, entry_price, stop_loss_price,
+                    take_profit_price, max_yes_entries_per_event,
+                    max_no_entries_per_event, status, eligible_after_event_id
+                ) VALUES ('legacy-missing-volume', ?, ?, 0.77, 0.60, 0.90, 1, 1, 'inactive', NULL)
+            """, (now, now))
+            rule_id = cursor.lastrowid
+            conn.execute("""
+                INSERT INTO deals (
+                    rule_id, rule_name, event_id, side, result, entry_at, entry_price,
+                    entry_orderbook_log_id, created_at, updated_at
+                ) VALUES (?, 'legacy-missing-volume', 'event-a', 'yes', 'open',
+                    '2026-07-17T09:00:01+00:00', 0.77, 1, ?, ?)
+            """, (rule_id, now, now))
+            conn.commit()
+
+        with patch.object(sys, "argv", [
+            "backfill_deal_btc_volume_snapshots.py",
+            "--apply",
+            "--db-path",
+            str(app.DB_PATH),
+        ]):
+            self.assertEqual(backfill_deal_btc_volume_snapshots.main(), 0)
+
+        deal = self.fetch_deals()[0]
+        self.assertEqual(deal["entry_btc_volume_sampled_at"], "2026-07-17T09:00:00+00:00")
+        self.assertAlmostEqual(deal["entry_btc_volume_btc_delta"], 6.8)
 
     def test_no_entry_for_inactive_open_deal_and_both_sides_match(self):
         app.create_rule(valid_rule(name="inactive", status="inactive"))
@@ -314,6 +403,58 @@ class RuleDealTests(unittest.TestCase):
         no_fee = app.calculate_demo_deal_financials(0.77, 0.90, fee_rate=0)
         self.assertEqual(float(no_fee["total_fees_usd"]), 0.0)
 
+    def test_gamma_fee_disabled_does_not_zero_demo_crypto_fees(self):
+        with app.get_conn() as conn:
+            now = app.now_iso()
+            conn.execute("""
+                INSERT INTO events (
+                    event_slug, fees_enabled, fee_rate, fee_calculation_source,
+                    fee_calculation_version, discovered_at, last_seen_at
+                ) VALUES ('event-fee-disabled', 0, 0, 'MARKET_SNAPSHOT', ?, ?, ?)
+            """, (app.DEMO_FEE_CALCULATION_VERSION, now, now))
+            conn.commit()
+
+        app.create_rule(valid_rule())
+        app.insert_orderbook_log(orderbook("event-fee-disabled", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19))
+        app.insert_orderbook_log(orderbook("event-fee-disabled", yes_ask=0.2, yes_bid=0.93, no_ask=0.2, no_bid=0.19))
+
+        deal = self.fetch_deals()[0]
+        self.assertEqual(deal["entry_fee_rate"], 0.07)
+        self.assertGreater(deal["total_fees_usd"], 0)
+        overview = app.load_dashboard_overview(1)
+        self.assertGreater(overview["total_fees_usd"], 0)
+
+    def test_fee_backfill_updates_closed_zero_fee_deals(self):
+        with app.get_conn() as conn:
+            now = app.now_iso()
+            conn.execute("""
+                INSERT INTO rules (
+                    name, created_at, updated_at, entry_price, stop_loss_price,
+                    take_profit_price, max_yes_entries_per_event,
+                    max_no_entries_per_event, status, eligible_after_event_id
+                ) VALUES ('legacy-zero-fee', ?, ?, 0.77, 0.60, 0.90, 1, 1, 'inactive', NULL)
+            """, (now, now))
+            rule_id = conn.execute("SELECT id FROM rules WHERE name = 'legacy-zero-fee'").fetchone()["id"]
+            conn.execute("""
+                INSERT INTO deals (
+                    rule_id, rule_name, event_id, side, result, entry_at, entry_price,
+                    entry_orderbook_log_id, exit_at, exit_price, exit_reason,
+                    entry_fee_rate, entry_fee_usd, exit_fee_rate, exit_fee_usd,
+                    total_fees_usd, gross_pnl_usd, net_pnl_usd,
+                    fee_calculation_source, created_at, updated_at
+                ) VALUES (?, 'legacy-zero-fee', 'event-a', 'yes', 'win', ?, 0.77,
+                    1, ?, 0.90, 'take_profit', 0, 0, 0, 0, 0, NULL, NULL,
+                    'MARKET_SNAPSHOT', ?, ?)
+            """, (rule_id, now, now, now, now))
+            updated = app.backfill_demo_fee_snapshots(conn)
+            conn.commit()
+
+        self.assertEqual(updated, 1)
+        deal = self.fetch_deals()[0]
+        self.assertEqual(deal["fee_calculation_source"], app.DEMO_FEE_SOURCE_BACKFILL)
+        self.assertGreater(deal["total_fees_usd"], 0)
+        self.assertAlmostEqual(deal["net_pnl_usd"], expected_net_pnl(0.77, 0.90))
+
     def test_excel_and_dashboard_include_rules_and_deals(self):
         active = app.create_rule(valid_rule(name="active"))
         app.create_rule(valid_rule(name="inactive", status="inactive"))
@@ -379,7 +520,7 @@ class RuleDealTests(unittest.TestCase):
 
         data_quality = app.load_data_quality_snapshot()
         self.assertIn(data_quality["status"], {"ok", "needs_review"})
-        self.assertEqual(len(data_quality["checks"]), 9)
+        self.assertEqual(len(data_quality["checks"]), 10)
 
         export_path, row_counts = app.write_xlsx_export()
         self.assertEqual(row_counts["rules"], 2)
@@ -413,11 +554,15 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("רווח/הפסד נטו", html)
         self.assertIn("ROI ממוצע", html)
         self.assertIn("$0.17", html)
+        self.assertIn("<h2>Interactive charts</h2>", html)
+        self.assertIn("<h2>BTC volume on deals</h2>", html)
         self.assertIn("<h2>Rules</h2>", html)
         self.assertIn("<h2>Deals</h2>", html)
         self.assertIn("Create Rule", html)
         self.assertNotIn('http-equiv="refresh"', html)
         self.assertIn("refreshDashboardContent", html)
+        self.assertIn("renderDashboardCharts", html)
+        self.assertIn("https://cdn.jsdelivr.net/npm/chart.js", html)
 
         dashboard_content = client.get("/dashboard-content")
         self.assertEqual(dashboard_content.status_code, 200)
@@ -426,7 +571,9 @@ class RuleDealTests(unittest.TestCase):
         self.assertIn("<h2>תמונת סיכון</h2>", dashboard_content.text)
         self.assertIn("<h2>תנאי שוק</h2>", dashboard_content.text)
         self.assertIn("<h2>מגמות לאורך זמן</h2>", dashboard_content.text)
+        self.assertIn("<h2>Interactive charts</h2>", dashboard_content.text)
         self.assertIn("<h2>גרפים</h2>", dashboard_content.text)
+        self.assertIn("<h2>BTC volume on deals</h2>", dashboard_content.text)
         self.assertIn("<h2>איכות נתונים</h2>", dashboard_content.text)
         self.assertIn("<h2>בריאות מערכת</h2>", dashboard_content.text)
         self.assertIn("<h2>Rules</h2>", dashboard_content.text)
