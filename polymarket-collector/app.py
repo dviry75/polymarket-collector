@@ -5,7 +5,7 @@ import os
 import shutil
 import sqlite3
 import threading
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -61,6 +61,19 @@ except ZoneInfoNotFoundError:
 
 EVENT_CHECK_INTERVAL_SECONDS = 5
 BOOK_CHECK_INTERVAL_SECONDS = 2
+DEMO_INVESTMENT_USD = Decimal("1.00")
+DEMO_FEE_CALCULATION_VERSION = "polymarket-platform-fee-v2-2026-07-21"
+DEMO_FEE_SOURCE_MARKET = "MARKET_SNAPSHOT"
+DEMO_FEE_SOURCE_FALLBACK = "SIMULATED_CRYPTO_DEFAULT"
+DEMO_ENTRY_LIQUIDITY_ROLE = "TAKER"
+DEMO_EXIT_LIQUIDITY_ROLE_BY_REASON = {
+    "stop_loss": "TAKER",
+    "take_profit": "TAKER",
+    "event_resolution": "TAKER",
+}
+POLYMARKET_CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
+MONEY_QUANT = Decimal("0.00000001")
+FEE_QUANT = Decimal("0.00001")
 
 active_market: Optional[dict[str, Any]] = None
 active_market_lock = asyncio.Lock()
@@ -106,6 +119,10 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             "closed",
             "enable_order_book",
             "accepting_orders",
+            "fees_enabled",
+            "fee_rate",
+            "fee_calculation_source",
+            "fee_calculation_version",
             "created_at_poly",
             "created_at_poly_local",
             "discovered_at",
@@ -138,6 +155,10 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             closed,
             enable_order_book,
             accepting_orders,
+            fees_enabled,
+            fee_rate,
+            fee_calculation_source,
+            fee_calculation_version,
             created_at_poly,
             created_at_poly_local,
             discovered_at,
@@ -309,6 +330,23 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             "market_result",
             "price_change_points",
             "return_percent",
+            "investment_usd",
+            "shares",
+            "entry_gross_value_usd",
+            "entry_liquidity_role",
+            "entry_fee_rate",
+            "entry_fee_usd",
+            "exit_gross_value_usd",
+            "exit_liquidity_role",
+            "exit_fee_rate",
+            "exit_fee_usd",
+            "total_fees_usd",
+            "gross_pnl_usd",
+            "net_pnl_usd",
+            "gross_roi_percent",
+            "net_roi_percent",
+            "fee_calculation_source",
+            "fee_calculation_version",
             "created_at",
             "updated_at",
         ],
@@ -330,6 +368,23 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             market_result,
             price_change_points,
             return_percent,
+            investment_usd,
+            shares,
+            entry_gross_value_usd,
+            entry_liquidity_role,
+            entry_fee_rate,
+            entry_fee_usd,
+            exit_gross_value_usd,
+            exit_liquidity_role,
+            exit_fee_rate,
+            exit_fee_usd,
+            total_fees_usd,
+            gross_pnl_usd,
+            net_pnl_usd,
+            gross_roi_percent,
+            net_roi_percent,
+            fee_calculation_source,
+            fee_calculation_version,
             created_at,
             updated_at
         FROM deals
@@ -435,6 +490,10 @@ def init_db() -> None:
             closed INTEGER,
             enable_order_book INTEGER,
             accepting_orders INTEGER,
+            fees_enabled INTEGER,
+            fee_rate REAL,
+            fee_calculation_source TEXT,
+            fee_calculation_version TEXT,
             created_at_poly TEXT,
             created_at_poly_local TEXT,
             discovered_at TEXT,
@@ -536,6 +595,23 @@ def init_db() -> None:
             market_result TEXT,
             price_change_points REAL,
             return_percent REAL,
+            investment_usd REAL,
+            shares REAL,
+            entry_gross_value_usd REAL,
+            entry_liquidity_role TEXT,
+            entry_fee_rate REAL,
+            entry_fee_usd REAL,
+            exit_gross_value_usd REAL,
+            exit_liquidity_role TEXT,
+            exit_fee_rate REAL,
+            exit_fee_usd REAL,
+            total_fees_usd REAL,
+            gross_pnl_usd REAL,
+            net_pnl_usd REAL,
+            gross_roi_percent REAL,
+            net_roi_percent REAL,
+            fee_calculation_source TEXT,
+            fee_calculation_version TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (rule_id) REFERENCES rules(id),
@@ -549,6 +625,10 @@ def init_db() -> None:
         ensure_column(conn, "events", "created_at_poly_local", "TEXT")
         ensure_column(conn, "events", "discovered_at_local", "TEXT")
         ensure_column(conn, "events", "last_seen_at_local", "TEXT")
+        ensure_column(conn, "events", "fees_enabled", "INTEGER")
+        ensure_column(conn, "events", "fee_rate", "REAL")
+        ensure_column(conn, "events", "fee_calculation_source", "TEXT")
+        ensure_column(conn, "events", "fee_calculation_version", "TEXT")
         ensure_column(conn, "orderbook_log", "sampled_at_local", "TEXT")
         ensure_column(conn, "orderbook_log", "up_volume_shares_10s", "REAL")
         ensure_column(conn, "orderbook_log", "down_volume_shares_10s", "REAL")
@@ -575,6 +655,23 @@ def init_db() -> None:
         ensure_column(conn, "btc_volume_log", "error", "TEXT")
         ensure_column(conn, "rules", "eligible_after_event_id", "TEXT")
         ensure_column(conn, "deals", "rule_name", "TEXT")
+        ensure_column(conn, "deals", "investment_usd", "REAL")
+        ensure_column(conn, "deals", "shares", "REAL")
+        ensure_column(conn, "deals", "entry_gross_value_usd", "REAL")
+        ensure_column(conn, "deals", "entry_liquidity_role", "TEXT")
+        ensure_column(conn, "deals", "entry_fee_rate", "REAL")
+        ensure_column(conn, "deals", "entry_fee_usd", "REAL")
+        ensure_column(conn, "deals", "exit_gross_value_usd", "REAL")
+        ensure_column(conn, "deals", "exit_liquidity_role", "TEXT")
+        ensure_column(conn, "deals", "exit_fee_rate", "REAL")
+        ensure_column(conn, "deals", "exit_fee_usd", "REAL")
+        ensure_column(conn, "deals", "total_fees_usd", "REAL")
+        ensure_column(conn, "deals", "gross_pnl_usd", "REAL")
+        ensure_column(conn, "deals", "net_pnl_usd", "REAL")
+        ensure_column(conn, "deals", "gross_roi_percent", "REAL")
+        ensure_column(conn, "deals", "net_roi_percent", "REAL")
+        ensure_column(conn, "deals", "fee_calculation_source", "TEXT")
+        ensure_column(conn, "deals", "fee_calculation_version", "TEXT")
 
         conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_volume_log_unique_bucket
@@ -827,6 +924,165 @@ def calculate_deal_pnl_usd(entry_price: Any, exit_price: Any, investment_usd: An
     return float(pnl), float(roi_percent), float(shares)
 
 
+def decimal_to_float(value: Optional[Decimal]) -> Optional[float]:
+    return None if value is None else float(value)
+
+
+def decimal_money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY_QUANT)
+
+
+def rounded_fee(value: Decimal) -> Decimal:
+    rounded = value.quantize(FEE_QUANT, rounding=ROUND_HALF_UP)
+    return Decimal("0.00000") if rounded < FEE_QUANT else rounded
+
+
+def calculate_platform_fee_usd(
+    shares: Decimal,
+    price: Decimal,
+    fee_rate: Decimal,
+    liquidity_role: str,
+) -> Decimal:
+    if liquidity_role.upper() != "TAKER" or fee_rate <= 0:
+        return Decimal("0.00000")
+    return rounded_fee(shares * fee_rate * price * (Decimal("1") - price))
+
+
+def normalize_fee_rate(value: Any) -> Optional[Decimal]:
+    if value is None or value == "":
+        return None
+    try:
+        rate = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not rate.is_finite() or rate < 0:
+        return None
+    return rate
+
+
+def extract_event_fee_snapshot(event_id: Optional[str], conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
+    snapshot = {
+        "fees_enabled": True,
+        "fee_rate": POLYMARKET_CRYPTO_TAKER_FEE_RATE,
+        "fee_calculation_source": DEMO_FEE_SOURCE_FALLBACK,
+        "fee_calculation_version": DEMO_FEE_CALCULATION_VERSION,
+    }
+    if not event_id:
+        return snapshot
+
+    owns_conn = conn is None
+    active_conn = conn or get_conn()
+    try:
+        row = active_conn.execute("""
+            SELECT fees_enabled, fee_rate, fee_calculation_source, fee_calculation_version
+            FROM events
+            WHERE event_slug = ?
+            LIMIT 1
+        """, (event_id,)).fetchone()
+    finally:
+        if owns_conn:
+            active_conn.close()
+
+    if not row:
+        return snapshot
+
+    fees_enabled = row["fees_enabled"]
+    fee_rate = normalize_fee_rate(row["fee_rate"])
+    if fees_enabled is not None and int(fees_enabled) == 0:
+        return {
+            "fees_enabled": False,
+            "fee_rate": Decimal("0"),
+            "fee_calculation_source": row["fee_calculation_source"] or DEMO_FEE_SOURCE_MARKET,
+            "fee_calculation_version": row["fee_calculation_version"] or DEMO_FEE_CALCULATION_VERSION,
+        }
+    if fee_rate is not None:
+        return {
+            "fees_enabled": True,
+            "fee_rate": fee_rate,
+            "fee_calculation_source": row["fee_calculation_source"] or DEMO_FEE_SOURCE_MARKET,
+            "fee_calculation_version": row["fee_calculation_version"] or DEMO_FEE_CALCULATION_VERSION,
+        }
+    return snapshot
+
+
+def calculate_demo_deal_financials(
+    entry_price: Any,
+    exit_price: Any = None,
+    investment_usd: Any = DEMO_INVESTMENT_USD,
+    entry_liquidity_role: str = DEMO_ENTRY_LIQUIDITY_ROLE,
+    exit_liquidity_role: Optional[str] = None,
+    fee_rate: Any = POLYMARKET_CRYPTO_TAKER_FEE_RATE,
+    fee_source: str = DEMO_FEE_SOURCE_FALLBACK,
+    fee_version: str = DEMO_FEE_CALCULATION_VERSION,
+) -> dict[str, Any]:
+    entry = Decimal(str(entry_price))
+    if entry <= 0:
+        raise ValueError("entry_price must be positive")
+
+    investment = normalize_investment_usd(investment_usd)
+    rate = normalize_fee_rate(fee_rate) or Decimal("0")
+    shares = investment / entry
+    entry_fee = calculate_platform_fee_usd(shares, entry, rate, entry_liquidity_role)
+    result = {
+        "investment_usd": decimal_money(investment),
+        "shares": decimal_money(shares),
+        "entry_gross_value_usd": decimal_money(investment),
+        "entry_liquidity_role": entry_liquidity_role.upper(),
+        "entry_fee_rate": rate,
+        "entry_fee_usd": entry_fee,
+        "fee_calculation_source": fee_source,
+        "fee_calculation_version": fee_version,
+    }
+
+    if exit_price is None:
+        return result
+
+    exit_value = Decimal(str(exit_price))
+    exit_role = (exit_liquidity_role or DEMO_EXIT_LIQUIDITY_ROLE_BY_REASON["event_resolution"]).upper()
+    exit_gross = shares * exit_value
+    gross_pnl = exit_gross - investment
+    exit_fee = calculate_platform_fee_usd(shares, exit_value, rate, exit_role)
+    total_fees = entry_fee + exit_fee
+    net_pnl = gross_pnl - total_fees
+    result.update({
+        "exit_gross_value_usd": decimal_money(exit_gross),
+        "exit_liquidity_role": exit_role,
+        "exit_fee_rate": rate,
+        "exit_fee_usd": exit_fee,
+        "total_fees_usd": total_fees,
+        "gross_pnl_usd": decimal_money(gross_pnl),
+        "net_pnl_usd": decimal_money(net_pnl),
+        "gross_roi_percent": (gross_pnl / investment) * Decimal("100"),
+        "net_roi_percent": (net_pnl / investment) * Decimal("100"),
+    })
+    return result
+
+
+def deal_financials_from_row(deal: sqlite3.Row, investment_usd: Any = 1) -> dict[str, Any]:
+    if "net_pnl_usd" in deal.keys() and deal["net_pnl_usd"] is not None:
+        return {
+            "gross_pnl_usd": float(deal["gross_pnl_usd"] or 0),
+            "net_pnl_usd": float(deal["net_pnl_usd"]),
+            "gross_roi_percent": float(deal["gross_roi_percent"] or 0),
+            "net_roi_percent": float(deal["net_roi_percent"] or 0),
+            "total_fees_usd": float(deal["total_fees_usd"] or 0),
+            "entry_fee_usd": float(deal["entry_fee_usd"] or 0),
+            "exit_fee_usd": float(deal["exit_fee_usd"] or 0),
+            "shares": float(deal["shares"] or 0),
+        }
+    pnl_usd, roi_percent, shares = calculate_deal_pnl_usd(deal["entry_price"], deal["exit_price"], investment_usd)
+    return {
+        "gross_pnl_usd": pnl_usd,
+        "net_pnl_usd": pnl_usd,
+        "gross_roi_percent": roi_percent,
+        "net_roi_percent": roi_percent,
+        "total_fees_usd": 0.0,
+        "entry_fee_usd": 0.0,
+        "exit_fee_usd": 0.0,
+        "shares": shares,
+    }
+
+
 def close_deal(
     conn: sqlite3.Connection,
     deal: sqlite3.Row,
@@ -838,6 +1094,31 @@ def close_deal(
     market_result: Optional[str] = None,
 ) -> None:
     price_change_points, return_percent = calculate_deal_metrics(deal["entry_price"], exit_price)
+    fee_snapshot = extract_event_fee_snapshot(deal["event_id"], conn)
+    fee_rate = normalize_fee_rate(deal["entry_fee_rate"] if "entry_fee_rate" in deal.keys() else None)
+    if fee_rate is None:
+        fee_rate = fee_snapshot["fee_rate"]
+    fee_source = (
+        deal["fee_calculation_source"]
+        if "fee_calculation_source" in deal.keys() and deal["fee_calculation_source"]
+        else fee_snapshot["fee_calculation_source"]
+    )
+    fee_version = (
+        deal["fee_calculation_version"]
+        if "fee_calculation_version" in deal.keys() and deal["fee_calculation_version"]
+        else fee_snapshot["fee_calculation_version"]
+    )
+    exit_role = DEMO_EXIT_LIQUIDITY_ROLE_BY_REASON.get(exit_reason, "TAKER")
+    financials = calculate_demo_deal_financials(
+        deal["entry_price"],
+        exit_price,
+        deal["investment_usd"] if "investment_usd" in deal.keys() and deal["investment_usd"] is not None else DEMO_INVESTMENT_USD,
+        deal["entry_liquidity_role"] if "entry_liquidity_role" in deal.keys() and deal["entry_liquidity_role"] else DEMO_ENTRY_LIQUIDITY_ROLE,
+        exit_role,
+        fee_rate,
+        fee_source,
+        fee_version,
+    )
     conn.execute("""
         UPDATE deals SET
             result = ?,
@@ -848,6 +1129,23 @@ def close_deal(
             market_result = ?,
             price_change_points = ?,
             return_percent = ?,
+            investment_usd = COALESCE(investment_usd, ?),
+            shares = COALESCE(shares, ?),
+            entry_gross_value_usd = COALESCE(entry_gross_value_usd, ?),
+            entry_liquidity_role = COALESCE(entry_liquidity_role, ?),
+            entry_fee_rate = COALESCE(entry_fee_rate, ?),
+            entry_fee_usd = COALESCE(entry_fee_usd, ?),
+            exit_gross_value_usd = ?,
+            exit_liquidity_role = ?,
+            exit_fee_rate = ?,
+            exit_fee_usd = ?,
+            total_fees_usd = ?,
+            gross_pnl_usd = ?,
+            net_pnl_usd = ?,
+            gross_roi_percent = ?,
+            net_roi_percent = ?,
+            fee_calculation_source = COALESCE(fee_calculation_source, ?),
+            fee_calculation_version = COALESCE(fee_calculation_version, ?),
             updated_at = ?
         WHERE id = ? AND result = 'open'
     """, (
@@ -859,6 +1157,23 @@ def close_deal(
         market_result,
         price_change_points,
         return_percent,
+        decimal_to_float(financials["investment_usd"]),
+        decimal_to_float(financials["shares"]),
+        decimal_to_float(financials["entry_gross_value_usd"]),
+        financials["entry_liquidity_role"],
+        decimal_to_float(financials["entry_fee_rate"]),
+        decimal_to_float(financials["entry_fee_usd"]),
+        decimal_to_float(financials["exit_gross_value_usd"]),
+        financials["exit_liquidity_role"],
+        decimal_to_float(financials["exit_fee_rate"]),
+        decimal_to_float(financials["exit_fee_usd"]),
+        decimal_to_float(financials["total_fees_usd"]),
+        decimal_to_float(financials["gross_pnl_usd"]),
+        decimal_to_float(financials["net_pnl_usd"]),
+        decimal_to_float(financials["gross_roi_percent"]),
+        decimal_to_float(financials["net_roi_percent"]),
+        financials["fee_calculation_source"],
+        financials["fee_calculation_version"],
         now_iso(),
         deal["id"],
     ))
@@ -993,6 +1308,41 @@ def is_market_open(event_data: dict[str, Any], market: dict[str, Any]) -> bool:
     )
 
 
+def extract_market_fee_config(event_data: dict[str, Any], market: dict[str, Any]) -> dict[str, Any]:
+    raw_enabled = market.get("feesEnabled", event_data.get("feesEnabled"))
+    fee_schedule = market.get("feeSchedule") or event_data.get("feeSchedule") or {}
+    fd = market.get("fd") or fee_schedule.get("fd") or {}
+    raw_rate = (
+        fee_schedule.get("feeRate")
+        or fee_schedule.get("takerFeeRate")
+        or fd.get("r")
+        or market.get("feeRate")
+        or event_data.get("feeRate")
+    )
+    fee_rate = normalize_fee_rate(raw_rate)
+
+    if raw_enabled is False:
+        return {
+            "fees_enabled": 0,
+            "fee_rate": 0.0,
+            "fee_calculation_source": DEMO_FEE_SOURCE_MARKET,
+            "fee_calculation_version": DEMO_FEE_CALCULATION_VERSION,
+        }
+    if raw_enabled is True and fee_rate is not None:
+        return {
+            "fees_enabled": 1,
+            "fee_rate": float(fee_rate),
+            "fee_calculation_source": DEMO_FEE_SOURCE_MARKET,
+            "fee_calculation_version": DEMO_FEE_CALCULATION_VERSION,
+        }
+    return {
+        "fees_enabled": None,
+        "fee_rate": None,
+        "fee_calculation_source": None,
+        "fee_calculation_version": None,
+    }
+
+
 def extract_market(event_data: dict[str, Any]) -> Optional[dict[str, Any]]:
     markets = event_data.get("markets") or []
     if not markets:
@@ -1019,6 +1369,7 @@ def extract_market(event_data: dict[str, Any]) -> Optional[dict[str, Any]]:
     start_time = event_data.get("startTime") or market.get("eventStartTime") or market.get("startDate")
     end_time = event_data.get("endDate") or market.get("endDate")
     created_at_poly = market.get("createdAt") or event_data.get("createdAt")
+    fee_config = extract_market_fee_config(event_data, market)
 
     return {
         "polymarket_event_id": str(event_data.get("id", "")),
@@ -1041,6 +1392,10 @@ def extract_market(event_data: dict[str, Any]) -> Optional[dict[str, Any]]:
         "closed": 1 if market.get("closed") is True else 0,
         "enable_order_book": 1 if market.get("enableOrderBook") is True else 0,
         "accepting_orders": 1 if market.get("acceptingOrders") is True else 0,
+        "fees_enabled": fee_config["fees_enabled"],
+        "fee_rate": fee_config["fee_rate"],
+        "fee_calculation_source": fee_config["fee_calculation_source"],
+        "fee_calculation_version": fee_config["fee_calculation_version"],
         "created_at_poly": created_at_poly,
         "created_at_poly_local": format_local_datetime(created_at_poly),
         "status": "open" if is_market_open(event_data, market) else "closed",
@@ -1084,6 +1439,10 @@ def upsert_event(market_row: dict[str, Any]) -> None:
                     closed = ?,
                     enable_order_book = ?,
                     accepting_orders = ?,
+                    fees_enabled = ?,
+                    fee_rate = ?,
+                    fee_calculation_source = ?,
+                    fee_calculation_version = ?,
                     created_at_poly = ?,
                     created_at_poly_local = ?,
                     last_seen_at = ?,
@@ -1112,6 +1471,10 @@ def upsert_event(market_row: dict[str, Any]) -> None:
                 market_row["closed"],
                 market_row["enable_order_book"],
                 market_row["accepting_orders"],
+                market_row.get("fees_enabled"),
+                market_row.get("fee_rate"),
+                market_row.get("fee_calculation_source"),
+                market_row.get("fee_calculation_version"),
                 market_row["created_at_poly"],
                 market_row["created_at_poly_local"],
                 last_seen_at,
@@ -1144,6 +1507,10 @@ def upsert_event(market_row: dict[str, Any]) -> None:
                     closed,
                     enable_order_book,
                     accepting_orders,
+                    fees_enabled,
+                    fee_rate,
+                    fee_calculation_source,
+                    fee_calculation_version,
                     created_at_poly,
                     created_at_poly_local,
                     discovered_at,
@@ -1153,7 +1520,7 @@ def upsert_event(market_row: dict[str, Any]) -> None:
                     status,
                     notes,
                     raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 market_row["polymarket_event_id"],
                 market_row["polymarket_market_id"],
@@ -1175,6 +1542,10 @@ def upsert_event(market_row: dict[str, Any]) -> None:
                 market_row["closed"],
                 market_row["enable_order_book"],
                 market_row["accepting_orders"],
+                market_row.get("fees_enabled"),
+                market_row.get("fee_rate"),
+                market_row.get("fee_calculation_source"),
+                market_row.get("fee_calculation_version"),
                 market_row["created_at_poly"],
                 market_row["created_at_poly_local"],
                 discovered_at,
@@ -1769,6 +2140,17 @@ def process_demo_entries(
             continue
 
         created_at = now_iso()
+        fee_snapshot = extract_event_fee_snapshot(event_id, conn)
+        financials = calculate_demo_deal_financials(
+            rule["entry_price"],
+            None,
+            DEMO_INVESTMENT_USD,
+            DEMO_ENTRY_LIQUIDITY_ROLE,
+            None,
+            fee_snapshot["fee_rate"],
+            fee_snapshot["fee_calculation_source"],
+            fee_snapshot["fee_calculation_version"],
+        )
         try:
             cursor = conn.execute("""
                 INSERT INTO deals (
@@ -1780,9 +2162,17 @@ def process_demo_entries(
                     entry_at,
                     entry_price,
                     entry_orderbook_log_id,
+                    investment_usd,
+                    shares,
+                    entry_gross_value_usd,
+                    entry_liquidity_role,
+                    entry_fee_rate,
+                    entry_fee_usd,
+                    fee_calculation_source,
+                    fee_calculation_version,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 rule_id,
                 rule["name"],
@@ -1791,6 +2181,14 @@ def process_demo_entries(
                 orderbook_row["sampled_at"],
                 rule["entry_price"],
                 orderbook_log_id,
+                decimal_to_float(financials["investment_usd"]),
+                decimal_to_float(financials["shares"]),
+                decimal_to_float(financials["entry_gross_value_usd"]),
+                financials["entry_liquidity_role"],
+                decimal_to_float(financials["entry_fee_rate"]),
+                decimal_to_float(financials["entry_fee_usd"]),
+                financials["fee_calculation_source"],
+                financials["fee_calculation_version"],
                 created_at,
                 created_at,
             ))
@@ -2325,16 +2723,7 @@ def load_dashboard_overview(
             WHERE status IS NOT NULL AND status != 'success'
         """).fetchone()[0])
         closed_deals = conn.execute("""
-            SELECT
-                id,
-                rule_id,
-                rule_name,
-                event_id,
-                side,
-                result,
-                entry_price,
-                exit_price,
-                exit_at
+            SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
@@ -2343,21 +2732,35 @@ def load_dashboard_overview(
 
     pnl_values: list[float] = []
     roi_values: list[float] = []
+    gross_pnl_values: list[float] = []
+    total_fees = 0.0
+    entry_fees = 0.0
+    exit_fees = 0.0
+    fee_charged_deals = 0
+    taker_fills = 0
+    maker_fills = 0
     results: list[str] = []
     per_rule: dict[int, dict[str, Any]] = {}
 
     for deal in closed_deals:
         try:
-            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
-                deal["entry_price"],
-                deal["exit_price"],
-                investment,
-            )
+            financials = deal_financials_from_row(deal, investment)
         except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
             continue
 
+        pnl_usd = financials["net_pnl_usd"]
+        roi_percent = financials["net_roi_percent"]
         pnl_values.append(pnl_usd)
         roi_values.append(roi_percent)
+        gross_pnl_values.append(financials["gross_pnl_usd"])
+        total_fees += financials["total_fees_usd"]
+        fee_charged_deals += 1 if financials["total_fees_usd"] > 0 else 0
+        entry_fees += financials["entry_fee_usd"]
+        exit_fees += financials["exit_fee_usd"]
+        taker_fills += 1 if deal["entry_liquidity_role"] == "TAKER" else 0
+        taker_fills += 1 if deal["exit_liquidity_role"] == "TAKER" else 0
+        maker_fills += 1 if deal["entry_liquidity_role"] == "MAKER" else 0
+        maker_fills += 1 if deal["exit_liquidity_role"] == "MAKER" else 0
         results.append(str(deal["result"]))
 
         rule_id = int(deal["rule_id"])
@@ -2378,6 +2781,7 @@ def load_dashboard_overview(
     wins = results.count("win")
     losses = results.count("loss")
     net_pnl = sum(pnl_values)
+    gross_pnl = sum(gross_pnl_values)
     gross_profit = sum(value for value in pnl_values if value > 0)
     gross_loss_abs = abs(sum(value for value in pnl_values if value < 0))
     profit_factor = None if gross_loss_abs == 0 else gross_profit / gross_loss_abs
@@ -2398,7 +2802,18 @@ def load_dashboard_overview(
         "wins": wins,
         "losses": losses,
         "win_rate": (wins / closed_count * 100) if closed_count else None,
+        "gross_pnl_usd": gross_pnl,
         "net_pnl_usd": net_pnl,
+        "total_fees_usd": total_fees,
+        "entry_fees_usd": entry_fees,
+        "exit_fees_usd": exit_fees,
+        "avg_fee_usd": (total_fees / closed_count) if closed_count else None,
+        "fees_to_investment_percent": (total_fees / (float(investment) * closed_count) * 100) if closed_count else None,
+        "fees_to_gross_profit_percent": (total_fees / gross_pnl * 100) if gross_pnl > 0 else None,
+        "fee_charged_deals": fee_charged_deals,
+        "maker_fills": maker_fills,
+        "taker_fills": taker_fills,
+        "estimated_maker_savings_usd": 0.0,
         "avg_pnl_usd": (net_pnl / closed_count) if closed_count else None,
         "avg_roi_percent": (sum(roi_values) / closed_count) if closed_count else None,
         "profit_factor": profit_factor,
@@ -2434,13 +2849,7 @@ def load_rules_performance(
             ORDER BY id ASC
         """).fetchall()
         deals = conn.execute("""
-            SELECT
-                id,
-                rule_id,
-                result,
-                entry_price,
-                exit_price,
-                exit_at
+            SELECT *
             FROM deals
             WHERE result = 'open' OR (result IN ('win', 'loss') AND exit_price IS NOT NULL AND """ + exit_filter + """)
             ORDER BY rule_id ASC, exit_at ASC, id ASC
@@ -2508,13 +2917,11 @@ def load_rules_performance(
             continue
 
         try:
-            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
-                deal["entry_price"],
-                deal["exit_price"],
-                investment,
-            )
+            financials = deal_financials_from_row(deal, investment)
         except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
             continue
+        pnl_usd = financials["net_pnl_usd"]
+        roi_percent = financials["net_roi_percent"]
 
         row["closed_deals"] += 1
         row["wins"] += 1 if deal["result"] == "win" else 0
@@ -2558,17 +2965,7 @@ def load_risk_snapshot(
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         closed_deals = conn.execute("""
-            SELECT
-                id,
-                rule_id,
-                rule_name,
-                event_id,
-                side,
-                result,
-                entry_price,
-                exit_price,
-                exit_at,
-                exit_reason
+            SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
@@ -2587,13 +2984,11 @@ def load_risk_snapshot(
 
     for deal in closed_deals:
         try:
-            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
-                deal["entry_price"],
-                deal["exit_price"],
-                investment,
-            )
+            financials = deal_financials_from_row(deal, investment)
         except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
             continue
+        pnl_usd = financials["net_pnl_usd"]
+        roi_percent = financials["net_roi_percent"]
 
         pnl_values.append(pnl_usd)
         results.append(str(deal["result"]))
@@ -2704,12 +3099,7 @@ def load_market_conditions(
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         closed_deals = conn.execute("""
-            SELECT
-                id,
-                side,
-                result,
-                entry_price,
-                exit_price
+            SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
@@ -2721,13 +3111,11 @@ def load_market_conditions(
 
     for deal in closed_deals:
         try:
-            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
-                deal["entry_price"],
-                deal["exit_price"],
-                investment,
-            )
+            financials = deal_financials_from_row(deal, investment)
         except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
             continue
+        pnl_usd = financials["net_pnl_usd"]
+        roi_percent = financials["net_roi_percent"]
 
         side = str(deal["side"] or "unknown").upper()
         side_group = side_groups.setdefault(side, {
@@ -2850,12 +3238,7 @@ def load_time_trends(
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
     with get_conn() as conn:
         closed_deals = conn.execute("""
-            SELECT
-                id,
-                result,
-                entry_price,
-                exit_price,
-                exit_at
+            SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
@@ -2865,13 +3248,11 @@ def load_time_trends(
     by_day: dict[str, dict[str, Any]] = {}
     for deal in closed_deals:
         try:
-            pnl_usd, roi_percent, _ = calculate_deal_pnl_usd(
-                deal["entry_price"],
-                deal["exit_price"],
-                investment,
-            )
+            financials = deal_financials_from_row(deal, investment)
         except (InvalidOperation, ValueError, TypeError, ZeroDivisionError):
             continue
+        pnl_usd = financials["net_pnl_usd"]
+        roi_percent = financials["net_roi_percent"]
 
         day = local_date_key(deal["exit_at"])
         row = by_day.setdefault(day, {
@@ -2919,6 +3300,13 @@ def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = 
             FROM deals
             WHERE result = 'open' AND entry_at < ?
         """, ((now_utc() - timedelta(minutes=30)).isoformat(),)).fetchone()[0])
+        closed_deals_missing_fee_snapshot = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM deals
+            WHERE result IN ('win', 'loss')
+              AND exit_price IS NOT NULL
+              AND (fee_calculation_source IS NULL OR net_pnl_usd IS NULL)
+        """).fetchone()[0])
         event_status_mismatch = int(conn.execute("""
             SELECT COUNT(*)
             FROM events
@@ -2962,6 +3350,7 @@ def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = 
         ("שגיאות נפח BTC", btc_volume_errors, "warning"),
         ("דלתא נפח BTC שלילית", negative_btc_delta, "error"),
     ]
+    checks.append(("Closed deals missing fee snapshot", closed_deals_missing_fee_snapshot, "warning"))
     issue_count = sum(count for _, count, _ in checks)
     return {
         "status": "ok" if issue_count == 0 else "needs_review",
@@ -2993,7 +3382,10 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
 
     metrics = [
         render_metric("רווח/הפסד נטו", format_money(overview["net_pnl_usd"]), "עסקאות סגורות בלבד"),
+        render_metric("Gross P&L", format_money(overview["gross_pnl_usd"]), "לפני עמלות"),
+        render_metric("Total fees", format_money(overview["total_fees_usd"]), f"Entry {format_money(overview['entry_fees_usd'])} / Exit {format_money(overview['exit_fees_usd'])}"),
         render_metric("עסקאות סגורות", str(overview["closed_deals"]), f"{overview['open_deals']} פתוחות"),
+        render_metric("Avg fee / deal", format_money(overview["avg_fee_usd"]), f"{format_percent(overview['fees_to_investment_percent'])} מההשקעה"),
         render_metric("אחוז הצלחה", format_percent(overview["win_rate"]), f"{overview['wins']} רווחיות / {overview['losses']} הפסדיות"),
         render_metric("ROI ממוצע לעסקה", format_percent(overview["avg_roi_percent"]), f"{format_money(overview['avg_pnl_usd'])} רווח/הפסד ממוצע"),
         render_metric(
@@ -3040,6 +3432,12 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
         <div class="metric-grid">
             {''.join(metrics)}
         </div>
+        <p class="muted">
+            Gross P&L - Entry fees - Exit fees = Net P&L |
+            Maker fills: {overview['maker_fills']} |
+            Taker fills: {overview['taker_fills']} |
+            Deals charged fees: {overview['fee_charged_deals']}
+        </p>
         <p class="muted">
             חוקים פעילים: {overview['active_rules']} |
             סך עסקאות: {overview['total_deals']} |
@@ -3447,6 +3845,28 @@ def write_xlsx_export() -> tuple[Path, dict[str, int]]:
                 row_counts[sheet_name] = count
             finally:
                 cursor.close()
+        overview = load_dashboard_overview(DEMO_INVESTMENT_USD)
+        fee_sheet = workbook.create_sheet("fee_summary")
+        fee_sheet.append(["metric", "value"])
+        fee_metrics = [
+            ("investment_usd", overview["investment_usd"]),
+            ("closed_deals", overview["closed_deals"]),
+            ("gross_pnl_usd", overview["gross_pnl_usd"]),
+            ("entry_fees_usd", overview["entry_fees_usd"]),
+            ("exit_fees_usd", overview["exit_fees_usd"]),
+            ("total_fees_usd", overview["total_fees_usd"]),
+            ("net_pnl_usd", overview["net_pnl_usd"]),
+            ("avg_fee_usd", overview["avg_fee_usd"]),
+            ("fees_to_investment_percent", overview["fees_to_investment_percent"]),
+            ("fees_to_gross_profit_percent", overview["fees_to_gross_profit_percent"]),
+            ("fee_charged_deals", overview["fee_charged_deals"]),
+            ("maker_fills", overview["maker_fills"]),
+            ("taker_fills", overview["taker_fills"]),
+            ("fee_calculation_version", DEMO_FEE_CALCULATION_VERSION),
+        ]
+        for metric, value in fee_metrics:
+            fee_sheet.append([metric, value])
+        row_counts["fee_summary"] = len(fee_metrics)
     finally:
         conn.close()
 
@@ -3690,6 +4110,10 @@ def load_dashboard_rows() -> tuple[
                 closed,
                 enable_order_book,
                 accepting_orders,
+                fees_enabled,
+                fee_rate,
+                fee_calculation_source,
+                fee_calculation_version,
                 created_at_poly,
                 created_at_poly_local,
                 discovered_at,
@@ -3799,7 +4223,19 @@ def load_dashboard_rows() -> tuple[
                 exit_reason,
                 market_result,
                 price_change_points,
-                return_percent
+                return_percent,
+                investment_usd,
+                shares,
+                entry_fee_usd,
+                exit_fee_usd,
+                total_fees_usd,
+                gross_pnl_usd,
+                net_pnl_usd,
+                gross_roi_percent,
+                net_roi_percent,
+                entry_liquidity_role,
+                exit_liquidity_role,
+                fee_calculation_source
             FROM deals
             ORDER BY id DESC
             LIMIT 200

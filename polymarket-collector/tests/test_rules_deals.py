@@ -63,6 +63,10 @@ def orderbook(event_id, *, yes_ask=None, yes_bid=None, no_ask=None, no_bid=None,
     }
 
 
+def expected_net_pnl(entry_price, exit_price):
+    return float(app.calculate_demo_deal_financials(entry_price, exit_price)["net_pnl_usd"])
+
+
 class RuleDealTests(unittest.TestCase):
     def setUp(self):
         self.original_db_path = app.DB_PATH
@@ -293,6 +297,23 @@ class RuleDealTests(unittest.TestCase):
         self.assertAlmostEqual(pnl, (1 / 0.74) * 0.65 - 1)
         self.assertAlmostEqual(roi, ((0.65 - 0.74) / 0.74) * 100)
 
+    def test_demo_fee_calculation_policy(self):
+        financials = app.calculate_demo_deal_financials(0.77, 0.90)
+        self.assertEqual(financials["entry_liquidity_role"], "TAKER")
+        self.assertEqual(financials["exit_liquidity_role"], "TAKER")
+        self.assertEqual(float(financials["entry_fee_rate"]), 0.07)
+        self.assertAlmostEqual(float(financials["entry_fee_usd"]), 0.01610)
+        self.assertAlmostEqual(float(financials["exit_fee_usd"]), 0.00818)
+        self.assertAlmostEqual(float(financials["gross_pnl_usd"]), (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(float(financials["net_pnl_usd"]), 0.14455117)
+
+        maker = app.calculate_demo_deal_financials(0.77, 0.90, entry_liquidity_role="MAKER", exit_liquidity_role="MAKER")
+        self.assertEqual(float(maker["total_fees_usd"]), 0.0)
+        self.assertAlmostEqual(float(maker["net_pnl_usd"]), float(maker["gross_pnl_usd"]))
+
+        no_fee = app.calculate_demo_deal_financials(0.77, 0.90, fee_rate=0)
+        self.assertEqual(float(no_fee["total_fees_usd"]), 0.0)
+
     def test_excel_and_dashboard_include_rules_and_deals(self):
         active = app.create_rule(valid_rule(name="active"))
         app.create_rule(valid_rule(name="inactive", status="inactive"))
@@ -304,7 +325,9 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(overview["closed_deals"], 1)
         self.assertEqual(overview["open_deals"], 0)
         self.assertEqual(overview["wins"], 1)
-        self.assertAlmostEqual(overview["net_pnl_usd"], (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(overview["gross_pnl_usd"], (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(overview["net_pnl_usd"], expected_net_pnl(0.77, 0.90))
+        self.assertGreater(overview["total_fees_usd"], 0)
         self.assertEqual(overview["range"], "all")
         self.assertEqual(app.normalize_dashboard_range("bad-value"), "all")
         self.assertEqual(app.normalize_dashboard_range("custom"), "custom")
@@ -322,13 +345,13 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(rules_performance[0]["rule_name"], "active")
         self.assertEqual(rules_performance[0]["closed_deals"], 1)
         self.assertEqual(rules_performance[0]["wins"], 1)
-        self.assertAlmostEqual(rules_performance[0]["net_pnl_usd"], (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(rules_performance[0]["net_pnl_usd"], expected_net_pnl(0.77, 0.90))
         self.assertEqual(rules_performance[1]["rule_name"], "inactive")
         self.assertEqual(rules_performance[1]["closed_deals"], 0)
 
         risk = app.load_risk_snapshot(1)
         self.assertEqual(risk["closed_deals"], 1)
-        self.assertAlmostEqual(risk["ending_equity_usd"], (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(risk["ending_equity_usd"], expected_net_pnl(0.77, 0.90))
         self.assertAlmostEqual(risk["max_drawdown_usd"], 0)
         self.assertEqual(risk["best_deal"]["deal_id"], 1)
         self.assertEqual(risk["worst_deal"]["deal_id"], 1)
@@ -337,7 +360,7 @@ class RuleDealTests(unittest.TestCase):
         conditions = app.load_market_conditions(1)
         self.assertEqual(conditions["by_side"][0]["label"], "YES")
         self.assertEqual(conditions["by_side"][0]["closed_deals"], 1)
-        self.assertAlmostEqual(conditions["by_side"][0]["net_pnl_usd"], (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(conditions["by_side"][0]["net_pnl_usd"], expected_net_pnl(0.77, 0.90))
         self.assertEqual(conditions["by_entry_price"][0]["label"], "0.70-0.79")
         self.assertEqual(conditions["by_entry_price"][0]["closed_deals"], 1)
 
@@ -352,18 +375,18 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(len(trends), 1)
         self.assertEqual(trends[0]["closed_deals"], 1)
         self.assertEqual(trends[0]["wins"], 1)
-        self.assertAlmostEqual(trends[0]["net_pnl_usd"], (1 / 0.77) * 0.90 - 1)
+        self.assertAlmostEqual(trends[0]["net_pnl_usd"], expected_net_pnl(0.77, 0.90))
 
         data_quality = app.load_data_quality_snapshot()
         self.assertIn(data_quality["status"], {"ok", "needs_review"})
-        self.assertEqual(len(data_quality["checks"]), 8)
+        self.assertEqual(len(data_quality["checks"]), 9)
 
         export_path, row_counts = app.write_xlsx_export()
         self.assertEqual(row_counts["rules"], 2)
         self.assertEqual(row_counts["deals"], 1)
         workbook = load_workbook(export_path, read_only=True)
         try:
-            self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals"])
+            self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals", "fee_summary"])
         finally:
             workbook.close()
 
@@ -425,7 +448,7 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(download.status_code, 200)
         downloaded = load_workbook(BytesIO(download.content), read_only=True)
         try:
-            self.assertEqual(downloaded.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals"])
+            self.assertEqual(downloaded.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals", "fee_summary"])
         finally:
             downloaded.close()
 

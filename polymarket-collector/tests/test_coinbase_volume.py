@@ -216,13 +216,14 @@ class CoinbaseVolumeTests(unittest.TestCase):
 
                 workbook = load_workbook(export_path, read_only=True)
                 try:
-                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals"])
+                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals", "fee_summary"])
                     self.assertEqual(row_counts, {
                         "events": 0,
                         "orderbook_log": 0,
                         "btc_volume_log": 0,
                         "rules": 0,
                         "deals": 0,
+                        "fee_summary": 14,
                     })
                 finally:
                     workbook.close()
@@ -269,7 +270,7 @@ class CoinbaseVolumeTests(unittest.TestCase):
                 )
                 workbook = load_workbook(BytesIO(response.content), read_only=True)
                 try:
-                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals"])
+                    self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals", "fee_summary"])
                 finally:
                     workbook.close()
         finally:
