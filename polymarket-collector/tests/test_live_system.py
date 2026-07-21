@@ -287,8 +287,10 @@ class LiveSystemTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("Polymarket LIVE", response.text)
             self.assertIn("Control Center", response.text)
+            self.assertIn('name="viewport"', response.text)
         self.assertIn("Dry Run Studio", client.get("/live?view=dry-run").text)
         self.assertIn("Deployment Checklist", client.get("/live?view=deployment").text)
+        self.assertIn("attr(data-label)", client.get("/live?view=risk").text)
 
 
 if __name__ == "__main__":

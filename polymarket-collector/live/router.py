@@ -127,7 +127,10 @@ def render_table(rows: list[dict[str, Any]], empty: str = "No rows") -> str:
     head = "".join(f"<th>{html.escape(str(key))}</th>" for key in headers)
     body = ""
     for row in rows:
-        body += "<tr>" + "".join(f"<td>{html.escape('' if row.get(key) is None else str(row.get(key)))}</td>" for key in headers) + "</tr>"
+        body += "<tr>" + "".join(
+            f"<td data-label=\"{html.escape(str(key))}\">{html.escape('' if row.get(key) is None else str(row.get(key)))}</td>"
+            for key in headers
+        ) + "</tr>"
     return f"<div class=\"table-wrap\"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
@@ -192,9 +195,9 @@ def compact_table(rows: list[dict[str, Any]], columns: list[str] | None = None, 
         for key in headers:
             value = row.get(key)
             if key in {"status", "result", "final_decision", "account_identity_status"}:
-                body += f"<td>{chip(value)}</td>"
+                body += f"<td data-label=\"{_e(key)}\">{chip(value)}</td>"
             else:
-                body += f"<td>{_e(value)}</td>"
+                body += f"<td data-label=\"{_e(key)}\">{_e(value)}</td>"
         body += "</tr>"
     return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
@@ -442,6 +445,7 @@ def live_dashboard(request: Request) -> str:
     <html>
     <head>
       <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
       <title>Polymarket LIVE</title>
       <style>
         :root {{ --bg:#151923; --panel:#1b202b; --panel2:#202737; --border:#303747; --muted:#9aa4b2; --fg:#f3f6fa; --up:#66d38e; --down:#ff6b6b; --warn:#f6c85f; --info:#78a6ff; --accent:#2a3243; }}
@@ -456,12 +460,13 @@ def live_dashboard(request: Request) -> str:
         .brand-sub {{ font-size:10px; color:var(--muted); letter-spacing:.12em; text-transform:uppercase; }}
         .nav {{ padding:10px 8px; display:flex; flex-direction:column; gap:3px; }}
         .nav-label {{ padding:10px 8px 4px; color:var(--muted); font-size:10px; letter-spacing:.12em; text-transform:uppercase; }}
-        .nav-item {{ color:var(--muted); text-decoration:none; padding:8px 10px; border-radius:8px; border:1px solid transparent; font-size:13px; }}
+        .nav-item {{ color:var(--muted); text-decoration:none; padding:10px 10px; min-height:44px; display:flex; align-items:center; border-radius:8px; border:1px solid transparent; font-size:13px; }}
         .nav-item:hover {{ color:var(--fg); background:var(--accent); }}
         .nav-item.active {{ color:var(--fg); border-color:rgba(120,166,255,.35); background:rgba(120,166,255,.10); }}
         .main {{ flex:1; min-width:0; display:flex; flex-direction:column; }}
         .topbar {{ height:58px; display:flex; align-items:center; gap:10px; padding:0 16px; border-bottom:1px solid var(--border); background:rgba(27,32,43,.76); backdrop-filter:blur(10px); }}
         .search {{ width:330px; max-width:42vw; height:34px; border:1px solid var(--border); background:#111721; color:var(--fg); border-radius:8px; padding:0 10px; }}
+        .topbar form {{ margin:0; }}
         .top-status {{ margin-left:auto; display:flex; align-items:center; gap:14px; color:var(--muted); font-size:12px; }}
         .dot {{ width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--up); box-shadow:0 0 14px var(--up); }}
         .content {{ padding:18px; overflow:auto; }}
@@ -475,7 +480,7 @@ def live_dashboard(request: Request) -> str:
         .stat-hint {{ color:var(--muted); font-size:11px; margin-top:2px; min-height:14px; }}
         .up {{ color:var(--up); }} .down {{ color:var(--down); }} .warn {{ color:var(--warn); }} .info {{ color:var(--info); }} .neutral {{ color:var(--fg); }}
         .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 14px; }}
-        button, .button {{ border:1px solid var(--border); background:#111721; color:var(--fg); padding:8px 11px; border-radius:8px; text-decoration:none; font:inherit; font-size:12px; cursor:pointer; }}
+        button, .button {{ border:1px solid var(--border); background:#111721; color:var(--fg); min-height:44px; padding:10px 12px; border-radius:8px; text-decoration:none; font:inherit; font-size:12px; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; }}
         button:hover, .button:hover {{ background:var(--accent); }}
         .two-col {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }}
         .panel {{ border:1px solid var(--border); background:var(--panel); border-radius:8px; margin-bottom:14px; overflow:hidden; }}
@@ -495,15 +500,55 @@ def live_dashboard(request: Request) -> str:
         .chip.info {{ color:var(--info); border-color:rgba(120,166,255,.35); background:rgba(120,166,255,.08); }}
         .empty, .muted {{ color:var(--muted); }}
         .dry-form {{ display:grid; grid-template-columns:repeat(7, minmax(120px,1fr)); gap:8px; align-items:center; }}
-        .dry-form input, .dry-form select {{ height:34px; border:1px solid var(--border); background:#111721; color:var(--fg); border-radius:8px; padding:0 9px; }}
+        .dry-form input, .dry-form select {{ min-height:44px; border:1px solid var(--border); background:#111721; color:var(--fg); border-radius:8px; padding:0 10px; font-size:16px; }}
         .json-box {{ margin-top:10px; background:#111721; border:1px solid var(--border); border-radius:8px; padding:10px; color:var(--muted); overflow:auto; max-height:260px; }}
         @media (max-width: 1100px) {{ .sidebar {{ width:210px; }} .stats-grid {{ grid-template-columns:repeat(2,1fr); }} .two-col {{ grid-template-columns:1fr; }} .dry-form {{ grid-template-columns:1fr 1fr; }} }}
+        @media (max-width: 760px) {{
+          .app {{ display:block; min-height:100vh; }}
+          .sidebar {{ position:sticky; top:0; z-index:5; width:100%; border-right:0; border-bottom:1px solid var(--border); }}
+          .brand {{ height:54px; padding:0 12px; }}
+          .logo {{ width:30px; height:30px; }}
+          .brand-title {{ font-size:13px; }}
+          .nav {{ padding:8px 10px; flex-direction:row; gap:8px; overflow-x:auto; scroll-snap-type:x proximity; -webkit-overflow-scrolling:touch; }}
+          .nav-label {{ display:none; }}
+          .nav-item {{ flex:0 0 auto; min-height:44px; padding:9px 12px; scroll-snap-align:start; white-space:nowrap; }}
+          .sidebar > .nav:last-child {{ display:none; }}
+          .main {{ display:block; }}
+          .topbar {{ position:sticky; top:109px; z-index:4; height:auto; min-height:56px; padding:8px 10px; flex-wrap:wrap; align-items:stretch; }}
+          .search {{ order:1; width:100%; max-width:none; height:44px; font-size:16px; }}
+          .topbar .button, .topbar form, .topbar button {{ flex:1 1 112px; }}
+          .top-status {{ order:4; width:100%; margin-left:0; justify-content:space-between; gap:8px; }}
+          .content {{ padding:12px 10px 18px; }}
+          .page-head {{ align-items:flex-start; gap:10px; margin-bottom:12px; }}
+          h1 {{ font-size:20px; }}
+          .subtitle {{ font-size:12px; max-width:280px; }}
+          .stats-grid {{ grid-template-columns:1fr; gap:8px; }}
+          .stat-card {{ min-height:72px; padding:11px; }}
+          .stat-value {{ font-size:20px; }}
+          .actions {{ display:grid; grid-template-columns:1fr; gap:8px; }}
+          .two-col {{ gap:10px; margin-bottom:10px; }}
+          .panel {{ margin-bottom:10px; border-radius:8px; }}
+          .panel-head {{ min-height:40px; height:auto; padding:9px 11px; }}
+          .panel-body {{ padding:10px; }}
+          .table-wrap {{ max-height:none; overflow:visible; border:0; }}
+          table:not(.kv-table) {{ min-width:0; display:block; font-size:12px; }}
+          table:not(.kv-table) thead {{ display:none; }}
+          table:not(.kv-table) tbody {{ display:grid; gap:10px; }}
+          table:not(.kv-table) tr {{ display:block; border:1px solid var(--border); border-radius:8px; background:#111721; overflow:hidden; }}
+          table:not(.kv-table) td {{ display:grid; grid-template-columns:minmax(104px, 38%) 1fr; gap:10px; min-height:36px; padding:8px 10px; white-space:normal; overflow-wrap:anywhere; }}
+          table:not(.kv-table) td::before {{ content:attr(data-label); color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:10px; font-weight:700; }}
+          .kv-table {{ min-width:0; display:table; table-layout:fixed; }}
+          .kv-table th, .kv-table td {{ white-space:normal; overflow-wrap:anywhere; padding:8px 6px; }}
+          .kv-table th {{ width:42%; }}
+          .dry-form {{ grid-template-columns:1fr; gap:8px; }}
+          .json-box {{ max-height:360px; white-space:pre-wrap; overflow-wrap:anywhere; }}
+        }}
       </style>
     </head>
     <body>
       <div class="app">
         <aside class="sidebar">
-          <div class="brand"><div class="logo">◎</div><div><div class="brand-title">Polymarket LIVE</div><div class="brand-sub">Control Center</div></div></div>
+          <div class="brand"><div class="logo">PM</div><div><div class="brand-title">Polymarket LIVE</div><div class="brand-sub">Control Center</div></div></div>
           <nav class="nav"><div class="nav-label">Workspace</div>{nav}</nav>
           <div class="nav-label">Safety</div>
           <div class="nav"><span class="nav-item">Real submission: disabled</span><span class="nav-item">Rules: not seeded</span></div>
