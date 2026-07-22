@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -4469,8 +4470,10 @@ def render_dashboard_scripts() -> str:
       let dashboardChartInstances = [];
 
       function modalIsOpen() {
-        return !document.getElementById("rule-modal").hidden ||
-          !document.getElementById("deactivate-modal").hidden;
+        const ruleModal = document.getElementById("rule-modal");
+        const deactivateModal = document.getElementById("deactivate-modal");
+        return Boolean((ruleModal && !ruleModal.hidden) ||
+          (deactivateModal && !deactivateModal.hidden));
       }
 
       function userIsEditing() {
@@ -4601,7 +4604,8 @@ def render_dashboard_scripts() -> str:
         }
         dashboardRefreshInFlight = true;
         try {
-          const response = await fetch(`/dashboard-content${window.location.search}`, {headers: {"X-Requested-With": "fetch"}});
+          const contentPath = document.body.dataset.contentPath || "/dashboard-content";
+          const response = await fetch(`${contentPath}${window.location.search}`, {headers: {"X-Requested-With": "fetch"}});
           if (response.ok) {
             document.getElementById("dashboard-content").innerHTML = await response.text();
             toggleCustomRangeInputs();
@@ -4613,17 +4617,29 @@ def render_dashboard_scripts() -> str:
       }
 
       function openRuleModal() {
+        if (!document.getElementById("rule-modal")) {
+          return;
+        }
         document.getElementById("rule-error").textContent = "";
         document.getElementById("rule-modal").hidden = false;
       }
       function closeRuleModal() {
+        if (!document.getElementById("rule-modal")) {
+          return;
+        }
         document.getElementById("rule-modal").hidden = true;
       }
       function openDeactivateModal() {
+        if (!document.getElementById("deactivate-modal")) {
+          return;
+        }
         document.getElementById("deactivate-error").textContent = "";
         document.getElementById("deactivate-modal").hidden = false;
       }
       function closeDeactivateModal() {
+        if (!document.getElementById("deactivate-modal")) {
+          return;
+        }
         document.getElementById("deactivate-modal").hidden = true;
       }
       async function submitRule() {
@@ -4849,61 +4865,181 @@ def render_dashboard_content(
 ) -> str:
     dashboard_range = normalize_dashboard_range(dashboard_range)
     overview = load_dashboard_overview(investment_usd, dashboard_range, custom_from, custom_to)
-    rules_performance = load_rules_performance(investment_usd, dashboard_range, custom_from, custom_to)
-    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range, custom_from, custom_to)
-    market_conditions = load_market_conditions(investment_usd, dashboard_range, custom_from, custom_to)
-    system_health = load_system_health_snapshot()
     time_trends = load_time_trends(investment_usd, dashboard_range, custom_from, custom_to)
     btc_volume_trends = load_btc_volume_trends(dashboard_range, custom_from, custom_to)
-    btc_volume_deal_snapshot = load_btc_volume_deal_snapshot(dashboard_range, custom_from, custom_to)
     data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to)
-    events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
         <div class="muted">רענון אוטומטי כל 10 שניות אלא אם טופס פתוח. זמן שרת: {html.escape(now_iso())}. טווח: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
 
         {render_dashboard_overview(overview)}
-        {render_rules_performance(rules_performance)}
-        {render_risk_snapshot(risk_snapshot)}
-        {render_market_conditions(market_conditions)}
         {render_time_trends(time_trends)}
         {render_chartjs_charts(time_trends, btc_volume_trends)}
-        {render_dashboard_charts(time_trends)}
-        {render_btc_volume_deal_snapshot(btc_volume_deal_snapshot)}
         {render_data_quality(data_quality)}
-        {render_system_health(system_health)}
+    """
 
+
+def render_rules_page_content(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> str:
+    dashboard_range = normalize_dashboard_range(dashboard_range)
+    rules_performance = load_rules_performance(investment_usd, dashboard_range, custom_from, custom_to)
+    _, _, _, _, rules, _, _ = load_dashboard_rows()
+    return f"""
+        <div class="storage-status">{html.escape(render_storage_status())}</div>
+        <div class="muted">Auto refresh every 10 seconds unless a form is open. Server time: {html.escape(now_iso())}. Range: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
         <div class="actions">
-            {render_export_actions()}
             {render_rule_actions()}
         </div>
+        {render_rules_performance(rules_performance)}
+        <div class="card">
+            <h2>Rules</h2>
+            {render_table(rules)}
+        </div>
+    """
 
+
+def render_deals_page_content(
+    investment_usd: Any = 1,
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> str:
+    dashboard_range = normalize_dashboard_range(dashboard_range)
+    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range, custom_from, custom_to)
+    market_conditions = load_market_conditions(investment_usd, dashboard_range, custom_from, custom_to)
+    btc_volume_deal_snapshot = load_btc_volume_deal_snapshot(dashboard_range, custom_from, custom_to)
+    _, _, _, _, _, deals, _ = load_dashboard_rows()
+    return f"""
+        <div class="storage-status">{html.escape(render_storage_status())}</div>
+        <div class="muted">Auto refresh every 10 seconds. Server time: {html.escape(now_iso())}. Range: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
+        {render_risk_snapshot(risk_snapshot)}
+        {render_market_conditions(market_conditions)}
+        {render_btc_volume_deal_snapshot(btc_volume_deal_snapshot)}
+        <div class="card">
+            <h2>Deals</h2>
+            {render_table(deals)}
+        </div>
+    """
+
+
+def render_market_data_page_content() -> str:
+    events, logs, btc_volume_rows, btc_volume_summary, _, _, btc_health = load_dashboard_rows()
+    return f"""
+        <div class="storage-status">{html.escape(render_storage_status())}</div>
+        <div class="muted">Auto refresh every 10 seconds. Server time: {html.escape(now_iso())}.</div>
         <div class="card">
             <h2>Events / Markets</h2>
             {render_table(events)}
         </div>
-
         <div class="card">
             <h2>Coinbase BTC Volume</h2>
             {render_btc_volume_summary(btc_volume_summary, btc_health)}
             {render_btc_volume_table(btc_volume_rows)}
         </div>
-
-        <div class="card">
-            <h2>Rules</h2>
-            {render_table(rules)}
-        </div>
-
-        <div class="card">
-            <h2>Deals</h2>
-            {render_table(deals)}
-        </div>
-
         <div class="card">
             <h2>Orderbook Log</h2>
             {render_table(logs)}
         </div>
     """
+
+
+def render_system_page_content(
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> str:
+    dashboard_range = normalize_dashboard_range(dashboard_range)
+    data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to)
+    system_health = load_system_health_snapshot()
+    return f"""
+        <div class="storage-status">{html.escape(render_storage_status())}</div>
+        <div class="muted">Auto refresh every 10 seconds. Server time: {html.escape(now_iso())}. Range: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
+        <div class="actions">
+            {render_export_actions()}
+        </div>
+        {render_data_quality(data_quality)}
+        {render_system_health(system_health)}
+    """
+
+
+PAGE_CONTENT_PATHS = {
+    "overview": "/dashboard-content",
+    "rules": "/rules-page-content",
+    "deals": "/deals-page-content",
+    "market": "/market-data-content",
+    "system": "/system-page-content",
+}
+
+
+def normalize_dashboard_page(value: Any) -> str:
+    selected = str(value or "overview").strip().lower()
+    return selected if selected in PAGE_CONTENT_PATHS else "overview"
+
+
+def page_query(
+    page: str,
+    investment_usd: Any,
+    range_filter: Any,
+    custom_from: Any,
+    custom_to: Any,
+) -> str:
+    params = {
+        "page": page,
+        "investment_usd": investment_usd,
+        "range_filter": range_filter,
+    }
+    if custom_from:
+        params["custom_from"] = custom_from
+    if custom_to:
+        params["custom_to"] = custom_to
+    return urlencode(params)
+
+
+def render_dashboard_nav(
+    active_page: str,
+    investment_usd: Any,
+    range_filter: Any,
+    custom_from: Any,
+    custom_to: Any,
+) -> str:
+    links = [
+        ("overview", "Overview", "/"),
+        ("rules", "Rules", "/rules-page"),
+        ("deals", "Deals", "/deals-page"),
+        ("market", "Market Data", "/market-data"),
+        ("system", "System", "/system-page"),
+    ]
+    items = []
+    for page, label, path in links:
+        query = page_query(page, investment_usd, range_filter, custom_from, custom_to)
+        active_class = " active" if page == active_page else ""
+        items.append(
+            f"<a class=\"nav-link{active_class}\" href=\"{path}?{html.escape(query)}\">{html.escape(label)}</a>"
+        )
+    return f"<nav class=\"top-nav\">{''.join(items)}</nav>"
+
+
+def render_page_content(
+    page: Any,
+    investment_usd: Any = 1,
+    range_filter: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+) -> str:
+    selected = normalize_dashboard_page(page)
+    if selected == "rules":
+        return render_rules_page_content(investment_usd, range_filter, custom_from, custom_to)
+    if selected == "deals":
+        return render_deals_page_content(investment_usd, range_filter, custom_from, custom_to)
+    if selected == "market":
+        return render_market_data_page_content()
+    if selected == "system":
+        return render_system_page_content(range_filter, custom_from, custom_to)
+    return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)
 
 
 @app.get("/dashboard-content", response_class=HTMLResponse)
@@ -4916,13 +5052,52 @@ def dashboard_content(
     return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)
 
 
+@app.get("/rules-page-content", response_class=HTMLResponse)
+def rules_page_content(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return render_rules_page_content(investment_usd, range_filter, custom_from, custom_to)
+
+
+@app.get("/deals-page-content", response_class=HTMLResponse)
+def deals_page_content(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return render_deals_page_content(investment_usd, range_filter, custom_from, custom_to)
+
+
+@app.get("/market-data-content", response_class=HTMLResponse)
+def market_data_content() -> str:
+    return render_market_data_page_content()
+
+
+@app.get("/system-page-content", response_class=HTMLResponse)
+def system_page_content(
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return render_system_page_content(range_filter, custom_from, custom_to)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(
     investment_usd: float = 1.0,
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    page: str = "overview",
 ) -> str:
+    active_page = normalize_dashboard_page(page)
+    content_path = PAGE_CONTENT_PATHS[active_page]
+    page_content = render_page_content(active_page, investment_usd, range_filter, custom_from, custom_to)
+    nav = render_dashboard_nav(active_page, investment_usd, range_filter, custom_from, custom_to)
     return f"""
     <!doctype html>
     <html>
@@ -4939,6 +5114,30 @@ def dashboard(
             }}
             h1, h2 {{
                 margin-bottom: 8px;
+            }}
+            .top-nav {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin: 12px 0 20px 0;
+            }}
+            .nav-link {{
+                display: inline-flex;
+                align-items: center;
+                min-height: 36px;
+                padding: 0 12px;
+                border: 1px solid #d4d4d4;
+                border-radius: 6px;
+                color: #222;
+                background: #fff;
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            .nav-link.active {{
+                color: #fff;
+                background: #111;
+                border-color: #111;
             }}
             .card {{
                 background: white;
@@ -5194,15 +5393,56 @@ def dashboard(
             }}
         </style>
     </head>
-    <body>
+    <body data-content-path="{html.escape(content_path)}">
         <h1>Polymarket BTC Collector</h1>
+        {nav}
         <div id="dashboard-content">
-            {render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)}
+            {page_content}
         </div>
         {render_dashboard_scripts()}
     </body>
     </html>
     """
+
+
+@app.get("/rules-page", response_class=HTMLResponse)
+def rules_page(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, "rules")
+
+
+@app.get("/deals-page", response_class=HTMLResponse)
+def deals_page(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, "deals")
+
+
+@app.get("/market-data", response_class=HTMLResponse)
+def market_data_page(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, "market")
+
+
+@app.get("/system-page", response_class=HTMLResponse)
+def system_page(
+    investment_usd: float = 1.0,
+    range_filter: str = "all",
+    custom_from: str = "",
+    custom_to: str = "",
+) -> str:
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, "system")
 
 
 @app.post("/rules")
