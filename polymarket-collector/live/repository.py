@@ -322,6 +322,12 @@ class LiveRepository:
 
     def _ensure_live_columns(self) -> None:
         additions = {
+            "live_websocket_events": {
+                "message_type": "TEXT", "message_status": "TEXT", "outcome": "TEXT",
+                "side": "TEXT", "price": "REAL", "original_size": "REAL",
+                "matched_size": "REAL", "remaining_size": "REAL", "liquidity_role": "TEXT",
+                "transaction_hash": "TEXT", "event_timestamp": "TEXT", "correlation_json": "TEXT",
+            },
             "live_account_snapshots": {
                 "configured_profile_address": "TEXT",
                 "account_login_type": "TEXT",
@@ -645,31 +651,34 @@ class LiveRepository:
         message_hash = sha256_text(json_dumps(message))
         try:
             with self.connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO live_websocket_events (
-                        channel, event_type, condition_id, asset_id, polymarket_order_id,
-                        polymarket_trade_id, message_hash, received_at, processed_at, status, raw_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        channel,
-                        message.get("event_type") or message.get("type"),
-                        message.get("condition_id") or message.get("market"),
-                        message.get("asset_id") or message.get("asset_id"),
-                        message.get("order_id"),
-                        message.get("trade_id"),
-                        message_hash,
-                        now_iso(),
-                        now_iso() if status == "processed" else None,
-                        status,
-                        json_dumps(message),
-                    ),
-                )
+                conn.execute("""INSERT INTO live_websocket_events (
+                    channel,event_type,condition_id,asset_id,polymarket_order_id,polymarket_trade_id,
+                    message_hash,received_at,processed_at,status,raw_message,message_type,message_status,
+                    outcome,side,price,original_size,matched_size,remaining_size,liquidity_role,
+                    transaction_hash,event_timestamp,correlation_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (channel,message.get("event_type"),message.get("condition_id"),message.get("asset_id"),
+                     message.get("order_id"),message.get("trade_id"),message_hash,now_iso(),now_iso() if status=="processed" else None,
+                     status,json_dumps(message),message.get("message_type"),message.get("message_status"),message.get("outcome"),
+                     message.get("side"),message.get("price"),message.get("original_size"),message.get("matched_size"),
+                     message.get("remaining_size"),message.get("liquidity_role"),message.get("transaction_hash"),
+                     message.get("event_timestamp"),json_dumps(message.get("correlation") or {})))
                 conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def user_ws_condition_ids(self) -> list[str]:
+        with self.connect() as conn:
+            rows=conn.execute("SELECT condition_id FROM live_markets WHERE market_resolved=0 ORDER BY accepting_orders DESC,id DESC LIMIT 2").fetchall()
+            old=conn.execute("SELECT DISTINCT condition_id FROM live_orders WHERE condition_id IS NOT NULL AND status NOT IN ('filled','cancelled','unmatched','failed')").fetchall()
+        return list(dict.fromkeys(str(row[0]) for row in [*rows,*old] if row[0]))
+
+    def outcome_for_asset(self, condition_id: str | None, asset_id: str | None) -> str | None:
+        market=self.latest_market(condition_id) if condition_id and asset_id else None
+        if not market: return None
+        if str(market.get("yes_token_id"))==str(asset_id): return "YES"
+        if str(market.get("no_token_id"))==str(asset_id): return "NO"
+        return None
 
     def start_reconciliation(self) -> int:
         with self.connect() as conn:

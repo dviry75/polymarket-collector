@@ -8,7 +8,6 @@ from .config import redact
 
 
 REQUIRED_SECRET_NAMES = (
-    "POLYMARKET_PRIVATE_KEY",
     "POLYMARKET_API_KEY",
     "POLYMARKET_API_SECRET",
     "POLYMARKET_API_PASSPHRASE",
@@ -53,5 +52,5 @@ def secret_readiness(provider: SecretProvider) -> dict[str, object]:
         "configured_count": sum(1 for value in values.values() if value),
         "missing": [name for name, value in values.items() if not value],
         "redacted": {name: redact(value) for name, value in values.items() if value},
-        "real_credentials_configured": all(values[name] for name in REQUIRED_SECRET_NAMES[:4]),
+        "user_ws_credentials_configured": all(values[name] for name in REQUIRED_SECRET_NAMES[:3]),
     }

@@ -50,7 +50,10 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _orders = OrderManager(_repo, _risk, _adapter)
     _reconciliation = ReconciliationWorker(_repo, _adapter)
     _market_ws = MarketWebSocketManager(_repo, stale_after_seconds=_config.max_market_data_age_seconds)
-    _user_ws = UserWebSocketManager(_repo, stale_after_seconds=_config.max_user_state_age_seconds)
+    _user_ws = UserWebSocketManager(
+        _repo, stale_after_seconds=_config.max_user_state_age_seconds,
+        reconciliation=lambda: _reconciliation.run_once(actor="user_ws_reconnect"),
+    )
     _engine = TradingEngine(_repo, _orders)
     _auth = LiveAuthManager(_config, session_version_getter=lambda: _repo.get_state("session_version", "1") if _repo else "1")
     _dry_run = DryRunService(_repo, _risk)
@@ -331,6 +334,7 @@ def dashboard_content(view: str = "overview") -> str:
     </div>
     """
     overview = f"""
+      <div class="panel" style="border:2px solid #b91c1c;color:#b91c1c;font-weight:800">READ-ONLY — REAL TRADING DISABLED</div>
       <div class="stats-grid">{stats}</div>
       {actions}
       <div class="two-col">
@@ -378,7 +382,14 @@ def dashboard_content(view: str = "overview") -> str:
                 ("Market WS", market_health.get("status"), None),
                 ("Market WS Last", market_health.get("last_message_at") or "never", None),
                 ("User WS", user_health.get("status"), None),
+                ("User WS Connected At", user_health.get("connected_at") or "never", None),
                 ("User WS Last", user_health.get("last_message_at") or "never", None),
+                ("User WS Last PONG", user_health.get("last_pong_at") or "never", None),
+                ("User WS Reconnects", user_health.get("reconnect_count"), None),
+                ("User WS Orders", user_health.get("order_events_received"), None),
+                ("User WS Trades", user_health.get("trade_events_received"), None),
+                ("User WS Markets", ", ".join(user_health.get("subscribed_condition_ids") or []) or "none", None),
+                ("User WS Error", user_health.get("last_error") or "none", None),
                 ("Reconciliation", summary["reconciliation"], None),
                 ("Export", _export_state.get("status"), None),
             ]))}
@@ -427,6 +438,17 @@ def dashboard_content(view: str = "overview") -> str:
         """,
         "reconciliation": f"""
           {actions}
+          {panel("User WebSocket", kv_table([
+              ("Status", user_health.get("status"), None),
+              ("Connected At", user_health.get("connected_at") or "never", None),
+              ("Last Message", user_health.get("last_message_at") or "never", None),
+              ("Last PONG", user_health.get("last_pong_at") or "never", None),
+              ("Reconnects", user_health.get("reconnect_count"), None),
+              ("Order Events", user_health.get("order_events_received"), None),
+              ("Trade Events", user_health.get("trade_events_received"), None),
+              ("Markets", ", ".join(user_health.get("subscribed_condition_ids") or []) or "none", None),
+              ("Error", user_health.get("last_error") or "none", None),
+          ]))}
           {panel("Reconciliation Runs", compact_table(repo.list_table("live_reconciliation_runs", 100), ["id", "started_at", "finished_at", "status", "gaps_count", "error"]))}
         """,
         "orders": f"""

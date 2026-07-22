@@ -68,6 +68,7 @@ class LiveConfig:
     clob_host: str = "https://clob.polymarket.com"
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    user_ws_enabled: bool = True
     max_market_data_age_seconds: int = 5
     max_user_state_age_seconds: int = 15
     max_reconciliation_age_seconds: int = 30
@@ -120,6 +121,7 @@ class LiveConfig:
             clob_host=_env("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"),
             market_ws_url=_env("POLYMARKET_MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
             user_ws_url=_env("POLYMARKET_USER_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/user"),
+            user_ws_enabled=_bool_env("POLYMARKET_USER_WS_ENABLED", True),
             max_market_data_age_seconds=int(_env("LIVE_MARKET_DATA_STALE_AFTER_SECONDS", _env("LIVE_MAX_MARKET_DATA_AGE_SECONDS", "5")) or "5"),
             max_user_state_age_seconds=int(_env("LIVE_USER_STATE_STALE_AFTER_SECONDS", "15") or "15"),
             max_reconciliation_age_seconds=int(_env("LIVE_RECONCILIATION_MAX_AGE_SECONDS", _env("LIVE_MAX_RECONCILIATION_AGE_SECONDS", "30")) or "30"),
