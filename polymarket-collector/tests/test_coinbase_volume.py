@@ -1,11 +1,13 @@
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 import asyncio
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
@@ -231,6 +233,115 @@ class CoinbaseVolumeTests(unittest.TestCase):
             app.DB_PATH = original_db_path
             app.EXPORT_DIR = original_export_dir
 
+    def test_xlsx_export_does_not_lock_live_db_while_workbook_is_saved(self):
+        original_db_path = app.DB_PATH
+        original_export_dir = app.EXPORT_DIR
+
+        class SlowWorksheet:
+            def append(self, _row):
+                return None
+
+        class SlowWorkbook:
+            def __init__(self, write_only=False):
+                self.write_only = write_only
+
+            def create_sheet(self, _name):
+                return SlowWorksheet()
+
+            def save(self, path):
+                save_started.set()
+                release_save.wait(timeout=5)
+                Path(path).write_bytes(b"fake xlsx")
+
+        save_started = threading.Event()
+        release_save = threading.Event()
+        errors = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                app.DB_PATH = temp_path / "test.sqlite3"
+                app.EXPORT_DIR = temp_path / "output"
+                app.init_db()
+
+                with patch.object(app, "Workbook", SlowWorkbook):
+                    export_thread = threading.Thread(target=lambda: app.write_xlsx_export(), daemon=True)
+                    export_thread.start()
+                    self.assertTrue(save_started.wait(timeout=5))
+
+                    try:
+                        inserted = app.insert_btc_volume_log({
+                            "sampled_at": app.now_iso(),
+                            "sample_bucket_at": "2026-07-22T16:10:00+00:00",
+                            "candle_start_at": "2026-07-22T16:10:00+00:00",
+                            "product_id": "BTC-USD",
+                            "granularity_seconds": 300,
+                            "volume_btc_cumulative": 1.0,
+                            "volume_btc_delta": None,
+                            "seconds_since_previous_sample": None,
+                            "event_slug": None,
+                            "condition_id": None,
+                            "source": "test",
+                            "status": "baseline",
+                            "error": None,
+                        })
+                        self.assertTrue(inserted)
+                    except Exception as exc:
+                        errors.append(exc)
+                    finally:
+                        release_save.set()
+                        export_thread.join(timeout=5)
+
+                self.assertFalse(export_thread.is_alive())
+                self.assertEqual(errors, [])
+        finally:
+            release_save.set()
+            app.DB_PATH = original_db_path
+            app.EXPORT_DIR = original_export_dir
+
+    def test_xlsx_export_failure_cleans_snapshot_and_partial_file(self):
+        original_db_path = app.DB_PATH
+        original_export_dir = app.EXPORT_DIR
+
+        class FailingWorksheet:
+            def append(self, _row):
+                return None
+
+        class FailingWorkbook:
+            def __init__(self, write_only=False):
+                self.write_only = write_only
+
+            def create_sheet(self, _name):
+                return FailingWorksheet()
+
+            def save(self, path):
+                Path(path).write_bytes(b"partial")
+                raise RuntimeError("forced save failure")
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                app.DB_PATH = temp_path / "test.sqlite3"
+                app.EXPORT_DIR = temp_path / "output"
+                app.init_db()
+
+                with patch.object(app, "Workbook", FailingWorkbook):
+                    with self.assertRaises(RuntimeError):
+                        app.write_xlsx_export()
+
+                leftovers = list(app.EXPORT_DIR.glob(".export_snapshot_*")) + list(app.EXPORT_DIR.glob("*.tmp.xlsx"))
+                self.assertEqual(leftovers, [])
+        finally:
+            app.DB_PATH = original_db_path
+            app.EXPORT_DIR = original_export_dir
+
+    def test_xlsx_export_uses_chunked_reads(self):
+        import inspect
+
+        source = inspect.getsource(app.write_xlsx_export)
+        self.assertIn("fetchmany(EXPORT_FETCH_CHUNK_SIZE)", source)
+        self.assertNotIn("fetchall()", source)
+
     def test_download_xlsx_serves_latest_generated_file(self):
         original_db_path = app.DB_PATH
         original_export_dir = app.EXPORT_DIR
@@ -276,6 +387,27 @@ class CoinbaseVolumeTests(unittest.TestCase):
         finally:
             app.DB_PATH = original_db_path
             app.EXPORT_DIR = original_export_dir
+            app.export_state.update(original_export_state)
+
+    def test_generate_xlsx_rejects_parallel_export(self):
+        original_export_state = dict(app.export_state)
+        try:
+            app.export_state.update({
+                "status": "running",
+                "started_at": app.now_iso(),
+                "finished_at": None,
+                "filename": None,
+                "path": None,
+                "error": None,
+                "row_counts": None,
+            })
+            client = TestClient(app.app)
+
+            response = client.post("/generate.xlsx")
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("Export already in progress", response.text)
+        finally:
             app.export_state.update(original_export_state)
 
     def test_fetch_current_coinbase_candle_retry_succeeds_second_attempt(self):

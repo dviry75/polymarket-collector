@@ -28,6 +28,10 @@ DB_PATH = APP_DIR / "poly_data.sqlite3"
 EXPORT_DIR = APP_DIR / "output"
 EXPORT_FILE_PREFIX = "polymarket_data_"
 EXPORT_FILE_SUFFIX = ".xlsx"
+EXPORT_FETCH_CHUNK_SIZE = 5000
+EXPORT_SNAPSHOT_PREFIX = ".export_snapshot_"
+SQLITE_TIMEOUT_SECONDS = 10
+SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
 
 
 def env_int(name: str, default: int) -> int:
@@ -420,8 +424,21 @@ class ClosingConnection(sqlite3.Connection):
         return result
 
 
+def configure_sqlite_connection(conn: sqlite3.Connection, *, set_journal_mode: bool = True) -> None:
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    if set_journal_mode:
+        conn.execute("PRAGMA journal_mode=WAL")
+
+
+def connect_sqlite(path: Path, *, set_journal_mode: bool = True) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SECONDS, factory=ClosingConnection)
+    configure_sqlite_connection(conn, set_journal_mode=set_journal_mode)
+    return conn
+
+
 def connect_db() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH, factory=ClosingConnection)
+    return connect_sqlite(DB_PATH)
 
 
 def now_utc() -> datetime:
@@ -2908,11 +2925,15 @@ def load_dashboard_overview(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
     entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range, custom_from, custom_to)
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
-    with get_conn() as conn:
+    owns_conn = conn is None
+    if conn is None:
+        conn = get_conn()
+    try:
         total_deals = int(conn.execute(f"SELECT COUNT(*) FROM deals WHERE {entry_filter}", entry_params).fetchone()[0])
         open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
         btc_volume_gt_6_deals = int(conn.execute(f"""
@@ -2941,6 +2962,9 @@ def load_dashboard_overview(
                 AND """ + exit_filter + """
             ORDER BY exit_at ASC, id ASC
         """, exit_params).fetchall()
+    finally:
+        if owns_conn:
+            conn.close()
 
     pnl_values: list[float] = []
     roi_values: list[float] = []
@@ -4224,6 +4248,30 @@ def latest_export_path() -> Optional[Path]:
     return exports[0] if exports else None
 
 
+def create_sqlite_snapshot(snapshot_path: Path) -> None:
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    source_conn = connect_db()
+    snapshot_conn = connect_sqlite(snapshot_path, set_journal_mode=False)
+    try:
+        source_conn.backup(snapshot_conn)
+        snapshot_conn.commit()
+    finally:
+        snapshot_conn.close()
+        source_conn.close()
+
+
+def cleanup_export_temp_file(path: Path) -> bool:
+    removed = False
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm"), Path(f"{path}-journal")):
+        try:
+            if candidate.exists():
+                candidate.unlink()
+                removed = True
+        except OSError as exc:
+            print(f"[export] cleanup warning path={candidate}: {type(exc).__name__}: {exc}", flush=True)
+    return removed
+
+
 def write_xlsx_export() -> tuple[Path, dict[str, int]]:
     init_db()
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -4231,28 +4279,48 @@ def write_xlsx_export() -> tuple[Path, dict[str, int]]:
     timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
     final_path = EXPORT_DIR / f"{EXPORT_FILE_PREFIX}{timestamp}{EXPORT_FILE_SUFFIX}"
     temp_path = EXPORT_DIR / f".{final_path.stem}.tmp{EXPORT_FILE_SUFFIX}"
+    snapshot_path = EXPORT_DIR / f"{EXPORT_SNAPSHOT_PREFIX}{timestamp}.sqlite3"
     row_counts: dict[str, int] = {}
+    started_at = now_utc()
 
-    workbook = Workbook(write_only=True)
-    conn = connect_db()
+    print(f"[export] started path={final_path}", flush=True)
+    create_sqlite_snapshot(snapshot_path)
+    print(
+        f"[export] snapshot_created path={snapshot_path} "
+        f"duration_seconds={(now_utc() - started_at).total_seconds():.3f}",
+        flush=True,
+    )
+
+    workbook: Optional[Workbook] = None
+    conn: Optional[sqlite3.Connection] = None
     try:
+        workbook = Workbook(write_only=True)
+        conn = connect_sqlite(snapshot_path, set_journal_mode=False)
+        conn.row_factory = sqlite3.Row
         for sheet_name, headers, query in EXPORT_SHEETS:
+            sheet_started_at = now_utc()
+            print(f"[export] sheet_started sheet={sheet_name}", flush=True)
             worksheet = workbook.create_sheet(sheet_name)
             worksheet.append(headers)
             cursor = conn.execute(query)
             try:
                 count = 0
                 while True:
-                    rows = cursor.fetchmany(1000)
+                    rows = cursor.fetchmany(EXPORT_FETCH_CHUNK_SIZE)
                     if not rows:
                         break
                     for row in rows:
                         worksheet.append(list(row))
                     count += len(rows)
                 row_counts[sheet_name] = count
+                print(
+                    f"[export] sheet_completed sheet={sheet_name} rows={count} "
+                    f"duration_seconds={(now_utc() - sheet_started_at).total_seconds():.3f}",
+                    flush=True,
+                )
             finally:
                 cursor.close()
-        overview = load_dashboard_overview(DEMO_INVESTMENT_USD)
+        overview = load_dashboard_overview(DEMO_INVESTMENT_USD, conn=conn)
         fee_sheet = workbook.create_sheet("fee_summary")
         fee_sheet.append(["metric", "value"])
         fee_metrics = [
@@ -4274,12 +4342,23 @@ def write_xlsx_export() -> tuple[Path, dict[str, int]]:
         for metric, value in fee_metrics:
             fee_sheet.append([metric, value])
         row_counts["fee_summary"] = len(fee_metrics)
+        workbook.save(temp_path)
+        temp_path.replace(final_path)
+        print(
+            f"[export] completed path={final_path} size_bytes={final_path.stat().st_size} "
+            f"duration_seconds={(now_utc() - started_at).total_seconds():.3f} rows={row_counts}",
+            flush=True,
+        )
+        return final_path, row_counts
+    except Exception as exc:
+        cleanup_export_temp_file(temp_path)
+        print(f"[export] failed error={type(exc).__name__}: {exc}", flush=True)
+        raise
     finally:
-        conn.close()
-
-    workbook.save(temp_path)
-    temp_path.replace(final_path)
-    return final_path, row_counts
+        if conn is not None:
+            conn.close()
+        snapshot_removed = cleanup_export_temp_file(snapshot_path)
+        print(f"[export] cleanup_completed snapshot_removed={snapshot_removed}", flush=True)
 
 
 def run_xlsx_export() -> None:
@@ -5177,17 +5256,18 @@ def api_get_deals() -> list[dict[str, Any]]:
 
 
 @app.post("/generate.xlsx")
-def generate_xlsx(background_tasks: BackgroundTasks) -> RedirectResponse:
+def generate_xlsx(background_tasks: BackgroundTasks):
     with export_state_lock:
-        if export_state.get("status") != "running":
-            export_state.update({
-                "status": "running",
-                "started_at": now_iso(),
-                "finished_at": None,
-                "error": None,
-                "row_counts": None,
-            })
-            background_tasks.add_task(run_xlsx_export)
+        if export_state.get("status") == "running":
+            return HTMLResponse("Export already in progress", status_code=409)
+        export_state.update({
+            "status": "running",
+            "started_at": now_iso(),
+            "finished_at": None,
+            "error": None,
+            "row_counts": None,
+        })
+        background_tasks.add_task(run_xlsx_export)
 
     return RedirectResponse("/", status_code=303)
 
