@@ -79,6 +79,16 @@ DEMO_EXIT_LIQUIDITY_ROLE_BY_REASON = {
 POLYMARKET_CRYPTO_TAKER_FEE_RATE = Decimal("0.07")
 MONEY_QUANT = Decimal("0.00000001")
 FEE_QUANT = Decimal("0.00001")
+DEFAULT_SCHEDULE_TIMEZONE = "Asia/Jerusalem"
+WEEKDAY_LABELS_HE = {
+    0: "שני",
+    1: "שלישי",
+    2: "רביעי",
+    3: "חמישי",
+    4: "שישי",
+    5: "שבת",
+    6: "ראשון",
+}
 
 active_market: Optional[dict[str, Any]] = None
 active_market_lock = asyncio.Lock()
@@ -298,6 +308,9 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             "max_no_entries_per_event",
             "status",
             "eligible_after_event_id",
+            "entry_window_start_seconds_before_end",
+            "entry_window_end_seconds_before_end",
+            "schedule_timezone",
         ],
         """
         SELECT
@@ -311,7 +324,10 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             max_yes_entries_per_event,
             max_no_entries_per_event,
             status,
-            eligible_after_event_id
+            eligible_after_event_id,
+            entry_window_start_seconds_before_end,
+            entry_window_end_seconds_before_end,
+            schedule_timezone
         FROM rules
         ORDER BY id ASC
         """,
@@ -357,6 +373,7 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             "entry_btc_volume_status",
             "fee_calculation_source",
             "fee_calculation_version",
+            "entry_seconds_before_event_end",
             "created_at",
             "updated_at",
         ],
@@ -400,10 +417,37 @@ EXPORT_SHEETS: list[tuple[str, list[str], str]] = [
             entry_btc_volume_status,
             fee_calculation_source,
             fee_calculation_version,
+            entry_seconds_before_event_end,
             created_at,
             updated_at
         FROM deals
         ORDER BY id ASC
+        """,
+    ),
+    (
+        "rule_inactive_windows",
+        [
+            "id",
+            "rule_id",
+            "day_of_week",
+            "start_time",
+            "end_time",
+            "status",
+            "created_at",
+            "updated_at",
+        ],
+        """
+        SELECT
+            id,
+            rule_id,
+            day_of_week,
+            start_time,
+            end_time,
+            status,
+            created_at,
+            updated_at
+        FROM rule_inactive_windows
+        ORDER BY rule_id ASC, day_of_week ASC, start_time ASC, id ASC
         """,
     ),
 ]
@@ -607,7 +651,24 @@ def init_db() -> None:
             max_yes_entries_per_event INTEGER NOT NULL,
             max_no_entries_per_event INTEGER NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
-            eligible_after_event_id TEXT
+            eligible_after_event_id TEXT,
+            entry_window_start_seconds_before_end INTEGER,
+            entry_window_end_seconds_before_end INTEGER,
+            schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Jerusalem'
+        )
+        """)
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS rule_inactive_windows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER NOT NULL,
+            day_of_week INTEGER NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE
         )
         """)
 
@@ -651,6 +712,7 @@ def init_db() -> None:
             entry_btc_volume_status TEXT,
             fee_calculation_source TEXT,
             fee_calculation_version TEXT,
+            entry_seconds_before_event_end INTEGER,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (rule_id) REFERENCES rules(id),
@@ -694,6 +756,9 @@ def init_db() -> None:
         ensure_column(conn, "btc_volume_log", "status", "TEXT")
         ensure_column(conn, "btc_volume_log", "error", "TEXT")
         ensure_column(conn, "rules", "eligible_after_event_id", "TEXT")
+        ensure_column(conn, "rules", "entry_window_start_seconds_before_end", "INTEGER")
+        ensure_column(conn, "rules", "entry_window_end_seconds_before_end", "INTEGER")
+        ensure_column(conn, "rules", "schedule_timezone", "TEXT NOT NULL DEFAULT 'Asia/Jerusalem'")
         ensure_column(conn, "deals", "rule_name", "TEXT")
         ensure_column(conn, "deals", "investment_usd", "REAL")
         ensure_column(conn, "deals", "shares", "REAL")
@@ -717,6 +782,8 @@ def init_db() -> None:
         ensure_column(conn, "deals", "entry_btc_volume_status", "TEXT")
         ensure_column(conn, "deals", "fee_calculation_source", "TEXT")
         ensure_column(conn, "deals", "fee_calculation_version", "TEXT")
+        ensure_column(conn, "deals", "entry_seconds_before_event_end", "INTEGER")
+        conn.execute("UPDATE rules SET schedule_timezone = ? WHERE schedule_timezone IS NULL OR schedule_timezone = ''", (DEFAULT_SCHEDULE_TIMEZONE,))
 
         conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_btc_volume_log_unique_bucket
@@ -737,6 +804,10 @@ def init_db() -> None:
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_rules_status
         ON rules (status)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_rule_inactive_windows_rule_day_status
+        ON rule_inactive_windows (rule_id, day_of_week, status)
         """)
         conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_deals_rule_id
@@ -767,6 +838,16 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_deals_entry_btc_volume_delta
         ON deals (entry_btc_volume_btc_delta)
         """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_entry_at
+        ON deals (entry_at)
+        """)
+        conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_deals_exit_at
+        ON deals (exit_at)
+        """)
+
+        backfill_entry_seconds_before_event_end(conn)
 
         backfill_demo_fee_snapshots(conn)
 
@@ -829,6 +910,54 @@ def find_entry_btc_volume_snapshot(
         ORDER BY sampled_at DESC, id DESC
         LIMIT 1
     """, params).fetchone()
+
+
+def calculate_entry_seconds_before_event_end(
+    conn: sqlite3.Connection,
+    event_id: Any,
+    entry_at: Any,
+) -> Optional[int]:
+    entry_dt = parse_iso_datetime(str(entry_at)) if entry_at else None
+    if entry_dt is None:
+        return None
+    if entry_dt.tzinfo is None:
+        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+
+    event = conn.execute(
+        "SELECT end_time FROM events WHERE event_slug = ? LIMIT 1",
+        (str(event_id),),
+    ).fetchone()
+    if not event or not event["end_time"]:
+        return None
+
+    end_dt = parse_iso_datetime(str(event["end_time"]))
+    if end_dt is None:
+        return None
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+    return int((end_dt - entry_dt).total_seconds())
+
+
+def backfill_entry_seconds_before_event_end(conn: sqlite3.Connection) -> tuple[int, int]:
+    conn.row_factory = sqlite3.Row
+    deals = conn.execute("""
+        SELECT id, event_id, entry_at
+        FROM deals
+        WHERE entry_seconds_before_event_end IS NULL
+          AND entry_at IS NOT NULL
+    """).fetchall()
+    updated = 0
+    for deal in deals:
+        seconds = calculate_entry_seconds_before_event_end(conn, deal["event_id"], deal["entry_at"])
+        if seconds is None:
+            continue
+        conn.execute(
+            "UPDATE deals SET entry_seconds_before_event_end = ?, updated_at = ? WHERE id = ?",
+            (seconds, now_iso(), deal["id"]),
+        )
+        updated += 1
+    return updated, len(deals) - updated
 
 
 def backfill_deal_btc_volume_snapshots(conn: sqlite3.Connection) -> None:
@@ -894,6 +1023,65 @@ def prices_equal(left: Any, right: Any) -> bool:
     return left_price is not None and right_price is not None and left_price == right_price
 
 
+def optional_non_negative_int(value: Any, field_name: str) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    if number < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return number
+
+
+def normalize_schedule_timezone(value: Any) -> str:
+    timezone_name = str(value or DEFAULT_SCHEDULE_TIMEZONE).strip() or DEFAULT_SCHEDULE_TIMEZONE
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        raise ValueError("schedule_timezone must be a valid IANA timezone")
+    return timezone_name
+
+
+def normalize_clock_time(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            parsed = datetime.strptime(text, fmt).time()
+            return parsed.strftime("%H:%M:%S")
+        except ValueError:
+            continue
+    raise ValueError(f"{field_name} must use HH:MM or HH:MM:SS")
+
+
+def validate_inactive_windows(value: Any) -> list[dict[str, Any]]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValueError("inactive_windows must be a list")
+    windows: list[dict[str, Any]] = []
+    for index, window in enumerate(value):
+        if not isinstance(window, dict):
+            raise ValueError(f"inactive_windows[{index}] must be an object")
+        try:
+            day_of_week = int(window.get("day_of_week"))
+        except (TypeError, ValueError):
+            raise ValueError(f"inactive_windows[{index}].day_of_week must be 0-6")
+        if day_of_week < 0 or day_of_week > 6:
+            raise ValueError(f"inactive_windows[{index}].day_of_week must be 0-6")
+        status = str(window.get("status", "active")).strip().lower()
+        if status not in {"active", "inactive"}:
+            raise ValueError(f"inactive_windows[{index}].status must be active or inactive")
+        windows.append({
+            "day_of_week": day_of_week,
+            "start_time": normalize_clock_time(window.get("start_time"), f"inactive_windows[{index}].start_time"),
+            "end_time": normalize_clock_time(window.get("end_time"), f"inactive_windows[{index}].end_time"),
+            "status": status,
+        })
+    return windows
+
+
 def validate_rule_payload(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name", "")).strip()
     if not name:
@@ -925,6 +1113,19 @@ def validate_rule_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if status not in {"active", "inactive"}:
         raise ValueError("status must be active or inactive")
 
+    window_start = optional_non_negative_int(
+        payload.get("entry_window_start_seconds_before_end"),
+        "entry_window_start_seconds_before_end",
+    )
+    window_end = optional_non_negative_int(
+        payload.get("entry_window_end_seconds_before_end"),
+        "entry_window_end_seconds_before_end",
+    )
+    if (window_start is None) != (window_end is None):
+        raise ValueError("entry window start and end must both be empty or both be set")
+    if window_start is not None and window_end is not None and window_start < window_end:
+        raise ValueError("entry_window_start_seconds_before_end must be >= entry_window_end_seconds_before_end")
+
     return {
         "name": name,
         "entry_price": float(entry_price),
@@ -933,6 +1134,10 @@ def validate_rule_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "max_yes_entries_per_event": max_yes,
         "max_no_entries_per_event": max_no,
         "status": status,
+        "entry_window_start_seconds_before_end": window_start,
+        "entry_window_end_seconds_before_end": window_end,
+        "schedule_timezone": normalize_schedule_timezone(payload.get("schedule_timezone")),
+        "inactive_windows": validate_inactive_windows(payload.get("inactive_windows")),
     }
 
 
@@ -959,8 +1164,11 @@ def create_rule(payload: dict[str, Any]) -> sqlite3.Row:
                     max_yes_entries_per_event,
                     max_no_entries_per_event,
                     status,
-                    eligible_after_event_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    eligible_after_event_id,
+                    entry_window_start_seconds_before_end,
+                    entry_window_end_seconds_before_end,
+                    schedule_timezone
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 values["name"],
                 created_at,
@@ -972,8 +1180,25 @@ def create_rule(payload: dict[str, Any]) -> sqlite3.Row:
                 values["max_no_entries_per_event"],
                 values["status"],
                 eligible_after_event_id,
+                values["entry_window_start_seconds_before_end"],
+                values["entry_window_end_seconds_before_end"],
+                values["schedule_timezone"],
             ))
             rule_id = cursor.lastrowid
+            for window in values["inactive_windows"]:
+                conn.execute("""
+                    INSERT INTO rule_inactive_windows (
+                        rule_id, day_of_week, start_time, end_time, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    rule_id,
+                    window["day_of_week"],
+                    window["start_time"],
+                    window["end_time"],
+                    window["status"],
+                    created_at,
+                    created_at,
+                ))
             conn.commit()
             row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
     except sqlite3.Error as exc:
@@ -992,6 +1217,35 @@ def create_rule(payload: dict[str, Any]) -> sqlite3.Row:
 
 def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
+
+
+def load_rule_inactive_windows(conn: sqlite3.Connection, rule_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    if not rule_ids:
+        return {}
+    placeholders = ",".join("?" for _ in rule_ids)
+    rows = conn.execute(f"""
+        SELECT *
+        FROM rule_inactive_windows
+        WHERE rule_id IN ({placeholders})
+        ORDER BY rule_id ASC, day_of_week ASC, start_time ASC, id ASC
+    """, tuple(rule_ids)).fetchall()
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = row_to_dict(row)
+        item["day_label_he"] = WEEKDAY_LABELS_HE.get(int(row["day_of_week"]), str(row["day_of_week"]))
+        grouped.setdefault(int(row["rule_id"]), []).append(item)
+    return grouped
+
+
+def rules_to_dicts(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    rule_ids = [int(row["id"]) for row in rows]
+    windows_by_rule = load_rule_inactive_windows(conn, rule_ids)
+    result = []
+    for row in rows:
+        item = row_to_dict(row)
+        item["inactive_windows"] = windows_by_rule.get(int(row["id"]), [])
+        result.append(item)
+    return result
 
 
 def deactivate_rule(rule_id: int) -> tuple[sqlite3.Row, str]:
@@ -2221,6 +2475,73 @@ def has_open_deal(conn: sqlite3.Connection, rule_id: int) -> bool:
     return row is not None
 
 
+def clock_seconds(value: str) -> int:
+    hour, minute, second = (int(part) for part in value.split(":"))
+    return hour * 3600 + minute * 60 + second
+
+
+def local_datetime_for_rule(rule: sqlite3.Row, sampled_at: Any) -> Optional[datetime]:
+    sampled = parse_iso_datetime(str(sampled_at)) if sampled_at else None
+    if sampled is None:
+        return None
+    if sampled.tzinfo is None:
+        sampled = sampled.replace(tzinfo=timezone.utc)
+    try:
+        rule_timezone = ZoneInfo(rule["schedule_timezone"] or DEFAULT_SCHEDULE_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        rule_timezone = ZoneInfo(DEFAULT_SCHEDULE_TIMEZONE)
+    return sampled.astimezone(rule_timezone)
+
+
+def rule_in_inactive_window(conn: sqlite3.Connection, rule: sqlite3.Row, sampled_at: Any) -> bool:
+    local_dt = local_datetime_for_rule(rule, sampled_at)
+    if local_dt is None:
+        return False
+    current_day = local_dt.weekday()
+    current_second = local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+    rows = conn.execute("""
+        SELECT day_of_week, start_time, end_time
+        FROM rule_inactive_windows
+        WHERE rule_id = ? AND status = 'active'
+    """, (rule["id"],)).fetchall()
+    for window in rows:
+        start_second = clock_seconds(window["start_time"])
+        end_second = clock_seconds(window["end_time"])
+        window_day = int(window["day_of_week"])
+        if start_second <= end_second:
+            if current_day == window_day and start_second <= current_second < end_second:
+                return True
+            continue
+        if current_day == window_day and current_second >= start_second:
+            return True
+        if current_day == ((window_day + 1) % 7) and current_second < end_second:
+            return True
+    return False
+
+
+def entry_window_allows_rule(
+    conn: sqlite3.Connection,
+    rule: sqlite3.Row,
+    event_id: str,
+    sampled_at: Any,
+) -> tuple[bool, Optional[int], str]:
+    start_seconds = rule["entry_window_start_seconds_before_end"]
+    end_seconds = rule["entry_window_end_seconds_before_end"]
+    if start_seconds is None and end_seconds is None:
+        return True, None, ""
+
+    remaining = calculate_entry_seconds_before_event_end(conn, event_id, sampled_at)
+    if remaining is None:
+        return False, None, "missing_event_end_time"
+    if remaining <= 0:
+        return False, remaining, "event_ended"
+    if remaining > int(start_seconds):
+        return False, remaining, "before_entry_window"
+    if remaining < int(end_seconds):
+        return False, remaining, "after_entry_window"
+    return True, remaining, ""
+
+
 def process_demo_exits(
     conn: sqlite3.Connection,
     orderbook_row: dict[str, Any],
@@ -2313,6 +2634,10 @@ def process_demo_entries(
             print(f"[rules] rule id={rule_id} waits for next event after {event_id}", flush=True)
             continue
 
+        if rule_in_inactive_window(conn, rule, orderbook_row.get("sampled_at")):
+            print(f"[rules] rule id={rule_id} inactive window blocks entry event_id={event_id}", flush=True)
+            continue
+
         yes_match = prices_equal(side_ask(orderbook_row, "yes"), rule["entry_price"])
         no_match = prices_equal(side_ask(orderbook_row, "no"), rule["entry_price"])
 
@@ -2342,6 +2667,20 @@ def process_demo_entries(
             print(
                 f"[deals] entry quota reached rule_id={rule_id} event_id={event_id} "
                 f"side={side} quota={max_entries}",
+                flush=True,
+            )
+            continue
+
+        entry_allowed, entry_seconds_before_end, reason = entry_window_allows_rule(
+            conn,
+            rule,
+            event_id,
+            orderbook_row.get("sampled_at"),
+        )
+        if not entry_allowed:
+            print(
+                f"[rules] rule id={rule_id} entry window blocks entry event_id={event_id} "
+                f"remaining_seconds={entry_seconds_before_end} reason={reason}",
                 flush=True,
             )
             continue
@@ -2383,9 +2722,10 @@ def process_demo_entries(
                     entry_btc_volume_status,
                     fee_calculation_source,
                     fee_calculation_version,
+                    entry_seconds_before_event_end,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 rule_id,
                 rule["name"],
@@ -2407,6 +2747,7 @@ def process_demo_entries(
                 volume_snapshot["status"] if volume_snapshot else None,
                 financials["fee_calculation_source"],
                 financials["fee_calculation_version"],
+                entry_seconds_before_end,
                 created_at,
                 created_at,
             ))
@@ -2906,6 +3247,50 @@ def time_filter_sql(
     return " AND ".join(clauses), tuple(params)
 
 
+def parse_rule_filter(value: Any) -> list[int]:
+    text = str(value or "all").strip().lower()
+    if not text or text == "all":
+        return []
+    rule_ids: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            rule_id = int(part)
+        except ValueError:
+            continue
+        if rule_id > 0 and rule_id not in rule_ids:
+            rule_ids.append(rule_id)
+    return rule_ids
+
+
+def normalize_rule_filter(value: Any) -> str:
+    rule_ids = parse_rule_filter(value)
+    return ",".join(str(rule_id) for rule_id in rule_ids) if rule_ids else "all"
+
+
+def rule_filter_sql(column: str, rule_filter: Any) -> tuple[str, tuple[Any, ...]]:
+    rule_ids = parse_rule_filter(rule_filter)
+    if not rule_ids:
+        return "1 = 1", ()
+    placeholders = ",".join("?" for _ in rule_ids)
+    return f"{column} IN ({placeholders})", tuple(rule_ids)
+
+
+def dashboard_rule_label(rule_filter: Any) -> str:
+    rule_ids = parse_rule_filter(rule_filter)
+    if not rule_ids:
+        return "כל החוקים"
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT id, name FROM rules WHERE id IN ({','.join('?' for _ in rule_ids)}) ORDER BY id ASC",
+            tuple(rule_ids),
+        ).fetchall()
+    names = [f"{row['name']} (#{row['id']})" for row in rows]
+    return ", ".join(names) if names else ", ".join(f"Rule #{rule_id}" for rule_id in rule_ids)
+
+
 def deal_matches_range(deal: sqlite3.Row, dashboard_range: Any, custom_from: Any = None, custom_to: Any = None) -> bool:
     start, end = dashboard_range_bounds(dashboard_range, custom_from, custom_to)
     exit_at = deal["exit_at"] if "exit_at" in deal.keys() else None
@@ -2926,30 +3311,44 @@ def load_dashboard_overview(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
     conn: Optional[sqlite3.Connection] = None,
 ) -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
     entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range, custom_from, custom_to)
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
+    deal_rule_filter, deal_rule_params = rule_filter_sql("rule_id", rule_filter)
+    active_rule_filter, active_rule_params = rule_filter_sql("id", rule_filter)
     owns_conn = conn is None
     if conn is None:
         conn = get_conn()
     try:
-        total_deals = int(conn.execute(f"SELECT COUNT(*) FROM deals WHERE {entry_filter}", entry_params).fetchone()[0])
-        open_deals = int(conn.execute("SELECT COUNT(*) FROM deals WHERE result = 'open'").fetchone()[0])
+        total_deals = int(conn.execute(
+            f"SELECT COUNT(*) FROM deals WHERE {entry_filter} AND {deal_rule_filter}",
+            entry_params + deal_rule_params,
+        ).fetchone()[0])
+        open_deals = int(conn.execute(
+            f"SELECT COUNT(*) FROM deals WHERE result = 'open' AND {deal_rule_filter}",
+            deal_rule_params,
+        ).fetchone()[0])
         btc_volume_gt_6_deals = int(conn.execute(f"""
             SELECT COUNT(*)
             FROM deals
             WHERE entry_btc_volume_btc_delta > 6
               AND {entry_filter}
-        """, entry_params).fetchone()[0])
+              AND {deal_rule_filter}
+        """, entry_params + deal_rule_params).fetchone()[0])
         missing_btc_volume_snapshot_deals = int(conn.execute(f"""
             SELECT COUNT(*)
             FROM deals
             WHERE entry_btc_volume_log_id IS NULL
               AND {entry_filter}
-        """, entry_params).fetchone()[0])
-        active_rules = int(conn.execute("SELECT COUNT(*) FROM rules WHERE status = 'active'").fetchone()[0])
+              AND {deal_rule_filter}
+        """, entry_params + deal_rule_params).fetchone()[0])
+        active_rules = int(conn.execute(
+            f"SELECT COUNT(*) FROM rules WHERE status = 'active' AND {active_rule_filter}",
+            active_rule_params,
+        ).fetchone()[0])
         last_orderbook_sample = conn.execute("SELECT MAX(sampled_at) FROM orderbook_log").fetchone()[0]
         orderbook_errors = int(conn.execute("""
             SELECT COUNT(*)
@@ -2961,8 +3360,9 @@ def load_dashboard_overview(
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
+                AND """ + deal_rule_filter + """
             ORDER BY exit_at ASC, id ASC
-        """, exit_params).fetchall()
+        """, exit_params + deal_rule_params).fetchall()
     finally:
         if owns_conn:
             conn.close()
@@ -3030,6 +3430,8 @@ def load_dashboard_overview(
         "investment_usd": float(investment),
         "range": normalize_dashboard_range(dashboard_range),
         "range_label": dashboard_range_label(dashboard_range, custom_from, custom_to),
+        "rule_filter": normalize_rule_filter(rule_filter),
+        "rule_label": dashboard_rule_label(rule_filter),
         "custom_from": dashboard_datetime_input_value(custom_from),
         "custom_to": dashboard_datetime_input_value(custom_to),
         "total_deals": total_deals,
@@ -3072,11 +3474,14 @@ def load_rules_performance(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> list[dict[str, Any]]:
     investment = normalize_investment_usd(investment_usd)
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
+    rules_filter, rules_params = rule_filter_sql("id", rule_filter)
+    deals_rule_filter, deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
-        rules = conn.execute("""
+        rules = conn.execute(f"""
             SELECT
                 id,
                 name,
@@ -3085,14 +3490,16 @@ def load_rules_performance(
                 stop_loss_price,
                 take_profit_price
             FROM rules
+            WHERE {rules_filter}
             ORDER BY id ASC
-        """).fetchall()
+        """, rules_params).fetchall()
         deals = conn.execute("""
             SELECT *
             FROM deals
-            WHERE result = 'open' OR (result IN ('win', 'loss') AND exit_price IS NOT NULL AND """ + exit_filter + """)
+            WHERE """ + deals_rule_filter + """
+              AND (result = 'open' OR (result IN ('win', 'loss') AND exit_price IS NOT NULL AND """ + exit_filter + """))
             ORDER BY rule_id ASC, exit_at ASC, id ASC
-        """, exit_params).fetchall()
+        """, deals_rule_params + exit_params).fetchall()
 
     performance: dict[int, dict[str, Any]] = {}
     for rule in rules:
@@ -3199,17 +3606,20 @@ def load_risk_snapshot(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> dict[str, Any]:
     investment = normalize_investment_usd(investment_usd)
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
+    deals_rule_filter, deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
+                AND """ + deals_rule_filter + """
             ORDER BY exit_at ASC, id ASC
-        """, exit_params).fetchall()
+        """, exit_params + deals_rule_params).fetchall()
 
     equity = 0.0
     peak = 0.0
@@ -3333,17 +3743,20 @@ def load_market_conditions(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> dict[str, list[dict[str, Any]]]:
     investment = normalize_investment_usd(investment_usd)
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
+    deals_rule_filter, deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
+                AND """ + deals_rule_filter + """
             ORDER BY id ASC
-        """, exit_params).fetchall()
+        """, exit_params + deals_rule_params).fetchall()
 
     side_groups: dict[str, dict[str, Any]] = {}
     price_groups: dict[str, dict[str, Any]] = {}
@@ -3479,17 +3892,20 @@ def load_time_trends(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> list[dict[str, Any]]:
     investment = normalize_investment_usd(investment_usd)
     exit_filter, exit_params = time_filter_sql("exit_at", dashboard_range, custom_from, custom_to)
+    deals_rule_filter, deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
         closed_deals = conn.execute("""
             SELECT *
             FROM deals
             WHERE result IN ('win', 'loss') AND exit_price IS NOT NULL
                 AND """ + exit_filter + """
+                AND """ + deals_rule_filter + """
             ORDER BY exit_at ASC, id ASC
-        """, exit_params).fetchall()
+        """, exit_params + deals_rule_params).fetchall()
 
     by_day: dict[str, dict[str, Any]] = {}
     for deal in closed_deals:
@@ -3560,8 +3976,14 @@ def load_btc_volume_trends(
     return result
 
 
-def load_btc_volume_deal_snapshot(dashboard_range: Any = "all", custom_from: Any = None, custom_to: Any = None) -> dict[str, Any]:
+def load_btc_volume_deal_snapshot(
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+    rule_filter: Any = "all",
+) -> dict[str, Any]:
     entry_filter, entry_params = time_filter_sql("entry_at", dashboard_range, custom_from, custom_to)
+    deals_rule_filter, deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
         summary = conn.execute("""
             SELECT
@@ -3571,7 +3993,8 @@ def load_btc_volume_deal_snapshot(dashboard_range: Any = "all", custom_from: Any
                 AVG(entry_btc_volume_btc_delta) AS avg_delta,
                 MAX(entry_btc_volume_btc_delta) AS max_delta
             FROM deals
-            WHERE """ + entry_filter, entry_params).fetchone()
+            WHERE """ + entry_filter + """
+              AND """ + deals_rule_filter, entry_params + deals_rule_params).fetchone()
         rows = conn.execute("""
             SELECT
                 id,
@@ -3586,9 +4009,10 @@ def load_btc_volume_deal_snapshot(dashboard_range: Any = "all", custom_from: Any
             FROM deals
             WHERE entry_btc_volume_btc_delta > 6
               AND """ + entry_filter + """
+              AND """ + deals_rule_filter + """
             ORDER BY entry_btc_volume_btc_delta DESC, entry_at DESC
             LIMIT 25
-        """, entry_params).fetchall()
+        """, entry_params + deals_rule_params).fetchall()
 
     return {
         "total_deals": int(summary["total_deals"] or 0),
@@ -3600,39 +4024,45 @@ def load_btc_volume_deal_snapshot(dashboard_range: Any = "all", custom_from: Any
     }
 
 
-def load_data_quality_snapshot(dashboard_range: Any = "all", custom_from: Any = None, custom_to: Any = None) -> dict[str, Any]:
+def load_data_quality_snapshot(
+    dashboard_range: Any = "all",
+    custom_from: Any = None,
+    custom_to: Any = None,
+    rule_filter: Any = "all",
+) -> dict[str, Any]:
     orderbook_filter, orderbook_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
     btc_filter, btc_params = time_filter_sql("sampled_at", dashboard_range, custom_from, custom_to)
+    deals_rule_filter, deals_rule_params = rule_filter_sql("d.rule_id", rule_filter)
+    simple_deals_rule_filter, simple_deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
         missing_rule_deals = int(conn.execute("""
             SELECT COUNT(*)
             FROM deals d
             LEFT JOIN rules r ON r.id = d.rule_id
-            WHERE r.id IS NULL
-        """).fetchone()[0])
+            WHERE r.id IS NULL AND """ + deals_rule_filter, deals_rule_params).fetchone()[0])
         missing_event_deals = int(conn.execute("""
             SELECT COUNT(*)
             FROM deals d
             LEFT JOIN events e ON e.event_slug = d.event_id
-            WHERE d.event_id IS NOT NULL AND e.event_slug IS NULL
-        """).fetchone()[0])
+            WHERE d.event_id IS NOT NULL AND e.event_slug IS NULL AND """ + deals_rule_filter, deals_rule_params).fetchone()[0])
         stale_open_deals = int(conn.execute("""
             SELECT COUNT(*)
             FROM deals
-            WHERE result = 'open' AND entry_at < ?
-        """, ((now_utc() - timedelta(minutes=30)).isoformat(),)).fetchone()[0])
+            WHERE result = 'open' AND entry_at < ? AND """ + simple_deals_rule_filter,
+            ((now_utc() - timedelta(minutes=30)).isoformat(),) + simple_deals_rule_params,
+        ).fetchone()[0])
         closed_deals_missing_fee_snapshot = int(conn.execute("""
             SELECT COUNT(*)
             FROM deals
             WHERE result IN ('win', 'loss')
               AND exit_price IS NOT NULL
               AND (fee_calculation_source IS NULL OR net_pnl_usd IS NULL)
-        """).fetchone()[0])
+              AND """ + simple_deals_rule_filter, simple_deals_rule_params).fetchone()[0])
         deals_missing_btc_volume_snapshot = int(conn.execute("""
             SELECT COUNT(*)
             FROM deals
             WHERE entry_btc_volume_log_id IS NULL
-        """).fetchone()[0])
+              AND """ + simple_deals_rule_filter, simple_deals_rule_params).fetchone()[0])
         event_status_mismatch = int(conn.execute("""
             SELECT COUNT(*)
             FROM events
@@ -3728,12 +4158,20 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
 
     investment_value = display_value(overview["investment_usd"])
     selected_range = normalize_dashboard_range(overview.get("range"))
+    selected_rule_filter = normalize_rule_filter(overview.get("rule_filter"))
     custom_from_value = html.escape(str(overview.get("custom_from") or ""))
     custom_to_value = html.escape(str(overview.get("custom_to") or ""))
     range_options = "".join(
         f"<option value=\"{html.escape(value)}\"{' selected' if value == selected_range else ''}>{html.escape(label)}</option>"
         for value, label in dashboard_range_options()
     )
+    with get_conn() as conn:
+        rules = conn.execute("SELECT id, name FROM rules ORDER BY id ASC").fetchall()
+    rule_options = [f"<option value=\"all\"{' selected' if selected_rule_filter == 'all' else ''}>כל החוקים</option>"]
+    for rule in rules:
+        value = str(rule["id"])
+        selected = " selected" if selected_rule_filter == value else ""
+        rule_options.append(f"<option value=\"{value}\"{selected}>{html.escape(rule['name'])} (#{rule['id']})</option>")
     return f"""
     <div class="card overview-card">
         <div class="overview-header">
@@ -3747,6 +4185,9 @@ def render_dashboard_overview(overview: dict[str, Any]) -> str:
                 </label>
                 <label>טווח תאריכים
                     <select name="range_filter" id="range-filter" onchange="toggleCustomRangeInputs()">{range_options}</select>
+                </label>
+                <label>Rule filter
+                    <select name="rule_filter" id="rule-filter" onchange="rememberRuleFilterDefault()">{''.join(rule_options)}</select>
                 </label>
                 <label class="custom-range-field">מתאריך ושעה
                     <input name="custom_from" type="text" inputmode="numeric" placeholder="DD/MM/YYYY HH:mm" value="{custom_from_value}">
@@ -4435,6 +4876,12 @@ def render_rule_actions() -> str:
         <label>Take profit <input id="rule-take" type="number" step="0.01" min="0.01" max="0.99"></label>
         <label>Max YES entries <input id="rule-max-yes" type="number" step="1" min="0" value="1"></label>
         <label>Max NO entries <input id="rule-max-no" type="number" step="1" min="0" value="1"></label>
+        <label>Entry window start, seconds before event end <input id="rule-window-start" type="number" step="1" min="0" placeholder="120"></label>
+        <label>Entry window end, seconds before event end <input id="rule-window-end" type="number" step="1" min="0" placeholder="0"></label>
+        <label>Schedule timezone <input id="rule-timezone" type="text" value="Asia/Jerusalem"></label>
+        <h3>Inactive windows</h3>
+        <div id="inactive-windows"></div>
+        <button class="button secondary" type="button" onclick="addInactiveWindow()">Add inactive window</button>
         <label>Status
           <select id="rule-status">
             <option value="active">active</option>
@@ -4494,6 +4941,28 @@ def render_dashboard_scripts() -> str:
         document.querySelectorAll(".custom-range-field").forEach((element) => {
           element.hidden = !visible;
         });
+      }
+
+      function rememberRuleFilterDefault() {
+        const ruleFilter = document.getElementById("rule-filter");
+        if (ruleFilter) {
+          window.localStorage.setItem("polymarket.dashboard.defaultRuleFilter", ruleFilter.value || "all");
+        }
+      }
+
+      function applyDefaultRuleFilter() {
+        const params = new URLSearchParams(window.location.search);
+        const ruleFilter = document.getElementById("rule-filter");
+        if (!ruleFilter || params.has("rule_filter")) {
+          return;
+        }
+        const saved = window.localStorage.getItem("polymarket.dashboard.defaultRuleFilter");
+        if (saved && [...ruleFilter.options].some((option) => option.value === saved)) {
+          ruleFilter.value = saved;
+          params.set("rule_filter", saved);
+          window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+          refreshDashboardContent(true);
+        }
       }
 
       function readDashboardChartData() {
@@ -4629,6 +5098,49 @@ def render_dashboard_scripts() -> str:
         }
         document.getElementById("rule-modal").hidden = true;
       }
+      function addInactiveWindow(windowData = {}) {
+        const container = document.getElementById("inactive-windows");
+        if (!container) {
+          return;
+        }
+        const row = document.createElement("div");
+        row.className = "inactive-window-row";
+        row.innerHTML = `
+          <label>Day
+            <select class="inactive-day">
+              <option value="0">Monday / שני</option>
+              <option value="1">Tuesday / שלישי</option>
+              <option value="2">Wednesday / רביעי</option>
+              <option value="3">Thursday / חמישי</option>
+              <option value="4">Friday / שישי</option>
+              <option value="5">Saturday / שבת</option>
+              <option value="6">Sunday / ראשון</option>
+            </select>
+          </label>
+          <label>Start <input class="inactive-start" type="time" step="1" value="${windowData.start_time || "02:00:00"}"></label>
+          <label>End <input class="inactive-end" type="time" step="1" value="${windowData.end_time || "05:00:00"}"></label>
+          <label>Status
+            <select class="inactive-status">
+              <option value="active">active</option>
+              <option value="inactive">inactive</option>
+            </select>
+          </label>
+          <button class="button secondary" type="button">Remove</button>
+        `;
+        row.querySelector(".inactive-day").value = String(windowData.day_of_week ?? 0);
+        row.querySelector(".inactive-status").value = windowData.status || "active";
+        row.querySelector("button").addEventListener("click", () => row.remove());
+        container.appendChild(row);
+      }
+
+      function readInactiveWindows() {
+        return [...document.querySelectorAll(".inactive-window-row")].map((row) => ({
+          day_of_week: row.querySelector(".inactive-day").value,
+          start_time: row.querySelector(".inactive-start").value,
+          end_time: row.querySelector(".inactive-end").value,
+          status: row.querySelector(".inactive-status").value
+        }));
+      }
       function openDeactivateModal() {
         if (!document.getElementById("deactivate-modal")) {
           return;
@@ -4650,6 +5162,10 @@ def render_dashboard_scripts() -> str:
           take_profit_price: document.getElementById("rule-take").value,
           max_yes_entries_per_event: document.getElementById("rule-max-yes").value,
           max_no_entries_per_event: document.getElementById("rule-max-no").value,
+          entry_window_start_seconds_before_end: document.getElementById("rule-window-start").value,
+          entry_window_end_seconds_before_end: document.getElementById("rule-window-end").value,
+          schedule_timezone: document.getElementById("rule-timezone").value,
+          inactive_windows: readInactiveWindows(),
           status: document.getElementById("rule-status").value
         };
         const response = await fetch("/rules", {
@@ -4679,6 +5195,7 @@ def render_dashboard_scripts() -> str:
 
       document.addEventListener("DOMContentLoaded", () => {
         toggleCustomRangeInputs();
+        applyDefaultRuleFilter();
         renderDashboardCharts();
       });
       window.setInterval(() => refreshDashboardContent(false), 10000);
@@ -4686,7 +5203,7 @@ def render_dashboard_scripts() -> str:
     """
 
 
-def load_dashboard_rows() -> tuple[
+def load_dashboard_rows(rule_filter: Any = "all") -> tuple[
     list[sqlite3.Row],
     list[sqlite3.Row],
     list[sqlite3.Row],
@@ -4695,6 +5212,7 @@ def load_dashboard_rows() -> tuple[
     list[sqlite3.Row],
     dict[str, Optional[str]],
 ]:
+    deals_rule_filter, deals_rule_params = rule_filter_sql("rule_id", rule_filter)
     with get_conn() as conn:
         events = conn.execute("""
             SELECT
@@ -4810,6 +5328,9 @@ def load_dashboard_rows() -> tuple[
                 max_no_entries_per_event,
                 status,
                 eligible_after_event_id,
+                entry_window_start_seconds_before_end,
+                entry_window_end_seconds_before_end,
+                schedule_timezone,
                 created_at,
                 updated_at
             FROM rules
@@ -4845,13 +5366,15 @@ def load_dashboard_rows() -> tuple[
                 entry_btc_volume_sampled_at,
                 entry_btc_volume_btc_cumulative,
                 entry_btc_volume_btc_delta,
+                entry_seconds_before_event_end,
                 entry_liquidity_role,
                 exit_liquidity_role,
                 fee_calculation_source
             FROM deals
+            WHERE """ + deals_rule_filter + """
             ORDER BY id DESC
             LIMIT 200
-        """).fetchall()
+        """, deals_rule_params).fetchall()
 
     btc_health = get_latest_coinbase_health()
     return events, logs, btc_volume_rows, btc_volume_summary, rules, deals, btc_health
@@ -4862,12 +5385,13 @@ def render_dashboard_content(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> str:
     dashboard_range = normalize_dashboard_range(dashboard_range)
-    overview = load_dashboard_overview(investment_usd, dashboard_range, custom_from, custom_to)
-    time_trends = load_time_trends(investment_usd, dashboard_range, custom_from, custom_to)
+    overview = load_dashboard_overview(investment_usd, dashboard_range, custom_from, custom_to, rule_filter)
+    time_trends = load_time_trends(investment_usd, dashboard_range, custom_from, custom_to, rule_filter)
     btc_volume_trends = load_btc_volume_trends(dashboard_range, custom_from, custom_to)
-    data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to)
+    data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to, rule_filter)
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
         <div class="muted">רענון אוטומטי כל 10 שניות אלא אם טופס פתוח. זמן שרת: {html.escape(now_iso())}. טווח: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
@@ -4884,9 +5408,10 @@ def render_rules_page_content(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> str:
     dashboard_range = normalize_dashboard_range(dashboard_range)
-    rules_performance = load_rules_performance(investment_usd, dashboard_range, custom_from, custom_to)
+    rules_performance = load_rules_performance(investment_usd, dashboard_range, custom_from, custom_to, rule_filter)
     _, _, _, _, rules, _, _ = load_dashboard_rows()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
@@ -4907,12 +5432,13 @@ def render_deals_page_content(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> str:
     dashboard_range = normalize_dashboard_range(dashboard_range)
-    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range, custom_from, custom_to)
-    market_conditions = load_market_conditions(investment_usd, dashboard_range, custom_from, custom_to)
-    btc_volume_deal_snapshot = load_btc_volume_deal_snapshot(dashboard_range, custom_from, custom_to)
-    _, _, _, _, _, deals, _ = load_dashboard_rows()
+    risk_snapshot = load_risk_snapshot(investment_usd, dashboard_range, custom_from, custom_to, rule_filter)
+    market_conditions = load_market_conditions(investment_usd, dashboard_range, custom_from, custom_to, rule_filter)
+    btc_volume_deal_snapshot = load_btc_volume_deal_snapshot(dashboard_range, custom_from, custom_to, rule_filter)
+    _, _, _, _, _, deals, _ = load_dashboard_rows(rule_filter)
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
         <div class="muted">Auto refresh every 10 seconds. Server time: {html.escape(now_iso())}. Range: {html.escape(dashboard_range_label(dashboard_range, custom_from, custom_to))}</div>
@@ -4951,9 +5477,10 @@ def render_system_page_content(
     dashboard_range: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> str:
     dashboard_range = normalize_dashboard_range(dashboard_range)
-    data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to)
+    data_quality = load_data_quality_snapshot(dashboard_range, custom_from, custom_to, rule_filter)
     system_health = load_system_health_snapshot()
     return f"""
         <div class="storage-status">{html.escape(render_storage_status())}</div>
@@ -4986,11 +5513,13 @@ def page_query(
     range_filter: Any,
     custom_from: Any,
     custom_to: Any,
+    rule_filter: Any = "all",
 ) -> str:
     params = {
         "page": page,
         "investment_usd": investment_usd,
         "range_filter": range_filter,
+        "rule_filter": normalize_rule_filter(rule_filter),
     }
     if custom_from:
         params["custom_from"] = custom_from
@@ -5005,6 +5534,7 @@ def render_dashboard_nav(
     range_filter: Any,
     custom_from: Any,
     custom_to: Any,
+    rule_filter: Any = "all",
 ) -> str:
     links = [
         ("overview", "Overview", "/"),
@@ -5015,7 +5545,7 @@ def render_dashboard_nav(
     ]
     items = []
     for page, label, path in links:
-        query = page_query(page, investment_usd, range_filter, custom_from, custom_to)
+        query = page_query(page, investment_usd, range_filter, custom_from, custom_to, rule_filter)
         active_class = " active" if page == active_page else ""
         items.append(
             f"<a class=\"nav-link{active_class}\" href=\"{path}?{html.escape(query)}\">{html.escape(label)}</a>"
@@ -5029,17 +5559,18 @@ def render_page_content(
     range_filter: Any = "all",
     custom_from: Any = None,
     custom_to: Any = None,
+    rule_filter: Any = "all",
 ) -> str:
     selected = normalize_dashboard_page(page)
     if selected == "rules":
-        return render_rules_page_content(investment_usd, range_filter, custom_from, custom_to)
+        return render_rules_page_content(investment_usd, range_filter, custom_from, custom_to, rule_filter)
     if selected == "deals":
-        return render_deals_page_content(investment_usd, range_filter, custom_from, custom_to)
+        return render_deals_page_content(investment_usd, range_filter, custom_from, custom_to, rule_filter)
     if selected == "market":
         return render_market_data_page_content()
     if selected == "system":
-        return render_system_page_content(range_filter, custom_from, custom_to)
-    return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)
+        return render_system_page_content(range_filter, custom_from, custom_to, rule_filter)
+    return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to, rule_filter)
 
 
 @app.get("/dashboard-content", response_class=HTMLResponse)
@@ -5048,8 +5579,9 @@ def dashboard_content(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to)
+    return render_dashboard_content(investment_usd, range_filter, custom_from, custom_to, rule_filter)
 
 
 @app.get("/rules-page-content", response_class=HTMLResponse)
@@ -5058,8 +5590,9 @@ def rules_page_content(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return render_rules_page_content(investment_usd, range_filter, custom_from, custom_to)
+    return render_rules_page_content(investment_usd, range_filter, custom_from, custom_to, rule_filter)
 
 
 @app.get("/deals-page-content", response_class=HTMLResponse)
@@ -5068,8 +5601,9 @@ def deals_page_content(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return render_deals_page_content(investment_usd, range_filter, custom_from, custom_to)
+    return render_deals_page_content(investment_usd, range_filter, custom_from, custom_to, rule_filter)
 
 
 @app.get("/market-data-content", response_class=HTMLResponse)
@@ -5082,8 +5616,9 @@ def system_page_content(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return render_system_page_content(range_filter, custom_from, custom_to)
+    return render_system_page_content(range_filter, custom_from, custom_to, rule_filter)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -5092,12 +5627,13 @@ def dashboard(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
     page: str = "overview",
 ) -> str:
     active_page = normalize_dashboard_page(page)
     content_path = PAGE_CONTENT_PATHS[active_page]
-    page_content = render_page_content(active_page, investment_usd, range_filter, custom_from, custom_to)
-    nav = render_dashboard_nav(active_page, investment_usd, range_filter, custom_from, custom_to)
+    page_content = render_page_content(active_page, investment_usd, range_filter, custom_from, custom_to, rule_filter)
+    nav = render_dashboard_nav(active_page, investment_usd, range_filter, custom_from, custom_to, rule_filter)
     return f"""
     <!doctype html>
     <html>
@@ -5411,8 +5947,9 @@ def rules_page(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return dashboard(investment_usd, range_filter, custom_from, custom_to, "rules")
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, rule_filter, "rules")
 
 
 @app.get("/deals-page", response_class=HTMLResponse)
@@ -5421,8 +5958,9 @@ def deals_page(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return dashboard(investment_usd, range_filter, custom_from, custom_to, "deals")
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, rule_filter, "deals")
 
 
 @app.get("/market-data", response_class=HTMLResponse)
@@ -5431,8 +5969,9 @@ def market_data_page(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return dashboard(investment_usd, range_filter, custom_from, custom_to, "market")
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, rule_filter, "market")
 
 
 @app.get("/system-page", response_class=HTMLResponse)
@@ -5441,8 +5980,9 @@ def system_page(
     range_filter: str = "all",
     custom_from: str = "",
     custom_to: str = "",
+    rule_filter: str = "all",
 ) -> str:
-    return dashboard(investment_usd, range_filter, custom_from, custom_to, "system")
+    return dashboard(investment_usd, range_filter, custom_from, custom_to, rule_filter, "system")
 
 
 @app.post("/rules")
@@ -5453,7 +5993,8 @@ def api_create_rule(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
     except sqlite3.Error:
         raise HTTPException(status_code=500, detail="Database error while creating rule")
-    return row_to_dict(row)
+    with get_conn() as conn:
+        return rules_to_dicts(conn, [row])[0]
 
 
 @app.get("/rules")
@@ -5465,9 +6006,9 @@ def api_get_rules() -> list[dict[str, Any]]:
                 FROM rules
                 ORDER BY id DESC
             """).fetchall()
+            return rules_to_dicts(conn, rows)
     except sqlite3.Error:
         raise HTTPException(status_code=500, detail="Database error while loading rules")
-    return [row_to_dict(row) for row in rows]
 
 
 @app.post("/rules/{rule_id}/deactivate")

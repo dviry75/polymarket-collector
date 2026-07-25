@@ -83,6 +83,36 @@ def btc_volume(sampled_at, *, event_id="event-a", cumulative=12.5, delta=6.7, st
     }
 
 
+def market_row(event_id, *, start_time="2026-07-17T09:00:00Z", end_time="2026-07-17T09:05:00Z", active=1, closed=0, status="open"):
+    return {
+        "polymarket_event_id": f"poly-{event_id}",
+        "polymarket_market_id": f"market-{event_id}",
+        "condition_id": f"condition-{event_id}",
+        "event_slug": event_id,
+        "market_slug": event_id,
+        "title": "title",
+        "question": "question",
+        "event_url": "url",
+        "start_time": start_time,
+        "start_time_local": app.format_local_datetime(start_time),
+        "end_time": end_time,
+        "end_time_local": app.format_local_datetime(end_time),
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "outcomes": '["Up", "Down"]',
+        "outcome_prices": '["1", "0"]',
+        "active": active,
+        "closed": closed,
+        "enable_order_book": 1,
+        "accepting_orders": 1 if active else 0,
+        "created_at_poly": "2026-07-17T08:59:00Z",
+        "created_at_poly_local": "17/07/2026 11:59:00",
+        "status": status,
+        "notes": "",
+        "raw_json": "{}",
+    }
+
+
 def expected_net_pnl(entry_price, exit_price):
     return float(app.calculate_demo_deal_financials(entry_price, exit_price)["net_pnl_usd"])
 
@@ -136,6 +166,100 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(first.json()["message"], "Rule is already inactive")
         self.assertEqual(client.post("/rules/9999/deactivate").status_code, 404)
         self.assertIn(client.put(f"/rules/{inactive_id}", json={"name": "changed"}).status_code, {404, 405})
+
+    def test_rule_scheduling_validation_and_api_payload(self):
+        client = TestClient(app.app)
+
+        valid = valid_rule(
+            entry_window_start_seconds_before_end=120,
+            entry_window_end_seconds_before_end=10,
+            schedule_timezone="Asia/Jerusalem",
+            inactive_windows=[
+                {"day_of_week": 0, "start_time": "22:00", "end_time": "02:00", "status": "active"},
+                {"day_of_week": 5, "start_time": "02:00:00", "end_time": "05:00:00", "status": "inactive"},
+            ],
+        )
+        response = client.post("/rules", json=valid)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["entry_window_start_seconds_before_end"], 120)
+        self.assertEqual(payload["entry_window_end_seconds_before_end"], 10)
+        self.assertEqual(payload["schedule_timezone"], "Asia/Jerusalem")
+        self.assertEqual(len(payload["inactive_windows"]), 2)
+        self.assertEqual(payload["inactive_windows"][0]["start_time"], "22:00:00")
+
+        invalid_cases = [
+            valid_rule(entry_window_start_seconds_before_end=120),
+            valid_rule(entry_window_start_seconds_before_end=5, entry_window_end_seconds_before_end=10),
+            valid_rule(schedule_timezone="UTC+3"),
+            valid_rule(inactive_windows=[{"day_of_week": 7, "start_time": "02:00", "end_time": "05:00"}]),
+        ]
+        for payload in invalid_cases:
+            self.assertEqual(client.post("/rules", json=payload).status_code, 400)
+
+    def test_entry_window_blocks_and_stores_seconds_before_event_end(self):
+        app.upsert_event(market_row("event-a"))
+        app.create_rule(valid_rule(
+            entry_window_start_seconds_before_end=120,
+            entry_window_end_seconds_before_end=10,
+        ))
+
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-17T09:02:00+00:00",
+        ))
+        self.assertEqual(len(self.fetch_deals()), 0)
+
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-17T09:03:37+00:00",
+        ))
+        deals = self.fetch_deals()
+        self.assertEqual(len(deals), 1)
+        self.assertEqual(deals[0]["entry_seconds_before_event_end"], 83)
+
+    def test_inactive_window_crossing_midnight_blocks_only_new_entries(self):
+        app.create_rule(valid_rule(
+            inactive_windows=[
+                {"day_of_week": 0, "start_time": "22:00", "end_time": "02:00", "status": "active"},
+            ],
+        ))
+
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-20T20:30:00+00:00",
+        ))
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-20T22:30:00+00:00",
+        ))
+        self.assertEqual(len(self.fetch_deals()), 0)
+
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-21T00:30:00+00:00",
+        ))
+        self.assertEqual(len(self.fetch_deals()), 1)
 
     def test_active_rule_starts_only_on_next_event_and_survives_restart(self):
         app.active_market = {"event_slug": "event-a", "condition_id": "condition-a"}
@@ -527,7 +651,15 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(row_counts["deals"], 1)
         workbook = load_workbook(export_path, read_only=True)
         try:
-            self.assertEqual(workbook.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals", "fee_summary"])
+            self.assertEqual(workbook.sheetnames, [
+                "events",
+                "orderbook_log",
+                "btc_volume_log",
+                "rules",
+                "deals",
+                "rule_inactive_windows",
+                "fee_summary",
+            ])
         finally:
             workbook.close()
 
@@ -613,7 +745,15 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(download.status_code, 200)
         downloaded = load_workbook(BytesIO(download.content), read_only=True)
         try:
-            self.assertEqual(downloaded.sheetnames, ["events", "orderbook_log", "btc_volume_log", "rules", "deals", "fee_summary"])
+            self.assertEqual(downloaded.sheetnames, [
+                "events",
+                "orderbook_log",
+                "btc_volume_log",
+                "rules",
+                "deals",
+                "rule_inactive_windows",
+                "fee_summary",
+            ])
         finally:
             downloaded.close()
 
