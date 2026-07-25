@@ -100,14 +100,25 @@ def require_reauth(request: Request, x_live_reauth_password: Optional[str] = Hea
 
 
 @router.get("/login", response_class=HTMLResponse)
-def login_page() -> str:
-    return """
-    <!doctype html><html><head><meta charset="utf-8"><title>LIVE Login</title>
-    <style>body{font-family:Arial,sans-serif;margin:32px;background:#f6f7f9;color:#111}form{max-width:360px;background:white;border:1px solid #d8dde6;padding:18px;border-radius:6px}label{display:block;margin:10px 0}input{width:100%;box-sizing:border-box;padding:9px}button{padding:9px 12px;background:#111;color:white;border:0;border-radius:6px}</style>
-    </head><body><h1>Polymarket LIVE Login</h1><form id="login"><label>Username<input id="u" autocomplete="username"></label><label>Password<input id="p" type="password" autocomplete="current-password"></label><button>Login</button><p id="msg"></p></form>
-    <script>document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const r=await fetch('/live/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value})});if(r.ok){location.href='/live'}else{msg.textContent=await r.text();}});</script></body></html>
-    """
-
+def login_page(request: Request):
+    config, _repo, *_rest, auth, _dry = services()
+    if auth.verify_session(request.cookies.get(COOKIE_NAME)):
+        return RedirectResponse("/live", status_code=303)
+    return HTMLResponse(f"""
+    <!doctype html><html lang="en"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Sign in · Polymarket LIVE</title><style>
+    :root{{--bg:#151923;--panel:#1b202b;--border:#303747;--muted:#9aa4b2;--fg:#f3f6fa;--up:#66d38e;--down:#ff6b6b;--info:#78a6ff}}*{{box-sizing:border-box}}
+    body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0,#202b41 0,var(--bg) 42%);color:var(--fg);font-family:Inter,Arial,sans-serif}}
+    .login-shell{{width:min(100%,420px)}}.brand{{display:flex;align-items:center;justify-content:center;gap:11px;margin-bottom:22px}}.logo{{width:42px;height:42px;display:grid;place-items:center;border-radius:10px;color:var(--info);background:rgba(120,166,255,.12);border:1px solid rgba(120,166,255,.35);font-weight:800}}
+    .brand-title{{font-size:16px;font-weight:750}}.brand-sub{{margin-top:2px;color:var(--muted);font-size:10px;letter-spacing:.14em;text-transform:uppercase}}.card{{padding:28px;border:1px solid var(--border);border-radius:12px;background:rgba(27,32,43,.96);box-shadow:0 24px 70px rgba(0,0,0,.32)}}
+    .eyebrow{{color:var(--info);font-size:10px;font-weight:750;letter-spacing:.14em;text-transform:uppercase}}h1{{margin:8px 0 6px;font-size:24px}}.intro{{margin:0 0 22px;color:var(--muted);font-size:13px;line-height:1.55}}label{{display:block;margin:14px 0 7px;color:var(--muted);font-size:12px;font-weight:650}}
+    input{{width:100%;min-height:46px;border:1px solid var(--border);border-radius:8px;padding:0 12px;background:#111721;color:var(--fg);font:inherit;font-size:16px;outline:none}}input:focus{{border-color:var(--info);box-shadow:0 0 0 3px rgba(120,166,255,.12)}}button{{width:100%;min-height:46px;margin-top:20px;border:1px solid rgba(120,166,255,.5);border-radius:8px;background:rgba(120,166,255,.14);color:var(--fg);font:inherit;font-weight:750;cursor:pointer}}button:hover{{background:rgba(120,166,255,.22)}}button:disabled{{cursor:wait;opacity:.65}}
+    .message{{min-height:20px;margin:12px 0 0;color:var(--down);font-size:12px;text-align:center}}.security{{display:flex;align-items:center;justify-content:center;gap:7px;margin-top:16px;color:var(--muted);font-size:11px}}.dot{{width:7px;height:7px;border-radius:50%;background:var(--up);box-shadow:0 0 12px var(--up)}}@media(max-width:520px){{body{{padding:14px}}.card{{padding:22px 18px}}}}
+    </style></head><body><main class="login-shell"><div class="brand"><div class="logo">PM</div><div><div class="brand-title">Polymarket LIVE</div><div class="brand-sub">Control Center</div></div></div><section class="card"><div class="eyebrow">Authorized access only</div><h1>Welcome back</h1><p class="intro">Sign in to monitor the live environment and operate the protected control center.</p>
+    <form id="login-form"><label for="username">Username</label><input id="username" name="username" value="{_e(config.login_username)}" autocomplete="username" required autofocus><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button id="submit-button" type="submit">Sign in to Control Center</button><p id="login-message" class="message" role="alert" aria-live="polite"></p></form></section><div class="security"><span class="dot"></span><span>Secure session · protected operations</span></div></main>
+    <script>const form=document.getElementById("login-form"),username=document.getElementById("username"),password=document.getElementById("password"),message=document.getElementById("login-message"),submitButton=document.getElementById("submit-button");form.addEventListener("submit",async event=>{{event.preventDefault();message.textContent="";submitButton.disabled=true;submitButton.textContent="Signing in…";try{{const response=await fetch("/live/login",{{method:"POST",credentials:"same-origin",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{username:username.value.trim(),password:password.value}})}});if(response.ok){{window.location.replace("/live");return}}const payload=await response.json().catch(()=>({{}}));message.textContent=payload.detail||"Unable to sign in. Please try again."}}catch(_error){{message.textContent="The server is unavailable. Please try again."}}finally{{submitButton.disabled=false;submitButton.textContent="Sign in to Control Center"}}}});</script></body></html>
+    """)
 
 @router.post("/login")
 def login(request: Request, payload: dict[str, Any] = Body(...)) -> JSONResponse:
@@ -494,7 +505,9 @@ def dashboard_content(view: str = "overview") -> str:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 def live_dashboard(request: Request) -> str:
-    require_live_session(request)
+    *_prefix, auth, _dry = services()
+    if not auth.verify_session(request.cookies.get(COOKIE_NAME)):
+        return RedirectResponse("/live/login", status_code=303)
     view = request.query_params.get("view", "overview")
     nav_items = [
         ("overview", "Overview"),

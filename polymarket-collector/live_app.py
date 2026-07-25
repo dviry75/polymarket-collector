@@ -36,6 +36,11 @@ def root() -> RedirectResponse:
     return RedirectResponse("/live", status_code=307)
 
 
+@app.get("/login")
+def login_alias() -> RedirectResponse:
+    return RedirectResponse("/live/login", status_code=307)
+
+
 @app.get("/health")
 def public_health() -> dict[str, str]:
     try:

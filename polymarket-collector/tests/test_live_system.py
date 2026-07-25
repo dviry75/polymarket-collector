@@ -157,9 +157,16 @@ class LiveSystemTests(unittest.TestCase):
     def test_live_routes_health_and_auth_blocks_writes_without_token(self):
         client = self.client()
         self.assertEqual(client.get("/health").json(), {"status": "ok"})
+        dashboard = client.get("/live", follow_redirects=False)
+        self.assertEqual(dashboard.status_code, 303)
+        self.assertEqual(dashboard.headers["location"], "/live/login")
         unauthenticated = client.get("/live/health")
         self.assertEqual(unauthenticated.status_code, 401)
         csrf = self.login(client)
+        self.assertEqual(client.get("/live", follow_redirects=False).status_code, 200)
+        logged_in_login = client.get("/live/login", follow_redirects=False)
+        self.assertEqual(logged_in_login.status_code, 303)
+        self.assertEqual(logged_in_login.headers["location"], "/live")
         response = client.get("/live/health")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -176,6 +183,17 @@ class LiveSystemTests(unittest.TestCase):
         ok = client.post("/live/kill-switch/deactivate", headers=self.auth_headers(csrf, reauth=True), follow_redirects=False)
         self.assertEqual(ok.status_code, 303)
         self.assertFalse(client.get("/live/health").json()["kill_switch_active"])
+
+    def test_root_login_alias_and_styled_login_page(self):
+        client = self.client()
+        alias = client.get("/login", follow_redirects=False)
+        self.assertEqual(alias.status_code, 307)
+        self.assertEqual(alias.headers["location"], "/live/login")
+        page = client.get("/live/login")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Polymarket LIVE", page.text)
+        self.assertIn("Control Center", page.text)
+        self.assertIn('credentials:"same-origin"', page.text)
 
     def test_argon2id_password_verification_and_revoke_all_sessions(self):
         if PasswordHasher is None:
