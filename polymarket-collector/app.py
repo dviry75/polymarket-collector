@@ -1064,21 +1064,29 @@ def validate_inactive_windows(value: Any) -> list[dict[str, Any]]:
     for index, window in enumerate(value):
         if not isinstance(window, dict):
             raise ValueError(f"inactive_windows[{index}] must be an object")
-        try:
-            day_of_week = int(window.get("day_of_week"))
-        except (TypeError, ValueError):
-            raise ValueError(f"inactive_windows[{index}].day_of_week must be 0-6")
-        if day_of_week < 0 or day_of_week > 6:
-            raise ValueError(f"inactive_windows[{index}].day_of_week must be 0-6")
+        raw_day = str(window.get("day_of_week", "")).strip().lower()
+        if raw_day == "all":
+            day_values = list(range(7))
+        else:
+            try:
+                day_of_week = int(window.get("day_of_week"))
+            except (TypeError, ValueError):
+                raise ValueError(f"inactive_windows[{index}].day_of_week must be 0-6 or all")
+            if day_of_week < 0 or day_of_week > 6:
+                raise ValueError(f"inactive_windows[{index}].day_of_week must be 0-6 or all")
+            day_values = [day_of_week]
         status = str(window.get("status", "active")).strip().lower()
         if status not in {"active", "inactive"}:
             raise ValueError(f"inactive_windows[{index}].status must be active or inactive")
-        windows.append({
-            "day_of_week": day_of_week,
-            "start_time": normalize_clock_time(window.get("start_time"), f"inactive_windows[{index}].start_time"),
-            "end_time": normalize_clock_time(window.get("end_time"), f"inactive_windows[{index}].end_time"),
-            "status": status,
-        })
+        start_time = normalize_clock_time(window.get("start_time"), f"inactive_windows[{index}].start_time")
+        end_time = normalize_clock_time(window.get("end_time"), f"inactive_windows[{index}].end_time")
+        for day_of_week in day_values:
+            windows.append({
+                "day_of_week": day_of_week,
+                "start_time": start_time,
+                "end_time": end_time,
+                "status": status,
+            })
     return windows
 
 
@@ -5108,6 +5116,7 @@ def render_dashboard_scripts() -> str:
         row.innerHTML = `
           <label>Day
             <select class="inactive-day">
+              <option value="all">All days / כל הימים</option>
               <option value="0">Monday / שני</option>
               <option value="1">Tuesday / שלישי</option>
               <option value="2">Wednesday / רביעי</option>

@@ -197,6 +197,28 @@ class RuleDealTests(unittest.TestCase):
         for payload in invalid_cases:
             self.assertEqual(client.post("/rules", json=payload).status_code, 400)
 
+    def test_inactive_window_all_days_expands_to_every_day(self):
+        client = TestClient(app.app)
+        response = client.post("/rules", json=valid_rule(
+            inactive_windows=[
+                {"day_of_week": "all", "start_time": "02:00", "end_time": "05:00", "status": "active"},
+            ],
+        ))
+        self.assertEqual(response.status_code, 200)
+        windows = response.json()["inactive_windows"]
+        self.assertEqual(len(windows), 7)
+        self.assertEqual({window["day_of_week"] for window in windows}, set(range(7)))
+
+        app.insert_orderbook_log(orderbook(
+            "event-a",
+            yes_ask=0.77,
+            yes_bid=0.76,
+            no_ask=0.2,
+            no_bid=0.19,
+            sampled_at="2026-07-22T00:30:00+00:00",
+        ))
+        self.assertEqual(len(self.fetch_deals()), 0)
+
     def test_entry_window_blocks_and_stores_seconds_before_event_end(self):
         app.upsert_event(market_row("event-a"))
         app.create_rule(valid_rule(
