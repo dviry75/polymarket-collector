@@ -2493,10 +2493,14 @@ def local_datetime_for_rule(rule: sqlite3.Row, sampled_at: Any) -> Optional[date
     return sampled.astimezone(rule_timezone)
 
 
-def rule_in_inactive_window(conn: sqlite3.Connection, rule: sqlite3.Row, sampled_at: Any) -> bool:
-    local_dt = local_datetime_for_rule(rule, sampled_at)
+def matching_inactive_window(
+    conn: sqlite3.Connection,
+    rule: sqlite3.Row,
+    current_time: Any,
+) -> Optional[dict[str, Any]]:
+    local_dt = local_datetime_for_rule(rule, current_time)
     if local_dt is None:
-        return False
+        return None
     current_day = local_dt.weekday()
     current_second = local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
     rows = conn.execute("""
@@ -2508,15 +2512,36 @@ def rule_in_inactive_window(conn: sqlite3.Connection, rule: sqlite3.Row, sampled
         start_second = clock_seconds(window["start_time"])
         end_second = clock_seconds(window["end_time"])
         window_day = int(window["day_of_week"])
-        if start_second <= end_second:
+        if start_second == end_second and current_day == window_day:
+            return row_to_dict(window)
+        if start_second < end_second:
             if current_day == window_day and start_second <= current_second < end_second:
-                return True
+                return row_to_dict(window)
             continue
         if current_day == window_day and current_second >= start_second:
-            return True
+            return row_to_dict(window)
         if current_day == ((window_day + 1) % 7) and current_second < end_second:
-            return True
-    return False
+            return row_to_dict(window)
+    return None
+
+
+def can_rule_open_new_deal(
+    conn: sqlite3.Connection,
+    rule_id: int,
+    current_time: Any,
+) -> tuple[bool, Optional[sqlite3.Row], str, Optional[dict[str, Any]]]:
+    """Authoritative DB-backed gate for every new DEMO deal."""
+    rule = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+    if rule is None:
+        return False, None, "rule_not_found", None
+    if rule["status"] != "active":
+        return False, rule, "rule_inactive", None
+    matched_window = matching_inactive_window(conn, rule, current_time)
+    if matched_window is not None:
+        return False, rule, "rule_in_inactive_schedule", matched_window
+    if has_open_deal(conn, rule_id):
+        return False, rule, "open_deal_exists", None
+    return True, rule, "", None
 
 
 def entry_window_allows_rule(
@@ -2634,8 +2659,14 @@ def process_demo_entries(
             print(f"[rules] rule id={rule_id} waits for next event after {event_id}", flush=True)
             continue
 
-        if rule_in_inactive_window(conn, rule, orderbook_row.get("sampled_at")):
-            print(f"[rules] rule id={rule_id} inactive window blocks entry event_id={event_id}", flush=True)
+        matched_window = matching_inactive_window(conn, rule, orderbook_row.get("sampled_at"))
+        if matched_window is not None:
+            print(
+                f"[rules] entry skipped reason=rule_in_inactive_schedule rule_id={rule_id} "
+                f"rule_name={rule['name']!r} event_id={event_id} timezone={rule['schedule_timezone']} "
+                f"window_day={matched_window['day_of_week']} "
+                f"window={matched_window['start_time']}-{matched_window['end_time']}", flush=True,
+            )
             continue
 
         yes_match = prices_equal(side_ask(orderbook_row, "yes"), rule["entry_price"])
@@ -2698,6 +2729,22 @@ def process_demo_entries(
             fee_snapshot["fee_calculation_source"],
             fee_snapshot["fee_calculation_version"],
         )
+        can_open, fresh_rule, gate_reason, final_window = can_rule_open_new_deal(
+            conn, rule_id, orderbook_row.get("sampled_at")
+        )
+        if not can_open:
+            if gate_reason == "rule_in_inactive_schedule" and final_window is not None:
+                print(
+                    f"[rules] final entry gate blocked reason={gate_reason} rule_id={rule_id} "
+                    f"rule_name={fresh_rule['name']!r} event_id={event_id} "
+                    f"timezone={fresh_rule['schedule_timezone']} "
+                    f"window_day={final_window['day_of_week']} "
+                    f"window={final_window['start_time']}-{final_window['end_time']}", flush=True,
+                )
+            else:
+                print(f"[rules] final entry gate blocked rule_id={rule_id} reason={gate_reason}", flush=True)
+            continue
+
         try:
             cursor = conn.execute("""
                 INSERT INTO deals (
@@ -5119,10 +5166,10 @@ def render_dashboard_scripts() -> str:
           </label>
           <label>Start <input class="inactive-start" type="time" step="1" value="${windowData.start_time || "02:00:00"}"></label>
           <label>End <input class="inactive-end" type="time" step="1" value="${windowData.end_time || "05:00:00"}"></label>
-          <label>Status
+          <label>Window state
             <select class="inactive-status">
-              <option value="active">active</option>
-              <option value="inactive">inactive</option>
+              <option value="active">Enabled — blocks new entries</option>
+              <option value="inactive">Disabled — does not block</option>
             </select>
           </label>
           <button class="button secondary" type="button">Remove</button>

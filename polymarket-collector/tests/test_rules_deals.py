@@ -261,6 +261,74 @@ class RuleDealTests(unittest.TestCase):
         ))
         self.assertEqual(len(self.fetch_deals()), 1)
 
+    def test_inactive_schedule_gate_boundaries_days_status_and_refresh(self):
+        rule = app.create_rule(valid_rule(
+            inactive_windows=[
+                {"day_of_week": 0, "start_time": "10:00", "end_time": "12:00", "status": "active"},
+                {"day_of_week": 1, "start_time": "22:00", "end_time": "02:00", "status": "active"},
+                {"day_of_week": 3, "start_time": "00:00", "end_time": "00:00", "status": "active"},
+                {"day_of_week": 4, "start_time": "10:00", "end_time": "12:00", "status": "inactive"},
+            ],
+        ))
+        cases = [
+            ("2026-07-20T06:59:00+00:00", True, "before"),
+            ("2026-07-20T07:00:00+00:00", False, "start included"),
+            ("2026-07-20T08:59:59+00:00", False, "inside"),
+            ("2026-07-20T09:00:00+00:00", True, "end excluded"),
+            ("2026-07-21T19:30:00+00:00", False, "cross midnight before"),
+            ("2026-07-21T22:30:00+00:00", False, "cross midnight after"),
+            ("2026-07-21T23:00:00+00:00", True, "cross midnight end"),
+            ("2026-07-23T09:00:00+00:00", False, "all day"),
+            ("2026-07-24T07:30:00+00:00", True, "disabled record ignored"),
+        ]
+        with app.get_conn() as conn:
+            for current_time, expected, label in cases:
+                with self.subTest(label=label):
+                    allowed, loaded_rule, reason, _window = app.can_rule_open_new_deal(
+                        conn, rule["id"], current_time
+                    )
+                    self.assertEqual(allowed, expected)
+                    self.assertIsNotNone(loaded_rule)
+                    self.assertEqual(reason, "" if expected else "rule_in_inactive_schedule")
+
+            conn.execute(
+                "UPDATE rule_inactive_windows SET start_time = '13:00:00', end_time = '14:00:00' "
+                "WHERE rule_id = ? AND day_of_week = 0",
+                (rule["id"],),
+            )
+            conn.commit()
+            allowed, _rule, _reason, _window = app.can_rule_open_new_deal(
+                conn, rule["id"], "2026-07-20T07:30:00+00:00"
+            )
+            self.assertTrue(allowed)
+
+    def test_final_gate_reloads_schedule_before_insert(self):
+        rule = app.create_rule(valid_rule())
+        original = app.can_rule_open_new_deal
+        calls = 0
+
+        def add_window_then_gate(conn, rule_id, current_time):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                now = app.now_iso()
+                conn.execute(
+                    "INSERT INTO rule_inactive_windows "
+                    "(rule_id, day_of_week, start_time, end_time, status, created_at, updated_at) "
+                    "VALUES (?, 4, '00:00:00', '00:00:00', 'active', ?, ?)",
+                    (rule_id, now, now),
+                )
+            return original(conn, rule_id, current_time)
+
+        with patch.object(app, "can_rule_open_new_deal", side_effect=add_window_then_gate):
+            app.insert_orderbook_log(orderbook(
+                "event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19,
+                sampled_at="2026-07-17T09:00:01+00:00",
+            ))
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(self.fetch_deals()), 0)
+        self.assertEqual(rule["status"], "active")
+
     def test_active_rule_starts_only_on_next_event_and_survives_restart(self):
         app.active_market = {"event_slug": "event-a", "condition_id": "condition-a"}
         rule = app.create_rule(valid_rule())
