@@ -1,3 +1,5 @@
+> **עדכון סגירה:** התקלה נסגרה בפועל בשרת TST. לדוח הפריסה, ה־E2E וה־rollback ראו [RULE_INACTIVE_SCHEDULE_FINAL_CLOSURE_REPORT.md](RULE_INACTIVE_SCHEDULE_FINAL_CLOSURE_REPORT.md).
+
 # דוח תקלה — שעות חוסר פעילות של חוקים
 
 ## 1. תקציר מנהלים
