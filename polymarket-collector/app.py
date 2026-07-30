@@ -1087,6 +1087,12 @@ def validate_inactive_windows(value: Any) -> list[dict[str, Any]]:
                 "end_time": end_time,
                 "status": status,
             })
+    unique_windows = {
+        (window["day_of_week"], window["start_time"], window["end_time"], window["status"])
+        for window in windows
+    }
+    if len(unique_windows) != len(windows):
+        raise ValueError("inactive_windows must not contain duplicates")
     return windows
 
 
@@ -1220,6 +1226,50 @@ def create_rule(payload: dict[str, Any]) -> sqlite3.Row:
     )
     if eligible_after_event_id:
         print(f"[rules] rule id={rule_id} waits for next event after {eligible_after_event_id}", flush=True)
+    return row
+
+
+def update_rule(rule_id: int, payload: dict[str, Any]) -> sqlite3.Row:
+    values = validate_rule_payload(payload)
+    updated_at = now_iso()
+    try:
+        with get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+            if existing is None:
+                raise KeyError(f"Rule {rule_id} does not exist")
+            conn.execute("""
+                UPDATE rules SET
+                    name = ?, updated_at = ?, entry_price = ?, stop_loss_price = ?,
+                    take_profit_price = ?, max_yes_entries_per_event = ?,
+                    max_no_entries_per_event = ?, status = ?,
+                    entry_window_start_seconds_before_end = ?,
+                    entry_window_end_seconds_before_end = ?, schedule_timezone = ?
+                WHERE id = ?
+            """, (
+                values["name"], updated_at, values["entry_price"], values["stop_loss_price"],
+                values["take_profit_price"], values["max_yes_entries_per_event"],
+                values["max_no_entries_per_event"], values["status"],
+                values["entry_window_start_seconds_before_end"],
+                values["entry_window_end_seconds_before_end"], values["schedule_timezone"], rule_id,
+            ))
+            conn.execute("DELETE FROM rule_inactive_windows WHERE rule_id = ?", (rule_id,))
+            for window in values["inactive_windows"]:
+                conn.execute("""
+                    INSERT INTO rule_inactive_windows (
+                        rule_id, day_of_week, start_time, end_time, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    rule_id, window["day_of_week"], window["start_time"], window["end_time"],
+                    window["status"], updated_at, updated_at,
+                ))
+            row = conn.execute("SELECT * FROM rules WHERE id = ?", (rule_id,)).fetchone()
+            conn.commit()
+    except (KeyError, sqlite3.Error) as exc:
+        if isinstance(exc, sqlite3.Error):
+            log_error("update rule db", exc)
+        raise
+    print(f"[rules] updated id={rule_id} name={values['name']} status={values['status']}", flush=True)
     return row
 
 
@@ -2667,11 +2717,15 @@ def process_demo_entries(
             print(f"[rules] rule id={rule_id} waits for next event after {event_id}", flush=True)
             continue
 
-        matched_window = matching_inactive_window(conn, rule, orderbook_row.get("sampled_at"))
+        precheck_time = now_utc()
+        matched_window = matching_inactive_window(conn, rule, precheck_time)
         if matched_window is not None:
+            local_decision_time = local_datetime_for_rule(rule, precheck_time)
             print(
                 f"[rules] entry skipped reason=rule_in_inactive_schedule rule_id={rule_id} "
-                f"rule_name={rule['name']!r} event_id={event_id} timezone={rule['schedule_timezone']} "
+                f"rule_name={rule['name']!r} event_id={event_id} "
+                f"decision_time={precheck_time.isoformat()} timezone={rule['schedule_timezone']} "
+                f"day_of_week={local_decision_time.weekday() if local_decision_time else 'unknown'} "
                 f"window_day={matched_window['day_of_week']} "
                 f"window={matched_window['start_time']}-{matched_window['end_time']}", flush=True,
             )
@@ -2737,15 +2791,18 @@ def process_demo_entries(
             fee_snapshot["fee_calculation_source"],
             fee_snapshot["fee_calculation_version"],
         )
+        decision_time = now_utc()
         can_open, fresh_rule, gate_reason, final_window = can_rule_open_new_deal(
-            conn, rule_id, orderbook_row.get("sampled_at")
+            conn, rule_id, decision_time
         )
         if not can_open:
             if gate_reason == "rule_in_inactive_schedule" and final_window is not None:
                 print(
                     f"[rules] final entry gate blocked reason={gate_reason} rule_id={rule_id} "
                     f"rule_name={fresh_rule['name']!r} event_id={event_id} "
+                    f"decision_time={decision_time.isoformat()} "
                     f"timezone={fresh_rule['schedule_timezone']} "
+                    f"day_of_week={local_datetime_for_rule(fresh_rule, decision_time).weekday()} "
                     f"window_day={final_window['day_of_week']} "
                     f"window={final_window['start_time']}-{final_window['end_time']}", flush=True,
                 )
@@ -4920,11 +4977,13 @@ def render_export_actions() -> str:
 def render_rule_actions() -> str:
     return """
     <button class="button" type="button" onclick="openRuleModal()">Create Rule / יצירת חוק</button>
+    <button class="button secondary" type="button" onclick="openEditRuleModal()">Edit Rule / עריכת חוק</button>
     <button class="button secondary" type="button" onclick="openDeactivateModal()">Deactivate Rule / השבתת חוק</button>
 
     <div id="rule-modal" class="modal" hidden>
       <div class="modal-panel">
-        <h2>Create Rule / יצירת חוק</h2>
+        <h2 id="rule-modal-title">Create Rule / יצירת חוק</h2>
+        <input id="rule-id" type="hidden">
         <label>Name <input id="rule-name" type="text"></label>
         <label>Entry price <input id="rule-entry" type="number" step="0.01" min="0.01" max="0.99"></label>
         <label>Stop loss <input id="rule-stop" type="number" step="0.01" min="0.01" max="0.99"></label>
@@ -5140,11 +5199,44 @@ def render_dashboard_scripts() -> str:
         }
       }
 
+      function setRuleForm(rule = null) {
+        document.getElementById("rule-id").value = rule?.id || "";
+        document.getElementById("rule-modal-title").textContent = rule ? "Edit Rule / עריכת חוק" : "Create Rule / יצירת חוק";
+        document.getElementById("rule-name").value = rule?.name || "";
+        document.getElementById("rule-entry").value = rule?.entry_price ?? "";
+        document.getElementById("rule-stop").value = rule?.stop_loss_price ?? "";
+        document.getElementById("rule-take").value = rule?.take_profit_price ?? "";
+        document.getElementById("rule-max-yes").value = rule?.max_yes_entries_per_event ?? 1;
+        document.getElementById("rule-max-no").value = rule?.max_no_entries_per_event ?? 1;
+        document.getElementById("rule-window-start").value = rule?.entry_window_start_seconds_before_end ?? "";
+        document.getElementById("rule-window-end").value = rule?.entry_window_end_seconds_before_end ?? "";
+        document.getElementById("rule-timezone").value = rule?.schedule_timezone || "Asia/Jerusalem";
+        document.getElementById("rule-status").value = rule?.status || "active";
+        document.getElementById("inactive-windows").innerHTML = "";
+        (rule?.inactive_windows || []).forEach((windowData) => addInactiveWindow(windowData));
+      }
       function openRuleModal() {
         if (!document.getElementById("rule-modal")) {
           return;
         }
         document.getElementById("rule-error").textContent = "";
+        setRuleForm();
+        document.getElementById("rule-modal").hidden = false;
+      }
+      async function openEditRuleModal() {
+        const ruleId = window.prompt("Rule ID to edit / מזהה חוק לעריכה");
+        if (!ruleId) {
+          return;
+        }
+        const response = await fetch("/rules");
+        const rules = await response.json();
+        const rule = response.ok ? rules.find((item) => String(item.id) === String(ruleId)) : null;
+        if (!rule) {
+          window.alert("Rule not found / החוק לא נמצא");
+          return;
+        }
+        document.getElementById("rule-error").textContent = "";
+        setRuleForm(rule);
         document.getElementById("rule-modal").hidden = false;
       }
       function closeRuleModal() {
@@ -5224,14 +5316,15 @@ def render_dashboard_scripts() -> str:
           inactive_windows: readInactiveWindows(),
           status: document.getElementById("rule-status").value
         };
-        const response = await fetch("/rules", {
-          method: "POST",
+        const ruleId = document.getElementById("rule-id").value;
+        const response = await fetch(ruleId ? `/rules/${ruleId}` : "/rules", {
+          method: ruleId ? "PUT" : "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(payload)
         });
         const data = await response.json();
         if (!response.ok) {
-          document.getElementById("rule-error").textContent = data.detail || "Rule creation failed";
+          document.getElementById("rule-error").textContent = data.detail || "Rule save failed";
           return;
         }
         closeRuleModal();
@@ -6049,6 +6142,20 @@ def api_create_rule(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc))
     except sqlite3.Error:
         raise HTTPException(status_code=500, detail="Database error while creating rule")
+    with get_conn() as conn:
+        return rules_to_dicts(conn, [row])[0]
+
+
+@app.put("/rules/{rule_id}")
+def api_update_rule(rule_id: int, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    try:
+        row = update_rule(rule_id, payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Rule {rule_id} does not exist")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except sqlite3.Error:
+        raise HTTPException(status_code=500, detail="Database error while updating rule")
     with get_conn() as conn:
         return rules_to_dicts(conn, [row])[0]
 

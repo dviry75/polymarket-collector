@@ -165,7 +165,8 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json()["message"], "Rule is already inactive")
         self.assertEqual(client.post("/rules/9999/deactivate").status_code, 404)
-        self.assertIn(client.put(f"/rules/{inactive_id}", json={"name": "changed"}).status_code, {404, 405})
+        self.assertEqual(client.put(f"/rules/{inactive_id}", json={"name": "changed"}).status_code, 400)
+        self.assertEqual(client.put("/rules/9999", json=valid_rule()).status_code, 404)
 
     def test_rule_scheduling_validation_and_api_payload(self):
         client = TestClient(app.app)
@@ -209,14 +210,15 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(len(windows), 7)
         self.assertEqual({window["day_of_week"] for window in windows}, set(range(7)))
 
-        app.insert_orderbook_log(orderbook(
-            "event-a",
-            yes_ask=0.77,
-            yes_bid=0.76,
-            no_ask=0.2,
-            no_bid=0.19,
-            sampled_at="2026-07-22T00:30:00+00:00",
-        ))
+        with patch.object(app, "now_utc", return_value=app.parse_iso_datetime("2026-07-22T00:30:00+00:00")):
+            app.insert_orderbook_log(orderbook(
+                "event-a",
+                yes_ask=0.77,
+                yes_bid=0.76,
+                no_ask=0.2,
+                no_bid=0.19,
+                sampled_at="2026-07-22T00:30:00+00:00",
+            ))
         self.assertEqual(len(self.fetch_deals()), 0)
 
     def test_entry_window_blocks_and_stores_seconds_before_event_end(self):
@@ -255,32 +257,20 @@ class RuleDealTests(unittest.TestCase):
             ],
         ))
 
-        app.insert_orderbook_log(orderbook(
-            "event-a",
-            yes_ask=0.77,
-            yes_bid=0.76,
-            no_ask=0.2,
-            no_bid=0.19,
-            sampled_at="2026-07-20T20:30:00+00:00",
-        ))
-        app.insert_orderbook_log(orderbook(
-            "event-a",
-            yes_ask=0.77,
-            yes_bid=0.76,
-            no_ask=0.2,
-            no_bid=0.19,
-            sampled_at="2026-07-20T22:30:00+00:00",
-        ))
+        for sampled_at in ("2026-07-20T20:30:00+00:00", "2026-07-20T22:30:00+00:00"):
+            with patch.object(app, "now_utc", return_value=app.parse_iso_datetime(sampled_at)):
+                app.insert_orderbook_log(orderbook(
+                    "event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19,
+                    sampled_at=sampled_at,
+                ))
         self.assertEqual(len(self.fetch_deals()), 0)
 
-        app.insert_orderbook_log(orderbook(
-            "event-a",
-            yes_ask=0.77,
-            yes_bid=0.76,
-            no_ask=0.2,
-            no_bid=0.19,
-            sampled_at="2026-07-21T00:30:00+00:00",
-        ))
+        after_window = "2026-07-21T00:30:00+00:00"
+        with patch.object(app, "now_utc", return_value=app.parse_iso_datetime(after_window)):
+            app.insert_orderbook_log(orderbook(
+                "event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19,
+                sampled_at=after_window,
+            ))
         self.assertEqual(len(self.fetch_deals()), 1)
 
     def test_inactive_schedule_gate_boundaries_days_status_and_refresh(self):
@@ -342,7 +332,9 @@ class RuleDealTests(unittest.TestCase):
                 )
             return original(conn, rule_id, current_time)
 
-        with patch.object(app, "can_rule_open_new_deal", side_effect=add_window_then_gate):
+        fixed_now = app.parse_iso_datetime("2026-07-17T09:00:01+00:00")
+        with patch.object(app, "now_utc", return_value=fixed_now), \
+                patch.object(app, "can_rule_open_new_deal", side_effect=add_window_then_gate):
             app.insert_orderbook_log(orderbook(
                 "event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19,
                 sampled_at="2026-07-17T09:00:01+00:00",
@@ -350,6 +342,85 @@ class RuleDealTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(len(self.fetch_deals()), 0)
         self.assertEqual(rule["status"], "active")
+
+    def test_decision_time_controls_final_schedule_gate(self):
+        app.create_rule(valid_rule(inactive_windows=[
+            {"day_of_week": 4, "start_time": "10:00", "end_time": "11:00", "status": "active"},
+        ]))
+        sampled_before = "2026-07-17T06:59:59+00:00"
+        decision_inside = app.parse_iso_datetime("2026-07-17T07:00:01+00:00")
+        with patch.object(app, "now_utc", return_value=decision_inside):
+            app.insert_orderbook_log(orderbook(
+                "event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19,
+                sampled_at=sampled_before,
+            ))
+        self.assertEqual(len(self.fetch_deals()), 0)
+
+        sampled_inside = "2026-07-17T07:30:00+00:00"
+        decision_after = app.parse_iso_datetime("2026-07-17T08:00:01+00:00")
+        with patch.object(app, "now_utc", return_value=decision_after):
+            app.insert_orderbook_log(orderbook(
+                "event-a", yes_ask=0.77, yes_bid=0.76, no_ask=0.2, no_bid=0.19,
+                sampled_at=sampled_inside,
+            ))
+        self.assertEqual(len(self.fetch_deals()), 1)
+
+    def test_update_rule_replaces_windows_and_rolls_back_on_db_failure(self):
+        client = TestClient(app.app)
+        created = client.post("/rules", json=valid_rule(inactive_windows=[
+            {"day_of_week": 0, "start_time": "10:00", "end_time": "12:00", "status": "active"},
+        ])).json()
+        rule_id = created["id"]
+        updated_payload = valid_rule(
+            name="updated rule",
+            schedule_timezone="UTC",
+            inactive_windows=[
+                {"day_of_week": 2, "start_time": "13:00", "end_time": "14:00", "status": "inactive"},
+                {"day_of_week": 3, "start_time": "15:00", "end_time": "16:00"},
+            ],
+        )
+        updated = client.put(f"/rules/{rule_id}", json=updated_payload)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["name"], "updated rule")
+        self.assertEqual(updated.json()["schedule_timezone"], "UTC")
+        self.assertEqual([window["status"] for window in updated.json()["inactive_windows"]], ["inactive", "active"])
+
+        with app.get_conn() as conn:
+            conn.execute("""
+                CREATE TRIGGER fail_test_window_insert BEFORE INSERT ON rule_inactive_windows
+                BEGIN SELECT RAISE(ABORT, 'forced test failure'); END
+            """)
+            conn.commit()
+        failed_payload = valid_rule(name="must roll back", inactive_windows=[
+            {"day_of_week": 5, "start_time": "17:00", "end_time": "18:00", "status": "active"},
+        ])
+        failed = client.put(f"/rules/{rule_id}", json=failed_payload)
+        self.assertEqual(failed.status_code, 500)
+        current = next(rule for rule in client.get("/rules").json() if rule["id"] == rule_id)
+        self.assertEqual(current["name"], "updated rule")
+        self.assertEqual(len(current["inactive_windows"]), 2)
+
+        duplicate = valid_rule(inactive_windows=[
+            {"day_of_week": 1, "start_time": "10:00", "end_time": "11:00"},
+            {"day_of_week": 1, "start_time": "10:00", "end_time": "11:00"},
+        ])
+        self.assertEqual(client.put(f"/rules/{rule_id}", json=duplicate).status_code, 400)
+
+        with app.get_conn() as conn:
+            conn.execute("DROP TRIGGER fail_test_window_insert")
+            conn.commit()
+        deleted = client.put(f"/rules/{rule_id}", json=valid_rule(name="windows removed", inactive_windows=[]))
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json()["inactive_windows"], [])
+        refreshed = next(rule for rule in client.get("/rules").json() if rule["id"] == rule_id)
+        self.assertEqual(refreshed["inactive_windows"], [])
+
+        page = client.get("/rules-page")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Enabled — blocks new entries", page.text)
+        self.assertIn("Disabled — does not block", page.text)
+        self.assertIn("openEditRuleModal", page.text)
+        self.assertIn('windowData.status || "active"', page.text)
 
     def test_active_rule_starts_only_on_next_event_and_survives_restart(self):
         app.active_market = {"event_slug": "event-a", "condition_id": "condition-a"}
