@@ -110,6 +110,9 @@ class MarketWebSocketManager:
                             for message in payload if isinstance(payload, list) else [payload]:
                                 if isinstance(message, dict):
                                     self.process_message(message)
+                            # A continuously readable socket may otherwise monopolize the
+                            # event loop while snapshots are persisted synchronously.
+                            await asyncio.sleep(0)
                     finally:
                         heartbeat.cancel()
                         subscriptions.cancel()
