@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+import json
 
 from .repository import LiveRepository
 
@@ -44,25 +45,53 @@ class PaperTradingEngine:
             return result
 
         closed_rule_ids: set[int] = set()
-        bid = self._decimal(snapshot.get("best_bid"))
-        if bid is not None:
-            for deal in self.repo.open_paper_deals(asset_id=str(snapshot["asset_id"])):
+        bid = self._valid_probability(snapshot.get("best_bid"))
+        open_deals = self.repo.open_paper_deals(asset_id=str(snapshot["asset_id"]))
+        if bid is None:
+            for deal in open_deals:
+                self.repo.audit(
+                    "paper_engine", "paper_exit_not_filled", "blocked",
+                    "NO_VALID_FRESH_BID", {
+                        "deal_id": deal["id"],
+                        "snapshot_id": snapshot.get("id"),
+                        "best_bid": snapshot.get("best_bid"),
+                    },
+                )
+        else:
+            for deal in open_deals:
                 stop_loss = self._decimal(deal.get("stop_loss_price"))
                 take_profit = self._decimal(deal.get("take_profit_price"))
                 if snapshot.get("event_type") == "market_resolved":
-                    self.repo.close_paper_deal(
-                        deal, snapshot, reason="event_resolution", exit_price=float(bid)
-                    )
+                    reason = "event_resolution"
+                    trigger_price = bid
                 elif stop_loss is not None and bid <= stop_loss:
-                    self.repo.close_paper_deal(
-                        deal, snapshot, reason="stop_loss", exit_price=float(stop_loss)
-                    )
+                    reason = "stop_loss"
+                    trigger_price = stop_loss
                 elif take_profit is not None and bid >= take_profit:
-                    self.repo.close_paper_deal(
-                        deal, snapshot, reason="take_profit", exit_price=float(take_profit)
-                    )
+                    reason = "take_profit"
+                    trigger_price = take_profit
                 else:
                     continue
+
+                execution_price, fill_method = self._executable_exit_price(deal, snapshot)
+                if execution_price is None:
+                    self.repo.audit(
+                        "paper_engine", "paper_exit_not_filled", "blocked",
+                        "NO_VALID_FRESH_BID", {
+                            "deal_id": deal["id"],
+                            "snapshot_id": snapshot.get("id"),
+                            "trigger_price": str(trigger_price),
+                        },
+                    )
+                    continue
+                self.repo.close_paper_deal(
+                    deal,
+                    snapshot,
+                    reason=reason,
+                    trigger_price=trigger_price,
+                    exit_price=execution_price,
+                    fill_method=fill_method,
+                )
                 closed_rule_ids.add(int(deal["live_rule_id"]))
                 self.closed += 1
                 result["closed"] += 1
@@ -144,6 +173,45 @@ class PaperTradingEngine:
         age = (datetime.now(timezone.utc) - received.astimezone(timezone.utc)).total_seconds()
         return age > self.max_market_age_seconds
 
+    def _executable_exit_price(
+        self, deal: dict[str, Any], snapshot: dict[str, Any]
+    ) -> tuple[Decimal | None, str]:
+        best_bid = self._valid_probability(snapshot.get("best_bid"))
+        if best_bid is None:
+            return None, "none"
+
+        requested_size = self._decimal(deal.get("filled_size"))
+        if requested_size is None or requested_size <= 0:
+            return None, "none"
+
+        raw_levels = snapshot.get("bids")
+        if raw_levels is None and snapshot.get("bids_json"):
+            try:
+                raw_levels = json.loads(str(snapshot["bids_json"]))
+            except (TypeError, ValueError):
+                raw_levels = []
+
+        levels: list[tuple[Decimal, Decimal]] = []
+        for level in raw_levels or []:
+            if not isinstance(level, dict):
+                continue
+            price = self._valid_probability(level.get("price"))
+            size = self._decimal(level.get("size"))
+            if price is not None and size is not None and size > 0:
+                levels.append((price, size))
+
+        if levels:
+            remaining = requested_size
+            notional = Decimal("0")
+            for price, available in sorted(levels, key=lambda item: item[0], reverse=True):
+                filled = min(remaining, available)
+                notional += filled * price
+                remaining -= filled
+                if remaining <= 0:
+                    return notional / requested_size, "ORDER_BOOK_VWAP"
+
+        return best_bid, "BEST_BID_FALLBACK"
+
     @staticmethod
     def _decimal(value: Any) -> Decimal | None:
         try:
@@ -151,3 +219,8 @@ class PaperTradingEngine:
         except Exception:
             return None
         return result if result.is_finite() else None
+
+    @classmethod
+    def _valid_probability(cls, value: Any) -> Decimal | None:
+        result = cls._decimal(value)
+        return result if result is not None and Decimal("0") <= result <= Decimal("1") else None

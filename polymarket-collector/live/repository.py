@@ -795,16 +795,23 @@ class LiveRepository:
             return None
 
     def close_paper_deal(
-        self, deal: dict[str, Any], snapshot: dict[str, Any], *, reason: str, exit_price: float
+        self,
+        deal: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        reason: str,
+        trigger_price: Decimal,
+        exit_price: Decimal,
+        fill_method: str,
     ) -> dict[str, Any]:
         entry_price = Decimal(str(deal["average_entry_fill_price"]))
         shares = Decimal(str(deal["filled_size"]))
-        exit_value = shares * Decimal(str(exit_price))
+        exit_value = shares * exit_price
         amount = Decimal(str(deal["requested_amount_usd"]))
         gross = exit_value - amount
         fee_rate = Decimal(str(deal.get("fee_rate") or 0))
         exit_fee = (
-            shares * fee_rate * Decimal(str(exit_price)) * (Decimal("1") - Decimal(str(exit_price)))
+            shares * fee_rate * exit_price * (Decimal("1") - exit_price)
         ).quantize(Decimal("0.00001"))
         total_fees = Decimal(str(deal.get("fees_usd") or 0)) + exit_fee
         net = gross - total_fees - Decimal(str(deal.get("slippage_usd") or 0))
@@ -821,7 +828,7 @@ class LiveRepository:
                 WHERE id = ? AND execution_mode = 'PAPER_TRADING'
                 """,
                 (
-                    float(exit_price), float(exit_price), float(net), float(gross), float(net),
+                    float(exit_price), float(trigger_price), float(net), float(gross), float(net),
                     float(roi), float(total_fees), reason, snapshot["id"], ts, ts, deal["id"],
                 ),
             )
@@ -829,7 +836,13 @@ class LiveRepository:
             conn.commit()
         result = row_to_dict(row) or {}
         self.audit("paper_engine", "paper_deal_closed", "ok", reason, {
-            "deal_id": deal["id"], "snapshot_id": snapshot["id"], "net_pnl_usd": float(net),
+            "deal_id": deal["id"],
+            "snapshot_id": snapshot["id"],
+            "trigger_price": float(trigger_price),
+            "best_bid": snapshot.get("best_bid"),
+            "execution_price": float(exit_price),
+            "fill_method": fill_method,
+            "net_pnl_usd": float(net),
         })
         return result
 

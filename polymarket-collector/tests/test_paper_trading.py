@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -99,6 +100,104 @@ class PaperTradingTests(unittest.TestCase):
         self.assertEqual(self.repo.list_table("live_order_fills", 10), [])
         self.assertGreaterEqual(len(self.repo.list_table("live_rule_evaluations", 10)), 2)
         self.assertEqual(self.engine.health()["write_dependencies"], [])
+
+    def test_exact_entry_does_not_open_on_crossing_and_deduplicates_exact_updates(self):
+        self.create_rule()
+        self.manager.process_message(self.book("no-token", 0.25, 0.26, 4))
+        self.manager.process_message(self.book("yes-token", 0.72, 0.73, 5))
+        self.manager.process_message(self.book("yes-token", 0.74, 0.75, 6))
+        self.assertEqual(self.repo.open_paper_deals(), [])
+
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 7))
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 8))
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 9))
+        deals = self.repo.open_paper_deals()
+        self.assertEqual(len(deals), 1)
+        self.assertEqual(Decimal(str(deals[0]["average_entry_fill_price"])), Decimal("0.74"))
+
+    def test_take_profit_executes_at_real_best_bid_and_pnl_uses_execution_price(self):
+        self.create_rule(take_profit_price=0.95)
+        self.manager.process_message(self.book("no-token", 0.25, 0.26, 40))
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 41))
+        self.manager.process_message(self.book("yes-token", 0.94, 0.96, 42))
+
+        deal = self.repo.open_paper_deals()[0]
+        snapshot = self.repo.latest_market_snapshot("yes-token")
+        execution_price, fill_method = self.engine._executable_exit_price(deal, snapshot)
+        self.repo.close_paper_deal(
+            deal,
+            snapshot,
+            reason="take_profit",
+            trigger_price=Decimal("0.95"),
+            exit_price=execution_price,
+            fill_method=fill_method,
+        )
+
+        deal = self.repo.list_table("live_deals", 1)[0]
+        self.assertEqual(deal["exit_reason"], "take_profit")
+        self.assertEqual(Decimal(str(deal["requested_exit_price"])), Decimal("0.95"))
+        self.assertEqual(Decimal(str(deal["average_exit_fill_price"])), Decimal("0.94"))
+        expected_gross = Decimal(str(deal["filled_size"])) * Decimal("0.94") - Decimal("1")
+        self.assertAlmostEqual(deal["gross_pnl_usd"], float(expected_gross))
+
+    def test_stop_loss_executes_at_real_best_bid(self):
+        self.create_rule(stop_loss_price=0.65)
+        self.manager.process_message(self.book("no-token", 0.25, 0.26, 50))
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 51))
+        self.manager.process_message(self.book("yes-token", 0.63, 0.64, 52))
+
+        deal = self.repo.list_table("live_deals", 1)[0]
+        self.assertEqual(deal["exit_reason"], "stop_loss")
+        self.assertEqual(Decimal(str(deal["requested_exit_price"])), Decimal("0.65"))
+        self.assertEqual(Decimal(str(deal["average_exit_fill_price"])), Decimal("0.63"))
+
+    def test_exit_uses_order_book_vwap_when_depth_is_sufficient(self):
+        self.create_rule(take_profit_price=0.93, requested_amount_usd=2)
+        self.manager.process_message(self.book("no-token", 0.25, 0.26, 60))
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 61))
+        exit_book = self.book("yes-token", 0.94, 0.96, 62)
+        exit_book["bids"] = [
+            {"price": "0.94", "size": "1"},
+            {"price": "0.93", "size": "10"},
+        ]
+        self.manager.process_message(exit_book)
+
+        deal = self.repo.list_table("live_deals", 1)[0]
+        size = Decimal("2") / Decimal("0.74")
+        expected = (Decimal("0.94") + (size - Decimal("1")) * Decimal("0.93")) / size
+        self.assertAlmostEqual(deal["average_exit_fill_price"], float(expected))
+        audit = next(
+            row for row in self.repo.list_table("live_audit_log", 10)
+            if row["action"] == "paper_deal_closed"
+        )
+        details = json.loads(audit["details_json"])
+        self.assertEqual(details["fill_method"], "ORDER_BOOK_VWAP")
+
+    def test_no_valid_bid_does_not_invent_exit_fill(self):
+        self.create_rule()
+        self.manager.process_message(self.book("no-token", 0.25, 0.26, 70))
+        self.manager.process_message(self.book("yes-token", 0.73, 0.74, 71))
+        snapshot = self.repo.store_market_snapshot({
+            "condition_id": "condition-next",
+            "event_id": "btc-updown-5m-next",
+            "asset_id": "yes-token",
+            "outcome": "YES",
+            "event_type": "price_change",
+            "best_bid": None,
+            "best_ask": 0.66,
+            "bids": [],
+            "asks": [],
+            "received_at": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat(),
+        })
+        self.engine.process_snapshot(snapshot)
+
+        deal = self.repo.list_table("live_deals", 1)[0]
+        self.assertEqual(deal["status"], "open")
+        self.assertIsNone(deal["average_exit_fill_price"])
+        audit = self.repo.list_table("live_audit_log", 1)[0]
+        self.assertEqual(audit["reason"], "NO_VALID_FRESH_BID")
 
     def test_both_sides_match_is_fail_closed(self):
         rule = self.create_rule(status="inactive")
