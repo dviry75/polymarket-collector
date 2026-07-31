@@ -16,6 +16,7 @@ from .config import LiveConfig, redact_mapping
 from .dry_run import DryRunService
 from .market_websocket import MarketWebSocketManager, UserWebSocketManager
 from .order_manager import OrderManager
+from .paper_trading import PaperTradingEngine
 from .public_client import MockPublicClobClient, PublicClobClient
 from .reconciliation import ReconciliationWorker
 from .repository import LiveRepository, now_iso
@@ -37,19 +38,33 @@ _user_ws: UserWebSocketManager | None = None
 _engine: TradingEngine | None = None
 _auth: LiveAuthManager | None = None
 _dry_run: DryRunService | None = None
+_paper: PaperTradingEngine | None = None
 _export_state: dict[str, Any] = {"status": "idle", "path": None, "error": None, "row_counts": None}
 
 
 def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
-    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper
     _config = config or LiveConfig.from_env()
+    errors = _config.validation_errors()
+    if errors:
+        raise ValueError("; ".join(errors))
     _repo = LiveRepository(db_path)
     _repo.migrate(_config.live_kill_switch_default)
     _adapter = MockTradingAdapter(_config.adapter_scenario) if _config.live_adapter == "mock" else RealPolymarketTradingAdapter(_config)
     _risk = RiskManager(_config, _repo)
     _orders = OrderManager(_repo, _risk, _adapter)
     _reconciliation = ReconciliationWorker(_repo, _adapter)
-    _market_ws = MarketWebSocketManager(_repo, stale_after_seconds=_config.max_market_data_age_seconds)
+    _paper = PaperTradingEngine(
+        _repo,
+        enabled=_config.paper_trading_active(),
+        max_market_age_seconds=_config.max_market_data_age_seconds,
+        taker_fee_rate=_config.paper_taker_fee_rate,
+    )
+    _market_ws = MarketWebSocketManager(
+        _repo,
+        stale_after_seconds=_config.max_market_data_age_seconds,
+        on_snapshot=_paper.process_snapshot,
+    )
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
         reconciliation=lambda: _reconciliation.run_once(actor="user_ws_reconnect"),
@@ -63,6 +78,12 @@ def services() -> tuple[LiveConfig, LiveRepository, TradingAdapter, RiskManager,
     if _repo is None or _config is None or _adapter is None or _risk is None or _orders is None or _reconciliation is None or _market_ws is None or _user_ws is None or _engine is None or _auth is None or _dry_run is None:
         raise RuntimeError("LIVE services are not configured")
     return _config, _repo, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run
+
+
+def paper_service() -> PaperTradingEngine:
+    if _paper is None:
+        raise RuntimeError("LIVE paper service is not configured")
+    return _paper
 
 
 def require_live_session(request: Request) -> None:
@@ -236,6 +257,8 @@ def compact_table(rows: list[dict[str, Any]], columns: list[str] | None = None, 
 
 
 def status_label(config: LiveConfig, repo: LiveRepository, market_ws: MarketWebSocketManager) -> str:
+    if config.paper_trading_active():
+        return "PAPER TRADING"
     if repo.kill_switch_active():
         return "KILLED"
     if config.real_submission_armed():
@@ -258,6 +281,7 @@ def dashboard_model() -> dict[str, Any]:
     account = repo.latest_account_snapshot() or {}
     market_health = market_ws.health()
     user_health = user_ws.health()
+    paper_health = paper_service().health()
     system_mode = status_label(config, repo, market_ws)
     risk_gates = [
         ("Kill Switch", "BLOCKED" if repo.kill_switch_active() else "PASS", "down" if repo.kill_switch_active() else "up"),
@@ -269,6 +293,7 @@ def dashboard_model() -> dict[str, Any]:
         ("Open Orders", f'{counts["open_orders"]}/{config.max_open_orders}', "up" if counts["open_orders"] < config.max_open_orders else "down"),
         ("Open Deals", f'{counts["open_deals"]}/{config.max_open_deals}', "up" if counts["open_deals"] < config.max_open_deals else "down"),
         ("Active Rules", f'{counts.get("active_rules", 0)}/{config.max_active_rules}', "up" if counts.get("active_rules", 0) <= config.max_active_rules else "down"),
+        ("Paper Engine", paper_health.get("status"), None),
         ("Exposure", f'{risk.current_exposure_usd()}/{config.max_total_exposure_usd}', "up"),
         ("Daily PnL", f'{daily.get("realized_pnl_usd", 0)}/-{config.max_daily_realized_loss_usd}', "up"),
         ("Failed Orders Streak", f'{daily.get("consecutive_failed_orders", 0)}/{config.max_consecutive_failed_orders}', "up"),
@@ -285,6 +310,7 @@ def dashboard_model() -> dict[str, Any]:
         "account": account,
         "market_health": market_health,
         "user_health": user_health,
+        "paper_health": paper_health,
         "mode": system_mode,
         "risk_gates": risk_gates,
         "auth": auth,
@@ -302,6 +328,7 @@ def dashboard_content(view: str = "overview") -> str:
     account = model["account"]
     market_health = model["market_health"]
     user_health = model["user_health"]
+    paper_health = model["paper_health"]
     summary = {
         "mode": model["mode"],
         "adapter": config.live_adapter,
@@ -321,8 +348,8 @@ def dashboard_content(view: str = "overview") -> str:
         stat_card("Kill Switch", summary["kill_switch"], "down" if summary["kill_switch"] else "up", "must stay true before live"),
         stat_card("Market WS", summary["market_ws"], _tone_for_value(summary["market_ws"]), f"stale={market_health.get('stale')}"),
         stat_card("User WS", summary["user_ws"], _tone_for_value(summary["user_ws"]), f"stale={user_health.get('stale')}"),
-        stat_card("Exposure", summary["exposure_usd"], "info", f"cap ${config.max_total_exposure_usd}"),
-        stat_card("Daily PnL", daily.get("realized_pnl_usd", 0), "up", f"limit -${config.max_daily_realized_loss_usd}"),
+        stat_card("Paper Deals", counts.get("open_paper_deals", 0), "info", f"closed={counts.get('closed_paper_deals', 0)}"),
+        stat_card("Paper PnL", counts.get("paper_realized_pnl_usd", 0), "up", "simulated USD"),
     ])
     actions = """
     <div class="actions">
@@ -395,6 +422,8 @@ def dashboard_content(view: str = "overview") -> str:
             ]))}
             {panel("Runtime Config", kv_table([
                 ("Trading Mode", config.trading_mode, None),
+                ("Execution Mode", config.execution_mode, None),
+                ("Paper Trading", paper_health.get("status"), None),
                 ("Live Module", config.live_module_enabled, None),
                 ("Live Trading", config.live_trading_enabled, None),
                 ("Order Submission", config.live_order_submission_enabled, None),
@@ -427,6 +456,49 @@ def dashboard_content(view: str = "overview") -> str:
               ("Market Stale", market_health.get("stale"), None),
               ("Reconnect Attempts", market_health.get("reconnect_attempts"), None),
           ]))}
+        """,
+        "paper-overview": f"""
+          <div class="panel" style="border:2px solid #2563eb;color:#1d4ed8;font-weight:800">
+            PAPER TRADING ONLY — REAL CLOB WRITES ARE NOT AVAILABLE TO THIS ENGINE
+          </div>
+          <div class="stats-grid">
+            {stat_card("Paper Engine", paper_health.get("status"), _tone_for_value(paper_health.get("status")), config.execution_mode)}
+            {stat_card("Active Rules", counts.get("active_paper_rules", 0), "info", f"total={counts.get('paper_rules', 0)}")}
+            {stat_card("Open Deals", counts.get("open_paper_deals", 0), "info", "simulated only")}
+            {stat_card("Closed Deals", counts.get("closed_paper_deals", 0), "info", "simulated only")}
+            {stat_card("Paper PnL", counts.get("paper_realized_pnl_usd", 0), "up", "net simulated USD")}
+            {stat_card("Market Snapshots", counts.get("market_snapshots", 0), "info", "Polymarket Market WS")}
+          </div>
+          {panel("Isolation", kv_table([
+              ("Execution Mode", config.execution_mode, None),
+              ("Paper Enabled", config.paper_trading_enabled, None),
+              ("Paper Active", config.paper_trading_active(), None),
+              ("Market WS Enabled", config.market_ws_enabled, None),
+              ("Real Trading Enabled", config.live_trading_enabled, "up" if not config.live_trading_enabled else "down"),
+              ("Order Submission Enabled", config.live_order_submission_enabled, "up" if not config.live_order_submission_enabled else "down"),
+              ("Paper Write Dependencies", ", ".join(paper_health.get("write_dependencies") or []) or "none", "up"),
+          ]))}
+          {panel("Recent Rule Decisions", compact_table(repo.list_table("live_rule_evaluations", 50), ["id", "live_rule_id", "event_id", "outcome", "decision", "reason", "observed_best_bid", "observed_best_ask", "entry_price", "evaluated_at"]))}
+        """,
+        "paper-rules": f"""
+          {panel("Paper Rules", compact_table(
+              [row for row in repo.list_table("live_rules", 200) if row.get("execution_mode") == "PAPER_TRADING"],
+              ["id", "name", "execution_mode", "entry_price", "stop_loss_price", "take_profit_price", "requested_amount_usd", "status", "eligible_after_event_id", "last_evaluated_at", "last_decision", "last_reason"],
+              "No Paper Rules"
+          ))}
+          {panel("API", '<p class="muted">Create with <code>POST /live/paper/rules</code>; activate or deactivate with <code>POST /live/paper/rules/{id}/status</code>. Active creation requires operator token and password re-authentication.</p>')}
+        """,
+        "paper-deals": f"""
+          {panel("Open Paper Deals", compact_table(
+              [row for row in repo.open_paper_deals()],
+              ["id", "live_rule_id", "event_id", "outcome", "status", "requested_amount_usd", "filled_size", "average_entry_fill_price", "entry_reason", "opened_at"],
+              "No open Paper Deals"
+          ))}
+          {panel("Paper Deal History", compact_table(
+              [row for row in repo.list_table("live_deals", 500) if row.get("execution_mode") == "PAPER_TRADING"],
+              ["id", "live_rule_id", "event_id", "outcome", "status", "average_entry_fill_price", "average_exit_fill_price", "gross_pnl_usd", "net_pnl_usd", "roi_percent", "exit_reason", "opened_at", "closed_at"],
+              "No Paper Deal history"
+          ))}
         """,
         "account": f"""
           {panel("Account Identity", compact_table(repo.list_table("live_account_snapshots", 50), ["id", "sampled_at", "configured_profile_address", "resolved_proxy_wallet", "expected_funder_candidate", "account_identity_status", "public_positions_count", "public_positions_value", "status", "error"]))}
@@ -502,6 +574,9 @@ def live_dashboard(request: Request) -> str:
         ("risk", "Risk"),
         ("logs", "Logs"),
         ("market", "Market Data"),
+        ("paper-overview", "Paper Overview"),
+        ("paper-rules", "Paper Rules"),
+        ("paper-deals", "Paper Deals"),
         ("account", "Account"),
         ("dry-run", "Dry Run"),
         ("reconciliation", "Reconciliation"),
@@ -748,6 +823,36 @@ def live_rules(request: Request) -> list[dict[str, Any]]:
     return services()[1].list_table("live_rules", 100)
 
 
+@router.get("/paper/rules")
+def paper_rules(request: Request) -> list[dict[str, Any]]:
+    require_live_session(request)
+    return [
+        row for row in services()[1].list_table("live_rules", 100)
+        if row.get("execution_mode") == "PAPER_TRADING"
+    ]
+
+
+@router.get("/paper/deals")
+def paper_deals(request: Request) -> list[dict[str, Any]]:
+    require_live_session(request)
+    return [
+        row for row in services()[1].list_table("live_deals", 500)
+        if row.get("execution_mode") == "PAPER_TRADING"
+    ]
+
+
+@router.get("/paper/evaluations")
+def paper_evaluations(request: Request) -> list[dict[str, Any]]:
+    require_live_session(request)
+    return services()[1].list_table("live_rule_evaluations", 500)
+
+
+@router.get("/paper/health")
+def paper_health(request: Request) -> dict[str, Any]:
+    require_live_session(request)
+    return paper_service().health()
+
+
 @router.get("/reconciliation")
 def live_reconciliation(request: Request) -> list[dict[str, Any]]:
     require_live_session(request)
@@ -786,12 +891,26 @@ async def run_reconciliation(request: Request, x_live_operator_token: Optional[s
 
 
 @router.post("/rules")
+@router.post("/paper/rules")
 def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None), x_live_reauth_password: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
     if str(payload.get("status") or "inactive").lower() == "active":
         require_reauth(request, x_live_reauth_password)
-    repo = services()[1]
+    config, repo, *_ = services()
+    execution_mode = str(payload.get("execution_mode") or "PAPER_TRADING").upper()
+    if execution_mode != "PAPER_TRADING":
+        raise HTTPException(status_code=400, detail="Only PAPER_TRADING rules can be created here")
+    if str(payload.get("status") or "inactive").lower() == "active" and not config.paper_trading_active():
+        raise HTTPException(
+            status_code=409,
+            detail="Active Paper Rules require LIVE_EXECUTION_MODE=PAPER_TRADING and LIVE_PAPER_TRADING_ENABLED=true",
+        )
+    if (
+        str(payload.get("status") or "inactive").lower() == "active"
+        and repo.counts().get("active_paper_rules", 0) >= config.max_active_rules
+    ):
+        raise HTTPException(status_code=409, detail="Maximum active Paper Rules reached")
     try:
         entry = float(payload.get("entry_price"))
         sl = float(payload.get("stop_loss_price"))
@@ -802,18 +921,56 @@ def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_li
         raise HTTPException(status_code=400, detail="entry_price 0.5 is not allowed")
     if sl >= entry or tp <= entry:
         raise HTTPException(status_code=400, detail="SL must be below entry and TP above entry")
+    amount = float(payload.get("requested_amount_usd", 1))
+    if amount <= 0 or amount > float(config.max_trade_amount_usd):
+        raise HTTPException(status_code=400, detail="requested_amount_usd exceeds Paper limit")
+    latest_market = repo.latest_market()
     rule = repo.create_rule({
         "name": str(payload.get("name") or "").strip() or "live rule",
         "entry_price": entry,
         "stop_loss_price": sl,
         "take_profit_price": tp,
-        "requested_amount_usd": float(payload.get("requested_amount_usd", 1)),
+        "requested_amount_usd": amount,
         "entry_order_type": str(payload.get("entry_order_type") or "FOK").upper(),
         "max_entry_slippage": float(payload.get("max_entry_slippage", 0.01)),
         "max_exit_slippage": float(payload.get("max_exit_slippage", 0.02)),
         "status": str(payload.get("status") or "inactive"),
+        "eligible_after_event_id": payload.get("eligible_after_event_id") or (
+            latest_market.get("event_id") if latest_market else None
+        ),
+        "execution_mode": execution_mode,
     })
     return rule
+
+
+@router.post("/paper/rules/{rule_id}/status")
+def update_paper_rule_status(
+    rule_id: int,
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+    x_live_operator_token: Optional[str] = Header(default=None),
+    x_live_csrf_token: Optional[str] = Header(default=None),
+    x_live_reauth_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    status = str(payload.get("status") or "").lower()
+    if status not in {"active", "inactive"}:
+        raise HTTPException(status_code=400, detail="status must be active or inactive")
+    config, repo, *_ = services()
+    rule = next((row for row in repo.list_table("live_rules", 100000) if row["id"] == rule_id), None)
+    if not rule or rule.get("execution_mode") != "PAPER_TRADING":
+        raise HTTPException(status_code=404, detail="Paper Rule not found")
+    if status == "active":
+        require_reauth(request, x_live_reauth_password)
+        if not config.paper_trading_active():
+            raise HTTPException(status_code=409, detail="Paper Trading is not active")
+        if (
+            rule.get("status") != "active"
+            and repo.counts().get("active_paper_rules", 0) >= config.max_active_rules
+        ):
+            raise HTTPException(status_code=409, detail="Maximum active Paper Rules reached")
+    return repo.update_rule_status(rule_id, status)
 
 
 @router.post("/orders/mock")
@@ -864,6 +1021,7 @@ def write_live_export() -> tuple[Path, dict[str, int]]:
         "live_markets", "live_rules", "live_deals", "live_orders", "live_order_fills",
         "live_positions", "live_account_snapshots", "live_reconciliation_runs", "live_audit_log",
         "live_websocket_events", "live_dry_runs", "live_daily_limits",
+        "live_market_snapshots", "live_rule_evaluations",
     ]
     counts: dict[str, int] = {}
     for table in tables:

@@ -302,6 +302,53 @@ class LiveRepository:
                     reason TEXT,
                     error TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS live_market_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    condition_id TEXT NOT NULL,
+                    event_id TEXT,
+                    asset_id TEXT NOT NULL,
+                    outcome TEXT,
+                    event_type TEXT NOT NULL,
+                    best_bid REAL,
+                    best_ask REAL,
+                    best_bid_size REAL,
+                    best_ask_size REAL,
+                    bids_json TEXT,
+                    asks_json TEXT,
+                    market_timestamp TEXT,
+                    received_at TEXT NOT NULL,
+                    latency_ms INTEGER,
+                    source TEXT NOT NULL DEFAULT 'POLYMARKET_MARKET_WS',
+                    message_hash TEXT NOT NULL UNIQUE,
+                    raw_message TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_market_snapshots_asset
+                ON live_market_snapshots(asset_id, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_live_market_snapshots_condition
+                ON live_market_snapshots(condition_id, id DESC);
+
+                CREATE TABLE IF NOT EXISTS live_rule_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    live_rule_id INTEGER NOT NULL,
+                    market_snapshot_id INTEGER NOT NULL,
+                    event_id TEXT,
+                    condition_id TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    outcome TEXT,
+                    decision TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    observed_best_bid REAL,
+                    observed_best_ask REAL,
+                    entry_price REAL,
+                    evaluated_at TEXT NOT NULL,
+                    rule_snapshot_json TEXT NOT NULL,
+                    UNIQUE(live_rule_id, market_snapshot_id),
+                    FOREIGN KEY (live_rule_id) REFERENCES live_rules(id),
+                    FOREIGN KEY (market_snapshot_id) REFERENCES live_market_snapshots(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_rule_evaluations_rule
+                ON live_rule_evaluations(live_rule_id, id DESC);
                 """
             )
             existing = conn.execute("SELECT value FROM live_system_state WHERE key = 'kill_switch'").fetchone()
@@ -339,6 +386,25 @@ class LiveRepository:
                 "public_closed_positions_count": "INTEGER NOT NULL DEFAULT 0",
                 "public_activity_count": "INTEGER NOT NULL DEFAULT 0",
             },
+            "live_markets": {
+                "yes_best_bid": "REAL", "yes_best_ask": "REAL",
+                "no_best_bid": "REAL", "no_best_ask": "REAL",
+                "market_timestamp": "TEXT", "market_received_at": "TEXT",
+            },
+            "live_rules": {
+                "execution_mode": "TEXT NOT NULL DEFAULT 'READ_ONLY'",
+                "last_evaluated_at": "TEXT", "last_decision": "TEXT", "last_reason": "TEXT",
+            },
+            "live_deals": {
+                "execution_mode": "TEXT NOT NULL DEFAULT 'READ_ONLY'",
+                "price_source": "TEXT", "entry_snapshot_id": "INTEGER", "exit_snapshot_id": "INTEGER",
+                "entry_reason": "TEXT", "gross_pnl_usd": "REAL NOT NULL DEFAULT 0",
+                "net_pnl_usd": "REAL NOT NULL DEFAULT 0", "roi_percent": "REAL NOT NULL DEFAULT 0",
+                "opened_at": "TEXT", "closed_at": "TEXT", "rule_snapshot_json": "TEXT",
+                "paper_fill_status": "TEXT",
+                "fee_rate": "REAL NOT NULL DEFAULT 0", "fee_source": "TEXT",
+                "fee_version": "TEXT",
+            },
         }
         with self.connect() as conn:
             for table, columns in additions.items():
@@ -346,6 +412,15 @@ class LiveRepository:
                 for column, column_type in columns.items():
                     if column not in existing:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            conn.commit()
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_live_paper_open_rule_event
+                ON live_deals(live_rule_id, event_id)
+                WHERE execution_mode = 'PAPER_TRADING'
+                  AND status IN ('created','entry_pending','open','partially_open','exit_pending')
+                """
+            )
             conn.commit()
 
     def audit(self, actor: str, action: str, status: str, reason: str = "", details: Optional[dict[str, Any]] = None) -> None:
@@ -466,8 +541,9 @@ class LiveRepository:
                 INSERT INTO live_rules (
                     name, entry_price, stop_loss_price, take_profit_price,
                     requested_amount_usd, entry_order_type, max_entry_slippage,
-                    max_exit_slippage, status, eligible_after_event_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_exit_slippage, status, eligible_after_event_id, execution_mode,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["name"],
@@ -480,6 +556,7 @@ class LiveRepository:
                     payload.get("max_exit_slippage", 0.02),
                     payload.get("status", "inactive"),
                     payload.get("eligible_after_event_id"),
+                    payload.get("execution_mode", "READ_ONLY"),
                     ts,
                     ts,
                 ),
@@ -488,6 +565,273 @@ class LiveRepository:
             conn.commit()
         self.audit("operator", "create_live_rule", "ok", details={"rule_id": row["id"]})
         return row_to_dict(row) or {}
+
+    def market_ws_asset_ids(self) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT yes_token_id, no_token_id
+                FROM live_markets
+                WHERE market_resolved = 0 AND accepting_orders = 1
+                ORDER BY id DESC LIMIT 2
+                """
+            ).fetchall()
+        return list(dict.fromkeys(
+            str(asset_id)
+            for row in rows
+            for asset_id in (row["yes_token_id"], row["no_token_id"])
+            if asset_id
+        ))
+
+    def market_for_asset(self, asset_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM live_markets
+                WHERE yes_token_id = ? OR no_token_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(asset_id), str(asset_id)),
+            ).fetchone()
+        return row_to_dict(row)
+
+    def mark_market_resolved(
+        self, condition_id: str, winning_asset_id: str | None, winning_outcome: str | None
+    ) -> None:
+        ts = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE live_markets SET
+                    market_resolved = 1, winning_asset_id = ?, winning_outcome = ?,
+                    source = 'POLYMARKET_MARKET_WS', last_update_at = ?, updated_at = ?
+                WHERE condition_id = ?
+                """,
+                (winning_asset_id, winning_outcome, ts, ts, str(condition_id)),
+            )
+            conn.commit()
+
+    def store_market_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+        raw = snapshot.get("raw_message") or snapshot
+        message_hash = snapshot.get("message_hash") or sha256_text(json_dumps(raw))
+        received_at = snapshot.get("received_at") or now_iso()
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO live_market_snapshots (
+                        condition_id,event_id,asset_id,outcome,event_type,best_bid,best_ask,
+                        best_bid_size,best_ask_size,bids_json,asks_json,market_timestamp,
+                        received_at,latency_ms,source,message_hash,raw_message
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        snapshot["condition_id"], snapshot.get("event_id"), snapshot["asset_id"],
+                        snapshot.get("outcome"), snapshot.get("event_type", "unknown"),
+                        snapshot.get("best_bid"), snapshot.get("best_ask"),
+                        snapshot.get("best_bid_size"), snapshot.get("best_ask_size"),
+                        json_dumps(snapshot.get("bids") or []), json_dumps(snapshot.get("asks") or []),
+                        snapshot.get("market_timestamp"), received_at, snapshot.get("latency_ms"),
+                        snapshot.get("source", "POLYMARKET_MARKET_WS"), message_hash, json_dumps(raw),
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM live_market_snapshots WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+                market = conn.execute(
+                    "SELECT yes_token_id, no_token_id FROM live_markets WHERE condition_id = ?",
+                    (snapshot["condition_id"],),
+                ).fetchone()
+                if market:
+                    if str(market["yes_token_id"]) == str(snapshot["asset_id"]):
+                        side_columns = ("yes_best_bid", "yes_best_ask")
+                    elif str(market["no_token_id"]) == str(snapshot["asset_id"]):
+                        side_columns = ("no_best_bid", "no_best_ask")
+                    else:
+                        side_columns = (None, None)
+                    if side_columns[0]:
+                        conn.execute(
+                            f"""
+                            UPDATE live_markets SET
+                                {side_columns[0]} = ?, {side_columns[1]} = ?,
+                                best_bid = ?, best_ask = ?, orderbook_depth_json = ?,
+                                source = 'POLYMARKET_MARKET_WS', market_timestamp = ?,
+                                market_received_at = ?, last_update_at = ?, updated_at = ?
+                            WHERE condition_id = ?
+                            """,
+                            (
+                                snapshot.get("best_bid"), snapshot.get("best_ask"),
+                                snapshot.get("best_bid"), snapshot.get("best_ask"),
+                                json_dumps({"bids": snapshot.get("bids") or [], "asks": snapshot.get("asks") or []}),
+                                snapshot.get("market_timestamp"), received_at, received_at, received_at,
+                                snapshot["condition_id"],
+                            ),
+                        )
+                conn.commit()
+            return row_to_dict(row)
+        except sqlite3.IntegrityError:
+            return None
+
+    def latest_market_snapshot(self, asset_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM live_market_snapshots WHERE asset_id = ? ORDER BY id DESC LIMIT 1",
+                (str(asset_id),),
+            ).fetchone()
+        return row_to_dict(row)
+
+    def active_paper_rules(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM live_rules
+                WHERE status = 'active' AND execution_mode = 'PAPER_TRADING'
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        return [row_to_dict(row) or {} for row in rows]
+
+    def open_paper_deals(self, *, asset_id: str | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT d.*, r.stop_loss_price, r.take_profit_price
+            FROM live_deals d
+            JOIN live_rules r ON r.id = d.live_rule_id
+            WHERE d.execution_mode = 'PAPER_TRADING'
+              AND d.status IN ('open','partially_open','exit_pending')
+        """
+        params: tuple[Any, ...] = ()
+        if asset_id is not None:
+            query += " AND d.token_id = ?"
+            params = (str(asset_id),)
+        query += " ORDER BY d.id ASC"
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [row_to_dict(row) or {} for row in rows]
+
+    def record_rule_evaluation(
+        self, rule: dict[str, Any], snapshot: dict[str, Any], decision: str, reason: str
+    ) -> dict[str, Any] | None:
+        evaluated_at = now_iso()
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO live_rule_evaluations (
+                        live_rule_id,market_snapshot_id,event_id,condition_id,asset_id,outcome,
+                        decision,reason,observed_best_bid,observed_best_ask,entry_price,
+                        evaluated_at,rule_snapshot_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        rule["id"], snapshot["id"], snapshot.get("event_id"),
+                        snapshot["condition_id"], snapshot["asset_id"], snapshot.get("outcome"),
+                        decision, reason, snapshot.get("best_bid"), snapshot.get("best_ask"),
+                        rule["entry_price"], evaluated_at, json_dumps(rule),
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE live_rules
+                    SET last_evaluated_at = ?, last_decision = ?, last_reason = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (evaluated_at, decision, reason, evaluated_at, rule["id"]),
+                )
+                row = conn.execute(
+                    "SELECT * FROM live_rule_evaluations WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+                conn.commit()
+            return row_to_dict(row)
+        except sqlite3.IntegrityError:
+            return None
+
+    def create_paper_deal(
+        self,
+        rule: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        reason: str,
+        fee_rate: Decimal = Decimal("0"),
+    ) -> dict[str, Any] | None:
+        amount = Decimal(str(rule.get("requested_amount_usd") or 1))
+        price = Decimal(str(snapshot["best_ask"]))
+        if price <= 0:
+            return None
+        size = amount / price
+        entry_fee = (size * fee_rate * price * (Decimal("1") - price)).quantize(Decimal("0.00001"))
+        ts = now_iso()
+        try:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO live_deals (
+                        live_rule_id,event_id,condition_id,token_id,outcome,side,status,
+                        requested_amount_usd,requested_size,filled_size,remaining_size,
+                        average_entry_fill_price,entry_status,trigger_price,realized_pnl_usd,
+                        fees_usd,slippage_usd,created_at,updated_at,execution_mode,price_source,
+                        entry_snapshot_id,entry_reason,gross_pnl_usd,net_pnl_usd,roi_percent,
+                        opened_at,rule_snapshot_json,paper_fill_status,fee_rate,fee_source,fee_version
+                    ) VALUES (?,?,?,?,?,'buy','open',?,?,?,?,?,'filled',?,0,?,0,?,?,
+                              'PAPER_TRADING','POLYMARKET_MARKET_WS',?,?,0,0,0,?,?, 'full',?,
+                              'SIMULATED_CRYPTO_DEFAULT','paper-fee-v1')
+                    """,
+                    (
+                        rule["id"], snapshot.get("event_id"), snapshot["condition_id"],
+                        snapshot["asset_id"], snapshot.get("outcome"),
+                        float(amount), float(size), float(size), 0,
+                        float(price), rule["entry_price"], float(entry_fee), ts, ts,
+                        snapshot["id"], reason, ts, json_dumps(rule), float(fee_rate),
+                    ),
+                )
+                row = conn.execute("SELECT * FROM live_deals WHERE id = ?", (cursor.lastrowid,)).fetchone()
+                conn.commit()
+            deal = row_to_dict(row)
+            self.audit("paper_engine", "paper_deal_opened", "ok", reason, {
+                "deal_id": deal["id"] if deal else None,
+                "rule_id": rule["id"], "snapshot_id": snapshot["id"],
+            })
+            return deal
+        except sqlite3.IntegrityError:
+            return None
+
+    def close_paper_deal(
+        self, deal: dict[str, Any], snapshot: dict[str, Any], *, reason: str, exit_price: float
+    ) -> dict[str, Any]:
+        entry_price = Decimal(str(deal["average_entry_fill_price"]))
+        shares = Decimal(str(deal["filled_size"]))
+        exit_value = shares * Decimal(str(exit_price))
+        amount = Decimal(str(deal["requested_amount_usd"]))
+        gross = exit_value - amount
+        fee_rate = Decimal(str(deal.get("fee_rate") or 0))
+        exit_fee = (
+            shares * fee_rate * Decimal(str(exit_price)) * (Decimal("1") - Decimal(str(exit_price)))
+        ).quantize(Decimal("0.00001"))
+        total_fees = Decimal(str(deal.get("fees_usd") or 0)) + exit_fee
+        net = gross - total_fees - Decimal(str(deal.get("slippage_usd") or 0))
+        roi = (net / amount * Decimal("100")) if amount else Decimal("0")
+        ts = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE live_deals SET
+                    status='closed', average_exit_fill_price=?, exit_status='filled',
+                    requested_exit_price=?, realized_pnl_usd=?, gross_pnl_usd=?,
+                    net_pnl_usd=?, roi_percent=?, fees_usd=?, exit_reason=?, exit_snapshot_id=?,
+                    closed_at=?, updated_at=?
+                WHERE id = ? AND execution_mode = 'PAPER_TRADING'
+                """,
+                (
+                    float(exit_price), float(exit_price), float(net), float(gross), float(net),
+                    float(roi), float(total_fees), reason, snapshot["id"], ts, ts, deal["id"],
+                ),
+            )
+            row = conn.execute("SELECT * FROM live_deals WHERE id = ?", (deal["id"],)).fetchone()
+            conn.commit()
+        result = row_to_dict(row) or {}
+        self.audit("paper_engine", "paper_deal_closed", "ok", reason, {
+            "deal_id": deal["id"], "snapshot_id": snapshot["id"], "net_pnl_usd": float(net),
+        })
+        return result
 
     def update_rule_status(self, rule_id: int, status: str) -> dict[str, Any]:
         with self.connect() as conn:
@@ -815,7 +1159,7 @@ class LiveRepository:
             "live_markets", "live_rules", "live_deals", "live_orders", "live_order_fills",
             "live_positions", "live_account_snapshots", "live_reconciliation_runs",
             "live_audit_log", "live_websocket_events", "live_dry_runs", "live_daily_limits",
-            "live_backups",
+            "live_backups", "live_market_snapshots", "live_rule_evaluations",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -842,6 +1186,31 @@ class LiveRepository:
                 "markets": int(conn.execute("SELECT COUNT(*) FROM live_markets").fetchone()[0]),
                 "rules": int(conn.execute("SELECT COUNT(*) FROM live_rules").fetchone()[0]),
                 "active_rules": int(conn.execute("SELECT COUNT(*) FROM live_rules WHERE status = 'active'").fetchone()[0]),
+                "paper_rules": int(conn.execute(
+                    "SELECT COUNT(*) FROM live_rules WHERE execution_mode = 'PAPER_TRADING'"
+                ).fetchone()[0]),
+                "active_paper_rules": int(conn.execute(
+                    "SELECT COUNT(*) FROM live_rules WHERE status = 'active' AND execution_mode = 'PAPER_TRADING'"
+                ).fetchone()[0]),
+                "open_paper_deals": int(conn.execute(
+                    """
+                    SELECT COUNT(*) FROM live_deals
+                    WHERE execution_mode = 'PAPER_TRADING'
+                      AND status IN ('open','partially_open','exit_pending')
+                    """
+                ).fetchone()[0]),
+                "closed_paper_deals": int(conn.execute(
+                    "SELECT COUNT(*) FROM live_deals WHERE execution_mode = 'PAPER_TRADING' AND status = 'closed'"
+                ).fetchone()[0]),
+                "paper_realized_pnl_usd": float(conn.execute(
+                    """
+                    SELECT COALESCE(SUM(net_pnl_usd), 0) FROM live_deals
+                    WHERE execution_mode = 'PAPER_TRADING' AND status = 'closed'
+                    """
+                ).fetchone()[0]),
+                "market_snapshots": int(conn.execute(
+                    "SELECT COUNT(*) FROM live_market_snapshots"
+                ).fetchone()[0]),
             }
 
     def revoke_all_sessions(self, actor: str = "operator") -> str:

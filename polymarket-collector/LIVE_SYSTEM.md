@@ -133,6 +133,63 @@ or:
 
 Detailed health is private at `/live/health`.
 
+## Market WebSocket Paper Trading
+
+LIVE now contains a separate, fail-closed Paper Trading path driven only by
+Polymarket's public Market WebSocket. It does not import or receive a trading
+adapter, `OrderManager`, private key, or authenticated CLOB credentials.
+
+Enable it explicitly:
+
+```dotenv
+LIVE_MODULE_ENABLED=true
+LIVE_EXECUTION_MODE=PAPER_TRADING
+LIVE_PAPER_TRADING_ENABLED=true
+POLYMARKET_MARKET_WS_ENABLED=true
+LIVE_TRADING_ENABLED=false
+LIVE_ORDER_SUBMISSION_ENABLED=false
+LIVE_PAPER_TAKER_FEE_RATE=0.07
+```
+
+`configure()` refuses mixed Paper/real write settings. `REAL_TRADING` is not an
+accepted execution mode in this build. The existing real-trading kill switch is
+independent from `LIVE_PAPER_TRADING_ENABLED`.
+
+The startup lifecycle continuously refreshes the current and next BTC five-minute
+markets, subscribes to all four YES/NO token IDs, keeps the connection alive with
+PING/PONG, dynamically subscribes and unsubscribes at rollover, and reconnects
+with bounded exponential backoff.
+
+Paper rules preserve the existing DEMO entry behavior: exact Best Ask match,
+no entry when both sides match, one open deal per rule and event, and a new rule
+waits for the next event. Exits use the purchased side's Best Bid; stop loss wins
+before take profit, and official `market_resolved` messages close at payout 0/1.
+The simulated financial model uses a `$1` default amount and the conservative
+DEMO taker-fee formula.
+
+Separate protected sections are available in the LIVE navigation:
+
+- `Paper Overview`
+- `Paper Rules`
+- `Paper Deals`
+
+Protected read APIs:
+
+- `GET /live/paper/health`
+- `GET /live/paper/rules`
+- `GET /live/paper/deals`
+- `GET /live/paper/evaluations`
+
+Operator APIs:
+
+- `POST /live/paper/rules`
+- `POST /live/paper/rules/{rule_id}/status`
+
+Paper history is stored in `live_market_snapshots` and
+`live_rule_evaluations`; Paper rows in `live_rules` and `live_deals` are labeled
+with `execution_mode=PAPER_TRADING`. These tables are also included in the LIVE
+XLSX export.
+
 ## Maintenance
 
 The Maintenance tab implements a safe `DRAINING` state machine:

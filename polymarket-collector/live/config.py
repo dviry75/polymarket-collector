@@ -29,6 +29,11 @@ def _decimal_env(name: str, default: str) -> Decimal:
 @dataclass(frozen=True)
 class LiveConfig:
     trading_mode: str = "DEMO"
+    execution_mode: str = "READ_ONLY"
+    paper_trading_enabled: bool = False
+    market_ws_enabled: bool = False
+    market_discovery_interval_seconds: int = 5
+    paper_taker_fee_rate: Decimal = Decimal("0.07")
     live_module_enabled: bool = False
     live_trading_enabled: bool = False
     live_order_submission_enabled: bool = False
@@ -82,6 +87,11 @@ class LiveConfig:
     def from_env(cls) -> "LiveConfig":
         return cls(
             trading_mode=_env("TRADING_MODE", "DEMO").upper(),
+            execution_mode=_env("LIVE_EXECUTION_MODE", "READ_ONLY").upper(),
+            paper_trading_enabled=_bool_env("LIVE_PAPER_TRADING_ENABLED", False),
+            market_ws_enabled=_bool_env("POLYMARKET_MARKET_WS_ENABLED", False),
+            market_discovery_interval_seconds=int(_env("LIVE_MARKET_DISCOVERY_INTERVAL_SECONDS", "5") or "5"),
+            paper_taker_fee_rate=_decimal_env("LIVE_PAPER_TAKER_FEE_RATE", "0.07"),
             live_module_enabled=_bool_env("LIVE_MODULE_ENABLED", False),
             live_trading_enabled=_bool_env("LIVE_TRADING_ENABLED", False),
             live_order_submission_enabled=_bool_env("LIVE_ORDER_SUBMISSION_ENABLED", False),
@@ -136,6 +146,16 @@ class LiveConfig:
         errors: list[str] = []
         if self.trading_mode not in {"DEMO", "LIVE"}:
             errors.append("TRADING_MODE must be DEMO or LIVE")
+        if self.execution_mode not in {"READ_ONLY", "PAPER_TRADING"}:
+            errors.append("LIVE_EXECUTION_MODE must be READ_ONLY or PAPER_TRADING; REAL_TRADING is blocked")
+        if self.paper_trading_enabled and self.execution_mode != "PAPER_TRADING":
+            errors.append("LIVE_PAPER_TRADING_ENABLED requires LIVE_EXECUTION_MODE=PAPER_TRADING")
+        if self.paper_trading_enabled and (
+            self.live_trading_enabled or self.live_order_submission_enabled
+        ):
+            errors.append("PAPER_TRADING cannot be combined with real trading or order submission")
+        if self.paper_taker_fee_rate < 0 or self.paper_taker_fee_rate > Decimal("1"):
+            errors.append("LIVE_PAPER_TAKER_FEE_RATE must be between 0 and 1")
         if self.live_adapter not in {"mock", "polymarket"}:
             errors.append("LIVE_ADAPTER must be mock or polymarket")
         if self.entry_order_type not in {"FOK", "FAK", "GTC", "GTD"}:
@@ -154,6 +174,15 @@ class LiveConfig:
             errors.append("LIVE_MAX_EXIT_SLIPPAGE must be <= 0.05")
         return errors
 
+    def paper_trading_active(self) -> bool:
+        return (
+            self.live_module_enabled
+            and self.execution_mode == "PAPER_TRADING"
+            and self.paper_trading_enabled
+            and not self.live_trading_enabled
+            and not self.live_order_submission_enabled
+        )
+
     def real_submission_armed(self) -> bool:
         return (
             self.trading_mode == "LIVE"
@@ -166,6 +195,11 @@ class LiveConfig:
     def safe_public_dict(self) -> dict[str, object]:
         return {
             "trading_mode": self.trading_mode,
+            "execution_mode": self.execution_mode,
+            "paper_trading_enabled": self.paper_trading_enabled,
+            "paper_trading_active": self.paper_trading_active(),
+            "market_ws_enabled": self.market_ws_enabled,
+            "paper_taker_fee_rate": str(self.paper_taker_fee_rate),
             "live_module_enabled": self.live_module_enabled,
             "live_trading_enabled": self.live_trading_enabled,
             "live_order_submission_enabled": self.live_order_submission_enabled,

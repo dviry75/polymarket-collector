@@ -23,16 +23,127 @@ class WebSocketStatus:
 
 
 class MarketWebSocketManager:
-    def __init__(self, repo: LiveRepository, stale_after_seconds: int = 30):
+    def __init__(
+        self,
+        repo: LiveRepository,
+        stale_after_seconds: int = 30,
+        on_snapshot: Callable[[dict[str, Any]], Any] | None = None,
+    ):
         self.repo = repo
         self.stale_after_seconds = stale_after_seconds
         self.status = WebSocketStatus(channel="market")
+        self.on_snapshot = on_snapshot
+        self.subscribed_asset_ids: list[str] = []
+        self.messages_received = 0
+        self.snapshots_received = 0
+        self.last_ping_at = self.last_pong_at = None
+        self._task: asyncio.Task[Any] | None = None
+        self._stop = asyncio.Event()
+        self._ws = None
+        self._lock = asyncio.Lock()
 
     def subscription_message(self, asset_ids: list[str]) -> dict[str, Any]:
         return {"type": "market", "assets_ids": asset_ids, "custom_feature_enabled": True}
 
     def dynamic_subscription_message(self, asset_ids: list[str], operation: str = "subscribe") -> dict[str, Any]:
+        if operation not in {"subscribe", "unsubscribe"}:
+            raise ValueError("invalid subscription operation")
         return {"operation": operation, "assets_ids": asset_ids, "custom_feature_enabled": True}
+
+    async def start(self, url: str) -> None:
+        async with self._lock:
+            if self._task and not self._task.done():
+                return
+            self._stop.clear()
+            self._task = asyncio.create_task(self.run(url), name="polymarket-market-ws")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._ws is not None:
+            await self._ws.close()
+        if self._task:
+            try:
+                await asyncio.wait_for(self._task, 5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+        self.status.status = "STOPPED"
+        self.status.stale = True
+
+    async def run(self, url: str, connect=None) -> None:
+        if connect is None:
+            try:
+                import websockets
+            except Exception:
+                self.mark_disconnect("websockets package unavailable")
+                return
+            connector = websockets.connect
+        else:
+            connector = connect
+        attempt = 0
+        while not self._stop.is_set():
+            asset_ids = self.repo.market_ws_asset_ids()
+            if not asset_ids:
+                self.status.status = "WAITING_FOR_MARKETS"
+                try:
+                    await asyncio.wait_for(self._stop.wait(), 1)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            self.status.status = "CONNECTING" if attempt == 0 else "RECONNECTING"
+            try:
+                async with connector(url, ping_interval=None, close_timeout=5) as ws:
+                    self._ws = ws
+                    await ws.send(json.dumps(self.subscription_message(asset_ids)))
+                    self.subscribed_asset_ids = asset_ids
+                    self.status.status = "CONNECTED"
+                    self.status.error = None
+                    attempt = 0
+                    heartbeat = asyncio.create_task(self._heartbeat(ws))
+                    subscriptions = asyncio.create_task(self._subscription_loop(ws))
+                    try:
+                        while not self._stop.is_set():
+                            raw = await asyncio.wait_for(ws.recv(), timeout=max(15, self.stale_after_seconds))
+                            if raw == "PONG" or raw == b"PONG":
+                                self.last_pong_at = now_iso()
+                                continue
+                            payload = json.loads(raw)
+                            for message in payload if isinstance(payload, list) else [payload]:
+                                if isinstance(message, dict):
+                                    self.process_message(message)
+                    finally:
+                        heartbeat.cancel()
+                        subscriptions.cancel()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._ws = None
+                attempt += 1
+                self.mark_disconnect(f"{type(exc).__name__}: {exc}"[:500])
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(), min(30.0, 2 ** min(attempt, 5)) + random.random()
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        self.status.status = "STOPPED"
+
+    async def _heartbeat(self, ws) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(10)
+            await ws.send("PING")
+            self.last_ping_at = now_iso()
+
+    async def _subscription_loop(self, ws) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(1)
+            wanted = self.repo.market_ws_asset_ids()
+            add = [asset for asset in wanted if asset not in self.subscribed_asset_ids]
+            remove = [asset for asset in self.subscribed_asset_ids if asset not in wanted]
+            if add:
+                await ws.send(json.dumps(self.dynamic_subscription_message(add, "subscribe")))
+            if remove:
+                await ws.send(json.dumps(self.dynamic_subscription_message(remove, "unsubscribe")))
+            self.subscribed_asset_ids = wanted
 
     async def connect_for_messages(self, url: str, asset_ids: list[str], *, max_messages: int = 1, timeout_seconds: float = 20.0) -> dict[str, Any]:
         """Bounded public smoke connection. It never uses credentials or trading APIs."""
@@ -87,24 +198,154 @@ class MarketWebSocketManager:
 
     def process_message(self, message: dict[str, Any]) -> bool:
         stored = self.repo.store_ws_event("market", message, "processed")
+        snapshots = self._normalize_snapshots(message)
+        stored_snapshots = 0
+        for candidate in snapshots:
+            snapshot = self.repo.store_market_snapshot(candidate)
+            if snapshot is None:
+                continue
+            stored_snapshots += 1
+            self.snapshots_received += 1
+            if self.on_snapshot is not None:
+                self.on_snapshot(snapshot)
+        self.messages_received += 1
         self.status.status = "CONNECTED"
         self.status.last_message_at = now_iso()
         self.status.stale = False
         if (message.get("event_type") or message.get("type")) == "market_resolved":
             condition_id = message.get("condition_id") or message.get("market")
             if condition_id:
-                current = self.repo.latest_market(str(condition_id)) or {"condition_id": condition_id}
-                current.update({
-                    "market_resolved": True,
-                    "winning_asset_id": message.get("winning_asset_id"),
-                    "winning_outcome": message.get("winning_outcome"),
-                    "source": "market_websocket",
-                    "last_update_at": now_iso(),
-                })
-                self.repo.upsert_market(current)
+                self.repo.mark_market_resolved(
+                    str(condition_id),
+                    message.get("winning_asset_id"),
+                    message.get("winning_outcome"),
+                )
         self.repo.set_state("market_ws_status", self.status.status, "market_ws")
         self.repo.set_state("market_ws_last_message_at", self.status.last_message_at or "", "market_ws")
-        return stored
+        return stored or stored_snapshots > 0
+
+    def _normalize_snapshots(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        event_type = str(message.get("event_type") or message.get("type") or "").lower()
+        if event_type == "market_resolved":
+            condition_id = str(message.get("condition_id") or message.get("market") or "")
+            market = self.repo.latest_market(condition_id) if condition_id else None
+            if not market:
+                return []
+            winning_asset = str(message.get("winning_asset_id") or "")
+            timestamp = str(message.get("timestamp") or "") or None
+            received_at = now_iso()
+            results = []
+            for index, (asset_id, outcome) in enumerate((
+                (market.get("yes_token_id"), "YES"),
+                (market.get("no_token_id"), "NO"),
+            )):
+                if not asset_id:
+                    continue
+                payout = 1.0 if str(asset_id) == winning_asset else 0.0
+                identity = {"message": message, "asset_id": str(asset_id), "index": index}
+                results.append({
+                    "condition_id": condition_id,
+                    "event_id": market.get("event_id"),
+                    "asset_id": str(asset_id),
+                    "outcome": outcome,
+                    "event_type": event_type,
+                    "best_bid": payout,
+                    "best_ask": payout,
+                    "market_timestamp": timestamp,
+                    "received_at": received_at,
+                    "latency_ms": self._latency_ms(timestamp),
+                    "source": "POLYMARKET_MARKET_WS",
+                    "message_hash": __import__("hashlib").sha256(
+                        json.dumps(identity, sort_keys=True).encode("utf-8")
+                    ).hexdigest(),
+                    "raw_message": identity,
+                })
+            return results
+        if event_type not in {"book", "best_bid_ask", "price_change"}:
+            return []
+        items = message.get("price_changes") if event_type == "price_change" else [message]
+        if not isinstance(items, list):
+            return []
+        snapshots: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            asset_id = str(item.get("asset_id") or message.get("asset_id") or "")
+            market = self.repo.market_for_asset(asset_id) if asset_id else None
+            if not market:
+                continue
+            bids = message.get("bids") if event_type == "book" else []
+            asks = message.get("asks") if event_type == "book" else []
+            bids = bids if isinstance(bids, list) else []
+            asks = asks if isinstance(asks, list) else []
+            best_bid, best_bid_size = self._best_level(bids, highest=True)
+            best_ask, best_ask_size = self._best_level(asks, highest=False)
+            if event_type != "book":
+                best_bid = self._number(item.get("best_bid"))
+                best_ask = self._number(item.get("best_ask"))
+            timestamp = str(message.get("timestamp") or item.get("timestamp") or "") or None
+            received_at = now_iso()
+            latency_ms = self._latency_ms(timestamp)
+            outcome = (
+                "YES" if str(market.get("yes_token_id")) == asset_id
+                else "NO" if str(market.get("no_token_id")) == asset_id
+                else None
+            )
+            raw_with_identity = {"message": message, "asset_id": asset_id, "index": index}
+            snapshots.append({
+                "condition_id": market["condition_id"],
+                "event_id": market.get("event_id"),
+                "asset_id": asset_id,
+                "outcome": outcome,
+                "event_type": event_type,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "best_bid_size": best_bid_size,
+                "best_ask_size": best_ask_size,
+                "bids": bids,
+                "asks": asks,
+                "market_timestamp": timestamp,
+                "received_at": received_at,
+                "latency_ms": latency_ms,
+                "source": "POLYMARKET_MARKET_WS",
+                "message_hash": __import__("hashlib").sha256(
+                    json.dumps(raw_with_identity, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "raw_message": raw_with_identity,
+            })
+        return snapshots
+
+    @staticmethod
+    def _number(value: Any) -> float | None:
+        try:
+            return float(value) if value not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _best_level(cls, levels: list[Any], *, highest: bool) -> tuple[float | None, float | None]:
+        parsed = [
+            (cls._number(level.get("price")), cls._number(level.get("size")))
+            for level in levels if isinstance(level, dict)
+        ]
+        valid = [(price, size) for price, size in parsed if price is not None and (size or 0) > 0]
+        if not valid:
+            return None, None
+        chooser = max if highest else min
+        return chooser(valid, key=lambda level: level[0])
+
+    @staticmethod
+    def _latency_ms(timestamp: str | None) -> int | None:
+        if not timestamp:
+            return None
+        try:
+            source_ms = int(float(timestamp))
+            if source_ms < 10_000_000_000:
+                source_ms *= 1000
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            return max(0, now_ms - source_ms)
+        except (TypeError, ValueError):
+            return None
 
     def mark_disconnect(self, error: str = "") -> None:
         self.status.status = "DISCONNECTED"
@@ -118,7 +359,14 @@ class MarketWebSocketManager:
             dt = datetime.fromisoformat(self.status.last_message_at.replace("Z", "+00:00"))
             stale = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() > self.stale_after_seconds
         self.status.stale = stale
-        return self.status.__dict__
+        return {
+            **self.status.__dict__,
+            "subscribed_asset_ids": list(self.subscribed_asset_ids),
+            "messages_received": self.messages_received,
+            "snapshots_received": self.snapshots_received,
+            "last_ping_at": self.last_ping_at,
+            "last_pong_at": self.last_pong_at,
+        }
 
 
 class UserWebSocketManager:
