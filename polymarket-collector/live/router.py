@@ -565,8 +565,16 @@ def dashboard_content(view: str = "overview") -> str:
 
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
-def live_dashboard(request: Request) -> str:
-    require_live_session(request)
+def live_dashboard(request: Request) -> Any:
+    config, repo, *_rest, auth, _dry = services()
+    if not auth.configured():
+        repo.audit("anonymous", "live_login", "blocked", "LIVE login is not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="LIVE login is not configured; all /live routes are blocked",
+        )
+    if not auth.verify_session(request.cookies.get(COOKIE_NAME)):
+        return RedirectResponse("/live/login", status_code=303)
     view = request.query_params.get("view", "overview")
     nav_items = [
         ("overview", "Overview"),

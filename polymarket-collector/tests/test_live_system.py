@@ -157,6 +157,9 @@ class LiveSystemTests(unittest.TestCase):
     def test_live_routes_health_and_auth_blocks_writes_without_token(self):
         client = self.client()
         self.assertEqual(client.get("/health").json(), {"status": "ok"})
+        dashboard = client.get("/live", follow_redirects=False)
+        self.assertEqual(dashboard.status_code, 303)
+        self.assertEqual(dashboard.headers["location"], "/live/login")
         unauthenticated = client.get("/live/health")
         self.assertEqual(unauthenticated.status_code, 401)
         csrf = self.login(client)
