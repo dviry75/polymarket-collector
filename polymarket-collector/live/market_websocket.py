@@ -142,11 +142,12 @@ class MarketWebSocketManager:
             wanted = self.repo.market_ws_asset_ids()
             add = [asset for asset in wanted if asset not in self.subscribed_asset_ids]
             remove = [asset for asset in self.subscribed_asset_ids if asset not in wanted]
-            if add:
-                await ws.send(json.dumps(self.dynamic_subscription_message(add, "subscribe")))
-            if remove:
-                await ws.send(json.dumps(self.dynamic_subscription_message(remove, "unsubscribe")))
-            self.subscribed_asset_ids = wanted
+            if add or remove:
+                # Reconnect so every rotating BTC 5m market receives a fresh initial
+                # book. In production the server accepted dynamic updates but did not
+                # reliably emit the newly subscribed assets.
+                await ws.close()
+                return
 
     async def connect_for_messages(self, url: str, asset_ids: list[str], *, max_messages: int = 1, timeout_seconds: float = 20.0) -> dict[str, Any]:
         """Bounded public smoke connection. It never uses credentials or trading APIs."""
