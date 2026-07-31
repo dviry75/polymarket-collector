@@ -71,6 +71,7 @@ class LiveConfig:
     backup_max_total_bytes: int = 1_073_741_824
     backup_warning_threshold_percent: int = 80
     clob_host: str = "https://clob.polymarket.com"
+    data_api_host: str = "https://data-api.polymarket.com"
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     user_ws_enabled: bool = True
@@ -80,6 +81,9 @@ class LiveConfig:
     reconciliation_interval_seconds: int = 15
     profile_address: str = ""
     account_login_type: str = "email"
+    signer_address: str = ""
+    funder_address: str = ""
+    signature_type: int = 1
     google_project_id: str = ""
     google_secret_prefix: str = ""
 
@@ -129,6 +133,7 @@ class LiveConfig:
             backup_max_total_bytes=int(_env("LIVE_BACKUP_MAX_TOTAL_BYTES", "1073741824") or "1073741824"),
             backup_warning_threshold_percent=int(_env("LIVE_BACKUP_WARNING_THRESHOLD_PERCENT", "80") or "80"),
             clob_host=_env("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"),
+            data_api_host=_env("POLYMARKET_DATA_API_HOST", "https://data-api.polymarket.com"),
             market_ws_url=_env("POLYMARKET_MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
             user_ws_url=_env("POLYMARKET_USER_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/user"),
             user_ws_enabled=_bool_env("POLYMARKET_USER_WS_ENABLED", True),
@@ -138,6 +143,9 @@ class LiveConfig:
             reconciliation_interval_seconds=int(_env("LIVE_RECONCILIATION_INTERVAL_SECONDS", "15") or "15"),
             profile_address=_env("POLYMARKET_PROFILE_ADDRESS", ""),
             account_login_type=_env("POLYMARKET_ACCOUNT_LOGIN_TYPE", "email").lower(),
+            signer_address=_env("POLYMARKET_SIGNER_ADDRESS", _env("POLY_ADDRESS", "")),
+            funder_address=_env("POLYMARKET_FUNDER_ADDRESS", ""),
+            signature_type=int(_env("POLYMARKET_SIGNATURE_TYPE", "1") or "1"),
             google_project_id=_env("GOOGLE_CLOUD_PROJECT", ""),
             google_secret_prefix=_env("GOOGLE_SECRET_MANAGER_PREFIX", ""),
         )
@@ -232,6 +240,9 @@ class LiveConfig:
             "backup_dir_configured": bool(self.backup_dir),
             "profile_address_configured": bool(self.profile_address),
             "account_login_type": self.account_login_type,
+            "signer_address_configured": bool(self.signer_address),
+            "funder_address_configured": bool(self.funder_address),
+            "signature_type": self.signature_type,
             "real_submission_armed": self.real_submission_armed(),
         }
 

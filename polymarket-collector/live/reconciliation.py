@@ -28,7 +28,16 @@ class ReconciliationWorker:
                     gaps.append({"type": "remote_order_missing_local", "polymarket_order_id": remote_id, "remote": remote})
             for trade in await self.adapter.get_trades():
                 order_id = trade.get("local_order_id")
-                if order_id:
+                if not order_id and trade.get("polymarket_order_id"):
+                    local = next(
+                        (
+                            item for item in local_orders
+                            if str(item.get("polymarket_order_id")) == str(trade.get("polymarket_order_id"))
+                        ),
+                        None,
+                    )
+                    order_id = local.get("local_order_id") if local else None
+                if order_id and trade.get("price") is not None and trade.get("size") is not None:
                     self.repo.add_fill(int(order_id), trade)
             for position in await self.adapter.get_positions():
                 if position.get("orphan"):
@@ -41,4 +50,3 @@ class ReconciliationWorker:
             self.repo.finish_reconciliation(run_id, "failed", gaps, f"{type(exc).__name__}: {exc}")
             self.repo.audit(actor, "live_reconciliation", "failed", str(exc), {"run_id": run_id})
             return {"run_id": run_id, "status": "failed", "gaps": gaps, "error": str(exc)}
-
