@@ -939,6 +939,14 @@ def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_li
             latest_market.get("event_id") if latest_market else None
         ),
         "execution_mode": execution_mode,
+        "max_yes_entries_per_event": int(payload.get("max_yes_entries_per_event", 1)),
+        "max_no_entries_per_event": int(payload.get("max_no_entries_per_event", 1)),
+        "entry_window_start_seconds_before_end": payload.get("entry_window_start_seconds_before_end"),
+        "entry_window_end_seconds_before_end": payload.get("entry_window_end_seconds_before_end"),
+        "schedule_timezone": str(payload.get("schedule_timezone") or "Asia/Jerusalem"),
+        "inactive_windows": payload.get("inactive_windows") or [],
+        "source_demo_rule_id": payload.get("source_demo_rule_id"),
+        "source_rule_snapshot": payload.get("source_rule_snapshot") or {},
     })
     return rule
 

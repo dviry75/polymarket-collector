@@ -199,6 +199,63 @@ class PaperTradingTests(unittest.TestCase):
         audit = self.repo.list_table("live_audit_log", 1)[0]
         self.assertEqual(audit["reason"], "NO_VALID_FRESH_BID")
 
+    def test_demo_rule_fields_are_persisted_and_entry_window_is_enforced(self):
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        event_start = int(now.timestamp()) - 100
+        event_id = f"btc-updown-5m-{event_start}"
+        self.repo.upsert_market({
+            "event_id": event_id,
+            "condition_id": "condition-window",
+            "yes_token_id": "window-yes",
+            "no_token_id": "window-no",
+            "token_mapping_status": "verified",
+            "accepting_orders": True,
+            "market_resolved": False,
+            "source": "gamma_public_read_only",
+        })
+        rule = self.repo.create_rule({
+            "name": "copied demo rule",
+            "entry_price": 0.74,
+            "stop_loss_price": 0.66,
+            "take_profit_price": 0.95,
+            "requested_amount_usd": 1,
+            "status": "active",
+            "execution_mode": "PAPER_TRADING",
+            "max_yes_entries_per_event": 1,
+            "max_no_entries_per_event": 1,
+            "entry_window_start_seconds_before_end": 120,
+            "entry_window_end_seconds_before_end": 0,
+            "schedule_timezone": "Asia/Jerusalem",
+            "inactive_windows": [{
+                "day_of_week": (now.weekday() + 1) % 7,
+                "start_time": "00:00:00",
+                "end_time": "23:59:59",
+                "status": "active",
+            }],
+            "source_demo_rule_id": 7,
+            "source_rule_snapshot": {"name": "רובוט פולימרקט"},
+        })
+        self.assertEqual(rule["entry_window_start_seconds_before_end"], 120)
+        self.assertEqual(rule["max_yes_entries_per_event"], 1)
+        self.assertEqual(rule["source_demo_rule_id"], 7)
+
+        snapshot = self.repo.store_market_snapshot({
+            "condition_id": "condition-window",
+            "event_id": event_id,
+            "asset_id": "window-yes",
+            "outcome": "YES",
+            "event_type": "book",
+            "best_bid": 0.73,
+            "best_ask": 0.74,
+            "bids": [{"price": "0.73", "size": "20"}],
+            "asks": [{"price": "0.74", "size": "20"}],
+            "received_at": now.isoformat(),
+        })
+        result = self.engine.process_snapshot(snapshot)
+        self.assertEqual(result["opened"], 0)
+        evaluation = self.repo.list_table("live_rule_evaluations", 1)[0]
+        self.assertEqual(evaluation["reason"], "BEFORE_ENTRY_WINDOW")
+
     def test_both_sides_match_is_fail_closed(self):
         rule = self.create_rule(status="inactive")
         self.manager.process_message(self.book("no-token", 0.73, 0.74, 10))

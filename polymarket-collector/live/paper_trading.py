@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 import json
+from zoneinfo import ZoneInfo
 
 from .repository import LiveRepository
 
@@ -127,6 +128,11 @@ class PaperTradingEngine:
             return "SKIP", "MISSING_EVENT_ID"
         if rule.get("eligible_after_event_id") == event_id:
             return "SKIP", "WAITING_FOR_NEXT_EVENT"
+        if self._in_inactive_window(rule, snapshot):
+            return "SKIP", "RULE_IN_INACTIVE_SCHEDULE"
+        window_reason = self._entry_window_reason(rule, snapshot, event_id)
+        if window_reason:
+            return "SKIP", window_reason
         ask = self._decimal(snapshot.get("best_ask"))
         if ask is None:
             return "SKIP", "MISSING_BEST_ASK"
@@ -147,9 +153,95 @@ class PaperTradingEngine:
             other_ask = self._decimal(other.get("best_ask")) if other else None
             if other_ask == entry:
                 return "SKIP", "BOTH_SIDES_MATCH"
+        outcome = str(snapshot.get("outcome") or "").upper()
+        quota_key = (
+            "max_yes_entries_per_event" if outcome == "YES"
+            else "max_no_entries_per_event" if outcome == "NO"
+            else ""
+        )
+        if not quota_key:
+            return "SKIP", "UNKNOWN_OUTCOME"
+        quota = int(rule.get(quota_key) or 0)
+        if self.repo.count_paper_entries(rule_id, event_id, outcome) >= quota:
+            return "SKIP", "ENTRY_QUOTA_REACHED"
         if any(int(deal["live_rule_id"]) == rule_id for deal in self.repo.open_paper_deals()):
             return "SKIP", "OPEN_DEAL_EXISTS"
         return "OPEN", "ENTRY_PRICE_MATCHED"
+
+    @staticmethod
+    def _snapshot_datetime(snapshot: dict[str, Any]) -> datetime | None:
+        raw = snapshot.get("received_at")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    def _entry_window_reason(
+        self, rule: dict[str, Any], snapshot: dict[str, Any], event_id: str
+    ) -> str | None:
+        start = rule.get("entry_window_start_seconds_before_end")
+        end = rule.get("entry_window_end_seconds_before_end")
+        if start is None and end is None:
+            return None
+        sampled_at = self._snapshot_datetime(snapshot)
+        try:
+            event_start = int(event_id.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return "MISSING_EVENT_END_TIME"
+        if sampled_at is None:
+            return "MISSING_EVENT_END_TIME"
+        remaining = Decimal(str(event_start + 300)) - Decimal(str(sampled_at.timestamp()))
+        if remaining <= 0:
+            return "EVENT_ENDED"
+        if start is not None and remaining > Decimal(str(start)):
+            return "BEFORE_ENTRY_WINDOW"
+        if end is not None and remaining < Decimal(str(end)):
+            return "AFTER_ENTRY_WINDOW"
+        return None
+
+    def _in_inactive_window(
+        self, rule: dict[str, Any], snapshot: dict[str, Any]
+    ) -> bool:
+        raw = rule.get("inactive_windows_json") or "[]"
+        try:
+            windows = json.loads(str(raw)) if isinstance(raw, str) else raw
+            local_now = self._snapshot_datetime(snapshot).astimezone(
+                ZoneInfo(str(rule.get("schedule_timezone") or "Asia/Jerusalem"))
+            )
+        except (TypeError, ValueError, KeyError):
+            return True
+        current_second = local_now.hour * 3600 + local_now.minute * 60 + local_now.second
+        for window in windows if isinstance(windows, list) else []:
+            if not isinstance(window, dict) or str(window.get("status", "active")) != "active":
+                continue
+            try:
+                day = int(window["day_of_week"])
+                start = self._time_seconds(str(window["start_time"]))
+                end = self._time_seconds(str(window["end_time"]))
+            except (KeyError, TypeError, ValueError):
+                return True
+            if start <= end:
+                if local_now.weekday() == day and start <= current_second < end:
+                    return True
+            elif (
+                (local_now.weekday() == day and current_second >= start)
+                or (local_now.weekday() == ((day + 1) % 7) and current_second < end)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _time_seconds(value: str) -> int:
+        parts = [int(part) for part in value.split(":")]
+        if len(parts) not in {2, 3}:
+            raise ValueError(value)
+        hour, minute = parts[:2]
+        second = parts[2] if len(parts) == 3 else 0
+        if hour not in range(24) or minute not in range(60) or second not in range(60):
+            raise ValueError(value)
+        return hour * 3600 + minute * 60 + second
 
     def health(self) -> dict[str, Any]:
         return {

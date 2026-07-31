@@ -394,6 +394,14 @@ class LiveRepository:
             "live_rules": {
                 "execution_mode": "TEXT NOT NULL DEFAULT 'READ_ONLY'",
                 "last_evaluated_at": "TEXT", "last_decision": "TEXT", "last_reason": "TEXT",
+                "max_yes_entries_per_event": "INTEGER NOT NULL DEFAULT 1",
+                "max_no_entries_per_event": "INTEGER NOT NULL DEFAULT 1",
+                "entry_window_start_seconds_before_end": "INTEGER",
+                "entry_window_end_seconds_before_end": "INTEGER",
+                "schedule_timezone": "TEXT NOT NULL DEFAULT 'Asia/Jerusalem'",
+                "inactive_windows_json": "TEXT NOT NULL DEFAULT '[]'",
+                "source_demo_rule_id": "INTEGER",
+                "source_rule_snapshot_json": "TEXT",
             },
             "live_deals": {
                 "execution_mode": "TEXT NOT NULL DEFAULT 'READ_ONLY'",
@@ -542,8 +550,12 @@ class LiveRepository:
                     name, entry_price, stop_loss_price, take_profit_price,
                     requested_amount_usd, entry_order_type, max_entry_slippage,
                     max_exit_slippage, status, eligible_after_event_id, execution_mode,
+                    max_yes_entries_per_event, max_no_entries_per_event,
+                    entry_window_start_seconds_before_end,
+                    entry_window_end_seconds_before_end, schedule_timezone,
+                    inactive_windows_json, source_demo_rule_id, source_rule_snapshot_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload["name"],
@@ -557,6 +569,14 @@ class LiveRepository:
                     payload.get("status", "inactive"),
                     payload.get("eligible_after_event_id"),
                     payload.get("execution_mode", "READ_ONLY"),
+                    payload.get("max_yes_entries_per_event", 1),
+                    payload.get("max_no_entries_per_event", 1),
+                    payload.get("entry_window_start_seconds_before_end"),
+                    payload.get("entry_window_end_seconds_before_end"),
+                    payload.get("schedule_timezone", "Asia/Jerusalem"),
+                    json_dumps(payload.get("inactive_windows") or []),
+                    payload.get("source_demo_rule_id"),
+                    json_dumps(payload.get("source_rule_snapshot") or {}),
                     ts,
                     ts,
                 ),
@@ -707,6 +727,18 @@ class LiveRepository:
         with self.connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [row_to_dict(row) or {} for row in rows]
+
+    def count_paper_entries(self, rule_id: int, event_id: str, outcome: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM live_deals
+                WHERE live_rule_id = ? AND event_id = ? AND outcome = ?
+                  AND execution_mode = 'PAPER_TRADING'
+                """,
+                (rule_id, event_id, outcome),
+            ).fetchone()
+        return int(row[0] if row else 0)
 
     def record_rule_evaluation(
         self, rule: dict[str, Any], snapshot: dict[str, Any], decision: str, reason: str
