@@ -1,7 +1,7 @@
 # דוח תיקון גידול האחסון — Polymarket Live
 
-תאריך ביצוע: 2026-08-03 (UTC)  
-ענף: agent/live-storage-retention  
+תאריך ביצוע: 2026-08-03 (UTC)
+ענף: agent/live-storage-retention
 סביבת יעד: polymarket-live.service ב־PAPER TRADING בלבד
 
 ## 1. תקציר מנהלים
@@ -204,7 +204,7 @@ VACUUM בוצע בניקוי החירום המבוקר שקדם לפריסה, ל
 | snapshots שנשמרו | 680.0 לדקה | 34.38 לדקה | ירידה 94.94% |
 | audit rows | 721.46 לדקה | 0.37 לדקה | ירידה 99.95% |
 
-יחס הודעות נכנסות ל־snapshot שנשמר: 30.45:1.  
+יחס הודעות נכנסות ל־snapshot שנשמר: 30.45:1.
 יחס snapshot candidates שעובדו ל־snapshot שנשמר: 58.80:1.
 
 ## 19. קצב גידול יומי ותחזית קיבולת
