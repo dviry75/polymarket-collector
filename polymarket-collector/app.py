@@ -5,6 +5,8 @@ import os
 import shutil
 import sqlite3
 import threading
+import tempfile
+import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +33,8 @@ EXPORT_FILE_PREFIX = "polymarket_data_"
 EXPORT_FILE_SUFFIX = ".xlsx"
 EXPORT_FETCH_CHUNK_SIZE = 5000
 EXPORT_SNAPSHOT_PREFIX = ".export_snapshot_"
+EXPORT_TEMP_PREFIX = ".polymarket-export-"
+EXPORT_TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 SQLITE_TIMEOUT_SECONDS = 10
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
 
@@ -99,6 +103,7 @@ coinbase_volume_state: dict[str, Optional[str]] = {
     "last_error": None,
 }
 export_state_lock = threading.Lock()
+export_execution_lock = threading.Lock()
 export_state: dict[str, Optional[str]] = {
     "status": "idle",
     "started_at": None,
@@ -4826,14 +4831,39 @@ def cleanup_export_temp_file(path: Path) -> bool:
     return removed
 
 
+def cleanup_stale_export_workspaces(now_timestamp: float | None = None) -> int:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = (now_timestamp if now_timestamp is not None else time.time()) - EXPORT_TEMP_MAX_AGE_SECONDS
+    removed = 0
+    for candidate in EXPORT_DIR.glob(f"{EXPORT_TEMP_PREFIX}*"):
+        try:
+            if candidate.is_dir() and candidate.stat().st_mtime < cutoff:
+                shutil.rmtree(candidate)
+                removed += 1
+        except OSError as exc:
+            print(f"[export] stale cleanup warning path={candidate}: {type(exc).__name__}: {exc}", flush=True)
+    return removed
+
+
 def write_xlsx_export() -> tuple[Path, dict[str, int]]:
     init_db()
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    with export_execution_lock:
+        cleanup_stale_export_workspaces()
+        with tempfile.TemporaryDirectory(prefix=EXPORT_TEMP_PREFIX, dir=EXPORT_DIR) as workspace_name:
+            previous_tempdir = tempfile.tempdir
+            tempfile.tempdir = workspace_name
+            try:
+                return _write_xlsx_export_in_workspace(Path(workspace_name))
+            finally:
+                tempfile.tempdir = previous_tempdir
 
+
+def _write_xlsx_export_in_workspace(workspace: Path) -> tuple[Path, dict[str, int]]:
     timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
     final_path = EXPORT_DIR / f"{EXPORT_FILE_PREFIX}{timestamp}{EXPORT_FILE_SUFFIX}"
-    temp_path = EXPORT_DIR / f".{final_path.stem}.tmp{EXPORT_FILE_SUFFIX}"
-    snapshot_path = EXPORT_DIR / f"{EXPORT_SNAPSHOT_PREFIX}{timestamp}.sqlite3"
+    temp_path = workspace / f".{final_path.stem}.tmp{EXPORT_FILE_SUFFIX}"
+    snapshot_path = workspace / f"{EXPORT_SNAPSHOT_PREFIX}{timestamp}.sqlite3"
     row_counts: dict[str, int] = {}
     started_at = now_utc()
 
@@ -4911,6 +4941,10 @@ def write_xlsx_export() -> tuple[Path, dict[str, int]]:
     finally:
         if conn is not None:
             conn.close()
+        if workbook is not None:
+            close_workbook = getattr(workbook, "close", None)
+            if callable(close_workbook):
+                close_workbook()
         snapshot_removed = cleanup_export_temp_file(snapshot_path)
         print(f"[export] cleanup_completed snapshot_removed={snapshot_removed}", flush=True)
 

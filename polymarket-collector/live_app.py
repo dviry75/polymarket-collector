@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import asyncio
+import logging
 
 try:
     import truststore
@@ -13,13 +14,15 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 
 from live.config import LiveConfig
-from live.router import configure, router, services
+from live.router import configure, retention_service, router, services
 from live.market_discovery import refresh_btc_5m_markets
 
 
 app = FastAPI(title="Polymarket LIVE Control Center")
 app.include_router(router)
 _discovery_task: asyncio.Task[None] | None = None
+_retention_task: asyncio.Task[None] | None = None
+_logger = logging.getLogger("live.app")
 
 
 async def market_discovery_loop(config: LiveConfig) -> None:
@@ -34,9 +37,18 @@ async def market_discovery_loop(config: LiveConfig) -> None:
         await asyncio.sleep(max(1, config.market_discovery_interval_seconds))
 
 
+async def retention_loop(config: LiveConfig) -> None:
+    while True:
+        try:
+            await asyncio.to_thread(retention_service().run)
+        except Exception:
+            _logger.exception("unexpected retention loop failure")
+        await asyncio.sleep(max(60, config.retention_interval_seconds))
+
+
 @app.on_event("startup")
 async def startup() -> None:
-    global _discovery_task
+    global _discovery_task, _retention_task
     config = LiveConfig.from_env()
     configure(Path(config.live_db_path), config)
     await refresh_btc_5m_markets(services()[1])
@@ -47,11 +59,21 @@ async def startup() -> None:
         await services()[6].start(config.market_ws_url)
     if config.user_ws_enabled:
         await services()[7].start(config.user_ws_url)
+    _retention_task = asyncio.create_task(
+        retention_loop(config), name="live-storage-retention"
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _discovery_task
+    global _discovery_task, _retention_task
+    if _retention_task is not None:
+        _retention_task.cancel()
+        try:
+            await _retention_task
+        except asyncio.CancelledError:
+            pass
+        _retention_task = None
     if _discovery_task is not None:
         _discovery_task.cancel()
         try:
@@ -74,7 +96,7 @@ def root() -> RedirectResponse:
 
 
 @app.get("/health")
-def public_health() -> dict[str, str]:
+def public_health() -> dict[str, object]:
     try:
         config = LiveConfig.from_env()
         if config.validation_errors():
@@ -88,6 +110,7 @@ def public_health() -> dict[str, str]:
                 return {"status": "degraded"}
         except RuntimeError:
             pass
-        return {"status": "ok"}
+        storage = retention_service().health(public=True)
+        return {"status": "ok", "storage": storage}
     except Exception:
         return {"status": "degraded"}

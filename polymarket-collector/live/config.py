@@ -70,6 +70,18 @@ class LiveConfig:
     backup_retention_days: int = 7
     backup_max_total_bytes: int = 1_073_741_824
     backup_warning_threshold_percent: int = 80
+    ws_raw_events_enabled: bool = False
+    ws_event_retention_hours: int = 48
+    snapshot_min_interval_ms: int = 1000
+    snapshot_save_only_on_change: bool = True
+    snapshot_raw_payload_enabled: bool = False
+    snapshot_retention_days: int = 30
+    technical_audit_retention_days: int = 14
+    retention_interval_seconds: int = 3600
+    retention_batch_size: int = 2000
+    disk_warning_percent: int = 70
+    disk_critical_percent: int = 80
+    disk_emergency_percent: int = 90
     clob_host: str = "https://clob.polymarket.com"
     data_api_host: str = "https://data-api.polymarket.com"
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -132,6 +144,18 @@ class LiveConfig:
             backup_retention_days=int(_env("LIVE_BACKUP_RETENTION_DAYS", "7") or "7"),
             backup_max_total_bytes=int(_env("LIVE_BACKUP_MAX_TOTAL_BYTES", "1073741824") or "1073741824"),
             backup_warning_threshold_percent=int(_env("LIVE_BACKUP_WARNING_THRESHOLD_PERCENT", "80") or "80"),
+            ws_raw_events_enabled=_bool_env("LIVE_WS_RAW_EVENTS_ENABLED", False),
+            ws_event_retention_hours=int(_env("LIVE_WS_EVENT_RETENTION_HOURS", "48") or "48"),
+            snapshot_min_interval_ms=int(_env("LIVE_SNAPSHOT_MIN_INTERVAL_MS", "1000") or "1000"),
+            snapshot_save_only_on_change=_bool_env("LIVE_SNAPSHOT_SAVE_ONLY_ON_CHANGE", True),
+            snapshot_raw_payload_enabled=_bool_env("LIVE_SNAPSHOT_RAW_PAYLOAD_ENABLED", False),
+            snapshot_retention_days=int(_env("LIVE_SNAPSHOT_RETENTION_DAYS", "30") or "30"),
+            technical_audit_retention_days=int(_env("LIVE_TECHNICAL_AUDIT_RETENTION_DAYS", "14") or "14"),
+            retention_interval_seconds=int(_env("LIVE_RETENTION_INTERVAL_SECONDS", "3600") or "3600"),
+            retention_batch_size=int(_env("LIVE_RETENTION_BATCH_SIZE", "2000") or "2000"),
+            disk_warning_percent=int(_env("LIVE_DISK_WARNING_PERCENT", "70") or "70"),
+            disk_critical_percent=int(_env("LIVE_DISK_CRITICAL_PERCENT", "80") or "80"),
+            disk_emergency_percent=int(_env("LIVE_DISK_EMERGENCY_PERCENT", "90") or "90"),
             clob_host=_env("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"),
             data_api_host=_env("POLYMARKET_DATA_API_HOST", "https://data-api.polymarket.com"),
             market_ws_url=_env("POLYMARKET_MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
@@ -180,6 +204,16 @@ class LiveConfig:
             errors.append("default trade amount exceeds max trade amount")
         if self.max_exit_slippage > Decimal("0.05"):
             errors.append("LIVE_MAX_EXIT_SLIPPAGE must be <= 0.05")
+        if self.snapshot_min_interval_ms < 0:
+            errors.append("LIVE_SNAPSHOT_MIN_INTERVAL_MS must be >= 0")
+        if self.ws_event_retention_hours < 1 or self.snapshot_retention_days < 1:
+            errors.append("LIVE WebSocket and snapshot retention must be positive")
+        if self.technical_audit_retention_days < 1:
+            errors.append("LIVE_TECHNICAL_AUDIT_RETENTION_DAYS must be positive")
+        if self.retention_interval_seconds < 60 or self.retention_batch_size < 1:
+            errors.append("LIVE retention interval/batch settings are invalid")
+        if not (0 < self.disk_warning_percent < self.disk_critical_percent < self.disk_emergency_percent < 100):
+            errors.append("LIVE disk thresholds must be ordered warning < critical < emergency < 100")
         return errors
 
     def paper_trading_active(self) -> bool:

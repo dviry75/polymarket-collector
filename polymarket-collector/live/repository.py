@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -30,8 +32,23 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 class LiveRepository:
-    def __init__(self, db_path: Path | str):
+    SILENT_TECHNICAL_STATE_KEYS = {"market_ws_last_message_at", "user_ws_health"}
+    TECHNICAL_STATUS_STATE_KEYS = {"market_ws_status", "user_ws_status"}
+
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        snapshot_min_interval_ms: int = 0,
+        snapshot_save_only_on_change: bool = False,
+        snapshot_raw_payload_enabled: bool = True,
+    ):
         self.db_path = Path(db_path)
+        self.snapshot_min_interval_ms = max(0, int(snapshot_min_interval_ms))
+        self.snapshot_save_only_on_change = bool(snapshot_save_only_on_change)
+        self.snapshot_raw_payload_enabled = bool(snapshot_raw_payload_enabled)
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_persistence: dict[tuple[str, str], tuple[float, tuple[Any, ...]]] = {}
 
     def connect(self) -> sqlite3.Connection:
         class ClosingConnection(sqlite3.Connection):
@@ -40,8 +57,9 @@ class LiveRepository:
                 self.close()
                 return result
 
-        conn = sqlite3.connect(self.db_path, factory=ClosingConnection)
+        conn = sqlite3.connect(self.db_path, timeout=10.0, factory=ClosingConnection)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000")
         return conn
 
     def migrate(self, kill_switch_default: bool = True) -> None:
@@ -282,7 +300,8 @@ class LiveRepository:
                     action TEXT NOT NULL,
                     status TEXT NOT NULL,
                     reason TEXT,
-                    details_json TEXT
+                    details_json TEXT,
+                    category TEXT NOT NULL DEFAULT 'UNCLASSIFIED'
                 );
 
                 CREATE TABLE IF NOT EXISTS live_system_state (
@@ -403,6 +422,9 @@ class LiveRepository:
                 "source_demo_rule_id": "INTEGER",
                 "source_rule_snapshot_json": "TEXT",
             },
+            "live_audit_log": {
+                "category": "TEXT NOT NULL DEFAULT 'UNCLASSIFIED'",
+            },
             "live_deals": {
                 "execution_mode": "TEXT NOT NULL DEFAULT 'READ_ONLY'",
                 "price_source": "TEXT", "entry_snapshot_id": "INTEGER", "exit_snapshot_id": "INTEGER",
@@ -421,6 +443,22 @@ class LiveRepository:
                     if column not in existing:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
             conn.commit()
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_live_ws_events_received_at
+                ON live_websocket_events(received_at, id);
+                CREATE INDEX IF NOT EXISTS idx_live_market_snapshots_received_at
+                ON live_market_snapshots(received_at, id);
+                CREATE INDEX IF NOT EXISTS idx_live_audit_category_occurred_at
+                ON live_audit_log(category, occurred_at, id);
+                CREATE INDEX IF NOT EXISTS idx_live_rule_evaluations_snapshot
+                ON live_rule_evaluations(market_snapshot_id);
+                CREATE INDEX IF NOT EXISTS idx_live_deals_entry_snapshot
+                ON live_deals(entry_snapshot_id);
+                CREATE INDEX IF NOT EXISTS idx_live_deals_exit_snapshot
+                ON live_deals(exit_snapshot_id);
+                """
+            )
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_live_paper_open_rule_event
@@ -431,14 +469,27 @@ class LiveRepository:
             )
             conn.commit()
 
-    def audit(self, actor: str, action: str, status: str, reason: str = "", details: Optional[dict[str, Any]] = None) -> None:
+    def audit(
+        self,
+        actor: str,
+        action: str,
+        status: str,
+        reason: str = "",
+        details: Optional[dict[str, Any]] = None,
+        *,
+        category: str = "UNCLASSIFIED",
+    ) -> None:
+        normalized_category = str(category or "UNCLASSIFIED").upper()
+        if normalized_category not in {"UNCLASSIFIED", "BUSINESS", "ADMIN", "TRADING", "SYSTEM", "TECHNICAL"}:
+            normalized_category = "UNCLASSIFIED"
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO live_audit_log (occurred_at, actor, action, status, reason, details_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO live_audit_log
+                    (occurred_at, actor, action, status, reason, details_json, category)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (now_iso(), actor, action, status, reason, json_dumps(details or {})),
+                (now_iso(), actor, action, status, reason, json_dumps(details or {}), normalized_category),
             )
             conn.commit()
 
@@ -447,18 +498,37 @@ class LiveRepository:
             row = conn.execute("SELECT value FROM live_system_state WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
-    def set_state(self, key: str, value: str, actor: str = "system") -> None:
+    def set_state(
+        self,
+        key: str,
+        value: str,
+        actor: str = "system",
+        *,
+        audit_change: bool | None = None,
+    ) -> bool:
+        ts = now_iso()
         with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT value FROM live_system_state WHERE key = ?", (key,)
+            ).fetchone()
             conn.execute(
                 """
                 INSERT INTO live_system_state (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
                 """,
-                (key, value, now_iso()),
+                (key, value, ts),
             )
             conn.commit()
-        self.audit(actor, f"set_{key}", "ok", details={"value": value})
+        changed = previous is None or str(previous["value"]) != str(value)
+        if not changed:
+            return False
+        if audit_change is None:
+            audit_change = key not in self.SILENT_TECHNICAL_STATE_KEYS
+        if audit_change:
+            category = "TECHNICAL" if key in self.TECHNICAL_STATUS_STATE_KEYS else "UNCLASSIFIED"
+            self.audit(actor, f"set_{key}", "ok", details={"value": value}, category=category)
+        return True
 
     def kill_switch_active(self) -> bool:
         return self.get_state("kill_switch", "true").lower() == "true"
@@ -631,66 +701,119 @@ class LiveRepository:
             )
             conn.commit()
 
-    def store_market_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    @staticmethod
+    def _normalized_level_fingerprint(levels: Any) -> tuple[tuple[float, float], ...]:
+        normalized: list[tuple[float, float]] = []
+        for level in levels if isinstance(levels, list) else []:
+            if not isinstance(level, dict):
+                continue
+            try:
+                price = float(level.get("price"))
+                size = float(level.get("size"))
+            except (TypeError, ValueError):
+                continue
+            normalized.append((price, size))
+        return tuple(sorted(normalized))
+
+    @classmethod
+    def _snapshot_fingerprint(cls, snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        def number(value: Any) -> float | None:
+            try:
+                return float(value) if value not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        return (
+            str(snapshot.get("event_type") or "unknown").lower(),
+            number(snapshot.get("best_bid")),
+            number(snapshot.get("best_ask")),
+            number(snapshot.get("best_bid_size")),
+            number(snapshot.get("best_ask_size")),
+            cls._normalized_level_fingerprint(snapshot.get("bids")),
+            cls._normalized_level_fingerprint(snapshot.get("asks")),
+        )
+
+    def store_market_snapshot(
+        self, snapshot: dict[str, Any], *, force: bool = False
+    ) -> dict[str, Any] | None:
         raw = snapshot.get("raw_message") or snapshot
         message_hash = snapshot.get("message_hash") or sha256_text(json_dumps(raw))
         received_at = snapshot.get("received_at") or now_iso()
-        try:
-            with self.connect() as conn:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO live_market_snapshots (
-                        condition_id,event_id,asset_id,outcome,event_type,best_bid,best_ask,
-                        best_bid_size,best_ask_size,bids_json,asks_json,market_timestamp,
-                        received_at,latency_ms,source,message_hash,raw_message
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        snapshot["condition_id"], snapshot.get("event_id"), snapshot["asset_id"],
-                        snapshot.get("outcome"), snapshot.get("event_type", "unknown"),
-                        snapshot.get("best_bid"), snapshot.get("best_ask"),
-                        snapshot.get("best_bid_size"), snapshot.get("best_ask_size"),
-                        json_dumps(snapshot.get("bids") or []), json_dumps(snapshot.get("asks") or []),
-                        snapshot.get("market_timestamp"), received_at, snapshot.get("latency_ms"),
-                        snapshot.get("source", "POLYMARKET_MARKET_WS"), message_hash, json_dumps(raw),
-                    ),
-                )
-                row = conn.execute(
-                    "SELECT * FROM live_market_snapshots WHERE id = ?", (cursor.lastrowid,)
-                ).fetchone()
-                market = conn.execute(
-                    "SELECT yes_token_id, no_token_id FROM live_markets WHERE condition_id = ?",
-                    (snapshot["condition_id"],),
-                ).fetchone()
-                if market:
-                    if str(market["yes_token_id"]) == str(snapshot["asset_id"]):
-                        side_columns = ("yes_best_bid", "yes_best_ask")
-                    elif str(market["no_token_id"]) == str(snapshot["asset_id"]):
-                        side_columns = ("no_best_bid", "no_best_ask")
-                    else:
-                        side_columns = (None, None)
-                    if side_columns[0]:
-                        conn.execute(
-                            f"""
-                            UPDATE live_markets SET
-                                {side_columns[0]} = ?, {side_columns[1]} = ?,
-                                best_bid = ?, best_ask = ?, orderbook_depth_json = ?,
-                                source = 'POLYMARKET_MARKET_WS', market_timestamp = ?,
-                                market_received_at = ?, last_update_at = ?, updated_at = ?
-                            WHERE condition_id = ?
-                            """,
-                            (
-                                snapshot.get("best_bid"), snapshot.get("best_ask"),
-                                snapshot.get("best_bid"), snapshot.get("best_ask"),
-                                json_dumps({"bids": snapshot.get("bids") or [], "asks": snapshot.get("asks") or []}),
-                                snapshot.get("market_timestamp"), received_at, received_at, received_at,
-                                snapshot["condition_id"],
-                            ),
-                        )
-                conn.commit()
-            return row_to_dict(row)
-        except sqlite3.IntegrityError:
-            return None
+        key = (str(snapshot.get("condition_id") or ""), str(snapshot.get("asset_id") or ""))
+        fingerprint = self._snapshot_fingerprint(snapshot)
+        monotonic_now = time.monotonic()
+        interval_seconds = self.snapshot_min_interval_ms / 1000.0
+
+        with self._snapshot_lock:
+            previous = self._snapshot_persistence.get(key)
+            if not force and previous is not None:
+                previous_at, previous_fingerprint = previous
+                if self.snapshot_save_only_on_change and fingerprint == previous_fingerprint:
+                    return None
+                if monotonic_now - previous_at < interval_seconds:
+                    return None
+            try:
+                with self.connect() as conn:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO live_market_snapshots (
+                            condition_id,event_id,asset_id,outcome,event_type,best_bid,best_ask,
+                            best_bid_size,best_ask_size,bids_json,asks_json,market_timestamp,
+                            received_at,latency_ms,source,message_hash,raw_message
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            snapshot["condition_id"], snapshot.get("event_id"), snapshot["asset_id"],
+                            snapshot.get("outcome"), snapshot.get("event_type", "unknown"),
+                            snapshot.get("best_bid"), snapshot.get("best_ask"),
+                            snapshot.get("best_bid_size"), snapshot.get("best_ask_size"),
+                            json_dumps(snapshot.get("bids") or []), json_dumps(snapshot.get("asks") or []),
+                            snapshot.get("market_timestamp"), received_at, snapshot.get("latency_ms"),
+                            snapshot.get("source", "POLYMARKET_MARKET_WS"), message_hash,
+                            json_dumps(raw) if self.snapshot_raw_payload_enabled else None,
+                        ),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM live_market_snapshots WHERE id = ?", (cursor.lastrowid,)
+                    ).fetchone()
+                    market = conn.execute(
+                        "SELECT yes_token_id, no_token_id FROM live_markets WHERE condition_id = ?",
+                        (snapshot["condition_id"],),
+                    ).fetchone()
+                    if market:
+                        if str(market["yes_token_id"]) == str(snapshot["asset_id"]):
+                            side_columns = ("yes_best_bid", "yes_best_ask")
+                        elif str(market["no_token_id"]) == str(snapshot["asset_id"]):
+                            side_columns = ("no_best_bid", "no_best_ask")
+                        else:
+                            side_columns = (None, None)
+                        if side_columns[0]:
+                            conn.execute(
+                                f"""
+                                UPDATE live_markets SET
+                                    {side_columns[0]} = ?, {side_columns[1]} = ?,
+                                    best_bid = ?, best_ask = ?, orderbook_depth_json = ?,
+                                    source = 'POLYMARKET_MARKET_WS', market_timestamp = ?,
+                                    market_received_at = ?, last_update_at = ?, updated_at = ?
+                                WHERE condition_id = ?
+                                """,
+                                (
+                                    snapshot.get("best_bid"), snapshot.get("best_ask"),
+                                    snapshot.get("best_bid"), snapshot.get("best_ask"),
+                                    json_dumps({"bids": snapshot.get("bids") or [], "asks": snapshot.get("asks") or []}),
+                                    snapshot.get("market_timestamp"), received_at, received_at, received_at,
+                                    snapshot["condition_id"],
+                                ),
+                            )
+                    conn.commit()
+                self._snapshot_persistence[key] = (monotonic_now, fingerprint)
+                return row_to_dict(row)
+            except sqlite3.IntegrityError:
+                with self.connect() as conn:
+                    existing = conn.execute(
+                        "SELECT * FROM live_market_snapshots WHERE message_hash = ?", (message_hash,)
+                    ).fetchone()
+                return row_to_dict(existing)
 
     def latest_market_snapshot(self, asset_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import html
 from pathlib import Path
+import tempfile
+import threading
 from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Header, HTTPException, Request
@@ -20,6 +22,7 @@ from .paper_trading import PaperTradingEngine
 from .public_client import MockPublicClobClient, PublicClobClient
 from .reconciliation import ReconciliationWorker
 from .repository import LiveRepository, now_iso
+from .retention import LiveRetentionManager
 from .risk_manager import RiskManager
 from .trading_engine import TradingEngine
 from .secrets import EnvSecretProvider, GoogleSecretManagerProvider, secret_readiness
@@ -39,16 +42,23 @@ _engine: TradingEngine | None = None
 _auth: LiveAuthManager | None = None
 _dry_run: DryRunService | None = None
 _paper: PaperTradingEngine | None = None
+_retention: LiveRetentionManager | None = None
 _export_state: dict[str, Any] = {"status": "idle", "path": None, "error": None, "row_counts": None}
+_export_lock = threading.Lock()
 
 
 def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
-    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _retention
     _config = config or LiveConfig.from_env()
     errors = _config.validation_errors()
     if errors:
         raise ValueError("; ".join(errors))
-    _repo = LiveRepository(db_path)
+    _repo = LiveRepository(
+        db_path,
+        snapshot_min_interval_ms=_config.snapshot_min_interval_ms,
+        snapshot_save_only_on_change=_config.snapshot_save_only_on_change,
+        snapshot_raw_payload_enabled=_config.snapshot_raw_payload_enabled,
+    )
     _repo.migrate(_config.live_kill_switch_default)
     _adapter = MockTradingAdapter(_config.adapter_scenario) if _config.live_adapter == "mock" else RealPolymarketTradingAdapter(_config)
     _risk = RiskManager(_config, _repo)
@@ -64,6 +74,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         _repo,
         stale_after_seconds=_config.max_market_data_age_seconds,
         on_snapshot=_paper.process_snapshot,
+        raw_events_enabled=_config.ws_raw_events_enabled,
     )
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
@@ -72,6 +83,13 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _engine = TradingEngine(_repo, _orders)
     _auth = LiveAuthManager(_config, session_version_getter=lambda: _repo.get_state("session_version", "1") if _repo else "1")
     _dry_run = DryRunService(_repo, _risk)
+    _retention = LiveRetentionManager(_repo, _config)
+
+
+def retention_service() -> LiveRetentionManager:
+    if _retention is None:
+        raise RuntimeError("LIVE retention service is not configured")
+    return _retention
 
 
 def services() -> tuple[LiveConfig, LiveRepository, TradingAdapter, RiskManager, OrderManager, ReconciliationWorker, MarketWebSocketManager, UserWebSocketManager, TradingEngine, LiveAuthManager, DryRunService]:
@@ -790,7 +808,14 @@ def live_health(request: Request) -> dict[str, Any]:
         "auth": auth.public_status(),
         "account_identity": repo.latest_account_snapshot(),
         "validation_errors": config.validation_errors(),
+        "storage": retention_service().health(),
     }
+
+
+@router.get("/retention/preview")
+def retention_preview(request: Request) -> dict[str, Any]:
+    require_live_session(request)
+    return retention_service().preview()
 
 
 @router.get("/markets")
@@ -1023,28 +1048,44 @@ def write_live_export() -> tuple[Path, dict[str, int]]:
     _config, repo, *_ = services()
     output_dir = repo.db_path.parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"polymarket_live_data_{now_iso().replace(':', '').replace('+', '_')}.xlsx"
-    workbook = Workbook(write_only=True)
-    tables = [
-        "live_markets", "live_rules", "live_deals", "live_orders", "live_order_fills",
-        "live_positions", "live_account_snapshots", "live_reconciliation_runs", "live_audit_log",
-        "live_websocket_events", "live_dry_runs", "live_daily_limits",
-        "live_market_snapshots", "live_rule_evaluations",
-    ]
-    counts: dict[str, int] = {}
-    for table in tables:
-        rows = repo.list_table(table, 100000)
-        sheet = workbook.create_sheet(table)
-        headers = list(rows[0].keys()) if rows else ["empty"]
-        sheet.append(headers)
-        count = 0
-        for row in rows:
-            safe_row = redact_mapping(row)
-            sheet.append([safe_row.get(header) for header in headers])
-            count += 1
-        counts[table] = count
-    workbook.save(path)
-    return path, counts
+    final_path = output_dir / f"polymarket_live_data_{now_iso().replace(':', '').replace('+', '_')}.xlsx"
+    if not _export_lock.acquire(blocking=False):
+        raise RuntimeError("LIVE export is already running")
+    previous_tempdir = tempfile.tempdir
+    workbook: Workbook | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix=".polymarket-live-export-", dir=output_dir) as workspace_name:
+            tempfile.tempdir = workspace_name
+            temp_path = Path(workspace_name) / final_path.name
+            workbook = Workbook(write_only=True)
+            tables = [
+                "live_markets", "live_rules", "live_deals", "live_orders", "live_order_fills",
+                "live_positions", "live_account_snapshots", "live_reconciliation_runs", "live_audit_log",
+                "live_websocket_events", "live_dry_runs", "live_daily_limits",
+                "live_market_snapshots", "live_rule_evaluations",
+            ]
+            counts: dict[str, int] = {}
+            for table in tables:
+                rows = repo.list_table(table, 100000)
+                sheet = workbook.create_sheet(table)
+                headers = list(rows[0].keys()) if rows else ["empty"]
+                sheet.append(headers)
+                count = 0
+                for row in rows:
+                    safe_row = redact_mapping(row)
+                    sheet.append([safe_row.get(header) for header in headers])
+                    count += 1
+                counts[table] = count
+            workbook.save(temp_path)
+            temp_path.replace(final_path)
+            return final_path, counts
+    finally:
+        if workbook is not None:
+            close_workbook = getattr(workbook, "close", None)
+            if callable(close_workbook):
+                close_workbook()
+        tempfile.tempdir = previous_tempdir
+        _export_lock.release()
 
 
 def _run_export() -> None:
@@ -1059,6 +1100,8 @@ def _run_export() -> None:
 def generate_live_export(request: Request, background_tasks: BackgroundTasks, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _export_state.get("status") == "running" or _export_lock.locked():
+        return RedirectResponse("/live", status_code=303)
     _export_state.update({"status": "running", "error": None})
     background_tasks.add_task(_run_export)
     return RedirectResponse("/live", status_code=303)

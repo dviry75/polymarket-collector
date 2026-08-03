@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from io import BytesIO
+from unittest.mock import patch
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -16,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import app
 import live_app
+import live.router as live_router
 from live.config import LiveConfig, redact_mapping
 from live.public_client import MockPublicClobClient
 from live.repository import LiveRepository
@@ -156,7 +158,10 @@ class LiveSystemTests(unittest.TestCase):
 
     def test_live_routes_health_and_auth_blocks_writes_without_token(self):
         client = self.client()
-        self.assertEqual(client.get("/health").json(), {"status": "ok"})
+        public_health = client.get("/health").json()
+        self.assertEqual(public_health["status"], "ok")
+        self.assertEqual(public_health["storage"]["disk"]["level"], "OK")
+        self.assertEqual(public_health["storage"]["retention"]["status"], "never_run")
         unauthenticated = client.get("/live/health")
         self.assertEqual(unauthenticated.status_code, 401)
         csrf = self.login(client)
@@ -315,6 +320,31 @@ class LiveSystemTests(unittest.TestCase):
             self.assertIn("live_dry_runs", workbook.sheetnames)
         finally:
             workbook.close()
+
+    def test_live_export_failure_removes_dedicated_workspace(self):
+        class FailingWorksheet:
+            def append(self, _row):
+                return None
+
+        class FailingWorkbook:
+            def __init__(self, write_only=False):
+                self.write_only = write_only
+
+            def create_sheet(self, _name):
+                return FailingWorksheet()
+
+            def save(self, path):
+                Path(path).write_bytes(b"partial")
+                raise RuntimeError("forced live export failure")
+
+            def close(self):
+                return None
+
+        with patch.object(live_router, "Workbook", FailingWorkbook):
+            with self.assertRaises(RuntimeError):
+                live_router.write_live_export()
+        output_dir = self.db_path.parent / "output"
+        self.assertEqual(list(output_dir.glob(".polymarket-live-export-*")), [])
 
     def test_account_identity_secret_readiness_and_dry_run(self):
         client = self.client()

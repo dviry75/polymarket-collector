@@ -347,9 +347,10 @@ class CoinbaseVolumeTests(unittest.TestCase):
     def test_xlsx_export_uses_chunked_reads(self):
         import inspect
 
-        source = inspect.getsource(app.write_xlsx_export)
+        source = inspect.getsource(app.write_xlsx_export) + inspect.getsource(app._write_xlsx_export_in_workspace)
         self.assertIn("fetchmany(EXPORT_FETCH_CHUNK_SIZE)", source)
         self.assertNotIn("fetchall()", source)
+        self.assertIn("TemporaryDirectory", source)
 
     def test_download_xlsx_serves_latest_generated_file(self):
         original_db_path = app.DB_PATH

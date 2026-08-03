@@ -33,11 +33,15 @@ class PaperTradingEngine:
         self.opened = 0
         self.closed = 0
         self.last_error: str | None = None
+        self._latest_by_asset: dict[str, dict[str, Any]] = {}
 
     def process_snapshot(self, snapshot: dict[str, Any]) -> dict[str, int]:
         result = {"evaluated": 0, "opened": 0, "closed": 0}
         if not self.enabled:
             return result
+        asset_id = str(snapshot.get("asset_id") or "")
+        if asset_id:
+            self._latest_by_asset[asset_id] = dict(snapshot)
         if self._is_stale(snapshot):
             self.repo.audit(
                 "paper_engine", "paper_snapshot_rejected", "blocked", "STALE_MARKET_DATA",
@@ -85,6 +89,10 @@ class PaperTradingEngine:
                         },
                     )
                     continue
+                snapshot = self._ensure_persisted(snapshot)
+                if snapshot.get("id") is None:
+                    self.last_error = "BUSINESS_SNAPSHOT_PERSIST_FAILED"
+                    continue
                 self.repo.close_paper_deal(
                     deal,
                     snapshot,
@@ -102,12 +110,13 @@ class PaperTradingEngine:
 
         for rule in self.repo.active_paper_rules():
             decision, reason = self._entry_decision(rule, snapshot, closed_rule_ids)
-            evaluation = self.repo.record_rule_evaluation(rule, snapshot, decision, reason)
-            if evaluation is None:
-                continue
             self.evaluations += 1
             result["evaluated"] += 1
-            if decision != "OPEN":
+            if decision == "OPEN" and snapshot.get("id") is None:
+                snapshot = self._ensure_persisted(snapshot)
+            if snapshot.get("id") is not None:
+                self.repo.record_rule_evaluation(rule, snapshot, decision, reason)
+            if decision != "OPEN" or snapshot.get("id") is None:
                 continue
             deal = self.repo.create_paper_deal(
                 rule, snapshot, reason=reason, fee_rate=self.taker_fee_rate
@@ -149,7 +158,7 @@ class PaperTradingEngine:
             else market.get("yes_token_id")
         )
         if other_asset:
-            other = self.repo.latest_market_snapshot(str(other_asset))
+            other = self._latest_by_asset.get(str(other_asset)) or self.repo.latest_market_snapshot(str(other_asset))
             other_ask = self._decimal(other.get("best_ask")) if other else None
             if other_ask == entry:
                 return "SKIP", "BOTH_SIDES_MATCH"
@@ -167,6 +176,17 @@ class PaperTradingEngine:
         if any(int(deal["live_rule_id"]) == rule_id for deal in self.repo.open_paper_deals()):
             return "SKIP", "OPEN_DEAL_EXISTS"
         return "OPEN", "ENTRY_PRICE_MATCHED"
+
+    def _ensure_persisted(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        if snapshot.get("id") is not None:
+            return snapshot
+        stored = self.repo.store_market_snapshot(snapshot, force=True)
+        if stored is None:
+            return snapshot
+        merged = dict(snapshot)
+        merged["id"] = stored["id"]
+        merged["_persisted"] = True
+        return merged
 
     @staticmethod
     def _snapshot_datetime(snapshot: dict[str, Any]) -> datetime | None:

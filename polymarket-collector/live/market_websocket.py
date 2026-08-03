@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+from time import monotonic
 
 from .repository import LiveRepository, now_iso
 
@@ -28,19 +29,24 @@ class MarketWebSocketManager:
         repo: LiveRepository,
         stale_after_seconds: int = 30,
         on_snapshot: Callable[[dict[str, Any]], Any] | None = None,
+        raw_events_enabled: bool = True,
     ):
         self.repo = repo
         self.stale_after_seconds = stale_after_seconds
         self.status = WebSocketStatus(channel="market")
         self.on_snapshot = on_snapshot
+        self.raw_events_enabled = bool(raw_events_enabled)
         self.subscribed_asset_ids: list[str] = []
         self.messages_received = 0
         self.snapshots_received = 0
+        self.snapshots_persisted = 0
         self.last_ping_at = self.last_pong_at = None
         self._task: asyncio.Task[Any] | None = None
         self._stop = asyncio.Event()
         self._ws = None
         self._lock = asyncio.Lock()
+        self._logger = logging.getLogger("live.market_ws")
+        self._last_message_state_persisted_at = 0.0
 
     def subscription_message(self, asset_ids: list[str]) -> dict[str, Any]:
         return {"type": "market", "assets_ids": asset_ids, "custom_feature_enabled": True}
@@ -200,18 +206,28 @@ class MarketWebSocketManager:
         base = min(30.0, 2 ** max(0, self.status.reconnect_attempts))
         return base + random.uniform(0, 1)
 
+    @staticmethod
+    def _is_technical_message(message: dict[str, Any]) -> bool:
+        event_type = str(message.get("event_type") or message.get("type") or "").lower()
+        return event_type in {"", "heartbeat", "ping", "pong", "subscribed", "subscription"}
+
     def process_message(self, message: dict[str, Any]) -> bool:
-        stored = self.repo.store_ws_event("market", message, "processed")
+        stored_event = False
+        if self.raw_events_enabled and not self._is_technical_message(message):
+            stored_event = self.repo.store_ws_event("market", message, "processed")
         snapshots = self._normalize_snapshots(message)
         stored_snapshots = 0
         for candidate in snapshots:
-            snapshot = self.repo.store_market_snapshot(candidate)
-            if snapshot is None:
-                continue
-            stored_snapshots += 1
+            stored = self.repo.store_market_snapshot(candidate)
+            realtime_snapshot = dict(candidate)
+            realtime_snapshot["id"] = stored.get("id") if stored else None
+            realtime_snapshot["_persisted"] = bool(stored)
             self.snapshots_received += 1
+            if stored is not None:
+                self.snapshots_persisted += 1
+                stored_snapshots += 1
             if self.on_snapshot is not None:
-                self.on_snapshot(snapshot)
+                self.on_snapshot(realtime_snapshot)
         self.messages_received += 1
         self.status.status = "CONNECTED"
         self.status.last_message_at = now_iso()
@@ -224,9 +240,23 @@ class MarketWebSocketManager:
                     message.get("winning_asset_id"),
                     message.get("winning_outcome"),
                 )
-        self.repo.set_state("market_ws_status", self.status.status, "market_ws")
-        self.repo.set_state("market_ws_last_message_at", self.status.last_message_at or "", "market_ws")
-        return stored or stored_snapshots > 0
+        self._persist_message_state()
+        return stored_event or stored_snapshots > 0
+
+    def _persist_message_state(self) -> None:
+        try:
+            self.repo.set_state("market_ws_status", self.status.status, "market_ws")
+            current = monotonic()
+            if current - self._last_message_state_persisted_at >= 1.0:
+                self.repo.set_state(
+                    "market_ws_last_message_at", self.status.last_message_at or "", "market_ws",
+                    audit_change=False,
+                )
+                self._last_message_state_persisted_at = current
+        except Exception as exc:
+            self._logger.warning(
+                "market WebSocket health persistence failed: %s", type(exc).__name__
+            )
 
     def _normalize_snapshots(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         event_type = str(message.get("event_type") or message.get("type") or "").lower()
@@ -356,6 +386,15 @@ class MarketWebSocketManager:
         self.status.reconnect_attempts += 1
         self.status.stale = True
         self.status.error = error or None
+        try:
+            self.repo.set_state("market_ws_status", self.status.status, "market_ws")
+        except Exception as exc:
+            # Persistence is diagnostic here. A temporary SQLite lock must not
+            # terminate the reconnect loop that restores the realtime feed.
+            self._logger.warning(
+                "market WebSocket state persistence failed during reconnect: %s",
+                type(exc).__name__,
+            )
 
     def health(self) -> dict[str, Any]:
         stale = True
@@ -368,6 +407,7 @@ class MarketWebSocketManager:
             "subscribed_asset_ids": list(self.subscribed_asset_ids),
             "messages_received": self.messages_received,
             "snapshots_received": self.snapshots_received,
+            "snapshots_persisted": self.snapshots_persisted,
             "last_ping_at": self.last_ping_at,
             "last_pong_at": self.last_pong_at,
         }
@@ -603,8 +643,16 @@ class UserWebSocketManager:
         self._persist_state()
 
     def _persist_state(self):
-        self.repo.set_state("user_ws_status", self.status.status, "user_ws")
-        self.repo.set_state("user_ws_health", json.dumps(self.health(), sort_keys=True), "user_ws")
+        try:
+            self.repo.set_state("user_ws_status", self.status.status, "user_ws")
+            self.repo.set_state(
+                "user_ws_health", json.dumps(self.health(), sort_keys=True), "user_ws",
+                audit_change=False,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "user WebSocket health persistence failed: %s", type(exc).__name__
+            )
 
     def health(self):
         return {"connected": self.status.status == "CONNECTED", "status": self.status.status,
