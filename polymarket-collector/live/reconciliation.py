@@ -137,13 +137,99 @@ class ReconciliationWorker:
                             "intent_id": intent["intent_id"],
                             "state": intent["state"],
                         })
-                    elif remote_id in remote_by_id:
-                        remote = remote_by_id[remote_id]
+                        continue
+                    remote = remote_by_id.get(remote_id)
+                    if remote is None:
+                        remote = await self.adapter.get_order(remote_id)
+                    summary = self.strategy_repo.fill_summary(str(intent["intent_id"]))
+                    filled = summary["shares"]
+                    status = str((remote or {}).get("status") or "unknown").lower()
+                    if status.startswith("order_status_"):
+                        status = status.removeprefix("order_status_")
+                    is_open = remote_id in remote_by_id or status in {
+                        "live", "open", "delayed", "pending", "retrying", "partially_filled"
+                    }
+                    terminal = status in {
+                        "filled", "matched", "cancelled", "canceled", "rejected",
+                        "failed", "unmatched", "expired",
+                    }
+                    if intent.get("action") == "ENTRY" and filled > 0:
+                        market = self.repo.latest_market(str(intent["condition_id"])) or {}
+                        self.strategy_repo.open_position(
+                            event_id=str(intent["event_id"]),
+                            condition_id=str(intent["condition_id"]),
+                            token_id=str(intent["token_id"]),
+                            outcome=str(intent.get("side") or "UNKNOWN"),
+                            shares=filled,
+                            average_price=summary["average_price"],
+                            cost_all_in=summary["notional"] + summary["fees"],
+                            fees=summary["fees"],
+                            min_sellable=(
+                                decimal_value(market.get("min_order_size")) or Decimal("0")
+                            ),
+                        )
+                        continue
+                    if intent.get("action") == "ENTRY" and terminal:
+                        self.strategy_repo.mark_zero_fill(
+                            str(intent["event_id"]), f"REMOTE_{status.upper()}_ZERO_FILL"
+                        )
+                        continue
+                    if intent.get("action") in {"EXIT", "TP"} and filled > 0:
+                        position = self.strategy_repo.position_for_token(str(intent["token_id"]))
+                        if position is None:
+                            gaps.append({
+                                "type": "exit_fill_without_local_position",
+                                "intent_id": intent["intent_id"],
+                            })
+                            continue
+                        prior_shares = decimal_value(intent.get("filled_shares_text")) or Decimal("0")
+                        prior_average = decimal_value(intent.get("average_price_text")) or Decimal("0")
+                        prior_fees = decimal_value(intent.get("fee_text")) or Decimal("0")
+                        delta = max(Decimal("0"), filled - prior_shares)
+                        if delta > 0:
+                            delta_notional = max(
+                                Decimal("0"), summary["notional"] - prior_shares * prior_average
+                            )
+                            requested = decimal_value(intent.get("requested_shares_text")) or filled
+                            final_state = (
+                                "PARTIAL" if is_open else
+                                "FILLED" if filled >= requested else "PARTIAL_FINAL"
+                            )
+                            market = self.repo.latest_market(str(intent["condition_id"])) or {}
+                            self.strategy_repo.apply_exit_fill(
+                                position_id=str(position["position_id"]),
+                                intent_id=str(intent["intent_id"]),
+                                sold_shares=delta,
+                                average_price=delta_notional / delta,
+                                fees=max(Decimal("0"), summary["fees"] - prior_fees),
+                                final_state=final_state,
+                                min_sellable=(
+                                    decimal_value(market.get("min_order_size"))
+                                    or Decimal("0.000001")
+                                ),
+                                purpose=str(intent.get("purpose") or "RECONCILED_EXIT"),
+                                book_hash="account-reconciliation",
+                            )
+                            self.strategy_repo.update_intent(
+                                str(intent["intent_id"]),
+                                filled_shares_text=canonical_decimal(filled),
+                                average_price_text=canonical_decimal(summary["average_price"]),
+                                fee_text=canonical_decimal(summary["fees"]),
+                            )
+                        continue
+                    if is_open:
                         self.strategy_repo.update_intent(
                             str(intent["intent_id"]),
                             state="LIVE",
-                            filled_shares_text=str(remote.get("filled_size") or "0"),
+                            filled_shares_text=canonical_decimal(filled),
                         )
+                    elif not terminal:
+                        gaps.append({
+                            "type": "remote_order_state_unknown",
+                            "intent_id": intent["intent_id"],
+                            "polymarket_order_id": remote_id,
+                            "status": status,
+                        })
 
                 remote_tokens: set[str] = set()
                 for remote in remote_positions:
@@ -226,6 +312,8 @@ class ReconciliationWorker:
         except Exception as exc:
             safe_error = f"{type(exc).__name__}: {exc}"[:500]
             self.repo.finish_reconciliation(run_id, "failed", sanitize(gaps), safe_error)
+            self.repo.set_state("kill_switch", "true", actor)
+            self.repo.set_state("canary_armed", "false", actor)
             if self.strategy_repo:
                 self.strategy_repo.set_reconciliation_state(
                     ready=False, reason="RECONCILIATION_FAILED", actor=actor

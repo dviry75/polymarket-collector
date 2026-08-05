@@ -34,9 +34,10 @@ class StrategyPolicy:
     stop_price: Decimal = Decimal("0.66")
     emergency_price: Decimal = Decimal("0.60")
     stop_min_price: Decimal = Decimal("0.55")
-    emergency_min_price: Decimal = Decimal("0.01")
+    emergency_min_price: Decimal = Decimal("0.55")
     max_spend: Decimal = Decimal("5.00")
     max_exposure: Decimal = Decimal("5.00")
+    max_shares: Decimal = Decimal("5.00")
     entry_window_seconds: int = 120
 
     def validate(self) -> None:
@@ -68,13 +69,19 @@ class FillEstimate:
 class AllInBudget:
     """Conservative preview; the SDK max_spend field is the final hard cap."""
 
-    def __init__(self, max_spend: Decimal = Decimal("5.00")):
+    def __init__(
+        self,
+        max_spend: Decimal = Decimal("5.00"),
+        max_shares: Decimal = Decimal("5.00"),
+    ):
         self.max_spend = max_spend.quantize(MONEY_QUANTUM, rounding=ROUND_DOWN)
+        self.max_shares = max_shares.quantize(SHARE_QUANTUM, rounding=ROUND_DOWN)
 
-    def sdk_buy_parameters(self) -> dict[str, str]:
-        # Unified SDK 0.1.0b21 documents max_spend as amount including fees.
-        amount = self.max_spend.quantize(MONEY_QUANTUM, rounding=ROUND_DOWN)
-        return {"amount": canonical_decimal(amount), "max_spend": canonical_decimal(amount)}
+    def sdk_buy_parameters(self, maximum_price: Decimal = Decimal("0.76")) -> dict[str, str]:
+        amount = min(self.max_spend, self.max_shares * maximum_price).quantize(
+            MONEY_QUANTUM, rounding=ROUND_DOWN
+        )
+        return {"amount": canonical_decimal(amount), "max_spend": canonical_decimal(self.max_spend)}
 
     def conservative_notional(self, maximum_fee_fraction: Decimal) -> Decimal:
         if maximum_fee_fraction < 0:
@@ -92,10 +99,13 @@ class AllInBudget:
     ) -> tuple[bool, str]:
         if min_order_shares <= 0 or maximum_price <= 0:
             return False, "INVALID_MARKET_CONSTRAINTS"
-        notional = self.conservative_notional(maximum_fee_fraction)
-        shares = (notional / maximum_price).quantize(SHARE_QUANTUM, rounding=ROUND_DOWN)
-        if shares < min_order_shares:
-            return False, "MINIMUM_ORDER_EXCEEDS_5_ALL_IN"
+        if min_order_shares > self.max_shares:
+            return False, "MINIMUM_ORDER_EXCEEDS_5_TOKEN_CAP"
+        required = min_order_shares * maximum_price * (
+            Decimal("1") + maximum_fee_fraction
+        )
+        if required > self.max_spend:
+            return False, "MINIMUM_ORDER_EXCEEDS_5_DOLLAR_CAP"
         return True, "VIABLE"
 
 
@@ -192,6 +202,7 @@ def simulate_buy_fak(
     max_price: Decimal,
     max_spend: Decimal,
     fee_rate: Decimal,
+    max_shares: Decimal | None = None,
 ) -> FillEstimate:
     remaining_budget = max_spend
     shares = Decimal("0")
@@ -210,7 +221,10 @@ def simulate_buy_fak(
         affordable = (remaining_budget / all_in_per_share).quantize(
             SHARE_QUANTUM, rounding=ROUND_DOWN
         )
-        fill = min(available, affordable)
+        remaining_shares = (
+            max(Decimal("0"), max_shares - shares) if max_shares is not None else available
+        )
+        fill = min(available, affordable, remaining_shares)
         if fill <= 0:
             continue
         level_notional = fill * price
@@ -226,6 +240,8 @@ def simulate_buy_fak(
     all_in = notional + fees
     if all_in > max_spend:
         raise AssertionError("paper fill exceeded all-in cap")
+    if max_shares is not None and shares > max_shares:
+        raise AssertionError("paper fill exceeded token cap")
     return FillEstimate(
         requested=max_spend,
         filled_shares=shares,

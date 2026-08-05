@@ -54,6 +54,7 @@ class LiveConfig:
     default_trade_amount_usd: Decimal = Decimal("5")
     max_trade_amount_usd: Decimal = Decimal("5")
     max_total_exposure_usd: Decimal = Decimal("5")
+    max_trade_tokens: Decimal = Decimal("5")
     max_open_deals: int = 1
     max_open_orders: int = 2
     max_active_rules: int = 1
@@ -68,9 +69,9 @@ class LiveConfig:
     strategy_stop_price: Decimal = Decimal("0.66")
     strategy_emergency_price: Decimal = Decimal("0.60")
     strategy_stop_min_price: Decimal = Decimal("0.55")
-    strategy_emergency_min_price: Decimal = Decimal("0.01")
+    strategy_emergency_min_price: Decimal = Decimal("0.55")
     strategy_entry_window_seconds: int = 120
-    stop_loss_order_type: str = "FAK"
+    stop_loss_order_type: str = "GTC"
     stop_loss_initial_slippage: Decimal = Decimal("0.02")
     max_exit_slippage: Decimal = Decimal("0.05")
     max_stop_loss_attempts: int = 3
@@ -103,6 +104,8 @@ class LiveConfig:
     profile_address: str = ""
     account_login_type: str = "email"
     signer_address: str = ""
+    google_private_key_secret_version: str = "1"
+    private_signing_readiness_enabled: bool = False
     funder_address: str = ""
     signature_type: int = 1
     google_project_id: str = ""
@@ -135,6 +138,7 @@ class LiveConfig:
             max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "5"),
             max_total_exposure_usd=_decimal_env("LIVE_MAX_TOTAL_EXPOSURE_USD", "5"),
             max_open_deals=int(_env("LIVE_MAX_OPEN_DEALS", "1") or "1"),
+            max_trade_tokens=_decimal_env("LIVE_MAX_TRADE_TOKENS", "5"),
             max_open_orders=int(_env("LIVE_MAX_OPEN_ORDERS", "2") or "2"),
             max_active_rules=int(_env("LIVE_MAX_ACTIVE_RULES", "1") or "1"),
             max_daily_realized_loss_usd=_decimal_env("LIVE_MAX_DAILY_REALIZED_LOSS_USD", "10"),
@@ -148,9 +152,9 @@ class LiveConfig:
             strategy_stop_price=_decimal_env("LIVE_STRATEGY_STOP_PRICE", "0.66"),
             strategy_emergency_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_PRICE", "0.60"),
             strategy_stop_min_price=_decimal_env("LIVE_STRATEGY_STOP_MIN_PRICE", "0.55"),
-            strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.01"),
+            strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.55"),
             strategy_entry_window_seconds=int(_env("LIVE_STRATEGY_ENTRY_WINDOW_SECONDS", "120") or "120"),
-            stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "FAK").upper(),
+            stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "GTC").upper(),
             stop_loss_initial_slippage=_decimal_env("LIVE_STOP_LOSS_INITIAL_SLIPPAGE", "0.02"),
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
             max_stop_loss_attempts=int(_env("LIVE_MAX_STOP_LOSS_ATTEMPTS", "3") or "3"),
@@ -187,6 +191,12 @@ class LiveConfig:
             signature_type=int(_env("POLYMARKET_SIGNATURE_TYPE", "1") or "1"),
             google_project_id=_env("GOOGLE_CLOUD_PROJECT", ""),
             google_secret_prefix=_env("GOOGLE_SECRET_MANAGER_PREFIX", ""),
+            google_private_key_secret_version=_env(
+                "POLYMARKET_PRIVATE_KEY_SECRET_VERSION", "1"
+            ),
+            private_signing_readiness_enabled=_bool_env(
+                "LIVE_PRIVATE_SIGNING_READINESS_ENABLED", False
+            ),
         )
 
     def validation_errors(self) -> list[str]:
@@ -217,8 +227,8 @@ class LiveConfig:
             errors.append("LIVE_ENTRY_ORDER_TYPE must remain FAK")
         if not self.partial_fills_allowed:
             errors.append("LIVE_PARTIAL_FILLS_ALLOWED must remain true for FAK lifecycle")
-        if self.stop_loss_order_type != "FAK":
-            errors.append("LIVE_STOP_LOSS_ORDER_TYPE must remain FAK for this phase")
+        if self.stop_loss_order_type != "GTC":
+            errors.append("LIVE_STOP_LOSS_ORDER_TYPE must remain GTC for the 0.66 stop")
         if self.redemption_mode not in {"manual", "approval", "automatic"}:
             errors.append("LIVE_REDEMPTION_MODE must be manual, approval, or automatic")
         if self.default_trade_amount_usd <= 0:
@@ -231,6 +241,10 @@ class LiveConfig:
             errors.append("entry amount and cap must remain exactly $5 All-In")
         if self.max_total_exposure_usd != Decimal("5"):
             errors.append("LIVE_MAX_TOTAL_EXPOSURE_USD must remain exactly 5")
+        if self.max_trade_tokens != Decimal("5"):
+            errors.append("LIVE_MAX_TRADE_TOKENS must remain exactly 5")
+        if self.google_project_id and self.google_private_key_secret_version != "1":
+            errors.append("POLYMARKET_PRIVATE_KEY_SECRET_VERSION must remain pinned to 1")
         expected_strategy = (
             (self.strategy_entry_price, Decimal("0.74")),
             (self.strategy_entry_max_price, Decimal("0.76")),
@@ -238,7 +252,7 @@ class LiveConfig:
             (self.strategy_stop_price, Decimal("0.66")),
             (self.strategy_emergency_price, Decimal("0.60")),
             (self.strategy_stop_min_price, Decimal("0.55")),
-            (self.strategy_emergency_min_price, Decimal("0.01")),
+            (self.strategy_emergency_min_price, Decimal("0.55")),
         )
         if any(actual != expected for actual, expected in expected_strategy):
             errors.append("strategy prices are immutable for this LIVE build")
@@ -271,6 +285,7 @@ class LiveConfig:
             and self.live_adapter == "polymarket"
             and self.canary_armed
             and not self.pause_entries_default
+            and not self.live_kill_switch_default
         )
 
     def safe_public_dict(self) -> dict[str, object]:
@@ -299,6 +314,7 @@ class LiveConfig:
             "max_total_exposure_usd": str(self.max_total_exposure_usd),
             "max_open_deals": self.max_open_deals,
             "max_open_orders": self.max_open_orders,
+            "max_trade_tokens": str(self.max_trade_tokens),
             "max_active_rules": self.max_active_rules,
             "max_daily_realized_loss_usd": str(self.max_daily_realized_loss_usd),
             "max_consecutive_failed_orders": self.max_consecutive_failed_orders,
@@ -328,6 +344,8 @@ class LiveConfig:
             "signer_address_configured": bool(self.signer_address),
             "funder_address_configured": bool(self.funder_address),
             "signature_type": self.signature_type,
+            "private_key_secret_version": self.google_private_key_secret_version,
+            "private_signing_readiness_enabled": self.private_signing_readiness_enabled,
             "real_submission_armed": self.real_submission_armed(),
         }
 

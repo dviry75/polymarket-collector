@@ -9,7 +9,12 @@ from eth_account import Account
 from .base import TradingAdapter
 from ..config import LiveConfig
 from ..order_book import canonical_decimal, decimal_value
-from ..secrets import EnvSecretProvider, GoogleSecretManagerProvider, SecretProvider
+from ..secrets import (
+    EnvSecretProvider,
+    GoogleSecretManagerProvider,
+    PrivateKeySecretProvider,
+    SecretProvider,
+)
 from ..strategy_repository import sanitize
 
 
@@ -72,7 +77,14 @@ class RealPolymarketTradingAdapter(TradingAdapter):
     ):
         self.config = config
         self.secret_provider = secret_provider or (
-            GoogleSecretManagerProvider(config.google_project_id, config.google_secret_prefix)
+            PrivateKeySecretProvider(
+                GoogleSecretManagerProvider(
+                    config.google_project_id,
+                    config.google_secret_prefix,
+                    config.google_private_key_secret_version,
+                ),
+                EnvSecretProvider(),
+            )
             if config.google_project_id
             else EnvSecretProvider()
         )
@@ -98,6 +110,11 @@ class RealPolymarketTradingAdapter(TradingAdapter):
     async def _client(self) -> SecureClientLike:
         if self._secure_client is not None:
             return self._secure_client
+        if not (
+            self.config.real_submission_armed()
+            or self.config.private_signing_readiness_enabled
+        ):
+            raise RuntimeError("private signing was not requested for this execution mode")
         async with self._client_lock:
             if self._secure_client is not None:
                 return self._secure_client
@@ -117,13 +134,23 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             wallet = self.config.funder_address or self.config.profile_address or None
             if not wallet:
                 raise RuntimeError("configured account wallet/funder address is missing")
-            client = await AsyncSecureClient.create(
-                private_key=private_key,
-                wallet=wallet,
-                credentials=ApiKeyCreds(
-                    apiKey=api_key, secret=api_secret, passphrase=passphrase
-                ),
+            credentials = ApiKeyCreds(
+                apiKey=api_key, secret=api_secret, passphrase=passphrase
             )
+            if self.config.real_submission_armed():
+                client = await AsyncSecureClient.create(
+                    private_key=private_key,
+                    wallet=wallet,
+                    credentials=credentials,
+                )
+            else:
+                # Explicit readiness must never deploy or mutate a wallet.
+                client = await AsyncSecureClient._create(
+                    private_key=private_key,
+                    wallet=wallet,
+                    credentials=credentials,
+                    validate_credentials=True,
+                )
             actual_wallet = str(client.wallet)
             actual_signer = str(client.signer)
             actual_type = str(client.wallet_type)
@@ -296,6 +323,22 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         order_type = str(order.get("order_type") or "").upper()
         requested_amount = _d(order.get("requested_amount_usd"))
         requested_shares = _d(order.get("requested_size"))
+        if side == "BUY":
+            max_price = _d(order.get("max_price"))
+            max_tokens = _d(order.get("max_tokens"))
+            max_spend = _d(order.get("max_spend"))
+            if (
+                max_tokens <= 0
+                or max_tokens > self.config.max_trade_tokens
+                or max_price <= 0
+                or requested_amount > max_tokens * max_price
+                or max_spend > self.config.max_trade_amount_usd
+            ):
+                return {
+                    "success": False,
+                    "status": "blocked",
+                    "failure_reason": "CANARY_EXPOSURE_CAP_EXCEEDED",
+                }
         try:
             await self._assert_allowance(
                 side=side,

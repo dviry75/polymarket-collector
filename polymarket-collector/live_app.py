@@ -17,7 +17,6 @@ from live.router import configure, router, services, strategy_services
 from live.market_discovery import refresh_btc_5m_markets
 from live.archive import SnapshotArchiveManager
 from live.geographic import geographic_preflight
-from live.secrets import GoogleSecretManagerProvider, load_runtime_secrets
 
 
 app = FastAPI(title="Polymarket LIVE Control Center")
@@ -62,11 +61,6 @@ async def metrics_loop(config: LiveConfig) -> None:
 async def startup() -> None:
     global _discovery_task, _reconciliation_task, _metrics_task
     config = LiveConfig.from_env()
-    if config.google_project_id:
-        load_runtime_secrets(
-            GoogleSecretManagerProvider(config.google_project_id, config.google_secret_prefix)
-        )
-        config = LiveConfig.from_env()
     configure(Path(config.live_db_path), config)
     repo = services()[1]
     strategy_repo, runtime = strategy_services()

@@ -310,6 +310,7 @@ class StrategyRepository:
         side: str | None,
         simultaneous: bool,
         reason_code: str,
+        consume_canary: bool = False,
     ) -> dict[str, Any]:
         ts = now_iso()
         intent_id = stable_id("entry", event_id)
@@ -323,6 +324,22 @@ class StrategyRepository:
             if existing is not None:
                 conn.rollback()
                 return {**(row_to_dict(existing) or {}), "_duplicate": True}
+            if consume_canary:
+                state = {
+                    row["key"]: row["value"]
+                    for row in conn.execute(
+                        "SELECT key,value FROM live_system_state WHERE key IN "
+                        "('canary_armed','canary_consumed','kill_switch','pause_entries')"
+                    ).fetchall()
+                }
+                if (
+                    state.get("canary_armed") != "true"
+                    or state.get("canary_consumed") == "true"
+                    or state.get("kill_switch", "true") != "false"
+                    or state.get("pause_entries", "true") != "false"
+                ):
+                    conn.rollback()
+                    return {"_blocked": True, "reason": "CANARY_NOT_AVAILABLE"}
             conn.execute(
                 """
                 INSERT INTO live_event_states(
@@ -340,15 +357,26 @@ class StrategyRepository:
                     """
                     INSERT INTO live_strategy_intents(
                         intent_id,correlation_id,event_id,condition_id,action,purpose,
-                        token_id,side,state,order_type,requested_amount_text,
+                        token_id,side,state,order_type,requested_amount_text,requested_shares_text,
                         price_limit_text,max_spend_text,reason_code,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,'FAK','5','0.76','5',?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,'FAK','3.8','5','0.76','5',?,?,?)
                     """,
                     (
                         intent_id, correlation_id, event_id, condition_id, "ENTRY", "ENTRY",
                         token_id, side, "RESERVED", reason_code, ts, ts,
                     ),
                 )
+            if consume_canary:
+                for key, value in {
+                    "pause_entries": "true",
+                    "canary_armed": "false",
+                    "canary_consumed": "true",
+                }.items():
+                    conn.execute(
+                        "INSERT INTO live_system_state(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (key, value, ts),
+                    )
                 conn.execute(
                     """
                     INSERT INTO live_strategy_deals(
@@ -486,6 +514,29 @@ class StrategyRepository:
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def fill_summary(self, intent_id: str) -> dict[str, Decimal]:
+        """Return a deterministic aggregate of deduplicated durable fills."""
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT shares_text,price_text,fee_text FROM live_strategy_fills WHERE intent_id=?",
+                (intent_id,),
+            ).fetchall()
+        shares = Decimal("0")
+        notional = Decimal("0")
+        fees = Decimal("0")
+        for row in rows:
+            fill_shares = decimal_value(row["shares_text"]) or Decimal("0")
+            fill_price = decimal_value(row["price_text"]) or Decimal("0")
+            shares += fill_shares
+            notional += fill_shares * fill_price
+            fees += decimal_value(row["fee_text"]) or Decimal("0")
+        return {
+            "shares": shares,
+            "notional": notional,
+            "fees": fees,
+            "average_price": notional / shares if shares > 0 else Decimal("0"),
+        }
 
     def open_position(
         self,
@@ -700,13 +751,37 @@ class StrategyRepository:
             conn.commit()
         return row_to_dict(row)
 
+    def cancel_active_exit(self, position_id: str, reason: str) -> dict[str, Any] | None:
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            position = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?", (position_id,)
+            ).fetchone()
+            if position is None or not position["active_exit_intent_id"]:
+                conn.rollback()
+                return None
+            intent_id = position["active_exit_intent_id"]
+            conn.execute(
+                """
+                UPDATE live_strategy_intents SET state='CANCEL_REQUESTED',reason_code=?,
+                    updated_at=? WHERE intent_id=?
+                """,
+                (reason, ts, intent_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            conn.commit()
+        return row_to_dict(row)
+
     def finalize_cancel(self, intent_id: str, success: bool, reason: str) -> None:
         state = "CANCELED" if success else "CANCEL_UNCERTAIN"
         ts = now_iso()
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT position_id FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
+                "SELECT position_id,purpose FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
             ).fetchone()
             conn.execute(
                 """
@@ -716,9 +791,12 @@ class StrategyRepository:
                 (state, reason, ts if success else None, ts, intent_id),
             )
             if row and row["position_id"]:
+                column = (
+                    "tp_intent_id" if row["purpose"] == "TAKE_PROFIT" else "active_exit_intent_id"
+                )
                 conn.execute(
-                    """
-                    UPDATE live_strategy_positions SET tp_intent_id=NULL,
+                    f"""
+                    UPDATE live_strategy_positions SET {column}=NULL,
                         state=CASE WHEN ? THEN 'OPEN' ELSE 'EXIT_RECONCILIATION_REQUIRED' END,
                         updated_at=? WHERE position_id=?
                     """,
@@ -748,6 +826,9 @@ class StrategyRepository:
             if row is None:
                 conn.rollback()
                 raise KeyError(position_id)
+            intent_row = conn.execute(
+                "SELECT order_type FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
+            ).fetchone()
             remaining_before = decimal_value(row["remaining_shares_text"]) or Decimal("0")
             actual_sold = min(max(Decimal("0"), sold_shares), remaining_before)
             remaining = remaining_before - actual_sold
@@ -760,6 +841,10 @@ class StrategyRepository:
             allocated_cost = cost * (acquired - remaining) / acquired if acquired > 0 else Decimal("0")
             pnl = exit_value - exit_fees - allocated_cost
             dust = remaining if Decimal("0") < remaining < min_sellable else Decimal("0")
+            keep_active = bool(
+                remaining > 0 and final_state == "PARTIAL"
+                and intent_row and intent_row["order_type"] == "GTC"
+            )
             if remaining == 0:
                 position_state = "CLOSED"
             elif dust > 0:
@@ -768,6 +853,8 @@ class StrategyRepository:
                 position_state = "EXIT_RECONCILIATION_REQUIRED"
             elif purpose == "TAKE_PROFIT":
                 position_state = "TP_OPEN"
+            elif keep_active:
+                position_state = "EXITING"
             else:
                 position_state = "OPEN"
             stop_stage = int(row["stop_stage"] or 0)
@@ -780,7 +867,7 @@ class StrategyRepository:
                 UPDATE live_strategy_positions SET
                     remaining_shares_text=?,sellable_shares_text=?,dust_shares_text=?,
                     exit_value_text=?,exit_fees_text=?,realized_pnl_text=?,state=?,
-                    stop_stage=?,active_exit_intent_id=NULL,
+                    stop_stage=?,active_exit_intent_id=CASE WHEN ? THEN active_exit_intent_id ELSE NULL END,
                     tp_intent_id=CASE WHEN ?='TAKE_PROFIT' AND ?=1 THEN tp_intent_id
                                       WHEN ?='TAKE_PROFIT' THEN NULL ELSE tp_intent_id END,
                     last_exit_book_hash=?,
@@ -791,7 +878,7 @@ class StrategyRepository:
                     canonical_decimal(remaining), canonical_decimal(max(Decimal("0"), remaining-dust)),
                     canonical_decimal(dust), canonical_decimal(exit_value),
                     canonical_decimal(exit_fees), canonical_decimal(pnl), position_state,
-                    stop_stage, purpose, 1 if remaining > 0 else 0, purpose, book_hash,
+                    stop_stage, 1 if keep_active else 0, purpose, 1 if remaining > 0 else 0, purpose, book_hash,
                     ts, position_state, ts, position_id,
                 ),
             )

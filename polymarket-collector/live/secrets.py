@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Protocol
 
+import google_crc32c
+
 from .config import redact
 
 
@@ -33,23 +35,46 @@ class EnvSecretProvider:
 class GoogleSecretManagerProvider:
     project_id: str
     prefix: str = ""
+    version: str = "1"
 
     def get_secret(self, name: str) -> str | None:
+        if not self.version.isdigit() or int(self.version) < 1:
+            raise ValueError("Secret Manager version must be a pinned positive integer")
         if not self.project_id:
             return None
         try:
             from google.cloud import secretmanager  # type: ignore
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError("Secret Manager client is unavailable") from exc
         client = secretmanager.SecretManagerServiceClient()
         normalized_prefix = (
             self.prefix if not self.prefix or self.prefix.endswith(("-", "_"))
             else f"{self.prefix}-"
         )
         secret_id = f"{normalized_prefix}{name}" if normalized_prefix else name
-        resource = f"projects/{self.project_id}/secrets/{secret_id}/versions/latest"
+        resource = f"projects/{self.project_id}/secrets/{secret_id}/versions/{self.version}"
         response = client.access_secret_version(request={"name": resource})
-        return response.payload.data.decode("utf-8")
+        checksum = google_crc32c.Checksum()
+        checksum.update(response.payload.data)
+        if response.payload.data_crc32c != int(checksum.hexdigest(), 16):
+            raise RuntimeError("Secret Manager payload checksum mismatch")
+        try:
+            return response.payload.data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("Secret Manager payload is not valid UTF-8") from exc
+
+
+@dataclass
+class PrivateKeySecretProvider:
+    """Read only the signing key from GSM and never copy it into os.environ."""
+
+    private_key_provider: SecretProvider
+    fallback: SecretProvider
+
+    def get_secret(self, name: str) -> str | None:
+        if name == "POLYMARKET_PRIVATE_KEY":
+            return self.private_key_provider.get_secret(name)
+        return self.fallback.get_secret(name)
 
 
 def secret_readiness(provider: SecretProvider) -> dict[str, object]:
@@ -76,11 +101,14 @@ def secret_readiness(provider: SecretProvider) -> dict[str, object]:
 
 
 def load_runtime_secrets(provider: SecretProvider) -> dict[str, object]:
-    """Load secrets into process memory only; never returns or logs their values."""
+    """Legacy helper for non-signing secrets; private keys are never exported."""
     loaded: list[str] = []
     missing: list[str] = []
     inaccessible: list[str] = []
     for name in REQUIRED_SECRET_NAMES:
+        if name == "POLYMARKET_PRIVATE_KEY":
+            missing.append(name)
+            continue
         try:
             value = provider.get_secret(name)
         except Exception:

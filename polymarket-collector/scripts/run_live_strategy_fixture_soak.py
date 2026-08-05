@@ -36,6 +36,7 @@ async def run() -> dict[str, object]:
             config, base, strategy, adapter,
             reconciliation=lambda reason: reconciliation.run_once(f"soak:{reason}"),
         )
+        base.set_state("kill_switch", "false", "soak")
         strategy.set_pause_entries(False, "soak", "DETERMINISTIC_FIXTURE")
         processed = 0
         for index in range(12):

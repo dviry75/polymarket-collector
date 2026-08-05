@@ -46,6 +46,7 @@ class LiveStrategyRuntime:
             emergency_min_price=config.strategy_emergency_min_price,
             max_spend=config.max_trade_amount_usd,
             max_exposure=config.max_total_exposure_usd,
+            max_shares=config.max_trade_tokens,
             entry_window_seconds=config.strategy_entry_window_seconds,
         )
         self.policy.validate()
@@ -164,6 +165,7 @@ class LiveStrategyRuntime:
             event_ready=event_ready,
             paused=(
                 self.repo.pause_entries()
+                or self.base.kill_switch_active()
                 or (
                     not self.paper_mode()
                     and self.base.get_state("canary_armed", "false").lower() != "true"
@@ -218,7 +220,7 @@ class LiveStrategyRuntime:
                 reason_code="MISSING_DYNAMIC_MARKET_CONSTRAINTS",
             )
             return
-        viable, viability_reason = AllInBudget(self.policy.max_spend).minimum_viable(
+        viable, viability_reason = AllInBudget(self.policy.max_spend, self.policy.max_shares).minimum_viable(
             min_order_shares=min_order,
             maximum_price=self.policy.entry_max_price,
             maximum_fee_fraction=fee_rate,
@@ -246,8 +248,9 @@ class LiveStrategyRuntime:
             event_id=event_id, condition_id=condition_id,
             token_id=decision.token_id, side=decision.side,
             simultaneous=False, reason_code=decision.reason,
+            consume_canary=not self.paper_mode(),
         )
-        if reservation.get("_duplicate"):
+        if reservation.get("_duplicate") or reservation.get("_blocked"):
             return
         intent_id = str(reservation["entry_intent_id"])
         self.repo.timeline(
@@ -259,13 +262,11 @@ class LiveStrategyRuntime:
             intent_id=intent_id, requested_action="BUY_MARKET_FAK",
             reason_code="ENTRY_PRICE_EXACT", previous_state="ELIGIBLE",
             new_state="ENTRY_INTENT_RESERVED", result_status="RESERVED",
-            requested_amount_text="5", parameters_json={
-                "max_price": "0.76", "max_spend": "5", "all_in": True,
+            requested_amount_text="3.8", requested_shares_text="5", parameters_json={
+                "max_price": "0.76", "max_spend": "5", "max_tokens": "5", "all_in": True,
                 "frame_hash": frame_hash,
             },
         )
-        if not self.paper_mode():
-            self.repo.consume_canary()
         update = next(
             item for item in updates if str(item.get("asset_id")) == decision.token_id
         )
@@ -316,6 +317,7 @@ class LiveStrategyRuntime:
                 max_price=self.policy.entry_max_price,
                 max_spend=self.policy.max_spend,
                 fee_rate=fee_rate,
+                max_shares=self.policy.max_shares,
             )
             if fill.filled_shares <= 0:
                 self.repo.mark_zero_fill(event_id, "FAK_ZERO_FILL")
@@ -325,7 +327,7 @@ class LiveStrategyRuntime:
                     condition_id=market["condition_id"], token_id=update["asset_id"],
                     side=side, intent_id=intent_id, requested_action="BUY_MARKET_FAK",
                     reason_code="FAK_ZERO_FILL", result_status="ZERO_FILL",
-                    requested_amount_text="5", filled_shares_text="0",
+                    requested_amount_text="3.8", requested_shares_text="5", filled_shares_text="0",
                     remaining_shares_text="0",
                 )
                 return
@@ -352,7 +354,7 @@ class LiveStrategyRuntime:
                 new_state="POSITION_OPEN", result_status=(
                     "PARTIAL" if fill.remaining_request > 0 else "FILLED"
                 ),
-                requested_amount_text="5",
+                requested_amount_text="3.8", requested_shares_text="5",
                 filled_shares_text=canonical_decimal(fill.filled_shares),
                 average_price_text=canonical_decimal(fill.average_price),
                 fees_text=canonical_decimal(fill.fee),
@@ -362,6 +364,9 @@ class LiveStrategyRuntime:
             return
 
         self.repo.update_intent(intent_id, state="SUBMITTING", submitted_at=now_iso())
+        entry_params = AllInBudget(
+            self.policy.max_spend, self.policy.max_shares
+        ).sdk_buy_parameters(self.policy.entry_max_price)
         response = await self.adapter.create_order({
             "idempotency_key": intent_id,
             "durable_intent_reserved": True,
@@ -372,8 +377,9 @@ class LiveStrategyRuntime:
             "side": "BUY",
             "order_type": "FAK",
             "purpose": "ENTRY",
-            "requested_amount_usd": "5",
-            "max_spend": "5",
+            "requested_amount_usd": entry_params["amount"],
+            "max_spend": entry_params["max_spend"],
+            "max_tokens": canonical_decimal(self.policy.max_shares),
             "max_price": "0.76",
         })
         status = str(response.get("status") or "unknown").lower()
@@ -393,7 +399,11 @@ class LiveStrategyRuntime:
                 reason_code=str(response.get("failure_reason") or status).upper(),
                 normalized_error=response.get("message"),
             )
-        await self._reconcile("entry_submission")
+        reconciled = await self._reconcile("entry_submission")
+        if reconciled.get("status") == "ok":
+            recovered = self.repo.position_for_token(str(update["asset_id"]))
+            if recovered:
+                await self._ensure_take_profit(recovered)
 
     async def _ensure_take_profit(self, position: dict[str, Any]) -> None:
         remaining = decimal_value(position.get("sellable_shares_text")) or Decimal("0")
@@ -449,6 +459,17 @@ class LiveStrategyRuntime:
         if bid is None:
             return
         for position in positions:
+            if (
+                not position.get("tp_intent_id")
+                and not position.get("active_exit_intent_id")
+                and position.get("state") == "OPEN"
+                and (
+                    self.paper_mode()
+                    or self.base.get_state("reconciliation_readiness", "NOT_READY") == "READY"
+                )
+            ):
+                await self._ensure_take_profit(position)
+                position = self.repo.position_for_token(token_id) or position
             tp_intent = (
                 self.repo.intent(str(position.get("tp_intent_id")))
                 if position.get("tp_intent_id") else None
@@ -457,14 +478,16 @@ class LiveStrategyRuntime:
                 await self._paper_tp_fill(position, tp_intent, update, frame_hash)
                 continue
             if exact_trigger(bid, self.policy.stop_price):
-                await self._emergency_exit(
-                    position, update, purpose="STOP_066",
-                    min_price=self.policy.stop_min_price, frame_hash=frame_hash,
+                await self._place_stop_loss(
+                    position, update, frame_hash=frame_hash
                 )
             elif exact_trigger(bid, self.policy.emergency_price):
                 await self._emergency_exit(
                     position, update, purpose="EMERGENCY_060",
-                    min_price=self.policy.emergency_min_price, frame_hash=frame_hash,
+                    min_price=max(
+                        self.policy.emergency_min_price,
+                        self.policy.emergency_price - self.config.max_exit_slippage,
+                    ), frame_hash=frame_hash,
                 )
 
     async def _paper_tp_fill(
@@ -509,6 +532,94 @@ class LiveStrategyRuntime:
             pnl_text=updated["realized_pnl_text"],
         )
 
+    async def _place_stop_loss(
+        self,
+        position: dict[str, Any],
+        update: dict[str, Any],
+        *,
+        frame_hash: str,
+    ) -> None:
+        if position.get("active_exit_intent_id") or int(position.get("stop_stage") or 0) >= 1:
+            return
+        if position.get("tp_intent_id"):
+            tp = self.repo.cancel_tp(position["position_id"], "STOP_066")
+            if tp:
+                if self.paper_mode():
+                    self.repo.finalize_cancel(str(tp["intent_id"]), True, "PAPER_CANCEL_ACK")
+                else:
+                    response = await self.adapter.cancel_order(str(tp.get("remote_order_id") or ""))
+                    if not response.get("success"):
+                        self.repo.finalize_cancel(
+                            str(tp["intent_id"]), False, "CANCEL_UNCERTAIN"
+                        )
+                        return
+                    self.repo.finalize_cancel(str(tp["intent_id"]), True, "CANCEL_ACK")
+                    reconciled = await self._reconcile("tp_cancel_before_stop")
+                    if reconciled.get("status") != "ok":
+                        return
+            refreshed = self.repo.active_positions(str(position["token_id"]))
+            position = next(
+                (item for item in refreshed if item["position_id"] == position["position_id"]),
+                position,
+            )
+        shares = decimal_value(position.get("sellable_shares_text")) or Decimal("0")
+        if shares <= 0:
+            return
+        intent = self.repo.reserve_position_intent(
+            position,
+            action="EXIT",
+            purpose="STOP_066",
+            order_type="GTC",
+            shares=shares,
+            price_limit=self.policy.stop_min_price,
+            book_hash=frame_hash,
+        )
+        if intent.get("_duplicate"):
+            return
+        if self.paper_mode():
+            fill = simulate_sell_fak(
+                update.get("bids") or [],
+                shares=shares,
+                min_price=self.policy.stop_min_price,
+                fee_rate=self._fee_rate(self.base.latest_market(position["condition_id"]) or {}),
+            )
+            if fill.filled_shares <= 0:
+                self.repo.update_intent(str(intent["intent_id"]), state="LIVE")
+                return
+            self.repo.apply_exit_fill(
+                position_id=position["position_id"],
+                intent_id=intent["intent_id"],
+                sold_shares=fill.filled_shares,
+                average_price=fill.average_price,
+                fees=fill.fee,
+                final_state="FILLED" if fill.remaining_request == 0 else "PARTIAL",
+                min_sellable=self._min_order(position["condition_id"]),
+                purpose="STOP_066",
+                book_hash=frame_hash,
+            )
+            return
+        response = await self.adapter.create_order({
+            "idempotency_key": intent["intent_id"],
+            "durable_intent_reserved": True,
+            "event_id": position["event_id"],
+            "condition_id": position["condition_id"],
+            "token_id": position["token_id"],
+            "outcome": position["outcome"],
+            "side": "SELL",
+            "order_type": "GTC",
+            "purpose": "STOP_066",
+            "requested_price": canonical_decimal(self.policy.stop_min_price),
+            "requested_size": canonical_decimal(shares),
+        })
+        self.repo.update_intent(
+            str(intent["intent_id"]),
+            state=str(response.get("status") or "UNKNOWN").upper(),
+            remote_order_id=response.get("polymarket_order_id"),
+            reason_code=response.get("failure_reason"),
+        )
+        await self._reconcile("stop_gtc_submission")
+
+
     async def _emergency_exit(
         self,
         position: dict[str, Any],
@@ -520,6 +631,41 @@ class LiveStrategyRuntime:
     ) -> None:
         if position.get("last_exit_book_hash") == frame_hash:
             return
+        if position.get("active_exit_intent_id"):
+            active = self.repo.cancel_active_exit(position["position_id"], purpose)
+            if active:
+                if self.paper_mode():
+                    self.repo.finalize_cancel(
+                        str(active["intent_id"]), True, "PAPER_CANCEL_ACK"
+                    )
+                else:
+                    response = await self.adapter.cancel_order(
+                        str(active.get("remote_order_id") or "")
+                    )
+                    if not response.get("success"):
+                        self.repo.finalize_cancel(
+                            str(active["intent_id"]), False, "CANCEL_UNCERTAIN"
+                        )
+                        self.repo.alert(
+                            alert_type="EXIT",
+                            severity="CRITICAL",
+                            reason_code="STOP_CANCEL_UNCERTAIN",
+                            message="STOP cancellation is uncertain; emergency SELL was not sent",
+                            entity_type="position",
+                            entity_id=position["position_id"],
+                        )
+                        return
+                    self.repo.finalize_cancel(
+                        str(active["intent_id"]), True, "CANCEL_ACK"
+                    )
+                    reconciled = await self._reconcile("stop_cancel_before_emergency")
+                    if reconciled.get("status") != "ok":
+                        return
+            refreshed = self.repo.active_positions(str(position["token_id"]))
+            position = next(
+                (item for item in refreshed if item["position_id"] == position["position_id"]),
+                position,
+            )
         if position.get("tp_intent_id"):
             tp = self.repo.cancel_tp(position["position_id"], purpose)
             if tp:

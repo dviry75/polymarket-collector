@@ -11,6 +11,7 @@ from live.order_book import OrderBookSet
 from live.reconciliation import ReconciliationWorker
 from live.repository import LiveRepository
 from live.strategy import AllInBudget, StrategyPolicy, choose_entry, exact_trigger, simulate_buy_fak
+from live.strategy_runtime import LiveStrategyRuntime
 from live.strategy_repository import StrategyRepository, sanitize
 
 
@@ -124,13 +125,14 @@ def test_order_book_snapshot_delta_delete_duplicate_out_of_order_reconnect_two_t
 
 def test_five_dollar_all_in_rounding_fees_and_minimum():
     budget = AllInBudget(Decimal("5"))
-    assert budget.sdk_buy_parameters() == {"amount": "5", "max_spend": "5"}
+    assert budget.sdk_buy_parameters() == {"amount": "3.8", "max_spend": "5"}
     result = simulate_buy_fak(
         [{"price": "0.74", "size": "100"}], max_price=Decimal("0.76"),
         max_spend=Decimal("5"), fee_rate=Decimal("0.07"),
+        max_shares=Decimal("5"),
     )
     assert result.all_in <= Decimal("5")
-    assert result.filled_shares > Decimal("5")
+    assert result.filled_shares <= Decimal("5")
     assert budget.minimum_viable(
         min_order_shares=Decimal("5"), maximum_price=Decimal("0.76"),
         maximum_fee_fraction=Decimal("0.07"),
@@ -140,6 +142,10 @@ def test_five_dollar_all_in_rounding_fees_and_minimum():
         maximum_fee_fraction=Decimal("0.07"),
     )[0] is False
 
+    assert budget.minimum_viable(
+        min_order_shares=Decimal("5.000001"), maximum_price=Decimal("0.76"),
+        maximum_fee_fraction=Decimal("0.07"),
+    ) == (False, "MINIMUM_ORDER_EXCEEDS_5_TOKEN_CAP")
 
 def test_event_lock_zero_fill_survives_restart_and_is_unique():
     temp, base, strategy = build_repo()
@@ -160,6 +166,31 @@ def test_event_lock_zero_fill_survives_restart_and_is_unique():
         assert restarted.intent(first["entry_intent_id"])["state"] == "ZERO_FILL"
     finally:
         temp.cleanup()
+def test_canary_reservation_consumes_and_disarms_atomically_across_restart():
+    temp, base, strategy = build_repo()
+    try:
+        base.set_state("canary_armed", "true", "test")
+        base.set_state("canary_consumed", "false", "test")
+        base.set_state("kill_switch", "false", "test")
+        base.set_state("pause_entries", "false", "test")
+        first = strategy.reserve_event_entry(
+            event_id="canary-event", condition_id="c", token_id="yes", side="YES",
+            simultaneous=False, reason_code="ENTRY_PRICE_EXACT", consume_canary=True,
+        )
+        assert not first.get("_blocked")
+        restarted = StrategyRepository(LiveRepository(base.db_path))
+        assert base.get_state("canary_armed") == "false"
+        assert base.get_state("canary_consumed") == "true"
+        assert base.get_state("pause_entries") == "true"
+        blocked = restarted.reserve_event_entry(
+            event_id="second-event", condition_id="c2", token_id="no", side="NO",
+            simultaneous=False, reason_code="ENTRY_PRICE_EXACT", consume_canary=True,
+        )
+        assert blocked == {"_blocked": True, "reason": "CANARY_NOT_AVAILABLE"}
+        assert restarted.event_state("second-event") is None
+    finally:
+        temp.cleanup()
+
 
 
 def test_atomic_simultaneous_lock_has_no_order_intent():
@@ -370,7 +401,7 @@ def armed_config():
         trading_mode="LIVE", execution_mode="REAL_TRADING", live_module_enabled=True,
         live_trading_enabled=True, live_order_submission_enabled=True,
         live_adapter="polymarket", pause_entries_default=False, canary_armed=True,
-        funder_address=FakeSecureClient.wallet, signature_type=1,
+        live_kill_switch_default=False, funder_address=FakeSecureClient.wallet, signature_type=1,
     )
 
 
@@ -379,12 +410,12 @@ def test_adapter_buy_fak_max_spend_max_price_and_no_auto_approval():
     adapter = RealPolymarketTradingAdapter(armed_config(), secure_client=fake)
     result = asyncio.run(adapter.create_order({
         "durable_intent_reserved": True, "token_id": "token", "side": "BUY",
-        "order_type": "FAK", "requested_amount_usd": "5", "max_spend": "5",
-        "max_price": "0.76",
+        "order_type": "FAK", "requested_amount_usd": "3.8", "max_spend": "5",
+        "max_price": "0.76", "max_tokens": "5",
     }))
     assert result["status"] == "matched"
     assert fake.market_calls == [{
-        "token_id": "token", "side": "BUY", "amount": "5", "max_spend": "5",
+        "token_id": "token", "side": "BUY", "amount": "3.8", "max_spend": "5",
         "max_price": "0.76", "order_type": "FAK",
     }]
     assert len(fake.posted) == 1
@@ -415,8 +446,8 @@ def test_adapter_insufficient_allowance_blocks_before_sign_and_post():
     adapter = RealPolymarketTradingAdapter(armed_config(), secure_client=fake)
     result = asyncio.run(adapter.create_order({
         "durable_intent_reserved": True, "token_id": "token", "side": "BUY",
-        "order_type": "FAK", "requested_amount_usd": "5", "max_spend": "5",
-        "max_price": "0.76",
+        "order_type": "FAK", "requested_amount_usd": "3.8", "max_spend": "5",
+        "max_price": "0.76", "max_tokens": "5",
     }))
     assert result["status"] == "blocked"
     assert "APPROVAL_REQUIRED" in result["failure_reason"]
@@ -439,10 +470,9 @@ class FakeResponseClient(FakeSecureClient):
 def _adapter_entry_order():
     return {
         "durable_intent_reserved": True, "token_id": "token", "side": "BUY",
-        "order_type": "FAK", "requested_amount_usd": "5", "max_spend": "5",
-        "max_price": "0.76",
+        "order_type": "FAK", "requested_amount_usd": "3.8", "max_spend": "5",
+        "max_price": "0.76", "max_tokens": "5",
     }
-
 
 def test_adapter_delayed_pending_partial_rejected_and_unknown_responses_never_retry():
     cases = [
@@ -497,3 +527,241 @@ def test_recursive_masking_covers_payloads_and_error_strings():
     rendered = str(masked)
     assert "never-show" not in rendered and "BearerNever" not in rendered and "hidden" not in rendered
     assert masked["token_id"] == "public-token-id"
+
+
+def test_paper_stop_gtc_partial_then_cancel_and_emergency_fak_closes_position():
+    temp, base, strategy = build_repo()
+    try:
+        base.upsert_market({
+            "event_id": "event-stop",
+            "condition_id": "condition-event-stop",
+            "yes_token_id": "token-event-stop",
+            "no_token_id": "token-no",
+            "token_mapping_status": "verified",
+            "accepting_orders": True,
+            "min_order_size": 1,
+            "min_tick_size": 0.01,
+            "taker_base_fee": 0,
+        })
+        position = reserve_and_open(
+            strategy, event="event-stop", shares=Decimal("5"), minimum=Decimal("1")
+        )
+        tp = strategy.reserve_position_intent(
+            position,
+            action="TP",
+            purpose="TAKE_PROFIT",
+            order_type="GTC",
+            shares=Decimal("5"),
+            price_limit=Decimal("0.96"),
+            book_hash="entry",
+        )
+        strategy.update_intent(tp["intent_id"], state="LIVE")
+        position = strategy.position_for_token("token-event-stop")
+        runtime = LiveStrategyRuntime(
+            LiveConfig(
+                live_module_enabled=True,
+                execution_mode="PAPER_TRADING",
+                paper_trading_enabled=True,
+            ),
+            base,
+            strategy,
+            MockTradingAdapter(),
+        )
+        asyncio.run(runtime._place_stop_loss(
+            position,
+            {
+                "asset_id": "token-event-stop",
+                "best_bid": "0.66",
+                "bids": [{"price": "0.66", "size": "2"}],
+            },
+            frame_hash="stop-book",
+        ))
+        partial = strategy.position_for_token("token-event-stop")
+        assert partial["remaining_shares_text"] == "3"
+        assert partial["active_exit_intent_id"]
+        stop_intent = strategy.intent(partial["active_exit_intent_id"])
+        assert stop_intent["order_type"] == "GTC"
+        assert stop_intent["price_limit_text"] == "0.55"
+        assert stop_intent["state"] == "PARTIAL"
+
+        restarted_strategy = StrategyRepository(LiveRepository(base.db_path))
+        restarted_strategy.migrate()
+        runtime = LiveStrategyRuntime(
+            LiveConfig(
+                live_module_enabled=True,
+                execution_mode="PAPER_TRADING",
+                paper_trading_enabled=True,
+            ),
+            base,
+            restarted_strategy,
+            MockTradingAdapter(),
+        )
+        partial = restarted_strategy.position_for_token("token-event-stop")
+        asyncio.run(runtime._emergency_exit(
+            partial,
+            {
+                "asset_id": "token-event-stop",
+                "best_bid": "0.60",
+                "bids": [{"price": "0.60", "size": "3"}],
+            },
+            purpose="EMERGENCY_060",
+            min_price=Decimal("0.55"),
+            frame_hash="emergency-book",
+        ))
+        closed = strategy.position_for_token("token-event-stop")
+        assert closed["state"] == "CLOSED"
+        assert closed["remaining_shares_text"] == "0"
+        assert strategy.intent(stop_intent["intent_id"])["state"] == "CANCELED"
+    finally:
+        temp.cleanup()
+
+
+def test_emergency_cancel_failure_never_submits_parallel_sell():
+    class CancelFailureAdapter(MockTradingAdapter):
+        def __init__(self):
+            super().__init__()
+            self.create_calls = []
+
+        async def cancel_order(self, order_id):
+            return {"success": False, "status": "unknown"}
+
+        async def create_order(self, order):
+            self.create_calls.append(order)
+            return await super().create_order(order)
+
+    temp, base, strategy = build_repo()
+    try:
+        position = reserve_and_open(
+            strategy, event="cancel-failure", shares=Decimal("5"), minimum=Decimal("1")
+        )
+        active = strategy.reserve_position_intent(
+            position,
+            action="EXIT",
+            purpose="STOP_066",
+            order_type="GTC",
+            shares=Decimal("5"),
+            price_limit=Decimal("0.55"),
+            book_hash="stop",
+        )
+        strategy.update_intent(
+            active["intent_id"], state="LIVE", remote_order_id="remote-stop"
+        )
+        position = strategy.position_for_token("token-cancel-failure")
+        adapter = CancelFailureAdapter()
+        runtime = LiveStrategyRuntime(
+            LiveConfig(execution_mode="READ_ONLY"),
+            base,
+            strategy,
+            adapter,
+        )
+        asyncio.run(runtime._emergency_exit(
+            position,
+            {
+                "asset_id": "token-cancel-failure",
+                "best_bid": "0.60",
+                "bids": [{"price": "0.60", "size": "5"}],
+            },
+            purpose="EMERGENCY_060",
+            min_price=Decimal("0.55"),
+            frame_hash="emergency",
+        ))
+        assert adapter.create_calls == []
+        assert strategy.intent(active["intent_id"])["state"] == "CANCEL_UNCERTAIN"
+        assert strategy.position_for_token("token-cancel-failure")[
+            "state"
+        ] == "EXIT_RECONCILIATION_REQUIRED"
+    finally:
+        temp.cleanup()
+
+
+def test_reconciliation_settles_entry_fill_and_position_across_restart():
+    temp, base, strategy = build_repo()
+    try:
+        base.upsert_market({
+            "event_id": "recovered-entry",
+            "condition_id": "recovered-condition",
+            "yes_token_id": "recovered-token",
+            "no_token_id": "recovered-no",
+            "token_mapping_status": "verified",
+            "accepting_orders": True,
+            "min_order_size": 5,
+        })
+        reservation = strategy.reserve_event_entry(
+            event_id="recovered-entry", condition_id="recovered-condition",
+            token_id="recovered-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        intent_id = reservation["entry_intent_id"]
+        strategy.update_intent(intent_id, state="RECONCILIATION_REQUIRED", remote_order_id="r1")
+        adapter = MockTradingAdapter()
+        adapter.orders["r1"] = {
+            "status": "filled",
+            "fills": [{
+                "polymarket_order_id": "r1", "polymarket_trade_id": "trade-r1",
+                "price": "0.74", "size": "5", "fee": "0.02", "status": "matched",
+            }],
+        }
+        adapter.positions = [{
+            "condition_id": "recovered-condition", "token_id": "recovered-token",
+            "outcome": "YES", "size": "5", "average_price": "0.74",
+            "current_value": "3.7",
+        }]
+        restarted = StrategyRepository(LiveRepository(base.db_path))
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, restarted).run_once("restart-test")
+        )
+        assert result["status"] == "ok"
+        position = restarted.position_for_token("recovered-token")
+        assert position["remaining_shares_text"] == "5"
+        assert position["cost_all_in_text"] == "3.72"
+        assert restarted.intent(intent_id)["state"] == "FILLED"
+    finally:
+        temp.cleanup()
+
+
+def test_reconciliation_failure_forces_kill_pause_and_disarms_canary():
+    class FailingAdapter(MockTradingAdapter):
+        async def get_balance(self):
+            raise RuntimeError("Secret Manager unavailable")
+
+    temp, base, strategy = build_repo()
+    try:
+        base.set_state("kill_switch", "false", "test")
+        base.set_state("canary_armed", "true", "test")
+        strategy.set_pause_entries(False, "test", "test")
+        result = asyncio.run(
+            ReconciliationWorker(base, FailingAdapter(), strategy).run_once("test")
+        )
+        assert result["status"] == "failed"
+        assert base.get_state("kill_switch") == "true"
+        assert base.get_state("canary_armed") == "false"
+        assert strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_configured_signer_mismatch_fails_before_network_client_creation():
+    class MemorySecrets:
+        values = {
+            "POLYMARKET_PRIVATE_KEY": "0x" + "11" * 32,
+            "POLYMARKET_API_KEY": "fake-api-key",
+            "POLYMARKET_API_SECRET": "fake-api-secret",
+            "POLYMARKET_API_PASSPHRASE": "fake-passphrase",
+        }
+
+        def get_secret(self, name):
+            return self.values.get(name)
+
+    config = LiveConfig(
+        private_signing_readiness_enabled=True,
+        signer_address="0x2222222222222222222222222222222222222222",
+        funder_address="0x3333333333333333333333333333333333333333",
+        signature_type=3,
+    )
+    result = asyncio.run(
+        RealPolymarketTradingAdapter(
+            config, secret_provider=MemorySecrets()
+        ).identity_preflight()
+    )
+    assert result["status"] == "SIGNER_MISMATCH"
+    assert result["signer"] is None

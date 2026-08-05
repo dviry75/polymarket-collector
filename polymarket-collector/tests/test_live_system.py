@@ -123,6 +123,7 @@ class LiveSystemTests(unittest.TestCase):
             live_adapter="polymarket",
             pause_entries_default=False,
             canary_armed=True,
+            live_kill_switch_default=False,
         )
         self.assertTrue(armed.real_submission_armed())
 
