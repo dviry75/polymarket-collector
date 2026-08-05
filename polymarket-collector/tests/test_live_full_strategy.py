@@ -423,6 +423,61 @@ def test_adapter_insufficient_allowance_blocks_before_sign_and_post():
     assert fake.market_calls == [] and fake.posted == []
 
 
+class FakeResponseClient(FakeSecureClient):
+    def __init__(self, response):
+        super().__init__()
+        self.response = response
+
+    async def post_order(self, signed):
+        self.posted.append(signed)
+        await asyncio.sleep(0)
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
+
+
+def _adapter_entry_order():
+    return {
+        "durable_intent_reserved": True, "token_id": "token", "side": "BUY",
+        "order_type": "FAK", "requested_amount_usd": "5", "max_spend": "5",
+        "max_price": "0.76",
+    }
+
+
+def test_adapter_delayed_pending_partial_rejected_and_unknown_responses_never_retry():
+    cases = [
+        ({"ok": True, "status": "delayed", "order_id": "delayed-1"}, True, "delayed"),
+        ({"ok": True, "status": "pending", "order_id": "pending-1"}, True, "pending"),
+        ({"ok": True, "status": "matched", "order_id": "partial-1",
+          "making_amount": "3", "taking_amount": "2.22"}, True, "matched"),
+        ({"ok": False, "code": "order_rejected", "message": "rejected"}, False, "rejected"),
+        ({"ok": True}, True, "unknown"),
+    ]
+    for response, expected_success, expected_status in cases:
+        fake = FakeResponseClient(response)
+        result = asyncio.run(
+            RealPolymarketTradingAdapter(armed_config(), secure_client=fake).create_order(
+                _adapter_entry_order()
+            )
+        )
+        assert result["success"] is expected_success
+        assert result["status"] == expected_status
+        assert len(fake.posted) == 1
+
+
+def test_adapter_transport_timeout_is_uncertain_and_never_retried():
+    fake = FakeResponseClient(asyncio.TimeoutError("SDK read timeout"))
+    result = asyncio.run(
+        RealPolymarketTradingAdapter(armed_config(), secure_client=fake).create_order(
+            _adapter_entry_order()
+        )
+    )
+    assert result["success"] is False
+    assert result["status"] == "unknown"
+    assert "TimeoutError" in result["failure_reason"]
+    assert len(fake.posted) == 1
+
+
 def test_adapter_fail_closed_when_not_armed_or_without_durable_intent():
     fake = FakeSecureClient()
     adapter = RealPolymarketTradingAdapter(LiveConfig(), secure_client=fake)

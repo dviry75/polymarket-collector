@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
@@ -42,7 +43,8 @@ class PaperTradingTests(unittest.TestCase):
             self.repo, enabled=True, max_market_age_seconds=10_000
         )
         self.manager = MarketWebSocketManager(
-            self.repo, stale_after_seconds=10_000, on_snapshot=self.engine.process_snapshot
+            self.repo, stale_after_seconds=10_000, on_snapshot=self.engine.process_snapshot,
+            snapshot_min_interval_seconds=0,
         )
 
     def tearDown(self):
@@ -227,7 +229,7 @@ class PaperTradingTests(unittest.TestCase):
             "entry_window_end_seconds_before_end": 0,
             "schedule_timezone": "Asia/Jerusalem",
             "inactive_windows": [{
-                "day_of_week": (now.weekday() + 1) % 7,
+                "day_of_week": (now.astimezone(ZoneInfo("Asia/Jerusalem")).weekday() + 1) % 7,
                 "start_time": "00:00:00",
                 "end_time": "23:59:59",
                 "status": "active",

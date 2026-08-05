@@ -1147,13 +1147,15 @@ class StrategyRepository:
         ts = now_iso()
         with self.base.connect() as conn:
             existing = conn.execute(
-                "SELECT id FROM live_alerts WHERE fingerprint=? AND active=1", (fingerprint,)
+                "SELECT id,active FROM live_alerts WHERE fingerprint=? ORDER BY active DESC,id DESC LIMIT 1",
+                (fingerprint,),
             ).fetchone()
             if existing:
                 conn.execute(
                     """
                     UPDATE live_alerts SET last_seen_at=?,occurrence_count=occurrence_count+1,
-                        severity=?,message=? WHERE id=?
+                        severity=?,message=?,active=1,acknowledged_at=NULL,acknowledged_by=NULL
+                    WHERE id=?
                     """,
                     (ts, severity, message, existing["id"]),
                 )

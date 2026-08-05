@@ -113,18 +113,22 @@ async def shutdown() -> None:
                 await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                # Background-loop failures are already persisted by the worker.
+                # They must not prevent the remaining resources from closing.
+                pass
     _discovery_task = _reconciliation_task = _metrics_task = None
     try:
         await strategy_services()[1].stop()
-    except RuntimeError:
+    except Exception:
         pass
     try:
         await services()[6].stop()
-    except RuntimeError:
+    except Exception:
         pass
     try:
         await services()[7].stop()
-    except RuntimeError:
+    except Exception:
         pass
 
 @app.get("/")

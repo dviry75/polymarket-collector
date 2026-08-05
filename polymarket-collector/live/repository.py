@@ -40,13 +40,24 @@ class LiveRepository:
                 self.close()
                 return result
 
-        conn = sqlite3.connect(self.db_path, factory=ClosingConnection)
+        conn = sqlite3.connect(
+            self.db_path, factory=ClosingConnection, timeout=30.0
+        )
         conn.row_factory = sqlite3.Row
+        # A bounded wait avoids transient writer contention surfacing as an
+        # application error. NORMAL is durable with WAL while avoiding one
+        # filesystem sync for every high-frequency market-data transaction.
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     def migrate(self, kill_switch_default: bool = True) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
+            # WAL permits readers while the single writer commits market frames.
+            # The setting is persistent for the database and is applied before
+            # migrations start any transaction.
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS live_markets (

@@ -202,7 +202,7 @@ class ReconciliationWorker:
                         alert_type="RECONCILIATION", severity="CRITICAL",
                         reason_code="RECONCILIATION_MISMATCH",
                         message=f"Reconciliation found {len(gaps)} mismatch(es); entries paused",
-                        entity_type="run", entity_id=str(run_id),
+                        entity_type="account", entity_id="remote_truth",
                     )
                 self.strategy_repo.timeline(
                     severity="INFO" if not gaps else "CRITICAL",
@@ -233,7 +233,7 @@ class ReconciliationWorker:
                 self.strategy_repo.alert(
                     alert_type="RECONCILIATION", severity="CRITICAL",
                     reason_code="RECONCILIATION_FAILED", message=safe_error,
-                    entity_type="run", entity_id=str(run_id),
+                    entity_type="account", entity_id="remote_truth",
                 )
             self.repo.audit(
                 actor, "live_reconciliation", "failed", safe_error, {"run_id": run_id}

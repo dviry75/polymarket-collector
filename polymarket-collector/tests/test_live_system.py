@@ -350,6 +350,17 @@ class LiveSystemTests(unittest.TestCase):
         )
         self.assertEqual(acknowledged.status_code, 200)
         self.assertEqual(acknowledged.json()["active"], 0)
+        reactivated_id = strategy.alert(
+            alert_type="TEST", severity="CRITICAL", reason_code="TEST_ALERT",
+            message="persistent test alert recurred",
+        )
+        self.assertEqual(reactivated_id, alert_id)
+        reactivated = next(
+            item for item in client.get("/live/alerts").json() if item["id"] == alert_id
+        )
+        self.assertEqual(reactivated["active"], 1)
+        self.assertEqual(reactivated["occurrence_count"], 2)
+        self.assertIsNone(reactivated["acknowledged_at"])
 
         preview = client.post("/live/emergency-close/preview", headers=headers)
         self.assertEqual(preview.status_code, 200)

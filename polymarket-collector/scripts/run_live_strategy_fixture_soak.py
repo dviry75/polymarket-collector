@@ -4,7 +4,11 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from live.adapters.mock import MockTradingAdapter
 from live.config import LiveConfig

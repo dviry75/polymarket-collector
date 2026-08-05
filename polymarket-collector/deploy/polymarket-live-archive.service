@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=polymarket-live
-Group=polymarket-live
+User=dvir
+Group=dvir
 WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
 EnvironmentFile=/etc/polymarket-live/live.env
 ExecStart=/opt/polymarket-btc-live/.venv/bin/python scripts/run_live_archive.py
