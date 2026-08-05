@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Polymarket LIVE snapshot archive timer
+
+[Timer]
+OnCalendar=*-*-* 02:17:00 UTC
+Persistent=true
+RandomizedDelaySec=900
+Unit=polymarket-live-archive.service
+
+[Install]
+WantedBy=timers.target

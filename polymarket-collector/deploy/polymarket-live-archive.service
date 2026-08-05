@@ -1,0 +1,20 @@
+[Unit]
+Description=Polymarket LIVE verified snapshot archive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=polymarket-live
+Group=polymarket-live
+WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
+EnvironmentFile=/etc/polymarket-live/live.env
+ExecStart=/opt/polymarket-btc-live/.venv/bin/python scripts/run_live_archive.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polymarket-btc-live
+
+[Install]
+WantedBy=multi-user.target

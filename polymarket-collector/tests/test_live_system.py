@@ -19,7 +19,7 @@ import live_app
 from live.config import LiveConfig, redact_mapping
 from live.public_client import MockPublicClobClient
 from live.repository import LiveRepository
-from live.router import configure, refresh_public_market_metadata
+from live.router import configure, refresh_public_market_metadata, strategy_services
 
 try:
     from argon2 import PasswordHasher
@@ -116,15 +116,18 @@ class LiveSystemTests(unittest.TestCase):
 
         armed = LiveConfig(
             trading_mode="LIVE",
+            execution_mode="REAL_TRADING",
             live_module_enabled=True,
             live_trading_enabled=True,
             live_order_submission_enabled=True,
             live_adapter="polymarket",
+            pause_entries_default=False,
+            canary_armed=True,
         )
         self.assertTrue(armed.real_submission_armed())
 
         redacted = redact_mapping({"POLYMARKET_API_SECRET": "abcdef", "safe": "value"})
-        self.assertEqual(redacted["POLYMARKET_API_SECRET"], "ab****ef")
+        self.assertEqual(redacted["POLYMARKET_API_SECRET"], "[CONFIGURED]")
         self.assertEqual(redacted["safe"], "value")
 
     def test_live_migration_is_idempotent_and_separate_from_demo_tables(self):
@@ -272,8 +275,8 @@ class LiveSystemTests(unittest.TestCase):
             },
         )
         self.assertEqual(fak.status_code, 200)
-        self.assertEqual(fak.json()["order"]["status"], "blocked")
-        self.assertEqual(fak.json()["risk"]["reason_code"], "PARTIAL_FILLS_DISABLED")
+        self.assertEqual(fak.json()["order"]["status"], "partially_filled")
+        self.assertEqual(fak.json()["risk"]["reason_code"], "ALLOWED")
 
     def test_public_metadata_and_websocket_resolution_fixture(self):
         metadata = asyncio.run(refresh_public_market_metadata("condition-1", use_mock=True))
@@ -295,6 +298,68 @@ class LiveSystemTests(unittest.TestCase):
         market = client.get("/live/markets").json()[0]
         self.assertEqual(market["market_resolved"], 1)
         self.assertEqual(market["winning_asset_id"], "yes-token")
+
+    def test_strategy_overview_logs_alerts_pause_resume_and_emergency_security(self):
+        client = self.client()
+        csrf = self.login(client)
+        headers = self.auth_headers(csrf)
+        dashboard = client.get("/live")
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn("Pause Entries", dashboard.text)
+        self.assertIn("Emergency Close", dashboard.text)
+        self.assertIn("Persistent Alerts", client.get("/live?view=logs").text)
+
+        status = client.get("/live/strategy/status")
+        self.assertEqual(status.status_code, 200)
+        self.assertTrue(status.json()["strategy"]["pause_entries"])
+        self.assertIn("database", status.json())
+
+        self.assertEqual(client.post("/live/pause-entries/pause").status_code, 403)
+        paused = client.post("/live/pause-entries/pause", headers=headers)
+        self.assertEqual(paused.status_code, 200)
+        self.assertTrue(paused.json()["pause_entries"])
+        blocked_resume = client.post(
+            "/live/pause-entries/resume", headers=self.auth_headers(csrf, reauth=True)
+        )
+        self.assertEqual(blocked_resume.status_code, 409)
+
+        strategy, _runtime = strategy_services()
+        strategy.timeline(
+            severity="ERROR", category="SECURITY", component="test", source="test",
+            requested_action="MASK", reason_code="MASKING_TEST", result_status="FAILED",
+            error_message="Authorization: should-never-appear API_SECRET=hidden-value",
+        )
+        logs = client.get("/live/logs?severity=ERROR&reason_code=MASKING_TEST")
+        self.assertEqual(logs.status_code, 200)
+        rendered = logs.text
+        self.assertNotIn("should-never-appear", rendered)
+        self.assertNotIn("hidden-value", rendered)
+        self.assertEqual(client.get("/live/logs/export?format=csv").status_code, 200)
+        self.assertEqual(client.get("/live/logs/export?format=json").status_code, 200)
+
+        alert_id = strategy.alert(
+            alert_type="TEST", severity="CRITICAL", reason_code="TEST_ALERT",
+            message="persistent test alert",
+        )
+        self.assertTrue(any(item["id"] == alert_id for item in client.get("/live/alerts").json()))
+        self.assertEqual(
+            client.post(f"/live/alerts/{alert_id}/acknowledge").status_code, 403
+        )
+        acknowledged = client.post(
+            f"/live/alerts/{alert_id}/acknowledge", headers=headers
+        )
+        self.assertEqual(acknowledged.status_code, 200)
+        self.assertEqual(acknowledged.json()["active"], 0)
+
+        preview = client.post("/live/emergency-close/preview", headers=headers)
+        self.assertEqual(preview.status_code, 200)
+        self.assertFalse(preview.json()["global_cancel"])
+        self.assertEqual(preview.json()["confirmation_required"], "EMERGENCY CLOSE")
+        missing_confirmation = client.post(
+            "/live/emergency-close/execute", headers=self.auth_headers(csrf, reauth=True),
+            json={"confirmation": "wrong"},
+        )
+        self.assertEqual(missing_confirmation.status_code, 409)
 
     def test_user_websocket_fixture_reconciliation_and_export(self):
         client = self.client()

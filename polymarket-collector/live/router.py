@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import csv
 import html
+import io
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, Header, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from openpyxl import Workbook
 
 from .adapters import MockTradingAdapter, RealPolymarketTradingAdapter, TradingAdapter
@@ -23,6 +25,8 @@ from .repository import LiveRepository, now_iso
 from .risk_manager import RiskManager
 from .trading_engine import TradingEngine
 from .secrets import EnvSecretProvider, GoogleSecretManagerProvider, secret_readiness
+from .strategy_repository import StrategyRepository, sanitize
+from .strategy_runtime import LiveStrategyRuntime
 
 
 router = APIRouter(prefix="/live", tags=["live"])
@@ -39,21 +43,29 @@ _engine: TradingEngine | None = None
 _auth: LiveAuthManager | None = None
 _dry_run: DryRunService | None = None
 _paper: PaperTradingEngine | None = None
+_strategy_repo: StrategyRepository | None = None
+_strategy_runtime: LiveStrategyRuntime | None = None
 _export_state: dict[str, Any] = {"status": "idle", "path": None, "error": None, "row_counts": None}
 
 
 def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
-    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime
     _config = config or LiveConfig.from_env()
     errors = _config.validation_errors()
     if errors:
         raise ValueError("; ".join(errors))
     _repo = LiveRepository(db_path)
     _repo.migrate(_config.live_kill_switch_default)
+    _strategy_repo = StrategyRepository(_repo)
+    _strategy_repo.migrate(pause_entries_default=_config.pause_entries_default)
     _adapter = MockTradingAdapter(_config.adapter_scenario) if _config.live_adapter == "mock" else RealPolymarketTradingAdapter(_config)
     _risk = RiskManager(_config, _repo)
     _orders = OrderManager(_repo, _risk, _adapter)
-    _reconciliation = ReconciliationWorker(_repo, _adapter)
+    _reconciliation = ReconciliationWorker(_repo, _adapter, _strategy_repo)
+    _strategy_runtime = LiveStrategyRuntime(
+        _config, _repo, _strategy_repo, _adapter,
+        reconciliation=lambda reason: _reconciliation.run_once(actor=f"strategy:{reason}"),
+    )
     _paper = PaperTradingEngine(
         _repo,
         enabled=_config.paper_trading_active(),
@@ -64,6 +76,10 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         _repo,
         stale_after_seconds=_config.max_market_data_age_seconds,
         on_snapshot=_paper.process_snapshot,
+        on_atomic_frame=_strategy_runtime.schedule_frame,
+        persist_raw_payloads=_config.raw_market_ws_payloads_enabled,
+        snapshot_min_interval_seconds=float(_config.snapshot_min_interval_seconds),
+        on_reconnect=lambda: _reconciliation.run_once(actor="market_ws_reconnect"),
     )
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
@@ -78,6 +94,12 @@ def services() -> tuple[LiveConfig, LiveRepository, TradingAdapter, RiskManager,
     if _repo is None or _config is None or _adapter is None or _risk is None or _orders is None or _reconciliation is None or _market_ws is None or _user_ws is None or _engine is None or _auth is None or _dry_run is None:
         raise RuntimeError("LIVE services are not configured")
     return _config, _repo, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run
+
+
+def strategy_services() -> tuple[StrategyRepository, LiveStrategyRuntime]:
+    if _strategy_repo is None or _strategy_runtime is None:
+        raise RuntimeError("LIVE strategy services are not configured")
+    return _strategy_repo, _strategy_runtime
 
 
 def paper_service() -> PaperTradingEngine:
@@ -282,6 +304,7 @@ def dashboard_model() -> dict[str, Any]:
     market_health = market_ws.health()
     user_health = user_ws.health()
     paper_health = paper_service().health()
+    strategy_health = strategy_services()[1].health()
     system_mode = status_label(config, repo, market_ws)
     risk_gates = [
         ("Kill Switch", "BLOCKED" if repo.kill_switch_active() else "PASS", "down" if repo.kill_switch_active() else "up"),
@@ -311,6 +334,7 @@ def dashboard_model() -> dict[str, Any]:
         "market_health": market_health,
         "user_health": user_health,
         "paper_health": paper_health,
+        "strategy_health": strategy_health,
         "mode": system_mode,
         "risk_gates": risk_gates,
         "auth": auth,
@@ -329,6 +353,7 @@ def dashboard_content(view: str = "overview") -> str:
     market_health = model["market_health"]
     user_health = model["user_health"]
     paper_health = model["paper_health"]
+    strategy_health = model["strategy_health"]
     summary = {
         "mode": model["mode"],
         "adapter": config.live_adapter,
@@ -344,24 +369,26 @@ def dashboard_content(view: str = "overview") -> str:
         "exposure_usd": risk.current_exposure_usd(),
     }
     stats = "".join([
-        stat_card("System", summary["mode"], _tone_for_value(summary["mode"]), "real writes blocked"),
-        stat_card("Kill Switch", summary["kill_switch"], "down" if summary["kill_switch"] else "up", "must stay true before live"),
-        stat_card("Market WS", summary["market_ws"], _tone_for_value(summary["market_ws"]), f"stale={market_health.get('stale')}"),
-        stat_card("User WS", summary["user_ws"], _tone_for_value(summary["user_ws"]), f"stale={user_health.get('stale')}"),
-        stat_card("Paper Deals", counts.get("open_paper_deals", 0), "info", f"closed={counts.get('closed_paper_deals', 0)}"),
-        stat_card("Paper PnL", counts.get("paper_realized_pnl_usd", 0), "up", "simulated USD"),
+        stat_card("Mode", config.execution_mode, _tone_for_value(config.execution_mode), config.live_adapter),
+        stat_card("Pause Entries", strategy_health.get("pause_entries"), "up" if strategy_health.get("pause_entries") else "down", strategy_health.get("block_reason")),
+        stat_card("Readiness", strategy_health.get("readiness"), "up" if strategy_health.get("readiness") == "READY" else "down", strategy_health.get("block_reason")),
+        stat_card("Market WS", summary["market_ws"], _tone_for_value(summary["market_ws"]), market_health.get("subscription_status")),
+        stat_card("Heartbeat", strategy_health.get("heartbeat_status"), _tone_for_value(strategy_health.get("heartbeat_status")), "5 second owner heartbeat"),
+        stat_card("Alerts", strategy_health.get("active_alerts"), "down" if strategy_health.get("active_alerts") else "up", "persistent UI alerts"),
     ])
     actions = """
     <div class="actions">
-      <button data-live-action="/live/kill-switch/activate">Activate Kill Switch</button>
-      <button data-live-action="/live/kill-switch/deactivate" data-reauth="true">Deactivate Kill Switch</button>
+      <button data-live-action="/live/pause-entries/pause">Pause Entries</button>
+      <button data-live-action="/live/pause-entries/resume" data-reauth="true">Resume Entries</button>
+      <button id="emergency-close-button">Emergency Close — Preview</button>
       <button data-live-action="/live/reconciliation/run">Run Reconciliation</button>
-      <button data-live-action="/live/export/generate">Generate Export</button>
-      <a class="button" href="/live/export/download">Download Export</a>
+      <a class="button" href="/live/logs/export?format=csv">Export Logs CSV</a>
     </div>
     """
     overview = f"""
-      <div class="panel" style="border:2px solid #b91c1c;color:#b91c1c;font-weight:800">READ-ONLY — REAL TRADING DISABLED</div>
+      <div class="panel" style="border:2px solid {'#15803d' if strategy_health.get('pause_entries') else '#b91c1c'};color:{'#66d38e' if strategy_health.get('pause_entries') else '#ff6b6b'};font-weight:800;padding:12px">
+        {"PAUSE ENTRIES ON — POSITION MANAGEMENT CONTINUES" if strategy_health.get("pause_entries") else "ENTRIES ENABLED — READINESS GATES ACTIVE"}
+      </div>
       <div class="stats-grid">{stats}</div>
       {actions}
       <div class="two-col">
@@ -371,14 +398,24 @@ def dashboard_content(view: str = "overview") -> str:
             ("Login Configured", model["auth"].configured(), None),
             ("Operator Token", bool(config.operator_token), None),
             ("Secret Provider", "Google Secret Manager" if config.google_project_id else "Environment", "info"),
-            ("Last Reconciliation", summary["reconciliation"], None),
+            ("Last Reconciliation", strategy_health.get("last_reconciliation") or summary["reconciliation"], None),
+            ("Market Readiness", strategy_health.get("market_data_readiness"), None),
+            ("Account Reconciliation", strategy_health.get("reconciliation_readiness"), None),
+            ("Canary Armed", strategy_health.get("canary_armed"), "down" if strategy_health.get("canary_armed") else "up"),
+            ("Geographic", repo.get_state("geographic_availability", "NOT_CHECKED"), None),
+            ("Geo Country / Region", f'{repo.get_state("geographic_country", "")}/{repo.get_state("geographic_region", "")}', None),
         ]))}
         {panel("Account", kv_table([
             ("Identity", repo.get_state("account_identity_status", "UNVERIFIED"), None),
             ("Profile", account.get("configured_profile_address") or config.profile_address or "not configured", None),
             ("Proxy Wallet", account.get("resolved_proxy_wallet") or "not resolved", None),
+            ("pUSD / Collateral", account.get("balance_usd") if account else "unavailable", None),
+            ("Minimum Allowance", account.get("allowance_usd") if account else "unavailable", None),
             ("Positions", account.get("public_positions_count", 0), None),
             ("Value", account.get("public_positions_value", 0), None),
+            ("Refreshed", account.get("sampled_at") or "never", None),
+            ("Open Exposure", strategy_health.get("exposure_text"), None),
+            ("Daily P&L", strategy_health.get("daily_pnl_text"), None),
         ]))}
       </div>
       {panel("Risk Gates", kv_table(model["risk_gates"]))}
@@ -391,12 +428,17 @@ def dashboard_content(view: str = "overview") -> str:
             ("Best Bid", latest_market.get("best_bid") if latest_market else "-", None),
             ("Best Ask", latest_market.get("best_ask") if latest_market else "-", None),
         ]))}
-        {panel("Deployment Readiness", kv_table([
-            ("DB Backup", "manual checklist", "warn"),
-            ("Secrets", "not configured" if not config.google_project_id else "provider configured", None),
-            ("Real Submission", "disabled", "up"),
-            ("Live Rule Exists", counts.get("active_rules", 0), "up" if counts.get("active_rules", 0) == 0 else "warn"),
-            ("Push Status", "local only", "warn"),
+        {panel("State / Storage", kv_table([
+            ("Current Event", latest_market.get("event_id") if latest_market else "none", None),
+            ("Locked Side", (strategy_health.get("event") or {}).get("locked_side") or "none", None),
+            ("Event State", (strategy_health.get("event") or {}).get("status") or "unlocked", None),
+            ("Active Positions", len(strategy_health.get("positions") or []), None),
+            ("Open Strategy Exposure", strategy_health.get("exposure_text"), None),
+            ("DB Size MB", round(repo.db_path.stat().st_size / 1_000_000, 3) if repo.db_path.exists() else 0, None),
+            ("Projected MB/day", repo.get_state("db_growth_projected_mb_day", "sampling"), None),
+            ("Last Backup", (repo.list_table("live_backups", 1) or [{}])[0].get("finished_at") or "never", None),
+            ("Last Archive", repo.get_state("last_archive_at", "never"), None),
+            ("Archive Configured", bool(config.archive_bucket), "up" if config.archive_bucket else "warn"),
         ]))}
       </div>
     """
@@ -444,9 +486,10 @@ def dashboard_content(view: str = "overview") -> str:
           {panel("Daily Limits", compact_table(repo.list_table("live_daily_limits", 50)))}
         """,
         "logs": f"""
-          {panel("Audit Log", compact_table(repo.list_table("live_audit_log", 200), ["id", "occurred_at", "actor", "action", "status", "reason"]))}
-          {panel("Alert Center", compact_table([r for r in repo.list_table("live_audit_log", 200) if str(r.get("action", "")).startswith("alert:")], ["id", "occurred_at", "action", "status", "reason"], "No alerts"))}
-          {panel("WebSocket Events", compact_table(repo.list_table("live_websocket_events", 100), ["id", "channel", "event_type", "condition_id", "asset_id", "status", "received_at"]))}
+          <div class="actions"><a class="button" href="/live/logs/export?format=csv">Export filtered CSV</a><a class="button" href="/live/logs/export?format=json">Export JSON</a></div>
+          {panel("Persistent Alerts", compact_table(strategy_services()[0].active_alerts(), ["id", "severity", "alert_type", "reason_code", "entity_type", "entity_id", "message", "last_seen_at", "occurrence_count"], "No active alerts"))}
+          {panel("Linked Audit Timeline", compact_table(strategy_services()[0].list_timeline(limit=200), ["id", "occurred_at", "severity", "category", "component", "event_id", "side", "deal_id", "intent_id", "order_id", "requested_action", "reason_code", "previous_state", "new_state", "result_status", "filled_shares_text", "remaining_shares_text", "pnl_text", "error_code"]))}
+          {panel("Filters API", '<p class="muted"><code>GET /live/logs</code> supports time cursor, severity, category, event, side, deal, order, status, reason and search. Entity timelines: <code>/live/timeline/{deal|order|event}/{id}</code>.</p>')}
         """,
         "market": f"""
           {panel("Market Data", compact_table(repo.list_table("live_markets", 100), ["id", "condition_id", "yes_token_id", "no_token_id", "token_mapping_status", "min_order_size", "min_tick_size", "accepting_orders", "one_dollar_valid", "best_bid", "best_ask", "last_update_at"]))}
@@ -709,17 +752,17 @@ def live_dashboard(request: Request) -> Any:
           <div class="brand"><div class="logo">PM</div><div><div class="brand-title">Polymarket LIVE</div><div class="brand-sub">Control Center</div></div></div>
           <nav class="nav"><div class="nav-label">Workspace</div>{nav}</nav>
           <div class="nav-label">Safety</div>
-          <div class="nav"><span class="nav-item">Real submission: disabled</span><span class="nav-item">Rules: not seeded</span></div>
+          <div class="nav"><span class="nav-item">Pause entries: {_e(strategy_services()[0].pause_entries())}</span><span class="nav-item">Canary: {_e(strategy_services()[1].health().get("canary_armed"))}</span></div>
         </aside>
         <div class="main">
           <header class="topbar">
             <input class="search" placeholder="Search order, condition, token, reason..." />
             <a class="button" href="/live?view=overview">Refresh</a>
             <button type="button" id="logout-button">Logout</button>
-            <div class="top-status"><span><span class="dot"></span> Read-only shell</span><span class="mono">{_e(now_iso())}</span></div>
+            <div class="top-status"><span><span class="dot"></span> {_e(config.execution_mode)}</span><span class="mono">{_e(now_iso())}</span></div>
           </header>
           <main class="content">
-            <div class="page-head"><div><h1>{_e(dict(nav_items).get(view, "Overview"))}</h1><div class="subtitle">Operational dashboard inspired by Market Event Radar · real writes remain blocked</div></div>{chip(dashboard_model()["mode"])}</div>
+            <div class="page-head"><div><h1>{_e(dict(nav_items).get(view, "Overview"))}</h1><div class="subtitle">Operational state, linked audit timeline and UI-only alerts</div></div>{chip(dashboard_model()["mode"])}</div>
             {dashboard_content(view)}
           </main>
         </div>
@@ -743,6 +786,28 @@ def live_dashboard(request: Request) -> Any:
             return;
           }}
           window.location.reload();
+        }}
+        const emergencyButton = document.getElementById("emergency-close-button");
+        if (emergencyButton) {{
+          emergencyButton.addEventListener("click", async () => {{
+            const token = window.prompt("LIVE operator token");
+            if (!token) return;
+            const headers = {{"X-Live-Operator-Token":token,"X-Live-CSRF-Token":liveCsrfToken}};
+            const previewResponse = await fetch("/live/emergency-close/preview", {{method:"POST",headers}});
+            if (!previewResponse.ok) {{ window.alert(await previewResponse.text()); return; }}
+            const preview = await previewResponse.json();
+            if (!window.confirm("Emergency Close preview:\n" + JSON.stringify(preview, null, 2))) return;
+            const password = window.prompt("Re-enter admin password");
+            if (!password) return;
+            headers["X-Live-Reauth-Password"] = password;
+            const response = await fetch("/live/emergency-close/execute", {{
+              method:"POST", headers:{{...headers,"Content-Type":"application/json"}},
+              body:JSON.stringify({{confirmation:"EMERGENCY CLOSE"}})
+            }});
+            if (!response.ok) {{ window.alert(await response.text()); return; }}
+            window.alert(JSON.stringify(await response.json(), null, 2));
+            window.location.reload();
+          }});
         }}
         const dryRunForm = document.getElementById("dry-run-form");
         if (dryRunForm) {{
@@ -796,7 +861,9 @@ def live_health(request: Request) -> dict[str, Any]:
         "market_ws": market_ws.health(),
         "user_ws": user_ws.health(),
         "auth": auth.public_status(),
-        "account_identity": repo.latest_account_snapshot(),
+        "account_identity": sanitize(repo.latest_account_snapshot() or {}),
+        "strategy": strategy_services()[1].health(),
+        "alerts": strategy_services()[0].active_alerts(),
         "validation_errors": config.validation_errors(),
     }
 
@@ -871,6 +938,223 @@ def live_reconciliation(request: Request) -> list[dict[str, Any]]:
 def live_audit(request: Request) -> list[dict[str, Any]]:
     require_live_session(request)
     return services()[1].list_table("live_audit_log", 100)
+
+
+@router.get("/strategy/status")
+def strategy_status(request: Request) -> dict[str, Any]:
+    require_live_session(request)
+    config, repo, adapter, *_ = services()
+    strategy_repo, runtime = strategy_services()
+    account = sanitize(repo.latest_account_snapshot() or {})
+    return sanitize({
+        "time": now_iso(),
+        "mode": config.execution_mode,
+        "adapter": adapter.name,
+        "strategy": runtime.health(),
+        "market_ws": services()[6].health(),
+        "user_ws": services()[7].health(),
+        "account": account,
+        "geographic": {
+            "status": repo.get_state("geographic_availability", "NOT_CHECKED"),
+            "country": repo.get_state("geographic_country", ""),
+            "region": repo.get_state("geographic_region", ""),
+        },
+        "database": {
+            "path_configured": bool(repo.db_path),
+            "size_bytes": repo.db_path.stat().st_size if repo.db_path.exists() else 0,
+            "projected_mb_day": repo.get_state("db_growth_projected_mb_day", "unknown"),
+            "last_backup": repo.list_table("live_backups", 1),
+            "last_archive": strategy_repo.strategy_status().get("last_archive"),
+        },
+    })
+
+
+@router.post("/pause-entries/pause")
+def pause_entries(
+    request: Request,
+    x_live_operator_token: Optional[str] = Header(default=None),
+    x_live_csrf_token: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    strategy_repo, _runtime = strategy_services()
+    strategy_repo.set_pause_entries(True, "operator", "OPERATOR_PAUSE")
+    return {"ok": True, "pause_entries": True}
+
+
+@router.post("/pause-entries/resume")
+def resume_entries(
+    request: Request,
+    x_live_operator_token: Optional[str] = Header(default=None),
+    x_live_csrf_token: Optional[str] = Header(default=None),
+    x_live_reauth_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    require_reauth(request, x_live_reauth_password)
+    config, repo, *_ = services()
+    strategy_repo, runtime = strategy_services()
+    status = runtime.health()
+    blockers: list[str] = []
+    if status.get("market_data_readiness") != "READY":
+        blockers.append("MARKET_DATA_NOT_READY")
+    if status.get("reconciliation_readiness") != "READY":
+        blockers.append("RECONCILIATION_NOT_READY")
+    if config.execution_mode == "REAL_TRADING":
+        if repo.get_state("canary_armed", "false").lower() != "true":
+            blockers.append("CANARY_NOT_ARMED")
+        if services()[7].health().get("status") != "CONNECTED":
+            blockers.append("USER_WS_NOT_CONNECTED")
+        if repo.get_state("order_heartbeat_status", "DISABLED") != "OK":
+            blockers.append("HEARTBEAT_NOT_READY")
+    if blockers:
+        strategy_repo.timeline(
+            severity="WARNING", category="OPERATOR", component="ui", source="operator",
+            requested_action="RESUME_ENTRIES", reason_code="READINESS_FAILED",
+            result_status="BLOCKED", parameters_json={"blockers": blockers},
+        )
+        raise HTTPException(status_code=409, detail={"reason": "READINESS_FAILED", "blockers": blockers})
+    strategy_repo.set_pause_entries(False, "operator", "READINESS_VERIFIED")
+    return {"ok": True, "pause_entries": False}
+
+
+@router.post("/emergency-close/preview")
+def emergency_close_preview(
+    request: Request,
+    x_live_operator_token: Optional[str] = Header(default=None),
+    x_live_csrf_token: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    strategy_repo, _runtime = strategy_services()
+    positions = strategy_repo.active_positions()
+    relevant_orders = [
+        intent for intent in strategy_repo.unresolved_intents()
+        if intent.get("position_id") in {position.get("position_id") for position in positions}
+    ]
+    strategy_repo.timeline(
+        severity="WARNING", category="OPERATOR", component="ui", source="operator",
+        requested_action="EMERGENCY_CLOSE_PREVIEW", reason_code="OPERATOR_PREVIEW",
+        result_status="PREVIEW", parameters_json={
+            "position_ids": [item.get("position_id") for item in positions],
+            "intent_ids": [item.get("intent_id") for item in relevant_orders],
+            "sell_floor": "0.01",
+        },
+    )
+    return sanitize({
+        "positions": positions,
+        "relevant_orders": relevant_orders,
+        "sell_floor": "0.01",
+        "global_cancel": False,
+        "confirmation_required": "EMERGENCY CLOSE",
+    })
+
+
+@router.post("/emergency-close/execute")
+async def emergency_close_execute(
+    request: Request,
+    payload: dict[str, Any] = Body(...),
+    x_live_operator_token: Optional[str] = Header(default=None),
+    x_live_csrf_token: Optional[str] = Header(default=None),
+    x_live_reauth_password: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    require_reauth(request, x_live_reauth_password)
+    if payload.get("confirmation") != "EMERGENCY CLOSE":
+        raise HTTPException(status_code=409, detail="Exact emergency confirmation is required")
+    strategy_repo, runtime = strategy_services()
+    result = await runtime.emergency_close_all(services()[6].order_books, actor="operator")
+    strategy_repo.timeline(
+        severity="CRITICAL", category="OPERATOR", component="ui", source="operator",
+        requested_action="EMERGENCY_CLOSE", reason_code=str(result.get("reason") or "CONFIRMED"),
+        result_status=str(result.get("status") or "UNKNOWN").upper(),
+        parameters_json={"position_results": result.get("results") or [], "global_cancel": False},
+    )
+    return sanitize(result)
+
+
+@router.get("/logs")
+def strategy_logs(request: Request) -> dict[str, Any]:
+    require_live_session(request)
+    query = request.query_params
+    try:
+        limit = int(query.get("limit", "100"))
+        before_id = int(query["before_id"]) if query.get("before_id") else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid pagination value") from exc
+    filters = {
+        key: str(query.get(key) or "")
+        for key in (
+            "severity", "category", "event_id", "side", "deal_id", "order_id",
+            "result_status", "reason_code", "from_time", "to_time", "search",
+        )
+    }
+    rows = strategy_services()[0].list_timeline(
+        limit=limit, before_id=before_id, filters=filters
+    )
+    return sanitize({
+        "items": rows,
+        "next_before_id": rows[-1]["id"] if rows else None,
+        "filters": filters,
+    })
+
+
+@router.get("/logs/export")
+def strategy_logs_export(request: Request, format: str = "json") -> Any:
+    require_live_session(request)
+    filters = {
+        key: str(request.query_params.get(key) or "")
+        for key in (
+            "severity", "category", "event_id", "side", "deal_id", "order_id",
+            "result_status", "reason_code", "from_time", "to_time", "search",
+        )
+    }
+    rows = sanitize(strategy_services()[0].list_timeline(limit=500, filters=filters))
+    if format.lower() == "json":
+        return JSONResponse(rows)
+    if format.lower() != "csv":
+        raise HTTPException(status_code=422, detail="format must be csv or json")
+    output = io.StringIO()
+    headers = list(rows[0].keys()) if rows else ["empty"]
+    writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return PlainTextResponse(
+        output.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=polymarket_live_logs.csv"},
+    )
+
+
+@router.get("/timeline/{entity_type}/{entity_id}")
+def entity_timeline(request: Request, entity_type: str, entity_id: str) -> list[dict[str, Any]]:
+    require_live_session(request)
+    if entity_type not in {"deal", "order", "event"}:
+        raise HTTPException(status_code=404, detail="Unsupported entity type")
+    key = {"deal": "deal_id", "order": "order_id", "event": "event_id"}[entity_type]
+    return sanitize(strategy_services()[0].list_timeline(limit=500, filters={key: entity_id}))
+
+
+@router.get("/alerts")
+def active_alerts(request: Request) -> list[dict[str, Any]]:
+    require_live_session(request)
+    return sanitize(strategy_services()[0].active_alerts())
+
+
+@router.post("/alerts/{alert_id}/acknowledge")
+def acknowledge_alert(
+    request: Request,
+    alert_id: int,
+    x_live_operator_token: Optional[str] = Header(default=None),
+    x_live_csrf_token: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    require_live_session(request)
+    require_operator(request, x_live_operator_token, x_live_csrf_token)
+    try:
+        return sanitize(strategy_services()[0].acknowledge_alert(alert_id, "operator"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Alert not found") from exc
 
 
 @router.post("/kill-switch/activate")
@@ -1047,7 +1331,7 @@ def write_live_export() -> tuple[Path, dict[str, int]]:
         sheet.append(headers)
         count = 0
         for row in rows:
-            safe_row = redact_mapping(row)
+            safe_row = sanitize(row)
             sheet.append([safe_row.get(header) for header in headers])
             count += 1
         counts[table] = count
