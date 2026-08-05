@@ -105,3 +105,29 @@ class MockTradingAdapter(TradingAdapter):
         ids = list(self.orders)
         return await self.cancel_orders(ids)
 
+    async def cancel_market_orders(
+        self, condition_id: str, token_id: str | None = None
+    ) -> dict[str, Any]:
+        canceled = []
+        for order_id, order in self.orders.items():
+            if (
+                order.get("condition_id") == condition_id
+                and (token_id is None or order.get("token_id") == token_id)
+                and order.get("status") in {"live", "delayed", "retrying"}
+            ):
+                order["status"] = "cancelled"
+                canceled.append(order_id)
+        return {"success": True, "status": "cancelled", "canceled": canceled}
+
+    async def heartbeat(self) -> dict[str, Any]:
+        return {"success": True, "status": "ok"}
+
+    async def redeem(
+        self, condition_id: str, *, authorized_intent: bool = False
+    ) -> dict[str, Any]:
+        return {
+            "success": bool(authorized_intent),
+            "status": "confirmed" if authorized_intent else "blocked",
+            "transaction_hash": f"mock-redeem-{condition_id}" if authorized_intent else None,
+        }
+

@@ -55,3 +55,16 @@ class TradingAdapter(ABC):
     async def cancel_all_orders(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def cancel_market_orders(
+        self, condition_id: str, token_id: str | None = None
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def heartbeat(self) -> dict[str, Any]:
+        return {"success": False, "status": "disabled"}
+
+    async def redeem(
+        self, condition_id: str, *, authorized_intent: bool = False
+    ) -> dict[str, Any]:
+        return {"success": False, "status": "blocked"}
+

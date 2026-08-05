@@ -28,6 +28,8 @@ class OrderManager:
                 "failure_reason": risk.reason_code,
                 "raw_response": json_dumps({"message": risk.message}),
             })
+            if local.get("live_deal_id"):
+                self.repo.fail_deal(int(local["live_deal_id"]), risk.reason_code)
             self.repo.audit(actor, "live_order_blocked", "blocked", risk.reason_code, {"local_order_id": local["local_order_id"]})
             return {"order": updated, "risk": risk.__dict__}
 

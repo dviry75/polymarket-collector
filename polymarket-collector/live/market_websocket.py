@@ -8,8 +8,10 @@ import json
 import logging
 import os
 import random
+import time
 
 from .repository import LiveRepository, now_iso
+from .order_book import OrderBookSet, canonical_decimal
 
 
 @dataclass
@@ -28,12 +30,23 @@ class MarketWebSocketManager:
         repo: LiveRepository,
         stale_after_seconds: int = 30,
         on_snapshot: Callable[[dict[str, Any]], Any] | None = None,
+        on_atomic_frame: Callable[[dict[str, Any]], Any] | None = None,
+        persist_raw_payloads: bool = False,
+        snapshot_min_interval_seconds: float = 0.5,
+        on_reconnect: Callable[[], Awaitable[Any]] | None = None,
     ):
         self.repo = repo
         self.stale_after_seconds = stale_after_seconds
         self.status = WebSocketStatus(channel="market")
         self.on_snapshot = on_snapshot
+        self.on_atomic_frame = on_atomic_frame
+        self.persist_raw_payloads = persist_raw_payloads
+        self.snapshot_min_interval_seconds = max(0.0, snapshot_min_interval_seconds)
+        self.on_reconnect = on_reconnect
         self.subscribed_asset_ids: list[str] = []
+        self.order_books = OrderBookSet()
+        self._last_snapshot_monotonic: dict[str, float] = {}
+        self._last_snapshot_signature: dict[str, str] = {}
         self.messages_received = 0
         self.snapshots_received = 0
         self.last_ping_at = self.last_pong_at = None
@@ -93,11 +106,15 @@ class MarketWebSocketManager:
             try:
                 async with connector(url, ping_interval=None, close_timeout=5) as ws:
                     self._ws = ws
+                    self.order_books.ensure_assets(asset_ids)
+                    self.order_books.mark_not_ready("RECONNECT_AWAITING_SNAPSHOT")
                     await ws.send(json.dumps(self.subscription_message(asset_ids)))
                     self.subscribed_asset_ids = asset_ids
-                    self.status.status = "CONNECTED"
+                    self.status.status = "SUBSCRIBED"
                     self.status.error = None
                     attempt = 0
+                    if self.on_reconnect is not None:
+                        await self.on_reconnect()
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     subscriptions = asyncio.create_task(self._subscription_loop(ws))
                     try:
@@ -201,22 +218,30 @@ class MarketWebSocketManager:
         return base + random.uniform(0, 1)
 
     def process_message(self, message: dict[str, Any]) -> bool:
-        stored = self.repo.store_ws_event("market", message, "processed")
-        snapshots = self._normalize_snapshots(message)
+        stored_raw = (
+            self.repo.store_ws_event("market", message, "processed")
+            if self.persist_raw_payloads else False
+        )
+        event_type = str(message.get("event_type") or message.get("type") or "").lower()
+        received_at = now_iso()
         stored_snapshots = 0
-        for candidate in snapshots:
-            snapshot = self.repo.store_market_snapshot(candidate)
-            if snapshot is None:
-                continue
-            stored_snapshots += 1
-            self.snapshots_received += 1
-            if self.on_snapshot is not None:
-                self.on_snapshot(snapshot)
-        self.messages_received += 1
-        self.status.status = "CONNECTED"
-        self.status.last_message_at = now_iso()
-        self.status.stale = False
-        if (message.get("event_type") or message.get("type")) == "market_resolved":
+        callback_updates: list[dict[str, Any]] = []
+
+        if event_type == "market_resolved":
+            for candidate in self._normalize_snapshots(message):
+                if not self.persist_raw_payloads:
+                    candidate["raw_message"] = {
+                        "event_type": event_type,
+                        "message_hash": candidate.get("message_hash"),
+                    }
+                snapshot = self.repo.store_market_snapshot(candidate)
+                callback = snapshot or candidate
+                callback_updates.append(callback)
+                if snapshot is not None:
+                    stored_snapshots += 1
+                    self.snapshots_received += 1
+                    if self.on_snapshot is not None:
+                        self.on_snapshot(snapshot)
             condition_id = message.get("condition_id") or message.get("market")
             if condition_id:
                 self.repo.mark_market_resolved(
@@ -224,9 +249,125 @@ class MarketWebSocketManager:
                     message.get("winning_asset_id"),
                     message.get("winning_outcome"),
                 )
+        else:
+            assets = self.subscribed_asset_ids or self.repo.market_ws_asset_ids()
+            self.order_books.ensure_assets(assets)
+            frame = self.order_books.apply(message)
+            for view in frame.updates:
+                asset_id = str(view["asset_id"])
+                market = self.repo.market_for_asset(asset_id)
+                if not market:
+                    continue
+                outcome = (
+                    "YES" if str(market.get("yes_token_id")) == asset_id
+                    else "NO" if str(market.get("no_token_id")) == asset_id
+                    else None
+                )
+                candidate = {
+                    **view,
+                    "condition_id": market["condition_id"],
+                    "event_id": market.get("event_id"),
+                    "outcome": outcome,
+                    "received_at": received_at,
+                    "latency_ms": self._latency_ms(frame.timestamp),
+                    "source": "POLYMARKET_MARKET_WS",
+                    "raw_message": (
+                        {"message": message, "asset_id": asset_id}
+                        if self.persist_raw_payloads
+                        else {
+                            "event_type": frame.event_type,
+                            "message_hash": frame.message_hash,
+                            "asset_id": asset_id,
+                        }
+                    ),
+                }
+                snapshot = None
+                if self._should_persist_snapshot(candidate):
+                    snapshot = self.repo.store_market_snapshot(candidate)
+                callback = {
+                    **candidate,
+                    "id": snapshot["id"] if snapshot is not None else -self.messages_received - len(callback_updates) - 1,
+                }
+                callback_updates.append(callback)
+                if snapshot is not None:
+                    stored_snapshots += 1
+                    self.snapshots_received += 1
+                if self.on_snapshot is not None:
+                    self.on_snapshot(snapshot or callback)
+
+        self.messages_received += 1
+        self.status.status = "CONNECTED"
+        self.status.last_message_at = received_at
+        self.status.stale = False
         self.repo.set_state("market_ws_status", self.status.status, "market_ws")
-        self.repo.set_state("market_ws_last_message_at", self.status.last_message_at or "", "market_ws")
-        return stored or stored_snapshots > 0
+        self.repo.set_state("market_ws_last_message_at", self.status.last_message_at, "market_ws")
+
+        event_readiness: dict[str, dict[str, Any]] = {}
+        for update in callback_updates:
+            condition_id = str(update.get("condition_id") or "")
+            if not condition_id or condition_id in event_readiness:
+                continue
+            market = self.repo.latest_market(condition_id)
+            asset_ids = [
+                str(market.get("yes_token_id") or "") if market else "",
+                str(market.get("no_token_id") or "") if market else "",
+            ]
+            ready, reason = self.order_books.event_ready(asset_ids)
+            ready = ready and self.status.status == "CONNECTED" and set(asset_ids).issubset(
+                set(self.subscribed_asset_ids or asset_ids)
+            )
+            event_readiness[condition_id] = {"ready": ready, "reason": reason}
+        if event_readiness:
+            all_ready = all(item["ready"] for item in event_readiness.values())
+            self.repo.set_state(
+                "strategy_readiness", "READY" if all_ready else "NOT_READY", "market_ws"
+            )
+            self.repo.set_state(
+                "strategy_block_reason",
+                "" if all_ready else next(
+                    item["reason"] for item in event_readiness.values() if not item["ready"]
+                ),
+                "market_ws",
+            )
+        if self.on_atomic_frame is not None and callback_updates:
+            context = {
+                "event_type": event_type,
+                "message_hash": (
+                    frame.message_hash if event_type != "market_resolved"
+                    else str(callback_updates[0].get("message_hash") or "")
+                ),
+                "received_at": received_at,
+                "updates": callback_updates,
+                "event_readiness": event_readiness,
+            }
+            result = self.on_atomic_frame(context)
+            if asyncio.iscoroutine(result):
+                try:
+                    asyncio.get_running_loop().create_task(result)
+                except RuntimeError:
+                    asyncio.run(result)
+        return bool(stored_raw or stored_snapshots or (callback_updates and event_type != "market_resolved"))
+
+    def _should_persist_snapshot(self, snapshot: dict[str, Any]) -> bool:
+        asset_id = str(snapshot["asset_id"])
+        signature = json.dumps(
+            {
+                "bids": snapshot.get("bids") or [],
+                "asks": snapshot.get("asks") or [],
+                "ready": snapshot.get("book_ready"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if signature == self._last_snapshot_signature.get(asset_id):
+            return False
+        now = time.monotonic()
+        previous = self._last_snapshot_monotonic.get(asset_id)
+        if previous is not None and now - previous < self.snapshot_min_interval_seconds:
+            return False
+        self._last_snapshot_signature[asset_id] = signature
+        self._last_snapshot_monotonic[asset_id] = now
+        return True
 
     def _normalize_snapshots(self, message: dict[str, Any]) -> list[dict[str, Any]]:
         event_type = str(message.get("event_type") or message.get("type") or "").lower()
@@ -356,6 +497,10 @@ class MarketWebSocketManager:
         self.status.reconnect_attempts += 1
         self.status.stale = True
         self.status.error = error or None
+        self.order_books.mark_not_ready("WS_DISCONNECTED")
+        self.repo.set_state("market_ws_status", "DISCONNECTED", "market_ws")
+        self.repo.set_state("strategy_readiness", "NOT_READY", "market_ws")
+        self.repo.set_state("strategy_block_reason", "WS_DISCONNECTED", "market_ws")
 
     def health(self) -> dict[str, Any]:
         stale = True
@@ -370,6 +515,22 @@ class MarketWebSocketManager:
             "snapshots_received": self.snapshots_received,
             "last_ping_at": self.last_ping_at,
             "last_pong_at": self.last_pong_at,
+            "subscription_status": (
+                "SUBSCRIBED" if self.subscribed_asset_ids else "NOT_SUBSCRIBED"
+            ),
+            "books": {
+                asset: {
+                    "ready": book.ready,
+                    "reason": book.reason,
+                    "generation": book.generation,
+                    "update_number": book.update_number,
+                    "best_bid": canonical_decimal(book.best_bid) if book.best_bid is not None else None,
+                    "best_ask": canonical_decimal(book.best_ask) if book.best_ask is not None else None,
+                }
+                for asset, book in self.order_books.books.items()
+            },
+            "raw_payload_persistence": self.persist_raw_payloads,
+            "snapshot_min_interval_seconds": self.snapshot_min_interval_seconds,
         }
 
 
@@ -540,6 +701,11 @@ class UserWebSocketManager:
             self.order_events_received += 1
         if stored and normalized.get("event_type") == "trade":
             self.trade_events_received += 1
+        if stored and normalized.get("event_type") in {"order", "trade"} and self._reconciliation:
+            try:
+                asyncio.get_running_loop().create_task(self._reconciliation())
+            except RuntimeError:
+                pass
         self.status.status, self.status.last_message_at, self.status.stale = "CONNECTED", now_iso(), False
         self._persist_state()
         return stored

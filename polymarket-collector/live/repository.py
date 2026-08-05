@@ -920,6 +920,14 @@ class LiveRepository:
             conn.commit()
         return deal_id
 
+    def fail_deal(self, deal_id: int, reason: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE live_deals SET status='failed',entry_status='blocked',exit_reason=?,updated_at=? WHERE id=?",
+                (reason, now_iso(), deal_id),
+            )
+            conn.commit()
+
     def create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         ts = now_iso()
         with self.connect() as conn:
@@ -1205,6 +1213,9 @@ class LiveRepository:
             "live_positions", "live_account_snapshots", "live_reconciliation_runs",
             "live_audit_log", "live_websocket_events", "live_dry_runs", "live_daily_limits",
             "live_backups", "live_market_snapshots", "live_rule_evaluations",
+            "live_event_states", "live_strategy_intents", "live_strategy_fills",
+            "live_strategy_positions", "live_strategy_deals", "live_audit_timeline",
+            "live_alerts", "live_archive_runs",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -1215,6 +1226,16 @@ class LiveRepository:
             order_col = "day_key"
         if table == "live_backups":
             order_col = "id"
+        if table == "live_event_states":
+            order_col = "locked_at"
+        if table == "live_strategy_intents":
+            order_col = "created_at"
+        if table == "live_strategy_fills":
+            order_col = "created_at"
+        if table == "live_strategy_positions":
+            order_col = "created_at"
+        if table == "live_strategy_deals":
+            order_col = "created_at"
         with self.connect() as conn:
             rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_col} DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(row) or {} for row in rows]
@@ -1223,7 +1244,7 @@ class LiveRepository:
         with self.connect() as conn:
             return {
                 "open_orders": int(conn.execute(
-                    "SELECT COUNT(*) FROM live_orders WHERE status NOT IN ('filled','cancelled','unmatched','failed')"
+                    "SELECT COUNT(*) FROM live_orders WHERE status NOT IN ('filled','cancelled','unmatched','failed','blocked')"
                 ).fetchone()[0]),
                 "open_deals": int(conn.execute(
                     "SELECT COUNT(*) FROM live_deals WHERE status IN ('created','entry_pending','open','partially_open','exit_pending')"

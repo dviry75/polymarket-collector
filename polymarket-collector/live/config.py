@@ -4,7 +4,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
 
-SECRET_MARKERS = ("PRIVATE_KEY", "API_KEY", "API_SECRET", "PASSPHRASE", "AUTH", "SIGNATURE")
+SECRET_MARKERS = (
+    "PRIVATE_KEY", "API_KEY", "API_SECRET", "PASSPHRASE", "AUTHORIZATION",
+    "SIGNATURE", "OPERATOR_TOKEN", "SESSION_SECRET", "COOKIE", "CSRF_TOKEN",
+)
 
 
 def _env(name: str, default: str) -> str:
@@ -34,23 +37,39 @@ class LiveConfig:
     market_ws_enabled: bool = False
     market_discovery_interval_seconds: int = 5
     paper_taker_fee_rate: Decimal = Decimal("0.07")
+    raw_market_ws_payloads_enabled: bool = False
+    snapshot_min_interval_seconds: Decimal = Decimal("0.5")
+    snapshot_retention_days: int = 30
+    archive_retention_days: int = 365
+    archive_bucket: str = ""
+    archive_prefix: str = "polymarket-live/snapshots"
     live_module_enabled: bool = False
     live_trading_enabled: bool = False
     live_order_submission_enabled: bool = False
     live_adapter: str = "mock"
     live_kill_switch_default: bool = True
-    default_trade_amount_usd: Decimal = Decimal("1")
-    max_trade_amount_usd: Decimal = Decimal("1")
-    max_total_exposure_usd: Decimal = Decimal("3")
-    max_open_deals: int = 3
-    max_open_orders: int = 3
+    pause_entries_default: bool = True
+    canary_armed: bool = False
+    canary_event_limit: int = 1
+    default_trade_amount_usd: Decimal = Decimal("5")
+    max_trade_amount_usd: Decimal = Decimal("5")
+    max_total_exposure_usd: Decimal = Decimal("5")
+    max_open_deals: int = 1
+    max_open_orders: int = 2
     max_active_rules: int = 1
     max_daily_realized_loss_usd: Decimal = Decimal("10")
     max_consecutive_failed_orders: int = 3
     max_consecutive_losing_deals: int = 5
-    entry_order_type: str = "FOK"
-    partial_fills_allowed: bool = False
-    max_entry_slippage: Decimal = Decimal("0.01")
+    entry_order_type: str = "FAK"
+    partial_fills_allowed: bool = True
+    strategy_entry_price: Decimal = Decimal("0.74")
+    strategy_entry_max_price: Decimal = Decimal("0.76")
+    strategy_take_profit_price: Decimal = Decimal("0.96")
+    strategy_stop_price: Decimal = Decimal("0.66")
+    strategy_emergency_price: Decimal = Decimal("0.60")
+    strategy_stop_min_price: Decimal = Decimal("0.55")
+    strategy_emergency_min_price: Decimal = Decimal("0.01")
+    strategy_entry_window_seconds: int = 120
     stop_loss_order_type: str = "FAK"
     stop_loss_initial_slippage: Decimal = Decimal("0.02")
     max_exit_slippage: Decimal = Decimal("0.05")
@@ -79,6 +98,8 @@ class LiveConfig:
     max_user_state_age_seconds: int = 15
     max_reconciliation_age_seconds: int = 30
     reconciliation_interval_seconds: int = 15
+    reconciliation_active_interval_seconds: int = 3
+    order_heartbeat_interval_seconds: int = 5
     profile_address: str = ""
     account_login_type: str = "email"
     signer_address: str = ""
@@ -96,23 +117,39 @@ class LiveConfig:
             market_ws_enabled=_bool_env("POLYMARKET_MARKET_WS_ENABLED", False),
             market_discovery_interval_seconds=int(_env("LIVE_MARKET_DISCOVERY_INTERVAL_SECONDS", "5") or "5"),
             paper_taker_fee_rate=_decimal_env("LIVE_PAPER_TAKER_FEE_RATE", "0.07"),
+            raw_market_ws_payloads_enabled=_bool_env("LIVE_RAW_MARKET_WS_PAYLOADS_ENABLED", False),
+            snapshot_min_interval_seconds=_decimal_env("LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS", "0.5"),
+            snapshot_retention_days=int(_env("LIVE_SNAPSHOT_RETENTION_DAYS", "30") or "30"),
+            archive_retention_days=int(_env("LIVE_ARCHIVE_RETENTION_DAYS", "365") or "365"),
+            archive_bucket=_env("LIVE_ARCHIVE_GCS_BUCKET", ""),
+            archive_prefix=_env("LIVE_ARCHIVE_GCS_PREFIX", "polymarket-live/snapshots"),
             live_module_enabled=_bool_env("LIVE_MODULE_ENABLED", False),
             live_trading_enabled=_bool_env("LIVE_TRADING_ENABLED", False),
             live_order_submission_enabled=_bool_env("LIVE_ORDER_SUBMISSION_ENABLED", False),
             live_adapter=_env("LIVE_ADAPTER", "mock").lower(),
             live_kill_switch_default=_bool_env("LIVE_KILL_SWITCH", True),
-            default_trade_amount_usd=_decimal_env("LIVE_DEFAULT_TRADE_AMOUNT_USD", "1"),
-            max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "1"),
-            max_total_exposure_usd=_decimal_env("LIVE_MAX_TOTAL_EXPOSURE_USD", "3"),
-            max_open_deals=int(_env("LIVE_MAX_OPEN_DEALS", "3") or "3"),
-            max_open_orders=int(_env("LIVE_MAX_OPEN_ORDERS", "3") or "3"),
+            pause_entries_default=_bool_env("LIVE_PAUSE_ENTRIES", True),
+            canary_armed=_bool_env("LIVE_CANARY_ARMED", False),
+            canary_event_limit=int(_env("LIVE_CANARY_EVENT_LIMIT", "1") or "1"),
+            default_trade_amount_usd=_decimal_env("LIVE_DEFAULT_TRADE_AMOUNT_USD", "5"),
+            max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "5"),
+            max_total_exposure_usd=_decimal_env("LIVE_MAX_TOTAL_EXPOSURE_USD", "5"),
+            max_open_deals=int(_env("LIVE_MAX_OPEN_DEALS", "1") or "1"),
+            max_open_orders=int(_env("LIVE_MAX_OPEN_ORDERS", "2") or "2"),
             max_active_rules=int(_env("LIVE_MAX_ACTIVE_RULES", "1") or "1"),
             max_daily_realized_loss_usd=_decimal_env("LIVE_MAX_DAILY_REALIZED_LOSS_USD", "10"),
             max_consecutive_failed_orders=int(_env("LIVE_MAX_CONSECUTIVE_FAILED_ORDERS", "3") or "3"),
             max_consecutive_losing_deals=int(_env("LIVE_MAX_CONSECUTIVE_LOSING_DEALS", "5") or "5"),
-            entry_order_type=_env("LIVE_ENTRY_ORDER_TYPE", "FOK").upper(),
-            partial_fills_allowed=_bool_env("LIVE_PARTIAL_FILLS_ALLOWED", False),
-            max_entry_slippage=_decimal_env("LIVE_MAX_ENTRY_SLIPPAGE", "0.01"),
+            entry_order_type=_env("LIVE_ENTRY_ORDER_TYPE", "FAK").upper(),
+            partial_fills_allowed=_bool_env("LIVE_PARTIAL_FILLS_ALLOWED", True),
+            strategy_entry_price=_decimal_env("LIVE_STRATEGY_ENTRY_PRICE", "0.74"),
+            strategy_entry_max_price=_decimal_env("LIVE_STRATEGY_ENTRY_MAX_PRICE", "0.76"),
+            strategy_take_profit_price=_decimal_env("LIVE_STRATEGY_TAKE_PROFIT_PRICE", "0.96"),
+            strategy_stop_price=_decimal_env("LIVE_STRATEGY_STOP_PRICE", "0.66"),
+            strategy_emergency_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_PRICE", "0.60"),
+            strategy_stop_min_price=_decimal_env("LIVE_STRATEGY_STOP_MIN_PRICE", "0.55"),
+            strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.01"),
+            strategy_entry_window_seconds=int(_env("LIVE_STRATEGY_ENTRY_WINDOW_SECONDS", "120") or "120"),
             stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "FAK").upper(),
             stop_loss_initial_slippage=_decimal_env("LIVE_STOP_LOSS_INITIAL_SLIPPAGE", "0.02"),
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
@@ -141,6 +178,8 @@ class LiveConfig:
             max_user_state_age_seconds=int(_env("LIVE_USER_STATE_STALE_AFTER_SECONDS", "15") or "15"),
             max_reconciliation_age_seconds=int(_env("LIVE_RECONCILIATION_MAX_AGE_SECONDS", _env("LIVE_MAX_RECONCILIATION_AGE_SECONDS", "30")) or "30"),
             reconciliation_interval_seconds=int(_env("LIVE_RECONCILIATION_INTERVAL_SECONDS", "15") or "15"),
+            reconciliation_active_interval_seconds=int(_env("LIVE_RECONCILIATION_ACTIVE_INTERVAL_SECONDS", "3") or "3"),
+            order_heartbeat_interval_seconds=int(_env("LIVE_ORDER_HEARTBEAT_INTERVAL_SECONDS", "5") or "5"),
             profile_address=_env("POLYMARKET_PROFILE_ADDRESS", ""),
             account_login_type=_env("POLYMARKET_ACCOUNT_LOGIN_TYPE", "email").lower(),
             signer_address=_env("POLYMARKET_SIGNER_ADDRESS", _env("POLY_ADDRESS", "")),
@@ -154,8 +193,8 @@ class LiveConfig:
         errors: list[str] = []
         if self.trading_mode not in {"DEMO", "LIVE"}:
             errors.append("TRADING_MODE must be DEMO or LIVE")
-        if self.execution_mode not in {"READ_ONLY", "PAPER_TRADING"}:
-            errors.append("LIVE_EXECUTION_MODE must be READ_ONLY or PAPER_TRADING; REAL_TRADING is blocked")
+        if self.execution_mode not in {"READ_ONLY", "PAPER_TRADING", "REAL_TRADING"}:
+            errors.append("LIVE_EXECUTION_MODE must be READ_ONLY, PAPER_TRADING or REAL_TRADING")
         if self.paper_trading_enabled and self.execution_mode != "PAPER_TRADING":
             errors.append("LIVE_PAPER_TRADING_ENABLED requires LIVE_EXECUTION_MODE=PAPER_TRADING")
         if self.paper_trading_enabled and (
@@ -164,10 +203,20 @@ class LiveConfig:
             errors.append("PAPER_TRADING cannot be combined with real trading or order submission")
         if self.paper_taker_fee_rate < 0 or self.paper_taker_fee_rate > Decimal("1"):
             errors.append("LIVE_PAPER_TAKER_FEE_RATE must be between 0 and 1")
+        if self.raw_market_ws_payloads_enabled and self.trading_mode == "LIVE":
+            errors.append("raw Market WebSocket payload persistence must remain disabled in LIVE")
+        if self.snapshot_min_interval_seconds < Decimal("0.5"):
+            errors.append("LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS must be >= 0.5")
+        if self.snapshot_retention_days != 30:
+            errors.append("LIVE_SNAPSHOT_RETENTION_DAYS must remain 30")
+        if self.archive_retention_days != 365:
+            errors.append("LIVE_ARCHIVE_RETENTION_DAYS must remain 365")
         if self.live_adapter not in {"mock", "polymarket"}:
             errors.append("LIVE_ADAPTER must be mock or polymarket")
-        if self.entry_order_type not in {"FOK", "FAK", "GTC", "GTD"}:
-            errors.append("LIVE_ENTRY_ORDER_TYPE must be FOK, FAK, GTC, or GTD")
+        if self.entry_order_type != "FAK":
+            errors.append("LIVE_ENTRY_ORDER_TYPE must remain FAK")
+        if not self.partial_fills_allowed:
+            errors.append("LIVE_PARTIAL_FILLS_ALLOWED must remain true for FAK lifecycle")
         if self.stop_loss_order_type != "FAK":
             errors.append("LIVE_STOP_LOSS_ORDER_TYPE must remain FAK for this phase")
         if self.redemption_mode not in {"manual", "approval", "automatic"}:
@@ -178,6 +227,27 @@ class LiveConfig:
             errors.append("LIVE_MAX_TRADE_AMOUNT_USD must be positive")
         if self.default_trade_amount_usd > self.max_trade_amount_usd:
             errors.append("default trade amount exceeds max trade amount")
+        if self.default_trade_amount_usd != Decimal("5") or self.max_trade_amount_usd != Decimal("5"):
+            errors.append("entry amount and cap must remain exactly $5 All-In")
+        if self.max_total_exposure_usd != Decimal("5"):
+            errors.append("LIVE_MAX_TOTAL_EXPOSURE_USD must remain exactly 5")
+        expected_strategy = (
+            (self.strategy_entry_price, Decimal("0.74")),
+            (self.strategy_entry_max_price, Decimal("0.76")),
+            (self.strategy_take_profit_price, Decimal("0.96")),
+            (self.strategy_stop_price, Decimal("0.66")),
+            (self.strategy_emergency_price, Decimal("0.60")),
+            (self.strategy_stop_min_price, Decimal("0.55")),
+            (self.strategy_emergency_min_price, Decimal("0.01")),
+        )
+        if any(actual != expected for actual, expected in expected_strategy):
+            errors.append("strategy prices are immutable for this LIVE build")
+        if self.strategy_entry_window_seconds != 120:
+            errors.append("entry window must remain exactly 120 seconds")
+        if self.order_heartbeat_interval_seconds != 5:
+            errors.append("order heartbeat interval must remain exactly 5 seconds")
+        if self.canary_event_limit != 1:
+            errors.append("LIVE_CANARY_EVENT_LIMIT must remain exactly 1")
         if self.max_exit_slippage > Decimal("0.05"):
             errors.append("LIVE_MAX_EXIT_SLIPPAGE must be <= 0.05")
         return errors
@@ -194,10 +264,13 @@ class LiveConfig:
     def real_submission_armed(self) -> bool:
         return (
             self.trading_mode == "LIVE"
+            and self.execution_mode == "REAL_TRADING"
             and self.live_module_enabled
             and self.live_trading_enabled
             and self.live_order_submission_enabled
             and self.live_adapter == "polymarket"
+            and self.canary_armed
+            and not self.pause_entries_default
         )
 
     def safe_public_dict(self) -> dict[str, object]:
@@ -208,11 +281,19 @@ class LiveConfig:
             "paper_trading_active": self.paper_trading_active(),
             "market_ws_enabled": self.market_ws_enabled,
             "paper_taker_fee_rate": str(self.paper_taker_fee_rate),
+            "raw_market_ws_payloads_enabled": self.raw_market_ws_payloads_enabled,
+            "snapshot_min_interval_seconds": str(self.snapshot_min_interval_seconds),
+            "snapshot_retention_days": self.snapshot_retention_days,
+            "archive_retention_days": self.archive_retention_days,
+            "archive_configured": bool(self.archive_bucket),
             "live_module_enabled": self.live_module_enabled,
             "live_trading_enabled": self.live_trading_enabled,
             "live_order_submission_enabled": self.live_order_submission_enabled,
             "live_adapter": self.live_adapter,
             "live_kill_switch_default": self.live_kill_switch_default,
+            "pause_entries_default": self.pause_entries_default,
+            "canary_armed": self.canary_armed,
+            "canary_event_limit": self.canary_event_limit,
             "default_trade_amount_usd": str(self.default_trade_amount_usd),
             "max_trade_amount_usd": str(self.max_trade_amount_usd),
             "max_total_exposure_usd": str(self.max_total_exposure_usd),
@@ -224,7 +305,11 @@ class LiveConfig:
             "max_consecutive_losing_deals": self.max_consecutive_losing_deals,
             "entry_order_type": self.entry_order_type,
             "partial_fills_allowed": self.partial_fills_allowed,
-            "max_entry_slippage": str(self.max_entry_slippage),
+            "strategy_entry_price": str(self.strategy_entry_price),
+            "strategy_entry_max_price": str(self.strategy_entry_max_price),
+            "strategy_take_profit_price": str(self.strategy_take_profit_price),
+            "strategy_stop_price": str(self.strategy_stop_price),
+            "strategy_emergency_price": str(self.strategy_emergency_price),
             "stop_loss_order_type": self.stop_loss_order_type,
             "stop_loss_initial_slippage": str(self.stop_loss_initial_slippage),
             "max_exit_slippage": str(self.max_exit_slippage),
@@ -251,9 +336,7 @@ def redact(value: object) -> str:
     text = "" if value is None else str(value)
     if not text:
         return ""
-    if len(text) <= 4:
-        return "****"
-    return f"{text[:2]}****{text[-2:]}"
+    return "[CONFIGURED]"
 
 
 def redact_mapping(mapping: dict[str, object], secret_markers: Iterable[str] = SECRET_MARKERS) -> dict[str, object]:

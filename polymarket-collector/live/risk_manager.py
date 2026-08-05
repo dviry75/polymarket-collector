@@ -58,9 +58,9 @@ class RiskManager:
             return RiskResult(False, "TRADE_AMOUNT_CAP", "Requested amount exceeds max trade amount")
 
         counts = self.repo.counts()
-        if counts["open_orders"] >= self.config.max_open_orders:
+        if counts["open_orders"] > self.config.max_open_orders:
             return RiskResult(False, "OPEN_ORDER_CAP", "Too many open LIVE orders")
-        if counts["open_deals"] >= self.config.max_open_deals:
+        if counts["open_deals"] > self.config.max_open_deals:
             return RiskResult(False, "OPEN_DEAL_CAP", "Too many open LIVE deals")
         if counts.get("active_rules", 0) > self.config.max_active_rules:
             return RiskResult(False, "ACTIVE_RULE_CAP", "Too many active LIVE rules")
