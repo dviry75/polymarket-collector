@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import json
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters.base import TradingAdapter
 from .config import LiveConfig
@@ -158,6 +159,7 @@ class LiveStrategyRuntime:
             observed_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
         except ValueError:
             observed_at = datetime.now(timezone.utc)
+        daily_loss_blocked = self._daily_loss_blocked()
         decision = choose_entry(
             updates=updates,
             yes_token_id=yes_token,
@@ -166,6 +168,7 @@ class LiveStrategyRuntime:
             paused=(
                 self.repo.pause_entries()
                 or self.base.kill_switch_active()
+                or daily_loss_blocked
                 or (
                     not self.paper_mode()
                     and self.base.get_state("canary_armed", "false").lower() != "true"
@@ -274,6 +277,27 @@ class LiveStrategyRuntime:
             market=market, update=update, side=str(decision.side),
             intent_id=intent_id, fee_rate=fee_rate,
         )
+
+    def _daily_loss_blocked(self) -> bool:
+        try:
+            tz = ZoneInfo("Asia/Jerusalem")
+        except ZoneInfoNotFoundError:
+            tz = timezone.utc
+        day_key = datetime.now(tz).date().isoformat()
+        daily = self.base.current_daily_limit(day_key, "Asia/Jerusalem")
+        realized = decimal_value(daily.get("realized_pnl_usd")) or Decimal("0")
+        blocked = realized <= -abs(self.config.max_daily_realized_loss_usd)
+        if blocked and not self.base.kill_switch_active():
+            self.base.set_state("kill_switch", "true", "strategy_daily_loss")
+            self.base.set_state("canary_armed", "false", "strategy_daily_loss")
+            self.repo.set_pause_entries(True, "strategy_daily_loss", "DAILY_LOSS_LIMIT")
+            self.repo.alert(
+                alert_type="RISK",
+                severity="CRITICAL",
+                reason_code="DAILY_LOSS_LIMIT",
+                message="Daily realized loss limit reached; LIVE entries locked",
+            )
+        return blocked
 
     def _eligible_market(self, market: dict[str, Any]) -> bool:
         event_id = str(market.get("event_id") or "")

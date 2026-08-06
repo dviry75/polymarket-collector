@@ -217,6 +217,19 @@ class ReconciliationWorker:
                                 fee_text=canonical_decimal(summary["fees"]),
                             )
                         continue
+                    if intent.get("action") in {"EXIT", "TP"} and terminal:
+                        if status in {"cancelled", "canceled", "expired"}:
+                            self.strategy_repo.finalize_cancel(
+                                str(intent["intent_id"]), True, f"REMOTE_{status.upper()}"
+                            )
+                        else:
+                            self.strategy_repo.update_intent(
+                                str(intent["intent_id"]),
+                                state="REJECTED" if status == "rejected" else "FAILED",
+                                reason_code=f"REMOTE_{status.upper()}",
+                                final_at=now_iso(),
+                            )
+                        continue
                     if is_open:
                         self.strategy_repo.update_intent(
                             str(intent["intent_id"]),
@@ -250,7 +263,7 @@ class ReconciliationWorker:
                     outcome = self.repo.outcome_for_asset(condition_id, token_id) or str(
                         remote.get("outcome") or "UNKNOWN"
                     ).upper()
-                    _position, changed = self.strategy_repo.reconcile_remote_position(
+                    position, changed = self.strategy_repo.reconcile_remote_position(
                         event_id=str(market.get("event_id") or condition_id),
                         condition_id=condition_id,
                         token_id=token_id,
@@ -265,6 +278,13 @@ class ReconciliationWorker:
                             "token_id": token_id,
                             "remote_shares": canonical_decimal(shares),
                         })
+                    if bool(remote.get("redeemable")):
+                        current_value = decimal_value(remote.get("current_value")) or Decimal("0")
+                        self.strategy_repo.mark_position_resolved(
+                            str(position["position_id"]),
+                            winner=current_value > 0,
+                            redeem_pending=current_value > 0,
+                        )
                 for local in self.strategy_repo.active_positions():
                     remaining = decimal_value(local.get("remaining_shares_text")) or Decimal("0")
                     if remaining > 0 and str(local.get("token_id")) not in remote_tokens:

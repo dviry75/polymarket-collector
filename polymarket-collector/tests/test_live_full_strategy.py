@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import tempfile
+from zoneinfo import ZoneInfo
 
 from live.adapters.mock import MockTradingAdapter
 from live.adapters.polymarket import RealPolymarketTradingAdapter
@@ -295,6 +296,21 @@ def test_resolution_winner_redeem_loser_zero_and_noop_closed():
         zero = strategy.mark_position_resolved(loser["position_id"], winner=False, redeem_pending=False)
         assert zero["state"] == "RESOLVED_LOSER"
         assert Decimal(zero["realized_pnl_text"]) == Decimal("-5")
+        repeated = strategy.mark_position_resolved(
+            loser["position_id"], winner=False, redeem_pending=False
+        )
+        assert repeated["state"] == "RESOLVED_LOSER"
+        with strategy.base.connect() as conn:
+            daily = conn.execute(
+                "SELECT realized_pnl_usd,consecutive_losing_deals FROM live_daily_limits"
+            ).fetchone()
+            deal = conn.execute(
+                "SELECT state,final_reason FROM live_strategy_deals WHERE event_id='loser'"
+            ).fetchone()
+        assert Decimal(str(daily["realized_pnl_usd"])) == Decimal("-5")
+        assert daily["consecutive_losing_deals"] == 1
+        assert deal["state"] == "RESOLVED_LOSER"
+        assert deal["final_reason"] == "MARKET_RESOLUTION"
         assert strategy.unresolved_positions() == []
     finally:
         temp.cleanup()
@@ -414,10 +430,11 @@ def test_adapter_buy_fak_max_spend_max_price_and_no_auto_approval():
         "max_price": "0.76", "max_tokens": "5",
     }))
     assert result["status"] == "matched"
-    assert fake.market_calls == [{
-        "token_id": "token", "side": "BUY", "amount": "3.8", "max_spend": "5",
-        "max_price": "0.76", "order_type": "FAK",
+    assert fake.limit_calls == [{
+        "token_id": "token", "price": "0.76", "size": "5", "side": "BUY",
     }]
+    assert fake.posted[0]["order_type"] == "FAK"
+    assert fake.market_calls == []
     assert len(fake.posted) == 1
 
 
@@ -733,6 +750,30 @@ def test_reconciliation_failure_forces_kill_pause_and_disarms_canary():
             ReconciliationWorker(base, FailingAdapter(), strategy).run_once("test")
         )
         assert result["status"] == "failed"
+        assert base.get_state("kill_switch") == "true"
+        assert base.get_state("canary_armed") == "false"
+        assert strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_strategy_daily_loss_limit_locks_real_entry_path():
+    temp, base, strategy = build_repo()
+    try:
+        config = LiveConfig(max_daily_realized_loss_usd=Decimal("10"))
+        runtime = LiveStrategyRuntime(config, base, strategy, MockTradingAdapter())
+        day_key = datetime.now(ZoneInfo("Asia/Jerusalem")).date().isoformat()
+        base.current_daily_limit(day_key, "Asia/Jerusalem")
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_daily_limits SET realized_pnl_usd='-10' WHERE day_key=?",
+                (day_key,),
+            )
+            conn.commit()
+        base.set_state("kill_switch", "false", "test")
+        base.set_state("canary_armed", "true", "test")
+        strategy.set_pause_entries(False, "test", "test")
+        assert runtime._daily_loss_blocked()
         assert base.get_state("kill_switch") == "true"
         assert base.get_state("canary_armed") == "false"
         assert strategy.pause_entries()

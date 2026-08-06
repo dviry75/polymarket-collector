@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 import asyncio
 from typing import Any, Protocol
@@ -349,14 +350,27 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             client = await self._client()
             if order_type == "FAK":
                 if side == "BUY":
-                    signed = await client.create_market_order(
+                    signed = await client.create_limit_order(
                         token_id=token_id,
+                        price=canonical_decimal(_d(order.get("max_price"))),
+                        size=canonical_decimal(max_tokens),
                         side="BUY",
-                        amount=canonical_decimal(requested_amount),
-                        max_spend=canonical_decimal(_d(order.get("max_spend"))),
-                        max_price=canonical_decimal(_d(order.get("max_price"))),
-                        order_type="FAK",
                     )
+                    if isinstance(signed, dict):
+                        signed = {**signed, "order_type": "FAK"}
+                    else:
+                        signed = replace(signed, order_type="FAK")
+                    maker_amount = getattr(signed, "maker_amount", None)
+                    taker_amount = getattr(signed, "taker_amount", None)
+                    if (
+                        maker_amount is not None
+                        and taker_amount is not None
+                        and (
+                            int(maker_amount) > int(self.config.max_trade_amount_usd * PUSD_SCALE)
+                            or int(taker_amount) > int(self.config.max_trade_tokens * PUSD_SCALE)
+                        )
+                    ):
+                        raise RuntimeError("SIGNED_CANARY_CAP_EXCEEDED")
                 elif side == "SELL":
                     signed = await client.create_market_order(
                         token_id=token_id,

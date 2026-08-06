@@ -243,6 +243,12 @@ class LiveConfig:
             errors.append("LIVE_MAX_TOTAL_EXPOSURE_USD must remain exactly 5")
         if self.max_trade_tokens != Decimal("5"):
             errors.append("LIVE_MAX_TRADE_TOKENS must remain exactly 5")
+        if self.max_open_deals != 1:
+            errors.append("LIVE_MAX_OPEN_DEALS must remain exactly 1")
+        if self.max_active_rules != 1:
+            errors.append("LIVE_MAX_ACTIVE_RULES must remain exactly 1")
+        if self.max_daily_realized_loss_usd != Decimal("10"):
+            errors.append("LIVE_MAX_DAILY_REALIZED_LOSS_USD must remain exactly 10")
         if self.google_project_id and self.google_private_key_secret_version != "1":
             errors.append("POLYMARKET_PRIVATE_KEY_SECRET_VERSION must remain pinned to 1")
         expected_strategy = (

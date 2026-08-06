@@ -7,6 +7,7 @@ import re
 import sqlite3
 import uuid
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso, row_to_dict
@@ -366,17 +367,6 @@ class StrategyRepository:
                         token_id, side, "RESERVED", reason_code, ts, ts,
                     ),
                 )
-            if consume_canary:
-                for key, value in {
-                    "pause_entries": "true",
-                    "canary_armed": "false",
-                    "canary_consumed": "true",
-                }.items():
-                    conn.execute(
-                        "INSERT INTO live_system_state(key,value,updated_at) VALUES(?,?,?) "
-                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                        (key, value, ts),
-                    )
                 conn.execute(
                     """
                     INSERT INTO live_strategy_deals(
@@ -389,6 +379,17 @@ class StrategyRepository:
                         "0.74", intent_id, ts, ts,
                     ),
                 )
+            if consume_canary:
+                for key, value in {
+                    "pause_entries": "true",
+                    "canary_armed": "false",
+                    "canary_consumed": "true",
+                }.items():
+                    conn.execute(
+                        "INSERT INTO live_system_state(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (key, value, ts),
+                    )
             row = conn.execute(
                 "SELECT * FROM live_event_states WHERE event_id = ?", (event_id,)
             ).fetchone()
@@ -933,6 +934,9 @@ class StrategyRepository:
             if row is None:
                 conn.rollback()
                 raise KeyError(position_id)
+            if str(row["state"]) in {"RESOLVED_LOSER", "RESOLVED_WINNER", "REDEEM_PENDING", "REDEEMED"}:
+                conn.rollback()
+                return row_to_dict(row) or {}
             remaining = decimal_value(row["remaining_shares_text"]) or Decimal("0")
             value = remaining if winner else Decimal("0")
             cost = decimal_value(row["cost_all_in_text"]) or Decimal("0")
@@ -948,6 +952,34 @@ class StrategyRepository:
                 "UPDATE live_event_states SET status=?,resolved_at=?,updated_at=? WHERE event_id=?",
                 (state, ts, ts, row["event_id"]),
             )
+            conn.execute(
+                """
+                UPDATE live_strategy_deals SET state=?,realized_pnl_text=?,
+                    final_reason='MARKET_RESOLUTION',
+                    closed_at=CASE WHEN ?='RESOLVED_LOSER' THEN ? ELSE closed_at END,
+                    updated_at=? WHERE event_id=?
+                """,
+                (state, canonical_decimal(pnl), state, ts, ts, row["event_id"]),
+            )
+            if not winner:
+                day_key = datetime.now(ZoneInfo("Asia/Jerusalem")).date().isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO live_daily_limits(day_key,timezone,created_at,updated_at)
+                    VALUES(?,'Asia/Jerusalem',?,?)
+                    ON CONFLICT(day_key) DO NOTHING
+                    """,
+                    (day_key, ts, ts),
+                )
+                conn.execute(
+                    """
+                    UPDATE live_daily_limits SET
+                        realized_pnl_usd=realized_pnl_usd+?,
+                        consecutive_losing_deals=consecutive_losing_deals+1,
+                        updated_at=? WHERE day_key=?
+                    """,
+                    (canonical_decimal(pnl), ts, day_key),
+                )
             updated = conn.execute(
                 "SELECT * FROM live_strategy_positions WHERE position_id=?", (position_id,)
             ).fetchone()
