@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -9,6 +10,9 @@ import time
 from live.adapters.mock import MockTradingAdapter
 from live.config import LiveConfig
 from live.market_websocket import MarketWebSocketManager
+from live.market_ws_latency_csv import (
+    CSV_FIELDS, MarketWsLatencyCsvDiagnostic, normalize_exchange_timestamp,
+)
 from live.order_book import OrderBookSet
 from live.repository import LiveRepository
 from live.strategy_repository import StrategyRepository
@@ -692,4 +696,85 @@ def test_delta_before_snapshot_closes_socket_and_requires_resync_warmup():
         assert not manager.order_books.books["yes"].ready
         assert repo.get_state("strategy_readiness") == "NOT_READY"
     finally:
+        temp.cleanup()
+
+
+def test_latency_csv_detects_timestamp_units_and_iso8601():
+    receive_ns = NOW_MS * 1_000_000
+    cases = (
+        (NOW_MS // 1_000, "unix_seconds"),
+        (NOW_MS, "unix_milliseconds"),
+        (NOW_MS * 1_000, "unix_microseconds"),
+        ("2027-01-15T08:00:00+00:00", "iso8601"),
+    )
+    for raw, expected_unit in cases:
+        raw_text, unit, normalized, value_ns, note = normalize_exchange_timestamp(
+            raw, receive_wall_ns=receive_ns
+        )
+        assert raw_text == str(raw)
+        assert unit == expected_unit
+        assert normalized
+        assert value_ns is not None
+        assert "validated" in note
+
+
+def test_latency_csv_is_bounded_and_stratified():
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "latency.csv"
+        diagnostic = MarketWsLatencyCsvDiagnostic(
+            path, duration_seconds=300, max_rows=6, stale_quota=3
+        )
+        diagnostic.start()
+        for _index in range(10):
+            diagnostic.submit({"exact_block_reason": "STALE"}, stale=True)
+            diagnostic.submit({"exact_block_reason": "READY"}, stale=False)
+        diagnostic.close()
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 6
+        assert tuple(rows[0]) == CSV_FIELDS
+        assert sum(row["exact_block_reason"] == "STALE" for row in rows) == 3
+        assert sum(row["exact_block_reason"] == "READY" for row in rows) == 3
+
+
+def test_market_ws_records_receive_and_processing_boundaries(monkeypatch):
+    temp, repo = make_repo()
+    csv_path = Path(temp.name) / "market-ws-latency.csv"
+    monkeypatch.setenv("LIVE_MARKET_WS_LATENCY_CSV_PATH", str(csv_path))
+    manager = MarketWebSocketManager(
+        repo, stale_after_seconds=1, clock_ms=lambda: NOW_MS
+    )
+    manager.subscribed_asset_ids = ["yes", "no"]
+    manager.status.status = "CONNECTED"
+    manager._refresh_market_cache(["yes", "no"])
+    assert manager._latency_csv is not None
+    manager._latency_csv.start()
+    timing = {
+        "receive_wall_ns": (NOW_MS - 50) * 1_000_000,
+        "receive_monotonic_ns": time.monotonic_ns(),
+        "socket_receive_wall_ms": NOW_MS - 50,
+        "frame_size_bytes": 512,
+        "connection_id": "market-ws-test",
+        "connection_generation": 1,
+        "batch_index": 0,
+        "batch_size": 1,
+        "ingress_queue_depth": 2,
+        "ws_internal_queue_depth": 3,
+        "tcp_recv_q_bytes": 4,
+        "occurred_after_reconnect": True,
+        "occurred_after_resubscribe": True,
+    }
+    try:
+        assert manager.process_message(book("yes", NOW_MS - 100), timing=timing)
+        manager._latency_csv.close()
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            row = next(csv.DictReader(handle))
+        assert row["raw_exchange_timestamp"] == str(NOW_MS - 100)
+        assert row["detected_timestamp_unit"] == "unix_milliseconds"
+        assert float(row["transport_latency_ms"]) == 50.0
+        assert float(row["queue_wait_ms"]) >= 0
+        assert row["frame_size_bytes"] == "512"
+        assert row["occurred_after_reconnect"] == "true"
+    finally:
+        manager._latency_csv.close()
         temp.cleanup()

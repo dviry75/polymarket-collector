@@ -18,7 +18,11 @@ import time
 from pathlib import Path
 
 from .repository import LiveRepository, now_iso
-from .order_book import OrderBookSet, canonical_decimal
+from .order_book import OrderBookSet, canonical_decimal, decimal_value
+from .market_ws_latency_csv import (
+    MarketWsLatencyCsvDiagnostic, normalize_exchange_timestamp,
+    utc_iso_from_ns,
+)
 
 
 @dataclass
@@ -119,6 +123,17 @@ class MarketWebSocketManager:
         self._last_handler_end_monotonic: float | None = None
         self._connection_generation = 0
         self._connection_diagnostics: dict[str, Any] = {}
+        self._connection_started_monotonic = 0.0
+        self._last_subscription_change_monotonic = 0.0
+        self._connection_frame_index = 0
+        latency_csv_path = os.getenv("LIVE_MARKET_WS_LATENCY_CSV_PATH", "").strip()
+        self._latency_csv = (
+            MarketWsLatencyCsvDiagnostic(
+                Path(latency_csv_path), duration_seconds=300,
+                max_rows=2_000, stale_quota=1_000,
+            )
+            if latency_csv_path else None
+        )
         diagnostics_default = (
             Path(getattr(self.repo, "db_path", "/opt/polymarket-btc-live/poly_live.sqlite3")).parent
             / "output" / "market_ws_latency_diagnostics.json"
@@ -145,6 +160,8 @@ class MarketWebSocketManager:
         async with self._lock:
             if self._task and not self._task.done():
                 return
+            if self._latency_csv is not None:
+                self._latency_csv.start()
             self._stop.clear()
             self._ensure_persistence_writer()
             self._event_loop_watchdog_task = asyncio.create_task(
@@ -178,6 +195,8 @@ class MarketWebSocketManager:
                     await task
                 except asyncio.CancelledError:
                     pass
+        if self._latency_csv is not None:
+            await asyncio.to_thread(self._latency_csv.close)
         self._event_loop_watchdog_task = self._diagnostics_task = None
         self.status.status = "STOPPED"
         self.status.stale = True
@@ -214,6 +233,9 @@ class MarketWebSocketManager:
                 ) as ws:
                     self._ws = ws
                     self._connection_generation += 1
+                    self._connection_started_monotonic = time.monotonic()
+                    self._last_subscription_change_monotonic = self._connection_started_monotonic
+                    self._connection_frame_index = 0
                     self._connection_diagnostics = self._connection_metadata(ws, url)
                     self._logger.info(
                         "MARKET_WS_CONNECTED generation=%s remote=%s assets=%s",
@@ -305,14 +327,23 @@ class MarketWebSocketManager:
                 raw = await asyncio.wait_for(
                     ws.recv(), timeout=max(15, self.stale_after_seconds)
                 )
+                # Earliest receipt boundary: before frame sizing or JSON parsing.
+                receive_wall_ns = time.time_ns()
+                receive_monotonic_ns = time.monotonic_ns()
                 recv_return = time.perf_counter()
-                socket_receive_wall_ms = self._clock_ms()
+                socket_receive_wall_ms = receive_wall_ns // 1_000_000
+                frame_size_bytes = (
+                    len(raw) if isinstance(raw, bytes)
+                    else len(str(raw).encode("utf-8"))
+                )
                 library_queue_depth = self._ws_internal_queue_depth(ws)
                 tcp_recv_q_bytes = self._tcp_recv_q_bytes(ws)
                 if raw == "PONG" or raw == b"PONG":
                     self.last_pong_at = now_iso()
                     continue
                 parse_start = time.perf_counter()
+                self._connection_frame_index += 1
+                receive_monotonic = receive_monotonic_ns / 1_000_000_000
                 payload = json.loads(raw)
                 parse_end = time.perf_counter()
                 messages = payload if isinstance(payload, list) else [payload]
@@ -321,6 +352,21 @@ class MarketWebSocketManager:
                     "before_recv_monotonic": before_recv,
                     "recv_return_monotonic": recv_return,
                     "socket_receive_wall_ms": socket_receive_wall_ms,
+                    "receive_wall_ns": receive_wall_ns,
+                    "receive_monotonic_ns": receive_monotonic_ns,
+                    "frame_size_bytes": frame_size_bytes,
+                    "connection_id": (
+                        f"market-ws-{self._connection_generation}-"
+                        f"{self._connection_diagnostics.get('connected_at', '')}"
+                    ),
+                    "connection_frame_index": self._connection_frame_index,
+                    "occurred_after_reconnect": (
+                        receive_monotonic - self._connection_started_monotonic <= 5.0
+                    ),
+                    "occurred_after_resubscribe": (
+                        receive_monotonic - self._last_subscription_change_monotonic
+                        <= 5.0
+                    ),
                     "recv_wait_ms": (recv_return - before_recv) * 1000,
                     "between_recv_gap_ms": between_recv_gap_ms,
                     "parse_start_monotonic": parse_start,
@@ -518,6 +564,7 @@ class MarketWebSocketManager:
                 self.order_books.ensure_assets(combined)
                 await asyncio.to_thread(self._refresh_market_cache, combined)
                 await ws.send(json.dumps(self.dynamic_subscription_message(add, "subscribe")))
+                self._last_subscription_change_monotonic = time.monotonic()
                 self.subscribed_asset_ids = combined
                 self.dynamic_subscriptions += 1
                 # Dynamic subscribe is supported by the market channel. Keep the old
@@ -551,6 +598,7 @@ class MarketWebSocketManager:
                 )
             if remove:
                 await ws.send(json.dumps(self.dynamic_subscription_message(remove, "unsubscribe")))
+                self._last_subscription_change_monotonic = time.monotonic()
             if add or remove:
                 self.subscribed_asset_ids = list(wanted)
                 self.order_books.ensure_assets(wanted)
@@ -634,7 +682,13 @@ class MarketWebSocketManager:
             timing["socket_receive_to_handler_ms"] = (
                 started - timing["recv_return_monotonic"]
             ) * 1000
+        # Second boundary: immediately before book/readiness processing.
+        processing_wall_ns = time.time_ns()
+        processing_monotonic_ns = time.monotonic_ns()
+        timing["processing_wall_ns"] = processing_wall_ns
+        timing["processing_monotonic_ns"] = processing_monotonic_ns
         now_ms = self._clock_ms()
+        frame = None
         # Local receipt time is observability/persistence only. It is never used
         # for market-data freshness or entry authorization.
         received_at = now_iso()
@@ -793,6 +847,10 @@ class MarketWebSocketManager:
                 "strategy_readiness": "READY" if all_ready else "NOT_READY",
                 "strategy_block_reason": reason,
             })
+        if diagnostic_timing and self._latency_csv is not None:
+            self._record_latency_csv(
+                message, timing=timing, frame=frame, event_readiness=event_readiness
+            )
         if (
             self.on_atomic_frame is not None and callback_updates
             and not (event_type != "market_resolved" and frame.rejected_reason)
@@ -847,6 +905,147 @@ class MarketWebSocketManager:
             })
         asset = str(message.get("asset_id") or "")
         return [asset] if asset else []
+
+    def _record_latency_csv(
+        self, message: dict[str, Any], *, timing: dict[str, Any],
+        frame: Any, event_readiness: dict[str, dict[str, Any]],
+    ) -> None:
+        diagnostic = self._latency_csv
+        receive_wall_ns = timing.get("receive_wall_ns")
+        receive_monotonic_ns = timing.get("receive_monotonic_ns")
+        processing_wall_ns = timing.get("processing_wall_ns")
+        processing_monotonic_ns = timing.get("processing_monotonic_ns")
+        if diagnostic is None or None in (
+            receive_wall_ns, receive_monotonic_ns,
+            processing_wall_ns, processing_monotonic_ns,
+        ):
+            return
+        raw_text, unit, normalized_utc, exchange_ns, timestamp_note = (
+            normalize_exchange_timestamp(
+                message.get("timestamp"), receive_wall_ns=int(receive_wall_ns)
+            )
+        )
+        transport_ms = (
+            (int(receive_wall_ns) - exchange_ns) / 1_000_000
+            if exchange_ns is not None else None
+        )
+        queue_wait_ms = (
+            int(processing_monotonic_ns) - int(receive_monotonic_ns)
+        ) / 1_000_000
+        total_age_ms = (
+            (int(processing_wall_ns) - exchange_ns) / 1_000_000
+            if exchange_ns is not None else None
+        )
+        event_type = str(
+            message.get("event_type") or message.get("type") or ""
+        ).lower()
+        nested = (
+            [item for item in message.get("price_changes") or []
+             if isinstance(item, dict)]
+            if event_type == "price_change" else [message]
+        )
+        frame_updates = list(getattr(frame, "updates", ()) or ())
+        rejected_reason = str(getattr(frame, "rejected_reason", "") or "")
+        duplicate = bool(getattr(frame, "duplicate", False))
+        outer_index = int(timing.get("batch_index") or 0)
+        outer_batch_size = int(timing.get("batch_size") or 1)
+        for nested_index, item in enumerate(nested):
+            token_id = str(item.get("asset_id") or message.get("asset_id") or "")
+            market = self._markets_by_asset.get(token_id) or {}
+            condition_id = str(
+                market.get("condition_id") or message.get("market") or ""
+            )
+            readiness_data = event_readiness.get(condition_id) or {}
+            block_reason = rejected_reason or str(readiness_data.get("reason") or "")
+            if duplicate and not block_reason:
+                block_reason = "DUPLICATE_FRAME_IGNORED"
+            if duplicate:
+                # Duplicate frames never reach readiness or strategy evaluation.
+                # This label is observability only; it does not alter the decision.
+                readiness = "NOT_EVALUATED"
+            elif rejected_reason:
+                readiness = "NOT_READY"
+            elif readiness_data:
+                readiness = "READY" if readiness_data.get("ready") else "NOT_READY"
+            else:
+                readiness = "NOT_EVALUATED"
+            stale = block_reason == "STALE_EXCHANGE_TIMESTAMP"
+            view = next((
+                candidate for candidate in frame_updates
+                if str(candidate.get("asset_id") or "") == token_id
+            ), {})
+            best_bid = item.get("best_bid", view.get("best_bid", ""))
+            best_ask = item.get("best_ask", view.get("best_ask", ""))
+            if event_type == "book" and not view:
+                bid_prices = [
+                    decimal_value(level.get("price"))
+                    for level in message.get("bids") or [] if isinstance(level, dict)
+                ]
+                ask_prices = [
+                    decimal_value(level.get("price"))
+                    for level in message.get("asks") or [] if isinstance(level, dict)
+                ]
+                bid_prices = [price for price in bid_prices if price is not None]
+                ask_prices = [price for price in ask_prices if price is not None]
+                best_bid = canonical_decimal(max(bid_prices)) if bid_prices else ""
+                best_ask = canonical_decimal(min(ask_prices)) if ask_prices else ""
+            notes = [
+                timestamp_note,
+                "timestamp_source=top_level_market_channel",
+                f"ws_internal_queue_depth={timing.get('ws_internal_queue_depth')}",
+                f"tcp_recv_q_bytes={timing.get('tcp_recv_q_bytes')}",
+            ]
+            if len(nested) > 1:
+                notes.extend((
+                    f"price_change_item={nested_index + 1}/{len(nested)}",
+                    "exchange_timestamp_shared_by_price_change_items=true",
+                ))
+            if timing.get("occurred_after_resubscribe"):
+                notes.append("within_5s_after_subscribe_or_resubscribe=true")
+            if event_type == "book":
+                notes.append("snapshot=true")
+            if duplicate:
+                notes.append("duplicate_frame_ignored=true")
+            diagnostic.submit({
+                "connection_id": timing.get("connection_id", ""),
+                "reconnect_generation": timing.get("connection_generation", ""),
+                "websocket_connected": str(
+                    self.status.status in {"SUBSCRIBED", "CONNECTED"}
+                ).lower(),
+                "message_type": event_type,
+                "event_id": market.get("event_id", ""),
+                "market_id": message.get("market") or condition_id,
+                "token_id": token_id,
+                "side": item.get("side", ""),
+                "raw_exchange_timestamp": raw_text,
+                "detected_timestamp_unit": unit,
+                "normalized_exchange_timestamp_utc": normalized_utc,
+                "receive_timestamp_utc": utc_iso_from_ns(int(receive_wall_ns)),
+                "processing_timestamp_utc": utc_iso_from_ns(int(processing_wall_ns)),
+                "transport_latency_ms": (
+                    round(transport_ms, 3) if transport_ms is not None else ""
+                ),
+                "queue_wait_ms": round(queue_wait_ms, 3),
+                "total_age_at_processing_ms": (
+                    round(total_age_ms, 3) if total_age_ms is not None else ""
+                ),
+                "frame_size_bytes": timing.get("frame_size_bytes", ""),
+                "batch_size": outer_batch_size,
+                "item_index_in_batch": (
+                    f"{outer_index}:{nested_index}" if len(nested) > 1
+                    else outer_index
+                ),
+                "queue_depth": timing.get("ingress_queue_depth", ""),
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "readiness": readiness,
+                "stale_classification": "STALE" if stale else "NOT_STALE",
+                "exact_block_reason": block_reason or "READY",
+                "occurred_after_reconnect": str(bool(
+                    timing.get("occurred_after_reconnect")
+                )).lower(),
+                "notes": ";".join(notes),
+            }, stale=stale)
 
     @staticmethod
     def _ws_internal_queue_depth(ws: Any) -> int | None:
