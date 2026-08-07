@@ -39,6 +39,7 @@ class LiveConfig:
     paper_taker_fee_rate: Decimal = Decimal("0.07")
     raw_market_ws_payloads_enabled: bool = False
     snapshot_min_interval_seconds: Decimal = Decimal("0.5")
+    market_ws_ingress_queue_capacity: int = 32
     snapshot_retention_days: int = 30
     archive_retention_days: int = 365
     archive_bucket: str = ""
@@ -50,6 +51,7 @@ class LiveConfig:
     live_kill_switch_default: bool = True
     pause_entries_default: bool = True
     canary_armed: bool = False
+    continuous_trading_enabled: bool = False
     canary_event_limit: int = 1
     default_trade_amount_usd: Decimal = Decimal("5")
     max_trade_amount_usd: Decimal = Decimal("5")
@@ -95,7 +97,7 @@ class LiveConfig:
     market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
     user_ws_enabled: bool = True
-    max_market_data_age_seconds: int = 5
+    max_market_data_age_seconds: int = 1
     max_user_state_age_seconds: int = 15
     max_reconciliation_age_seconds: int = 30
     reconciliation_interval_seconds: int = 15
@@ -122,6 +124,9 @@ class LiveConfig:
             paper_taker_fee_rate=_decimal_env("LIVE_PAPER_TAKER_FEE_RATE", "0.07"),
             raw_market_ws_payloads_enabled=_bool_env("LIVE_RAW_MARKET_WS_PAYLOADS_ENABLED", False),
             snapshot_min_interval_seconds=_decimal_env("LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS", "0.5"),
+            market_ws_ingress_queue_capacity=int(
+                _env("LIVE_MARKET_WS_INGRESS_QUEUE_CAPACITY", "32") or "32"
+            ),
             snapshot_retention_days=int(_env("LIVE_SNAPSHOT_RETENTION_DAYS", "30") or "30"),
             archive_retention_days=int(_env("LIVE_ARCHIVE_RETENTION_DAYS", "365") or "365"),
             archive_bucket=_env("LIVE_ARCHIVE_GCS_BUCKET", ""),
@@ -133,6 +138,7 @@ class LiveConfig:
             live_kill_switch_default=_bool_env("LIVE_KILL_SWITCH", True),
             pause_entries_default=_bool_env("LIVE_PAUSE_ENTRIES", True),
             canary_armed=_bool_env("LIVE_CANARY_ARMED", False),
+            continuous_trading_enabled=_bool_env("LIVE_CONTINUOUS_TRADING_ENABLED", False),
             canary_event_limit=int(_env("LIVE_CANARY_EVENT_LIMIT", "1") or "1"),
             default_trade_amount_usd=_decimal_env("LIVE_DEFAULT_TRADE_AMOUNT_USD", "5"),
             max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "5"),
@@ -178,7 +184,7 @@ class LiveConfig:
             market_ws_url=_env("POLYMARKET_MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
             user_ws_url=_env("POLYMARKET_USER_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/user"),
             user_ws_enabled=_bool_env("POLYMARKET_USER_WS_ENABLED", True),
-            max_market_data_age_seconds=int(_env("LIVE_MARKET_DATA_STALE_AFTER_SECONDS", _env("LIVE_MAX_MARKET_DATA_AGE_SECONDS", "5")) or "5"),
+            max_market_data_age_seconds=int(_env("LIVE_MARKET_DATA_STALE_AFTER_SECONDS", _env("LIVE_MAX_MARKET_DATA_AGE_SECONDS", "1")) or "1"),
             max_user_state_age_seconds=int(_env("LIVE_USER_STATE_STALE_AFTER_SECONDS", "15") or "15"),
             max_reconciliation_age_seconds=int(_env("LIVE_RECONCILIATION_MAX_AGE_SECONDS", _env("LIVE_MAX_RECONCILIATION_AGE_SECONDS", "30")) or "30"),
             reconciliation_interval_seconds=int(_env("LIVE_RECONCILIATION_INTERVAL_SECONDS", "15") or "15"),
@@ -217,6 +223,8 @@ class LiveConfig:
             errors.append("raw Market WebSocket payload persistence must remain disabled in LIVE")
         if self.snapshot_min_interval_seconds < Decimal("0.5"):
             errors.append("LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS must be >= 0.5")
+        if self.market_ws_ingress_queue_capacity < 2:
+            errors.append("LIVE_MARKET_WS_INGRESS_QUEUE_CAPACITY must be >= 2")
         if self.snapshot_retention_days != 30:
             errors.append("LIVE_SNAPSHOT_RETENTION_DAYS must remain 30")
         if self.archive_retention_days != 365:
@@ -289,7 +297,7 @@ class LiveConfig:
             and self.live_trading_enabled
             and self.live_order_submission_enabled
             and self.live_adapter == "polymarket"
-            and self.canary_armed
+            and (self.canary_armed or self.continuous_trading_enabled)
             and not self.pause_entries_default
             and not self.live_kill_switch_default
         )
@@ -314,6 +322,7 @@ class LiveConfig:
             "live_kill_switch_default": self.live_kill_switch_default,
             "pause_entries_default": self.pause_entries_default,
             "canary_armed": self.canary_armed,
+            "continuous_trading_enabled": self.continuous_trading_enabled,
             "canary_event_limit": self.canary_event_limit,
             "default_trade_amount_usd": str(self.default_trade_amount_usd),
             "max_trade_amount_usd": str(self.max_trade_amount_usd),

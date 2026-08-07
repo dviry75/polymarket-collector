@@ -110,6 +110,7 @@ class LiveSystemTests(unittest.TestCase):
         self.assertFalse(defaults.live_order_submission_enabled)
         self.assertEqual(defaults.live_adapter, "mock")
         self.assertTrue(defaults.live_kill_switch_default)
+        self.assertEqual(defaults.max_market_data_age_seconds, 1)
         self.assertEqual(defaults.login_username, "Admin@system.com")
         self.assertEqual(defaults.session_ttl_seconds, 0)
         self.assertFalse(defaults.real_submission_armed())

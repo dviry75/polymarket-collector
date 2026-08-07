@@ -118,7 +118,8 @@ def test_order_book_snapshot_delta_delete_duplicate_out_of_order_reconnect_two_t
         "event_type": "price_change", "timestamp": "99",
         "price_changes": [{"asset_id": "yes", "side": "BUY", "price": "0.71", "size": "1"}],
     })
-    assert out.out_of_order and not books.books["yes"].ready
+    assert out.out_of_order and books.books["yes"].ready
+    assert books.books["yes"].best_ask == Decimal("0.75")
     books.mark_not_ready("RECONNECT_AWAITING_SNAPSHOT")
     assert not books.books["yes"].bids and not books.books["no"].asks
     assert books.event_ready(["yes", "no"])[0] is False
@@ -806,3 +807,53 @@ def test_configured_signer_mismatch_fails_before_network_client_creation():
     )
     assert result["status"] == "SIGNER_MISMATCH"
     assert result["signer"] is None
+
+
+def test_entry_schedule_blocks_weekdays_14_to_23_jerusalem():
+    jerusalem = ZoneInfo("Asia/Jerusalem")
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 3, 13, 59, 59, tzinfo=jerusalem)
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 3, 14, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 3, 22, 59, 59, tzinfo=jerusalem)
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 3, 23, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 8, 16, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+
+
+def test_continuous_entry_slot_is_atomic_for_intents_and_positions():
+    temporary, base, strategy = build_repo()
+    try:
+        first = strategy.reserve_event_entry(
+            event_id="event-slot-1", condition_id="condition-slot-1",
+            token_id="token-slot-1", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+        assert not first.get("_blocked")
+        blocked_by_intent = strategy.reserve_event_entry(
+            event_id="event-slot-2", condition_id="condition-slot-2",
+            token_id="token-slot-2", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+        assert blocked_by_intent["reason"] == "ACTIVE_ENTRY_SLOT_OCCUPIED"
+        strategy.open_position(
+            event_id="event-slot-1", condition_id="condition-slot-1",
+            token_id="token-slot-1", outcome="YES", shares=Decimal("5"),
+            average_price=Decimal("0.74"), cost_all_in=Decimal("3.8"),
+            fees=Decimal("0"), min_sellable=Decimal("1"),
+        )
+        blocked_by_position = strategy.reserve_event_entry(
+            event_id="event-slot-3", condition_id="condition-slot-3",
+            token_id="token-slot-3", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+        assert blocked_by_position["reason"] == "ACTIVE_ENTRY_SLOT_OCCUPIED"
+    finally:
+        temporary.cleanup()

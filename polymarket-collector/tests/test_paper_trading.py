@@ -45,6 +45,7 @@ class PaperTradingTests(unittest.TestCase):
         self.manager = MarketWebSocketManager(
             self.repo, stale_after_seconds=10_000, on_snapshot=self.engine.process_snapshot,
             snapshot_min_interval_seconds=0,
+            clock_ms=lambda: 100_000,
         )
 
     def tearDown(self):
@@ -313,7 +314,8 @@ class PaperTradingTests(unittest.TestCase):
             manager._stop.set()
 
         manager = MarketWebSocketManager(
-            self.repo, stale_after_seconds=10_000, on_snapshot=on_snapshot
+            self.repo, stale_after_seconds=10_000, on_snapshot=on_snapshot,
+            clock_ms=lambda: 100_000,
         )
 
         async def scenario():

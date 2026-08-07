@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 import asyncio
+import array
+import fcntl
+import hashlib
 import json
 import logging
 import os
 import random
+import socket
+import statistics
 import time
+from pathlib import Path
 
 from .repository import LiveRepository, now_iso
 from .order_book import OrderBookSet, canonical_decimal
@@ -34,8 +41,13 @@ class MarketWebSocketManager:
         persist_raw_payloads: bool = False,
         snapshot_min_interval_seconds: float = 0.5,
         on_reconnect: Callable[[], Awaitable[Any]] | None = None,
+        persistence_queue_capacity: int = 64,
+        ingress_queue_capacity: int = 32,
+        future_tolerance_ms: int = 1_000,
+        clock_ms: Callable[[], int] | None = None,
     ):
         self.repo = repo
+        self._logger = logging.getLogger("uvicorn.error")
         self.stale_after_seconds = stale_after_seconds
         self.status = WebSocketStatus(channel="market")
         self.on_snapshot = on_snapshot
@@ -54,6 +66,66 @@ class MarketWebSocketManager:
         self._stop = asyncio.Event()
         self._ws = None
         self._lock = asyncio.Lock()
+        self.future_tolerance_ms = max(0, int(future_tolerance_ms))
+        self._clock_ms = clock_ms or (
+            lambda: int(datetime.now(timezone.utc).timestamp() * 1000)
+        )
+        self.persistence_queue_capacity = max(2, int(persistence_queue_capacity))
+        self.ingress_queue_capacity = max(2, int(ingress_queue_capacity))
+        self._ingress_queue: asyncio.Queue[Any] | None = None
+        self.max_ingress_queue_depth = 0
+        self.ingress_frames_enqueued = 0
+        self.ingress_frames_dequeued = 0
+        self.ingress_queue_saturations = 0
+        self.ingress_resyncs = 0
+        self.ingress_market_frames_discarded = 0
+        self.ingress_critical_frames_preserved = 0
+        self.ingress_resync_reasons: dict[str, int] = {}
+        self._integrity_resync_reason = ""
+        self.unsubscribed_market_frames_ignored = 0
+        self.unsubscribed_asset_counts: dict[str, int] = {}
+        self._pending_snapshots: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._persistence_event = asyncio.Event()
+        self._persistence_task: asyncio.Task[Any] | None = None
+        self._markets_by_asset: dict[str, dict[str, Any]] = {}
+        self._markets_by_condition: dict[str, dict[str, Any]] = {}
+        self.snapshots_coalesced = 0
+        self.snapshots_dropped = 0
+        self.dynamic_subscriptions = 0
+        self.dynamic_subscription_fallbacks = 0
+        self.rejected_frames = 0
+        self.out_of_order_frames = 0
+        self.rejection_reasons: dict[str, int] = {}
+        self.idle_ready_checks_over_threshold = 0
+        self.last_exchange_age_ms: int | None = None
+        self.last_receive_latency_ms: int | None = None
+        self.last_message_processing_ms = 0.0
+        self.max_message_processing_ms = 0.0
+        self.max_persistence_queue_depth = 0
+        self._pending_states: dict[str, str] = {}
+        self._last_queued_state_values: dict[str, str] = {}
+        self._last_message_state_monotonic = 0.0
+        self._readiness_state = ""
+        self._not_ready_started_monotonic: float | None = None
+        self.not_ready_transitions = 0
+        self.not_ready_total_seconds = 0.0
+        self.not_ready_max_seconds = 0.0
+        self._latency_records: deque[dict[str, Any]] = deque(maxlen=10_000)
+        self._event_loop_lag_samples: deque[float] = deque(maxlen=10_000)
+        self._event_loop_lag_ms = 0.0
+        self._event_loop_lag_max_ms = 0.0
+        self._event_loop_watchdog_task: asyncio.Task[Any] | None = None
+        self._diagnostics_task: asyncio.Task[Any] | None = None
+        self._last_handler_end_monotonic: float | None = None
+        self._connection_generation = 0
+        self._connection_diagnostics: dict[str, Any] = {}
+        diagnostics_default = (
+            Path(getattr(self.repo, "db_path", "/opt/polymarket-btc-live/poly_live.sqlite3")).parent
+            / "output" / "market_ws_latency_diagnostics.json"
+        )
+        self._diagnostics_path = Path(
+            os.getenv("LIVE_MARKET_WS_DIAGNOSTICS_PATH", str(diagnostics_default))
+        )
 
     def subscription_message(self, asset_ids: list[str]) -> dict[str, Any]:
         return {"type": "market", "assets_ids": asset_ids, "custom_feature_enabled": True}
@@ -61,13 +133,26 @@ class MarketWebSocketManager:
     def dynamic_subscription_message(self, asset_ids: list[str], operation: str = "subscribe") -> dict[str, Any]:
         if operation not in {"subscribe", "unsubscribe"}:
             raise ValueError("invalid subscription operation")
-        return {"operation": operation, "assets_ids": asset_ids, "custom_feature_enabled": True}
+        message: dict[str, Any] = {"operation": operation, "assets_ids": asset_ids}
+        # The official SDK intentionally omits custom_feature_enabled from
+        # unsubscribe updates. Some CLOB deployments reject or ignore the
+        # unsubscribe frame when this subscribe-only field is present.
+        if operation == "subscribe":
+            message["custom_feature_enabled"] = True
+        return message
 
     async def start(self, url: str) -> None:
         async with self._lock:
             if self._task and not self._task.done():
                 return
             self._stop.clear()
+            self._ensure_persistence_writer()
+            self._event_loop_watchdog_task = asyncio.create_task(
+                self._event_loop_watchdog(), name="market-ws-event-loop-watchdog"
+            )
+            self._diagnostics_task = asyncio.create_task(
+                self._diagnostics_loop(), name="market-ws-latency-diagnostics"
+            )
             self._task = asyncio.create_task(self.run(url), name="polymarket-market-ws")
 
     async def stop(self) -> None:
@@ -79,6 +164,21 @@ class MarketWebSocketManager:
                 await asyncio.wait_for(self._task, 5)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
+        if self._pending_snapshots or self._pending_states:
+            self._persistence_event.set()
+        if self._persistence_task:
+            try:
+                await asyncio.wait_for(self._persistence_task, 5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._persistence_task.cancel()
+        for task in (self._event_loop_watchdog_task, self._diagnostics_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._event_loop_watchdog_task = self._diagnostics_task = None
         self.status.status = "STOPPED"
         self.status.stale = True
 
@@ -94,7 +194,7 @@ class MarketWebSocketManager:
             connector = connect
         attempt = 0
         while not self._stop.is_set():
-            asset_ids = self.repo.market_ws_asset_ids()
+            asset_ids = await asyncio.to_thread(self.repo.market_ws_asset_ids)
             if not asset_ids:
                 self.status.status = "WAITING_FOR_MARKETS"
                 try:
@@ -104,10 +204,25 @@ class MarketWebSocketManager:
                 continue
             self.status.status = "CONNECTING" if attempt == 0 else "RECONNECTING"
             try:
-                async with connector(url, ping_interval=None, close_timeout=5) as ws:
+                async with connector(
+                    url,
+                    ping_interval=None,
+                    close_timeout=5,
+                    max_queue=(4, 1),
+                    max_size=2 * 1024 * 1024,
+                    compression=None,
+                ) as ws:
                     self._ws = ws
+                    self._connection_generation += 1
+                    self._connection_diagnostics = self._connection_metadata(ws, url)
+                    self._logger.info(
+                        "MARKET_WS_CONNECTED generation=%s remote=%s assets=%s",
+                        self._connection_generation, getattr(ws, "remote_address", None),
+                        len(asset_ids),
+                    )
                     self.order_books.ensure_assets(asset_ids)
-                    self.order_books.mark_not_ready("RECONNECT_AWAITING_SNAPSHOT")
+                    self.order_books.mark_not_ready("RECONNECT_AWAITING_FRESH_BOOKS")
+                    await asyncio.to_thread(self._refresh_market_cache, asset_ids)
                     await ws.send(json.dumps(self.subscription_message(asset_ids)))
                     self.subscribed_asset_ids = asset_ids
                     self.status.status = "SUBSCRIBED"
@@ -118,18 +233,7 @@ class MarketWebSocketManager:
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     subscriptions = asyncio.create_task(self._subscription_loop(ws))
                     try:
-                        while not self._stop.is_set():
-                            raw = await asyncio.wait_for(ws.recv(), timeout=max(15, self.stale_after_seconds))
-                            if raw == "PONG" or raw == b"PONG":
-                                self.last_pong_at = now_iso()
-                                continue
-                            payload = json.loads(raw)
-                            for message in payload if isinstance(payload, list) else [payload]:
-                                if isinstance(message, dict):
-                                    self.process_message(message)
-                            # A continuously readable socket may otherwise monopolize the
-                            # event loop while snapshots are persisted synchronously.
-                            await asyncio.sleep(0)
+                        await self._run_ingress_pipeline(ws)
                     finally:
                         heartbeat.cancel()
                         subscriptions.cancel()
@@ -147,6 +251,250 @@ class MarketWebSocketManager:
                     pass
         self.status.status = "STOPPED"
 
+    async def _run_ingress_pipeline(self, ws: Any) -> None:
+        """Drain the websocket continuously while processing book events in order."""
+        queue: asyncio.Queue[Any] = asyncio.Queue(self.ingress_queue_capacity)
+        self._ingress_queue = queue
+        self._integrity_resync_reason = ""
+        reader_done = asyncio.Event()
+        resync = asyncio.Event()
+        reader = asyncio.create_task(
+            self._market_frame_reader(ws, queue, reader_done, resync),
+            name="market-ws-reader",
+        )
+        processor = asyncio.create_task(
+            self._market_frame_processor(ws, queue, reader_done, resync),
+            name="market-ws-frame-processor",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {reader, processor}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if processor in done and not reader.done():
+                processor_error = processor.exception()
+                await ws.close()
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+                if processor_error is not None:
+                    raise processor_error
+                return
+            reader_done.set()
+            reader_error = reader.exception()
+            await processor
+            if reader_error is not None:
+                raise reader_error
+        finally:
+            reader_done.set()
+            for task in (reader, processor):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(reader, processor, return_exceptions=True)
+            self._ingress_queue = None
+
+    async def _market_frame_reader(
+        self, ws: Any, queue: asyncio.Queue[Any], reader_done: asyncio.Event,
+        resync: asyncio.Event,
+    ) -> None:
+        try:
+            while not self._stop.is_set() and not resync.is_set():
+                before_recv = time.perf_counter()
+                between_recv_gap_ms = (
+                    (before_recv - self._last_handler_end_monotonic) * 1000
+                    if self._last_handler_end_monotonic is not None else None
+                )
+                raw = await asyncio.wait_for(
+                    ws.recv(), timeout=max(15, self.stale_after_seconds)
+                )
+                recv_return = time.perf_counter()
+                socket_receive_wall_ms = self._clock_ms()
+                library_queue_depth = self._ws_internal_queue_depth(ws)
+                tcp_recv_q_bytes = self._tcp_recv_q_bytes(ws)
+                if raw == "PONG" or raw == b"PONG":
+                    self.last_pong_at = now_iso()
+                    continue
+                parse_start = time.perf_counter()
+                payload = json.loads(raw)
+                parse_end = time.perf_counter()
+                messages = payload if isinstance(payload, list) else [payload]
+                base_timing = {
+                    "connection_generation": self._connection_generation,
+                    "before_recv_monotonic": before_recv,
+                    "recv_return_monotonic": recv_return,
+                    "socket_receive_wall_ms": socket_receive_wall_ms,
+                    "recv_wait_ms": (recv_return - before_recv) * 1000,
+                    "between_recv_gap_ms": between_recv_gap_ms,
+                    "parse_start_monotonic": parse_start,
+                    "parse_end_monotonic": parse_end,
+                    "parse_ms": (parse_end - parse_start) * 1000,
+                    "ws_internal_queue_depth": library_queue_depth,
+                    "tcp_recv_q_bytes": tcp_recv_q_bytes,
+                    "event_loop_lag_ms": self._event_loop_lag_ms,
+                }
+                for index, message in enumerate(messages):
+                    if resync.is_set():
+                        break
+                    if not isinstance(message, dict):
+                        continue
+                    timing = dict(base_timing)
+                    timing["batch_index"] = index
+                    timing["batch_size"] = len(messages)
+                    timing["ingress_enqueued_monotonic"] = time.perf_counter()
+                    item = (message, timing)
+                    try:
+                        queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        self._handle_ingress_saturation(queue, item, resync)
+                        await ws.close()
+                        raise ConnectionError("MARKET_WS_INGRESS_QUEUE_SATURATED")
+                    self.ingress_frames_enqueued += 1
+                    self.max_ingress_queue_depth = max(
+                        self.max_ingress_queue_depth, queue.qsize()
+                    )
+                    if queue.qsize() >= max(2, self.ingress_queue_capacity // 2):
+                        await asyncio.sleep(0)
+        finally:
+            reader_done.set()
+
+    async def _market_frame_processor(
+        self, ws: Any, queue: asyncio.Queue[Any], reader_done: asyncio.Event,
+        resync: asyncio.Event,
+    ) -> None:
+        resync_error = ""
+        while not (reader_done.is_set() and queue.empty()):
+            try:
+                message, timing = await asyncio.wait_for(queue.get(), 0.1)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                event_type = str(
+                    message.get("event_type") or message.get("type") or ""
+                ).lower()
+                if resync.is_set() and event_type != "market_resolved":
+                    self.ingress_market_frames_discarded += 1
+                    continue
+                asset_ids = self._message_asset_ids(message)
+                unexpected = [
+                    asset for asset in asset_ids
+                    if asset not in self.subscribed_asset_ids
+                ]
+                if unexpected and event_type != "market_resolved":
+                    for asset in unexpected:
+                        self.unsubscribed_asset_counts[asset] = (
+                            self.unsubscribed_asset_counts.get(asset, 0) + 1
+                        )
+                    if event_type == "price_change":
+                        retained = [
+                            change for change in message.get("price_changes") or []
+                            if isinstance(change, dict)
+                            and str(change.get("asset_id") or "")
+                            in self.subscribed_asset_ids
+                        ]
+                        if retained:
+                            message = {**message, "price_changes": retained}
+                        else:
+                            self.unsubscribed_market_frames_ignored += 1
+                            continue
+                    elif asset_ids and len(unexpected) == len(asset_ids):
+                        self.unsubscribed_market_frames_ignored += 1
+                        continue
+                timing["ingress_dequeued_monotonic"] = time.perf_counter()
+                timing["ingress_queue_wait_ms"] = (
+                    timing["ingress_dequeued_monotonic"]
+                    - timing["ingress_enqueued_monotonic"]
+                ) * 1000
+                timing["ingress_queue_depth"] = queue.qsize()
+                self.ingress_frames_dequeued += 1
+                self.process_message(message, timing=timing)
+                if self._integrity_resync_reason and not resync.is_set():
+                    resync_error = self._integrity_resync_reason
+                    latest = None
+                    if isinstance(message.get("price_changes"), list):
+                        latest = next((
+                            item for item in reversed(message["price_changes"])
+                            if isinstance(item, dict)
+                        ), None)
+                    self._logger.warning(
+                        "MARKET_WS_BOOK_INTEGRITY_FAILURE generation=%s reason=%s "
+                        "event_type=%s assets=%s timestamp=%s advertised_bid=%s "
+                        "advertised_ask=%s computed_top=%s changes=%s exchange_age_ms=%s",
+                        self._connection_generation, resync_error, event_type,
+                        self._message_asset_ids(message), message.get("timestamp"),
+                        (latest or message).get("best_bid"),
+                        (latest or message).get("best_ask"),
+                        timing.get("book_top"),
+                        [
+                            {
+                                key: change.get(key) for key in (
+                                    "asset_id", "side", "price", "size",
+                                    "best_bid", "best_ask",
+                                )
+                            }
+                            for change in (message.get("price_changes") or [])[-16:]
+                            if isinstance(change, dict)
+                        ],
+                        timing.get("exchange_to_socket_receive_ms"),
+                    )
+                    self._begin_ingress_resync(resync_error, resync)
+                    await ws.close()
+            finally:
+                queue.task_done()
+        if resync_error:
+            raise ConnectionError(f"MARKET_WS_BOOK_RESYNC:{resync_error}")
+
+    def _begin_ingress_resync(self, reason: str, resync: asyncio.Event) -> None:
+        self.ingress_resyncs += 1
+        self.ingress_resync_reasons[reason] = (
+            self.ingress_resync_reasons.get(reason, 0) + 1
+        )
+        resync.set()
+        self.order_books.mark_not_ready(reason)
+        self._queue_states({
+            "strategy_readiness": "NOT_READY",
+            "strategy_block_reason": reason,
+        })
+        self._logger.warning(
+            "MARKET_WS_BOOK_RESYNC generation=%s reason=%s",
+            self._connection_generation, reason,
+        )
+
+    def _handle_ingress_saturation(
+        self, queue: asyncio.Queue[Any], current: tuple[Any, Any],
+        resync: asyncio.Event,
+    ) -> None:
+        self.ingress_queue_saturations += 1
+        self._begin_ingress_resync("INGRESS_QUEUE_SATURATED_RESYNC", resync)
+        retained: list[tuple[Any, Any]] = []
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            queue.task_done()
+            event_type = str(
+                item[0].get("event_type") or item[0].get("type") or ""
+            ).lower()
+            if event_type == "market_resolved":
+                retained.append(item)
+                self.ingress_critical_frames_preserved += 1
+            else:
+                self.ingress_market_frames_discarded += 1
+        current_type = str(
+            current[0].get("event_type") or current[0].get("type") or ""
+        ).lower()
+        if current_type == "market_resolved":
+            retained.append(current)
+            self.ingress_critical_frames_preserved += 1
+        else:
+            self.ingress_market_frames_discarded += 1
+        for item in retained:
+            queue.put_nowait(item)
+        self._logger.warning(
+            "MARKET_WS_INGRESS_QUEUE_SATURATED generation=%s capacity=%s "
+            "critical_preserved=%s discarded_total=%s action=RECONNECT_RESYNC",
+            self._connection_generation, self.ingress_queue_capacity,
+            len(retained), self.ingress_market_frames_discarded,
+        )
+
     async def _heartbeat(self, ws) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(10)
@@ -156,15 +504,62 @@ class MarketWebSocketManager:
     async def _subscription_loop(self, ws) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(1)
-            wanted = self.repo.market_ws_asset_ids()
+            wanted = await asyncio.to_thread(self.repo.market_ws_asset_ids)
             add = [asset for asset in wanted if asset not in self.subscribed_asset_ids]
             remove = [asset for asset in self.subscribed_asset_ids if asset not in wanted]
+            if add:
+                rotation_started = time.perf_counter()
+                prior_generation = self._connection_generation
+                self._logger.info(
+                    "MARKET_WS_DYNAMIC_SUBSCRIBE_START generation=%s add=%s remove=%s",
+                    prior_generation, add, remove,
+                )
+                combined = list(dict.fromkeys([*self.subscribed_asset_ids, *add]))
+                self.order_books.ensure_assets(combined)
+                await asyncio.to_thread(self._refresh_market_cache, combined)
+                await ws.send(json.dumps(self.dynamic_subscription_message(add, "subscribe")))
+                self.subscribed_asset_ids = combined
+                self.dynamic_subscriptions += 1
+                # Dynamic subscribe is supported by the market channel. Keep the old
+                # assets until every added token receives a new snapshot; otherwise
+                # fail closed and reconnect for a full generation warm-up.
+                deadline = time.monotonic() + 5.0
+                missing = list(add)
+                while time.monotonic() < deadline and not self._stop.is_set():
+                    missing = [
+                        asset for asset in add
+                        if not self.order_books.books.get(asset)
+                        or not self.order_books.books[asset].ready
+                    ]
+                    if not missing:
+                        break
+                    await asyncio.sleep(0.05)
+                if missing:
+                    self._logger.warning(
+                        "MARKET_WS_DYNAMIC_SUBSCRIBE_TIMEOUT generation=%s missing=%s elapsed_ms=%.3f",
+                        prior_generation, missing,
+                        (time.perf_counter() - rotation_started) * 1000,
+                    )
+                    self.dynamic_subscription_fallbacks += 1
+                    await ws.close()
+                    return
+            if add:
+                self._logger.info(
+                    "MARKET_WS_DYNAMIC_SUBSCRIBE_READY generation=%s assets=%s elapsed_ms=%.3f",
+                    self._connection_generation, add,
+                    (time.perf_counter() - rotation_started) * 1000,
+                )
+            if remove:
+                await ws.send(json.dumps(self.dynamic_subscription_message(remove, "unsubscribe")))
             if add or remove:
-                # Reconnect so every rotating BTC 5m market receives a fresh initial
-                # book. In production the server accepted dynamic updates but did not
-                # reliably emit the newly subscribed assets.
-                await ws.close()
-                return
+                self.subscribed_asset_ids = list(wanted)
+                self.order_books.ensure_assets(wanted)
+                await asyncio.to_thread(self._refresh_market_cache, wanted)
+                self._logger.info(
+                    "MARKET_WS_ROTATION_COMPLETE generation_before=%s generation_after=%s subscribed=%s removed=%s",
+                    prior_generation if add else self._connection_generation,
+                    self._connection_generation, wanted, remove,
+                )
 
     async def connect_for_messages(self, url: str, asset_ids: list[str], *, max_messages: int = 1, timeout_seconds: float = 20.0) -> dict[str, Any]:
         """Bounded public smoke connection. It never uses credentials or trading APIs."""
@@ -217,45 +612,109 @@ class MarketWebSocketManager:
         base = min(30.0, 2 ** max(0, self.status.reconnect_attempts))
         return base + random.uniform(0, 1)
 
-    def process_message(self, message: dict[str, Any]) -> bool:
-        stored_raw = (
-            self.repo.store_ws_event("market", message, "processed")
-            if self.persist_raw_payloads else False
-        )
+    def process_message(
+        self, message: dict[str, Any], timing: dict[str, Any] | None = None
+    ) -> bool:
+        started = time.perf_counter()
+        diagnostic_timing = timing is not None
+        timing = timing if timing is not None else {}
+        timing["handler_entry_monotonic"] = started
         event_type = str(message.get("event_type") or message.get("type") or "").lower()
+        timing["event_type"] = event_type
+        timestamp_raw = message.get("timestamp")
+        exchange_ms, _timestamp_error = self.order_books._exchange_timestamp_ms(
+            str(timestamp_raw) if timestamp_raw not in (None, "") else None
+        )
+        timing["exchange_timestamp_ms"] = exchange_ms
+        if exchange_ms is not None and timing.get("socket_receive_wall_ms") is not None:
+            timing["exchange_to_socket_receive_ms"] = (
+                timing["socket_receive_wall_ms"] - exchange_ms
+            )
+        if timing.get("recv_return_monotonic") is not None:
+            timing["socket_receive_to_handler_ms"] = (
+                started - timing["recv_return_monotonic"]
+            ) * 1000
+        now_ms = self._clock_ms()
+        # Local receipt time is observability/persistence only. It is never used
+        # for market-data freshness or entry authorization.
         received_at = now_iso()
-        stored_snapshots = 0
         callback_updates: list[dict[str, Any]] = []
+        stored_critical = False
 
         if event_type == "market_resolved":
+            # Resolution is critical and must never enter the lossy snapshot queue.
             for candidate in self._normalize_snapshots(message):
-                if not self.persist_raw_payloads:
-                    candidate["raw_message"] = {
-                        "event_type": event_type,
-                        "message_hash": candidate.get("message_hash"),
-                    }
                 snapshot = self.repo.store_market_snapshot(candidate)
                 callback = snapshot or candidate
                 callback_updates.append(callback)
                 if snapshot is not None:
-                    stored_snapshots += 1
+                    stored_critical = True
                     self.snapshots_received += 1
                     if self.on_snapshot is not None:
                         self.on_snapshot(snapshot)
             condition_id = message.get("condition_id") or message.get("market")
             if condition_id:
                 self.repo.mark_market_resolved(
-                    str(condition_id),
-                    message.get("winning_asset_id"),
+                    str(condition_id), message.get("winning_asset_id"),
                     message.get("winning_outcome"),
                 )
         else:
-            assets = self.subscribed_asset_ids or self.repo.market_ws_asset_ids()
+            assets = self.subscribed_asset_ids or list(self._markets_by_asset)
+            if not assets:
+                assets = self.repo.market_ws_asset_ids()
+                self._refresh_market_cache(assets)
             self.order_books.ensure_assets(assets)
-            frame = self.order_books.apply(message)
+            frame = self.order_books.apply(
+                message,
+                now_ms=now_ms,
+                max_age_ms=self.stale_after_seconds * 1000,
+                future_tolerance_ms=self.future_tolerance_ms,
+            )
+            timing["message_hash"] = frame.message_hash
+            timing["book_update_monotonic"] = time.perf_counter()
+            timing["handler_to_book_update_ms"] = (
+                timing["book_update_monotonic"] - started
+            ) * 1000
+            timing["rejected_reason"] = frame.rejected_reason
+            timing["out_of_order"] = frame.out_of_order
+            timing["book_top"] = [
+                {
+                    "asset_id": view.get("asset_id"),
+                    "best_bid": view.get("best_bid"),
+                    "best_ask": view.get("best_ask"),
+                    "reason": view.get("readiness_reason"),
+                }
+                for view in frame.updates
+            ]
+            self.last_exchange_age_ms = frame.exchange_age_ms
+            self.last_receive_latency_ms = frame.receive_latency_ms
+            if frame.out_of_order:
+                self.out_of_order_frames += 1
+                self.rejected_frames += 1
+                self.rejection_reasons["OUT_OF_ORDER_EXCHANGE_TIMESTAMP"] = (
+                    self.rejection_reasons.get("OUT_OF_ORDER_EXCHANGE_TIMESTAMP", 0) + 1
+                )
+            if frame.rejected_reason:
+                if not frame.out_of_order:
+                    self.rejected_frames += 1
+                if not (
+                    frame.out_of_order
+                    and frame.rejected_reason == "OUT_OF_ORDER_EXCHANGE_TIMESTAMP"
+                ):
+                    self.rejection_reasons[frame.rejected_reason] = (
+                        self.rejection_reasons.get(frame.rejected_reason, 0) + 1
+                    )
+                self._queue_states({
+                    "strategy_readiness": "NOT_READY",
+                    "strategy_block_reason": frame.rejected_reason,
+                })
             for view in frame.updates:
                 asset_id = str(view["asset_id"])
-                market = self.repo.market_for_asset(asset_id)
+                market = self._markets_by_asset.get(asset_id)
+                if not market:
+                    market = self.repo.market_for_asset(asset_id)
+                    if market:
+                        self._cache_market(market)
                 if not market:
                     continue
                 outcome = (
@@ -269,67 +728,75 @@ class MarketWebSocketManager:
                     "event_id": market.get("event_id"),
                     "outcome": outcome,
                     "received_at": received_at,
-                    "latency_ms": self._latency_ms(frame.timestamp),
+                    "latency_ms": frame.receive_latency_ms,
                     "source": "POLYMARKET_MARKET_WS",
                     "raw_message": (
                         {"message": message, "asset_id": asset_id}
-                        if self.persist_raw_payloads
-                        else {
+                        if self.persist_raw_payloads else {
                             "event_type": frame.event_type,
                             "message_hash": frame.message_hash,
                             "asset_id": asset_id,
                         }
                     ),
+                    "id": -self.messages_received - len(callback_updates) - 1,
                 }
-                snapshot = None
+                callback_updates.append(candidate)
                 if self._should_persist_snapshot(candidate):
-                    snapshot = self.repo.store_market_snapshot(candidate)
-                callback = {
-                    **candidate,
-                    "id": snapshot["id"] if snapshot is not None else -self.messages_received - len(callback_updates) - 1,
-                }
-                callback_updates.append(callback)
-                if snapshot is not None:
-                    stored_snapshots += 1
-                    self.snapshots_received += 1
-                if self.on_snapshot is not None:
-                    self.on_snapshot(snapshot or callback)
+                    self._enqueue_snapshot(candidate)
+            integrity_reasons = {
+                str(view.get("readiness_reason") or "") for view in frame.updates
+            }
+            for reason in (
+                "DELTA_BEFORE_SNAPSHOT", "BEST_UPDATE_BEFORE_SNAPSHOT",
+                "BEST_PRICE_MISMATCH", "MALFORMED_DELTA",
+            ):
+                if reason in integrity_reasons:
+                    if reason == "BEST_PRICE_MISMATCH" and event_type == "best_bid_ask":
+                        continue
+                    self._integrity_resync_reason = reason
+                    break
 
+        if "book_update_monotonic" not in timing:
+            timing["message_hash"] = hashlib.sha256(
+                json.dumps(
+                    message, sort_keys=True, separators=(",", ":"), default=str
+                ).encode()
+            ).hexdigest()
+            timing["book_update_monotonic"] = time.perf_counter()
+            timing["handler_to_book_update_ms"] = (
+                timing["book_update_monotonic"] - started
+            ) * 1000
         self.messages_received += 1
         self.status.status = "CONNECTED"
         self.status.last_message_at = received_at
         self.status.stale = False
-        self.repo.set_state("market_ws_status", self.status.status, "market_ws")
-        self.repo.set_state("market_ws_last_message_at", self.status.last_message_at, "market_ws")
+        status_values = {"market_ws_status": self.status.status}
+        monotonic_now = time.monotonic()
+        if monotonic_now - self._last_message_state_monotonic >= 1.0:
+            status_values["market_ws_last_message_at"] = self.status.last_message_at
+            self._last_message_state_monotonic = monotonic_now
+        self._queue_states(status_values)
 
         event_readiness: dict[str, dict[str, Any]] = {}
         for update in callback_updates:
             condition_id = str(update.get("condition_id") or "")
-            if not condition_id or condition_id in event_readiness:
-                continue
-            market = self.repo.latest_market(condition_id)
-            asset_ids = [
-                str(market.get("yes_token_id") or "") if market else "",
-                str(market.get("no_token_id") or "") if market else "",
-            ]
-            ready, reason = self.order_books.event_ready(asset_ids)
-            ready = ready and self.status.status == "CONNECTED" and set(asset_ids).issubset(
-                set(self.subscribed_asset_ids or asset_ids)
-            )
-            event_readiness[condition_id] = {"ready": ready, "reason": reason}
+            if condition_id and condition_id not in event_readiness:
+                event_readiness[condition_id] = self.event_freshness(
+                    condition_id, now_ms=now_ms
+                )
         if event_readiness:
             all_ready = all(item["ready"] for item in event_readiness.values())
-            self.repo.set_state(
-                "strategy_readiness", "READY" if all_ready else "NOT_READY", "market_ws"
+            reason = "" if all_ready else next(
+                item["reason"] for item in event_readiness.values() if not item["ready"]
             )
-            self.repo.set_state(
-                "strategy_block_reason",
-                "" if all_ready else next(
-                    item["reason"] for item in event_readiness.values() if not item["ready"]
-                ),
-                "market_ws",
-            )
-        if self.on_atomic_frame is not None and callback_updates:
+            self._queue_states({
+                "strategy_readiness": "READY" if all_ready else "NOT_READY",
+                "strategy_block_reason": reason,
+            })
+        if (
+            self.on_atomic_frame is not None and callback_updates
+            and not (event_type != "market_resolved" and frame.rejected_reason)
+        ):
             context = {
                 "event_type": event_type,
                 "message_hash": (
@@ -340,16 +807,335 @@ class MarketWebSocketManager:
                 "updates": callback_updates,
                 "event_readiness": event_readiness,
             }
+            timing["strategy_scheduled_monotonic"] = time.perf_counter()
+            timing["book_update_to_strategy_ms"] = (
+                timing["strategy_scheduled_monotonic"]
+                - timing["book_update_monotonic"]
+            ) * 1000
+            context["_latency_timing"] = timing
             result = self.on_atomic_frame(context)
             if asyncio.iscoroutine(result):
                 try:
                     asyncio.get_running_loop().create_task(result)
                 except RuntimeError:
                     asyncio.run(result)
-        return bool(stored_raw or stored_snapshots or (callback_updates and event_type != "market_resolved"))
+
+        ended = time.perf_counter()
+        elapsed_ms = (ended - started) * 1000
+        timing["handler_end_monotonic"] = ended
+        timing["total_processing_ms"] = elapsed_ms
+        timing["handler_to_strategy_ms"] = (
+            (timing.get("strategy_scheduled_monotonic") or ended) - started
+        ) * 1000
+        self._last_handler_end_monotonic = ended
+        if diagnostic_timing:
+            timing["asset_ids"] = self._message_asset_ids(message)
+            self._latency_records.append(timing)
+        self.last_message_processing_ms = elapsed_ms
+        self.max_message_processing_ms = max(self.max_message_processing_ms, elapsed_ms)
+        return (
+            stored_critical if event_type == "market_resolved"
+            else bool(callback_updates) and not frame.rejected_reason
+        )
+
+    @staticmethod
+    def _message_asset_ids(message: dict[str, Any]) -> list[str]:
+        if isinstance(message.get("price_changes"), list):
+            return sorted({
+                str(item.get("asset_id") or "") for item in message["price_changes"]
+                if isinstance(item, dict) and item.get("asset_id")
+            })
+        asset = str(message.get("asset_id") or "")
+        return [asset] if asset else []
+
+    @staticmethod
+    def _ws_internal_queue_depth(ws: Any) -> int | None:
+        try:
+            return len(ws.recv_messages.frames)
+        except (AttributeError, TypeError):
+            return None
+
+    @staticmethod
+    def _tcp_recv_q_bytes(ws: Any) -> int | None:
+        try:
+            transport = getattr(ws, "transport", None)
+            raw_socket = transport.get_extra_info("socket") if transport else None
+            if raw_socket is None:
+                return None
+            pending = array.array("i", [0])
+            fcntl.ioctl(raw_socket.fileno(), 0x541B, pending, True)  # Linux FIONREAD
+            return int(pending[0])
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    def _connection_metadata(self, ws: Any, url: str) -> dict[str, Any]:
+        protocol = getattr(ws, "protocol", None)
+        extensions = [
+            type(extension).__name__
+            for extension in (getattr(protocol, "extensions", None) or [])
+        ]
+        return {
+            "generation": self._connection_generation,
+            "connected_at": now_iso(),
+            "url": url,
+            "max_queue": list(getattr(ws, "max_queue", (None, None))),
+            "max_size": getattr(protocol, "max_size", None),
+            "write_limit": list(getattr(ws, "write_limit", (None, None))),
+            "compression_extensions": extensions,
+            "ping_interval": getattr(ws, "ping_interval", None),
+            "ping_timeout": getattr(ws, "ping_timeout", None),
+            "local_address": str(getattr(ws, "local_address", None)),
+            "remote_address": str(getattr(ws, "remote_address", None)),
+            "proxy_environment": bool(
+                os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("ALL_PROXY")
+            ),
+        }
+
+    async def _event_loop_watchdog(self) -> None:
+        interval = 0.01
+        expected = time.perf_counter() + interval
+        while not self._stop.is_set():
+            await asyncio.sleep(interval)
+            current = time.perf_counter()
+            lag_ms = max(0.0, (current - expected) * 1000)
+            self._event_loop_lag_ms = lag_ms
+            self._event_loop_lag_max_ms = max(self._event_loop_lag_max_ms, lag_ms)
+            self._event_loop_lag_samples.append(lag_ms)
+            expected = current + interval
+
+    @staticmethod
+    def _percentiles(values: list[float]) -> dict[str, float | None]:
+        if not values:
+            return {"p50": None, "p95": None, "p99": None, "max": None}
+        ordered = sorted(values)
+        def at(fraction: float) -> float:
+            return ordered[min(len(ordered) - 1, max(0, int(len(ordered) * fraction) - 1))]
+        return {
+            "p50": round(statistics.median(ordered), 4),
+            "p95": round(at(0.95), 4),
+            "p99": round(at(0.99), 4),
+            "max": round(ordered[-1], 4),
+        }
+
+    def latency_diagnostics(self) -> dict[str, Any]:
+        records = list(self._latency_records)
+        metric_names = (
+            "exchange_to_socket_receive_ms", "socket_receive_to_handler_ms",
+            "parse_ms", "handler_to_book_update_ms",
+            "book_update_to_strategy_ms", "strategy_queue_delay_ms",
+            "total_processing_ms", "event_loop_lag_ms", "recv_wait_ms",
+            "between_recv_gap_ms", "ws_internal_queue_depth", "tcp_recv_q_bytes",
+            "ingress_queue_wait_ms", "ingress_queue_depth",
+        )
+        metrics = {
+            name: self._percentiles([
+                float(record[name]) for record in records
+                if record.get(name) is not None
+            ])
+            for name in metric_names
+        }
+        by_type: dict[str, dict[str, Any]] = {}
+        for event_type in sorted({str(record.get("event_type") or "") for record in records}):
+            subset = [record for record in records if record.get("event_type") == event_type]
+            by_type[event_type] = {
+                "count": len(subset),
+                "exchange_to_socket_receive_ms": self._percentiles([
+                    float(record["exchange_to_socket_receive_ms"]) for record in subset
+                    if record.get("exchange_to_socket_receive_ms") is not None
+                ]),
+            }
+        return {
+            "generated_at": now_iso(),
+            "health": self.health(),
+            "record_count": len(records),
+            "connection": dict(self._connection_diagnostics),
+            "metrics": metrics,
+            "by_event_type": by_type,
+            "event_loop_lag_max_lifetime_ms": round(self._event_loop_lag_max_ms, 4),
+            "recent_records": records[-2_000:],
+        }
+
+    async def _diagnostics_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(30)
+            try:
+                snapshot = await asyncio.to_thread(self.latency_diagnostics)
+                await asyncio.to_thread(self._write_diagnostics, snapshot)
+            except OSError:
+                pass
+
+    def _write_diagnostics(self, snapshot: dict[str, Any]) -> None:
+        self._diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._diagnostics_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(snapshot, sort_keys=True, default=str))
+        temporary.replace(self._diagnostics_path)
+
+    def _cache_market(self, market: dict[str, Any]) -> None:
+        condition_id = str(market.get("condition_id") or "")
+        if condition_id:
+            self._markets_by_condition[condition_id] = market
+        for key in ("yes_token_id", "no_token_id"):
+            token = str(market.get(key) or "")
+            if token:
+                self._markets_by_asset[token] = market
+
+    def _refresh_market_cache(self, asset_ids: list[str]) -> None:
+        self._markets_by_asset.clear()
+        self._markets_by_condition.clear()
+        for asset_id in asset_ids:
+            market = self.repo.market_for_asset(asset_id)
+            if market:
+                self._cache_market(market)
+
+    def event_freshness(
+        self, condition_id: str, *, now_ms: int | None = None
+    ) -> dict[str, Any]:
+        market = self._markets_by_condition.get(str(condition_id))
+        if not market:
+            market = self.repo.latest_market(str(condition_id))
+            if market:
+                self._cache_market(market)
+        if not market:
+            return {"ready": False, "reason": "UNKNOWN_EVENT"}
+        asset_ids = [
+            str(market.get("yes_token_id") or ""),
+            str(market.get("no_token_id") or ""),
+        ]
+        checked_ms = self._clock_ms() if now_ms is None else int(now_ms)
+        ready, reason = self.order_books.event_ready(
+            asset_ids, now_ms=checked_ms,
+            max_age_ms=self.stale_after_seconds * 1000,
+            future_tolerance_ms=self.future_tolerance_ms,
+        )
+        if self.status.status != "CONNECTED":
+            ready, reason = False, "MARKET_WS_NOT_CONNECTED"
+        if not set(asset_ids).issubset(set(self.subscribed_asset_ids or asset_ids)):
+            ready, reason = False, "EVENT_NOT_SUBSCRIBED"
+        ages = {
+            asset: (
+                checked_ms - self.order_books.books[asset].last_exchange_timestamp_ms
+                if asset in self.order_books.books
+                and self.order_books.books[asset].last_exchange_timestamp_ms is not None
+                else None
+            )
+            for asset in asset_ids
+        }
+        arrival_latencies = {
+            asset: (
+                self.order_books.books[asset].receive_latency_ms
+                if asset in self.order_books.books else None
+            )
+            for asset in asset_ids
+        }
+        if ready and any(
+            age is not None and age > self.stale_after_seconds * 1000
+            for age in ages.values()
+        ):
+            self.idle_ready_checks_over_threshold += 1
+        return {
+            "ready": ready, "reason": reason, "asset_ids": asset_ids,
+            "generation": self.order_books.generation,
+            "idle_exchange_age_ms": ages,
+            "message_arrival_latency_ms": arrival_latencies,
+            "book_versions": {
+                asset: {
+                    "generation": self.order_books.books[asset].generation,
+                    "update_number": self.order_books.books[asset].update_number,
+                    "message_hash": self.order_books.books[asset].last_message_hash,
+                }
+                for asset in asset_ids if asset in self.order_books.books
+            },
+            "checked_at_ms": checked_ms,
+        }
+
+    def _ensure_persistence_writer(self) -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if self._persistence_task is None or self._persistence_task.done():
+            self._persistence_task = loop.create_task(
+                self._persistence_writer(), name="market-ws-persistence-writer"
+            )
+        return True
+
+    def _enqueue_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if not self._ensure_persistence_writer():
+            stored = self.repo.store_market_snapshot(snapshot)
+            if stored is not None:
+                self.snapshots_received += 1
+                if self.on_snapshot is not None:
+                    self.on_snapshot(stored)
+            return
+        key = str(snapshot["asset_id"])
+        if key in self._pending_snapshots:
+            self._pending_snapshots.pop(key)
+            self.snapshots_coalesced += 1
+        elif len(self._pending_snapshots) >= self.persistence_queue_capacity:
+            self._pending_snapshots.popitem(last=False)
+            self.snapshots_dropped += 1
+        self._pending_snapshots[key] = snapshot
+        self.max_persistence_queue_depth = max(
+            self.max_persistence_queue_depth, len(self._pending_snapshots)
+        )
+        self._persistence_event.set()
+
+    def _queue_states(self, values: dict[str, str]) -> None:
+        changed = {
+            key: str(value) for key, value in values.items()
+            if self._last_queued_state_values.get(key) != str(value)
+        }
+        if not changed:
+            return
+        new_readiness = changed.get("strategy_readiness")
+        if new_readiness and new_readiness != self._readiness_state:
+            transition_at = time.monotonic()
+            if self._readiness_state == "NOT_READY" and self._not_ready_started_monotonic is not None:
+                duration = transition_at - self._not_ready_started_monotonic
+                self.not_ready_total_seconds += duration
+                self.not_ready_max_seconds = max(self.not_ready_max_seconds, duration)
+                self._not_ready_started_monotonic = None
+            if new_readiness == "NOT_READY":
+                self.not_ready_transitions += 1
+                self._not_ready_started_monotonic = transition_at
+            self._readiness_state = new_readiness
+        self._last_queued_state_values.update(changed)
+        if not self._ensure_persistence_writer():
+            self.repo.set_states(changed, "market_ws")
+            return
+        self._pending_states.update(changed)
+        self._persistence_event.set()
+
+    async def _persistence_writer(self) -> None:
+        while not self._stop.is_set() or self._pending_snapshots or self._pending_states:
+            if not self._pending_snapshots and not self._pending_states:
+                self._persistence_event.clear()
+                try:
+                    await asyncio.wait_for(self._persistence_event.wait(), 0.25)
+                except asyncio.TimeoutError:
+                    continue
+            await asyncio.sleep(0.01)
+            snapshots = list(self._pending_snapshots.values())
+            states = dict(self._pending_states)
+            self._pending_snapshots.clear()
+            self._pending_states.clear()
+            if snapshots:
+                stored = await asyncio.to_thread(
+                    self.repo.store_market_snapshots, snapshots
+                )
+                self.snapshots_received += len(stored)
+                if self.on_snapshot is not None:
+                    for snapshot in stored:
+                        await asyncio.to_thread(self.on_snapshot, snapshot)
+            if states:
+                await asyncio.to_thread(self.repo.set_states, states, "market_ws")
 
     def _should_persist_snapshot(self, snapshot: dict[str, Any]) -> bool:
         asset_id = str(snapshot["asset_id"])
+        now = time.monotonic()
+        previous = self._last_snapshot_monotonic.get(asset_id)
+        if previous is not None and now - previous < self.snapshot_min_interval_seconds:
+            return False
         signature = json.dumps(
             {
                 "bids": snapshot.get("bids") or [],
@@ -360,10 +1146,6 @@ class MarketWebSocketManager:
             separators=(",", ":"),
         )
         if signature == self._last_snapshot_signature.get(asset_id):
-            return False
-        now = time.monotonic()
-        previous = self._last_snapshot_monotonic.get(asset_id)
-        if previous is not None and now - previous < self.snapshot_min_interval_seconds:
             return False
         self._last_snapshot_signature[asset_id] = signature
         self._last_snapshot_monotonic[asset_id] = now
@@ -493,14 +1275,22 @@ class MarketWebSocketManager:
             return None
 
     def mark_disconnect(self, error: str = "") -> None:
+        self._logger.warning(
+            "MARKET_WS_DISCONNECTED generation=%s reason=%s",
+            self._connection_generation, error or "UNKNOWN",
+        )
         self.status.status = "DISCONNECTED"
         self.status.reconnect_attempts += 1
         self.status.stale = True
         self.status.error = error or None
         self.order_books.mark_not_ready("WS_DISCONNECTED")
-        self.repo.set_state("market_ws_status", "DISCONNECTED", "market_ws")
-        self.repo.set_state("strategy_readiness", "NOT_READY", "market_ws")
-        self.repo.set_state("strategy_block_reason", "WS_DISCONNECTED", "market_ws")
+        # Serialize disconnect state through the same coalescing writer so an
+        # in-flight READY update can never commit after DISCONNECTED.
+        self._queue_states({
+            "market_ws_status": "DISCONNECTED",
+            "strategy_readiness": "NOT_READY",
+            "strategy_block_reason": "WS_DISCONNECTED",
+        })
 
     def health(self) -> dict[str, Any]:
         stale = True
@@ -524,6 +1314,12 @@ class MarketWebSocketManager:
                     "reason": book.reason,
                     "generation": book.generation,
                     "update_number": book.update_number,
+                    "exchange_timestamp_ms": book.last_exchange_timestamp_ms,
+                    "exchange_age_ms": (
+                        self._clock_ms() - book.last_exchange_timestamp_ms
+                        if book.last_exchange_timestamp_ms is not None else None
+                    ),
+                    "receive_latency_ms": book.receive_latency_ms,
                     "best_bid": canonical_decimal(book.best_bid) if book.best_bid is not None else None,
                     "best_ask": canonical_decimal(book.best_ask) if book.best_ask is not None else None,
                 }
@@ -531,6 +1327,54 @@ class MarketWebSocketManager:
             },
             "raw_payload_persistence": self.persist_raw_payloads,
             "snapshot_min_interval_seconds": self.snapshot_min_interval_seconds,
+            "freshness_threshold_ms": self.stale_after_seconds * 1000,
+            "future_tolerance_ms": self.future_tolerance_ms,
+            "exchange_age_ms": self.last_exchange_age_ms,
+            "receive_latency_ms": self.last_receive_latency_ms,
+            "message_processing_ms": self.last_message_processing_ms,
+            "max_message_processing_ms": self.max_message_processing_ms,
+            "persistence_queue_depth": len(self._pending_snapshots),
+            "max_persistence_queue_depth": self.max_persistence_queue_depth,
+            "ingress_queue_capacity": self.ingress_queue_capacity,
+            "ingress_queue_depth": (
+                self._ingress_queue.qsize() if self._ingress_queue is not None else 0
+            ),
+            "max_ingress_queue_depth": self.max_ingress_queue_depth,
+            "ingress_frames_enqueued": self.ingress_frames_enqueued,
+            "ingress_frames_dequeued": self.ingress_frames_dequeued,
+            "ingress_queue_saturations": self.ingress_queue_saturations,
+            "ingress_resyncs": self.ingress_resyncs,
+            "ingress_resync_reasons": dict(self.ingress_resync_reasons),
+            "ingress_market_frames_discarded": self.ingress_market_frames_discarded,
+            "ingress_critical_frames_preserved": self.ingress_critical_frames_preserved,
+            "unsubscribed_market_frames_ignored": self.unsubscribed_market_frames_ignored,
+            "unsubscribed_asset_counts": dict(
+                sorted(
+                    self.unsubscribed_asset_counts.items(),
+                    key=lambda item: item[1], reverse=True,
+                )[:32]
+            ),
+            "snapshots_coalesced": self.snapshots_coalesced,
+            "snapshots_dropped": self.snapshots_dropped,
+            "dynamic_subscriptions": self.dynamic_subscriptions,
+            "dynamic_subscription_fallbacks": self.dynamic_subscription_fallbacks,
+            "readiness_state": self._readiness_state,
+            "not_ready_transitions": self.not_ready_transitions,
+            "not_ready_total_seconds": self.not_ready_total_seconds + (
+                time.monotonic() - self._not_ready_started_monotonic
+                if self._readiness_state == "NOT_READY"
+                and self._not_ready_started_monotonic is not None else 0.0
+            ),
+            "not_ready_max_seconds": max(
+                self.not_ready_max_seconds,
+                time.monotonic() - self._not_ready_started_monotonic
+                if self._readiness_state == "NOT_READY"
+                and self._not_ready_started_monotonic is not None else 0.0
+            ),
+            "rejected_frames": self.rejected_frames,
+            "out_of_order_frames": self.out_of_order_frames,
+            "rejection_reasons": dict(self.rejection_reasons),
+            "idle_ready_checks_over_threshold": self.idle_ready_checks_over_threshold,
         }
 
 

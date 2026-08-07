@@ -312,6 +312,7 @@ class StrategyRepository:
         simultaneous: bool,
         reason_code: str,
         consume_canary: bool = False,
+        require_empty_slot: bool = False,
     ) -> dict[str, Any]:
         ts = now_iso()
         intent_id = stable_id("entry", event_id)
@@ -325,6 +326,19 @@ class StrategyRepository:
             if existing is not None:
                 conn.rollback()
                 return {**(row_to_dict(existing) or {}), "_duplicate": True}
+            if require_empty_slot:
+                unresolved = conn.execute(
+                    "SELECT 1 FROM live_strategy_intents "
+                    "WHERE state NOT IN ('FILLED', 'PARTIAL_FINAL', 'ZERO_FILL', 'CANCELED', "
+                    "'REJECTED', 'FAILED', 'SETTLED', 'REDEEMED') LIMIT 1"
+                ).fetchone()
+                active_position = conn.execute(
+                    "SELECT 1 FROM live_strategy_positions "
+                    "WHERE state IN ('OPEN', 'TP_OPEN', 'EXITING', 'EXIT_RECONCILIATION_REQUIRED', 'DUST') LIMIT 1"
+                ).fetchone()
+                if unresolved is not None or active_position is not None:
+                    conn.rollback()
+                    return {"_blocked": True, "reason": "ACTIVE_ENTRY_SLOT_OCCUPIED"}
             if consume_canary:
                 state = {
                     row["key"]: row["value"]

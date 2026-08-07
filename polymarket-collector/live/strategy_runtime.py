@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
+import logging
+import time
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -53,9 +56,74 @@ class LiveStrategyRuntime:
         self.policy.validate()
         self._event_locks: dict[str, asyncio.Lock] = {}
         self._heartbeat_task: asyncio.Task[Any] | None = None
+        self._frame_task: asyncio.Task[Any] | None = None
+        self._frame_event = asyncio.Event()
+        self._pending_frames: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._frame_queue_capacity = 32
+        self.frames_coalesced = 0
+        self.frames_dropped = 0
         self._stop = asyncio.Event()
         self.frames_processed = 0
         self.last_error = ""
+        self._market_freshness: Callable[[str], dict[str, Any]] | None = None
+        self._logger = logging.getLogger(__name__)
+        self._entry_trigger_log_state: dict[tuple[str, str], str] = {}
+
+
+    @staticmethod
+    def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
+        instant = at or datetime.now(timezone.utc)
+        local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
+        inactive = local.weekday() < 5 and 14 <= local.hour < 23
+        return {
+            "allowed": not inactive,
+            "reason": "ENTRY_SCHEDULE_INACTIVE" if inactive else "ENTRY_SCHEDULE_ACTIVE",
+            "timezone": "Asia/Jerusalem",
+            "local_time": local.isoformat(),
+        }
+
+    def set_market_freshness_provider(
+        self, provider: Callable[[str], dict[str, Any]]
+    ) -> None:
+        self._market_freshness = provider
+
+    def _freshness(
+        self, condition_id: str, update: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if self._market_freshness is None:
+            if self.paper_mode():
+                return {"ready": True, "reason": "PAPER_PROVIDER_NOT_CONFIGURED"}
+            return {"ready": False, "reason": "FRESHNESS_PROVIDER_UNAVAILABLE"}
+        result = self._market_freshness(condition_id)
+        if not result.get("ready"):
+            return result
+        if update is not None:
+            token_id = str(update.get("asset_id") or "")
+            expected_generation = update.get("generation")
+            expected_number = update.get("update_number")
+            version = (result.get("book_versions") or {}).get(token_id) or {}
+            if (
+                expected_generation is not None
+                and int(version.get("generation", -1)) != int(expected_generation)
+            ) or (
+                expected_number is not None
+                and int(version.get("update_number", -1)) != int(expected_number)
+            ):
+                return {**result, "ready": False, "reason": "FRAME_SUPERSEDED"}
+        return result
+
+    def _record_freshness_block(
+        self, *, market: dict[str, Any], reason: str, intent_id: str | None = None,
+        phase: str, details: dict[str, Any] | None = None,
+    ) -> None:
+        self.repo.timeline(
+            severity="WARNING", category="DECISION", component="strategy",
+            source="market_ws", event_id=str(market.get("event_id") or ""),
+            condition_id=str(market.get("condition_id") or ""),
+            intent_id=intent_id, requested_action="ENTRY",
+            reason_code=reason, result_status="SKIPPED",
+            parameters_json={"freshness_phase": phase, **(details or {})},
+        )
 
     def enabled(self) -> bool:
         return self.config.live_module_enabled and self.config.execution_mode in {
@@ -66,6 +134,7 @@ class LiveStrategyRuntime:
         return self.config.execution_mode == "PAPER_TRADING"
 
     def schedule_frame(self, context: dict[str, Any]) -> None:
+        self._observe_entry_trigger(context)
         if not self.enabled():
             return
         try:
@@ -73,7 +142,125 @@ class LiveStrategyRuntime:
         except RuntimeError:
             asyncio.run(self.process_atomic_frame(context))
             return
-        loop.create_task(self.process_atomic_frame(context))
+        if str(context.get("event_type") or "") == "market_resolved":
+            loop.create_task(self.process_atomic_frame(context))
+            return
+        if self._frame_task is None or self._frame_task.done():
+            self._frame_task = loop.create_task(
+                self._frame_worker(), name="strategy-frame-worker"
+            )
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for update in context.get("updates") or []:
+            if isinstance(update, dict):
+                condition_id = str(update.get("condition_id") or "")
+                if condition_id:
+                    grouped.setdefault(condition_id, []).append(update)
+        for condition_id, updates in grouped.items():
+            isolated = {
+                **context,
+                "updates": updates,
+                "event_readiness": {
+                    condition_id: (context.get("event_readiness") or {}).get(
+                        condition_id, {"ready": False, "reason": "NOT_READY"}
+                    )
+                },
+            }
+            if condition_id in self._pending_frames:
+                self._pending_frames.pop(condition_id)
+                self.frames_coalesced += 1
+            elif len(self._pending_frames) >= self._frame_queue_capacity:
+                self._pending_frames.popitem(last=False)
+                self.frames_dropped += 1
+            self._pending_frames[condition_id] = isolated
+        if grouped:
+            self._frame_event.set()
+
+    def _observe_entry_trigger(self, context: dict[str, Any]) -> None:
+        """Log the 0.74 decision path, including while execution is READ_ONLY."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for update in context.get("updates") or []:
+            if isinstance(update, dict) and update.get("condition_id"):
+                grouped.setdefault(str(update["condition_id"]), []).append(update)
+        for condition_id, updates in grouped.items():
+            market = self.base.latest_market(condition_id)
+            if not market:
+                continue
+            event_id = str(market.get("event_id") or "")
+            readiness = (context.get("event_readiness") or {}).get(condition_id) or {}
+            triggers = [
+                update for update in updates
+                if exact_trigger(update.get("best_ask"), self.policy.entry_price)
+            ]
+            active_tokens = {str(update.get("asset_id") or "") for update in triggers}
+            for key in [key for key in self._entry_trigger_log_state if key[0] == event_id]:
+                if key[1] not in active_tokens:
+                    self._entry_trigger_log_state.pop(key, None)
+            if not triggers:
+                continue
+            schedule = self.entry_schedule_status()
+            paused = (
+                self.repo.pause_entries()
+                or self.base.kill_switch_active()
+                or not schedule["allowed"]
+                or (
+                    self.config.execution_mode == "REAL_TRADING"
+                    and not self.config.continuous_trading_enabled
+                    and self.base.get_state("canary_armed", "false").lower() != "true"
+                )
+            )
+            decision = choose_entry(
+                updates=updates,
+                yes_token_id=str(market.get("yes_token_id") or ""),
+                no_token_id=str(market.get("no_token_id") or ""),
+                event_ready=bool(readiness.get("ready")),
+                paused=paused,
+                event_locked=self.repo.event_state(event_id) is not None,
+                active_exposure=self.repo.exposure(),
+                observed_at=datetime.now(timezone.utc),
+                event_id=event_id,
+                policy=self.policy,
+            )
+            reason = decision.reason
+            if reason == "PAUSE_ENTRIES" and not schedule["allowed"]:
+                reason = str(schedule["reason"])
+            elif reason == "MARKET_DATA_NOT_READY":
+                reason = str(readiness.get("reason") or reason)
+            outcome = "WOULD_ENTER" if decision.allowed else "BLOCKED"
+            for update in triggers:
+                token_id = str(update.get("asset_id") or "")
+                state = f"{outcome}:{reason}"
+                key = (event_id, token_id)
+                if self._entry_trigger_log_state.get(key) == state:
+                    continue
+                self._entry_trigger_log_state[key] = state
+                self._logger.warning(
+                    "ENTRY_074 event=%s outcome=%s reason=%s side=%s readiness=%s",
+                    event_id, outcome, reason, update.get("outcome"),
+                    readiness.get("reason") or "NOT_READY",
+                )
+
+    async def _frame_worker(self) -> None:
+        while not self._stop.is_set() or self._pending_frames:
+            if not self._pending_frames:
+                self._frame_event.clear()
+                try:
+                    await asyncio.wait_for(self._frame_event.wait(), 0.25)
+                except asyncio.TimeoutError:
+                    continue
+            await asyncio.sleep(0)
+            _condition_id, context = self._pending_frames.popitem(last=False)
+            timing = context.get("_latency_timing")
+            if isinstance(timing, dict):
+                strategy_started = time.perf_counter()
+                timing["strategy_check_monotonic"] = strategy_started
+                scheduled = timing.get("strategy_scheduled_monotonic")
+                if scheduled is not None:
+                    timing["strategy_queue_delay_ms"] = (
+                        strategy_started - scheduled
+                    ) * 1000
+            await self.process_atomic_frame(context)
+            if isinstance(timing, dict):
+                timing["strategy_finished_monotonic"] = time.perf_counter()
 
     async def process_atomic_frame(self, context: dict[str, Any]) -> None:
         self.frames_processed += 1
@@ -160,6 +347,7 @@ class LiveStrategyRuntime:
         except ValueError:
             observed_at = datetime.now(timezone.utc)
         daily_loss_blocked = self._daily_loss_blocked()
+        schedule = self.entry_schedule_status()
         decision = choose_entry(
             updates=updates,
             yes_token_id=yes_token,
@@ -169,8 +357,10 @@ class LiveStrategyRuntime:
                 self.repo.pause_entries()
                 or self.base.kill_switch_active()
                 or daily_loss_blocked
+                or not schedule["allowed"]
                 or (
                     not self.paper_mode()
+                    and not self.config.continuous_trading_enabled
                     and self.base.get_state("canary_armed", "false").lower() != "true"
                 )
             ),
@@ -195,7 +385,8 @@ class LiveStrategyRuntime:
                     category="DECISION", component="strategy", source="market_ws",
                     event_id=event_id, condition_id=condition_id,
                     requested_action="ENTRY", reason_code=(
-                        readiness_reason if decision.reason == "MARKET_DATA_NOT_READY"
+                        schedule["reason"] if decision.reason == "PAUSE_ENTRIES" and not schedule["allowed"]
+                        else readiness_reason if decision.reason == "MARKET_DATA_NOT_READY"
                         else decision.reason
                     ),
                     result_status="SKIPPED",
@@ -247,11 +438,22 @@ class LiveStrategyRuntime:
                 },
             )
             return
+        selected_update = next(
+            item for item in updates if str(item.get("asset_id")) == decision.token_id
+        )
+        freshness = self._freshness(condition_id, selected_update)
+        if not freshness.get("ready"):
+            self._record_freshness_block(
+                market=market, reason=str(freshness.get("reason") or "FRESHNESS_FAILED"),
+                phase="PRE_INTENT", details=freshness,
+            )
+            return
         reservation = self.repo.reserve_event_entry(
             event_id=event_id, condition_id=condition_id,
             token_id=decision.token_id, side=decision.side,
             simultaneous=False, reason_code=decision.reason,
-            consume_canary=not self.paper_mode(),
+            consume_canary=(not self.paper_mode() and not self.config.continuous_trading_enabled),
+            require_empty_slot=(not self.paper_mode() and self.config.continuous_trading_enabled),
         )
         if reservation.get("_duplicate") or reservation.get("_blocked"):
             return
@@ -270,11 +472,8 @@ class LiveStrategyRuntime:
                 "frame_hash": frame_hash,
             },
         )
-        update = next(
-            item for item in updates if str(item.get("asset_id")) == decision.token_id
-        )
         await self._submit_entry(
-            market=market, update=update, side=str(decision.side),
+            market=market, update=selected_update, side=str(decision.side),
             intent_id=intent_id, fee_rate=fee_rate,
         )
 
@@ -335,6 +534,42 @@ class LiveStrategyRuntime:
         fee_rate: Decimal,
     ) -> None:
         event_id = str(market["event_id"])
+        freshness = self._freshness(str(market["condition_id"]), update)
+        if not freshness.get("ready"):
+            reason = str(freshness.get("reason") or "FRESHNESS_FAILED")
+            self.repo.update_intent(
+                intent_id, state="REJECTED", reason_code=reason,
+                normalized_error="Blocked by exchange timestamp freshness before submission",
+                final_at=now_iso(),
+            )
+            self._record_freshness_block(
+                market=market, reason=reason, intent_id=intent_id,
+                phase="PRE_SUBMISSION", details=freshness,
+            )
+            if not self.paper_mode():
+                self.repo.set_pause_entries(True, "strategy", reason)
+                self.base.set_states({
+                    "canary_armed": "false",
+                    "strategy_readiness": "NOT_READY",
+                    "strategy_block_reason": reason,
+                }, "strategy")
+            return
+        schedule = self.entry_schedule_status()
+        if not schedule["allowed"]:
+            reason = str(schedule["reason"])
+            self.repo.update_intent(
+                intent_id, state="REJECTED", reason_code=reason,
+                normalized_error="Blocked by entry schedule before submission",
+                final_at=now_iso(),
+            )
+            self.repo.timeline(
+                severity="WARNING", category="DECISION", component="strategy",
+                source="schedule", event_id=str(market.get("event_id") or ""),
+                condition_id=str(market.get("condition_id") or ""), intent_id=intent_id,
+                requested_action="ENTRY", reason_code=reason, result_status="SKIPPED",
+                parameters_json=schedule,
+            )
+            return
         if self.paper_mode():
             fill = simulate_buy_fak(
                 update.get("asks") or [],
@@ -848,6 +1083,10 @@ class LiveStrategyRuntime:
         if self._heartbeat_task and not self._heartbeat_task.done():
             return
         self._stop.clear()
+        if self._frame_task is None or self._frame_task.done():
+            self._frame_task = asyncio.create_task(
+                self._frame_worker(), name="strategy-frame-worker"
+            )
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="polymarket-order-heartbeat"
         )
@@ -861,6 +1100,13 @@ class LiveStrategyRuntime:
             except asyncio.CancelledError:
                 pass
             self._heartbeat_task = None
+        if self._frame_task:
+            self._frame_event.set()
+            try:
+                await asyncio.wait_for(self._frame_task, 5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._frame_task.cancel()
+            self._frame_task = None
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
@@ -889,6 +1135,10 @@ class LiveStrategyRuntime:
             "enabled": self.enabled(),
             "mode": self.config.execution_mode,
             "frames_processed": self.frames_processed,
+            "frame_queue_depth": len(self._pending_frames),
+            "frames_coalesced": self.frames_coalesced,
+            "frames_dropped": self.frames_dropped,
             "last_error": self.last_error,
+            "entry_schedule": self.entry_schedule_status(),
             **self.repo.strategy_status(),
         }

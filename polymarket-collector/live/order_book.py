@@ -35,18 +35,30 @@ class OrderBookState:
     bids: dict[Decimal, Decimal] = field(default_factory=dict)
     asks: dict[Decimal, Decimal] = field(default_factory=dict)
     ready: bool = False
+    snapshot_loaded: bool = False
     reason: str = "AWAITING_SNAPSHOT"
     last_timestamp: Decimal | None = None
+    last_exchange_timestamp_ms: int | None = None
+    last_received_at_ms: int | None = None
+    receive_latency_ms: int | None = None
     last_message_hash: str = ""
     update_number: int = 0
+    _levels_cache: dict[str, list[dict[str, str]]] = field(
+        default_factory=dict, repr=False
+    )
 
     def clear_for_resync(self, generation: int, reason: str) -> None:
         self.generation = generation
         self.bids.clear()
         self.asks.clear()
+        self._levels_cache.clear()
         self.ready = False
+        self.snapshot_loaded = False
         self.reason = reason
         self.last_timestamp = None
+        self.last_exchange_timestamp_ms = None
+        self.last_received_at_ms = None
+        self.receive_latency_ms = None
         self.last_message_hash = ""
         self.update_number += 1
 
@@ -59,14 +71,24 @@ class OrderBookState:
         return min(self.asks) if self.asks else None
 
     def levels(self, side: str) -> list[dict[str, str]]:
+        cached = self._levels_cache.get(side)
+        if cached is not None:
+            return cached
         source = self.bids if side == "bids" else self.asks
         reverse = side == "bids"
-        return [
+        levels = [
             {"price": canonical_decimal(price), "size": canonical_decimal(source[price])}
             for price in sorted(source, reverse=reverse)
         ]
+        self._levels_cache[side] = levels
+        return levels
 
-    def view(self, *, event_type: str, timestamp: str | None, message_hash: str) -> dict[str, Any]:
+    def invalidate_levels(self, *sides: str) -> None:
+        for side in sides:
+            self._levels_cache.pop(side, None)
+
+    def view(self, *, event_type: str, timestamp: str | None, message_hash: str,
+             now_ms: int | None = None) -> dict[str, Any]:
         best_bid = self.best_bid
         best_ask = self.best_ask
         return {
@@ -79,6 +101,12 @@ class OrderBookState:
             "bids": self.levels("bids"),
             "asks": self.levels("asks"),
             "market_timestamp": timestamp,
+            "exchange_timestamp_ms": self.last_exchange_timestamp_ms,
+            "exchange_age_ms": (
+                now_ms - self.last_exchange_timestamp_ms
+                if now_ms is not None and self.last_exchange_timestamp_ms is not None else None
+            ),
+            "receive_latency_ms": self.receive_latency_ms,
             "book_ready": self.ready,
             "readiness_reason": self.reason,
             "generation": self.generation,
@@ -95,6 +123,10 @@ class AtomicBookFrame:
     updates: tuple[dict[str, Any], ...]
     duplicate: bool = False
     out_of_order: bool = False
+    rejected_reason: str = ""
+    exchange_timestamp_ms: int | None = None
+    exchange_age_ms: int | None = None
+    receive_latency_ms: int | None = None
 
     def assets_at_exact_ask(self, price: Decimal) -> tuple[str, ...]:
         return tuple(
@@ -126,7 +158,10 @@ class OrderBookSet:
         for book in self.books.values():
             book.clear_for_resync(self.generation, reason)
 
-    def event_ready(self, asset_ids: Iterable[str]) -> tuple[bool, str]:
+    def event_ready(
+        self, asset_ids: Iterable[str], *, now_ms: int | None = None,
+        max_age_ms: int | None = None, future_tolerance_ms: int = 0,
+    ) -> tuple[bool, str]:
         assets = [str(asset) for asset in asset_ids if asset]
         if not assets:
             return False, "NO_ASSETS"
@@ -136,9 +171,17 @@ class OrderBookSet:
                 return False, book.reason if book else "UNKNOWN_ASSET"
             if book.generation != self.generation:
                 return False, "GENERATION_MISMATCH"
+            # Freshness is decided when each message arrives in apply(). The
+            # stored timestamp marks the last book change; it is not a lease
+            # that expires while a connected, unchanged book is idle.
+            if book.last_exchange_timestamp_ms is None:
+                return False, "MISSING_EXCHANGE_TIMESTAMP"
         return True, "READY"
 
-    def apply(self, message: dict[str, Any]) -> AtomicBookFrame:
+    def apply(
+        self, message: dict[str, Any], *, now_ms: int | None = None,
+        max_age_ms: int | None = None, future_tolerance_ms: int = 0,
+    ) -> AtomicBookFrame:
         event_type = str(message.get("event_type") or message.get("type") or "").lower()
         identity = json.dumps(message, sort_keys=True, separators=(",", ":"), default=str)
         message_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -148,29 +191,96 @@ class OrderBookSet:
             return AtomicBookFrame(event_type, timestamp, message_hash, (), duplicate=True)
         self._remember_hash(message_hash)
 
+        exchange_ms, timestamp_error = self._exchange_timestamp_ms(timestamp)
+        exchange_age_ms = (
+            int(now_ms) - exchange_ms
+            if now_ms is not None and exchange_ms is not None else None
+        )
+        structural_only = False
+        if max_age_ms is not None:
+            rejected_reason = timestamp_error
+            if not rejected_reason and exchange_age_ms is not None:
+                if exchange_age_ms < -future_tolerance_ms:
+                    rejected_reason = "FUTURE_EXCHANGE_TIMESTAMP"
+                elif exchange_age_ms > max_age_ms:
+                    rejected_reason = "STALE_EXCHANGE_TIMESTAMP"
+            if rejected_reason:
+                # An initial CLOB `book` event is an authoritative structural
+                # snapshot even when its exchange timestamp reflects an older
+                # last change. Load it only as an unready base. It cannot reach
+                # strategy, and a stale snapshot can never replace an existing
+                # generation snapshot.
+                if rejected_reason == "STALE_EXCHANGE_TIMESTAMP" and event_type == "book":
+                    asset = str(message.get("asset_id") or "")
+                    book = self.books.get(asset)
+                    if book is not None and not book.snapshot_loaded:
+                        book.bids = self._parse_levels(message.get("bids"))
+                        book.asks = self._parse_levels(message.get("asks"))
+                        book.invalidate_levels("bids", "asks")
+                        book.snapshot_loaded = True
+                        book.ready = False
+                        book.reason = rejected_reason
+                        book.last_timestamp = decimal_value(timestamp)
+                        book.last_exchange_timestamp_ms = exchange_ms
+                        book.last_received_at_ms = now_ms
+                        book.receive_latency_ms = exchange_age_ms
+                        book.last_message_hash = message_hash
+                        book.update_number += 1
+                        return AtomicBookFrame(
+                            event_type, timestamp, message_hash, (),
+                            rejected_reason=rejected_reason,
+                            exchange_timestamp_ms=exchange_ms,
+                            exchange_age_ms=exchange_age_ms,
+                            receive_latency_ms=exchange_age_ms,
+                        )
+                if rejected_reason == "STALE_EXCHANGE_TIMESTAMP" and event_type in {
+                    "price_change", "best_bid_ask",
+                }:
+                    structural_only = True
+                else:
+                    return AtomicBookFrame(
+                        event_type, timestamp, message_hash, (),
+                        rejected_reason=rejected_reason,
+                        exchange_timestamp_ms=exchange_ms,
+                        exchange_age_ms=exchange_age_ms,
+                        receive_latency_ms=exchange_age_ms,
+                    )
+
         if event_type == "book":
             asset = str(message.get("asset_id") or "")
             book = self.books.get(asset)
             if not book:
                 return AtomicBookFrame(event_type, timestamp, message_hash, ())
             if self._is_out_of_order(book, timestamp):
-                book.ready = False
-                book.reason = "OUT_OF_ORDER"
-                return AtomicBookFrame(event_type, timestamp, message_hash, (book.view(
-                    event_type=event_type, timestamp=timestamp, message_hash=message_hash
-                ),), out_of_order=True)
+                return AtomicBookFrame(
+                    event_type, timestamp, message_hash, (), out_of_order=True,
+                    rejected_reason="OUT_OF_ORDER_EXCHANGE_TIMESTAMP",
+                    exchange_timestamp_ms=exchange_ms, exchange_age_ms=exchange_age_ms,
+                    receive_latency_ms=exchange_age_ms,
+                )
             bids = self._parse_levels(message.get("bids"))
             asks = self._parse_levels(message.get("asks"))
             book.bids = bids
             book.asks = asks
+            book.invalidate_levels("bids", "asks")
             book.ready = True
+            book.snapshot_loaded = True
             book.reason = "READY"
             book.last_timestamp = decimal_value(timestamp)
+            book.last_exchange_timestamp_ms = exchange_ms
+            book.last_received_at_ms = now_ms
+            book.receive_latency_ms = exchange_age_ms
             book.last_message_hash = message_hash
             book.update_number += 1
-            return AtomicBookFrame(event_type, timestamp, message_hash, (book.view(
-                event_type=event_type, timestamp=timestamp, message_hash=message_hash
-            ),))
+            return AtomicBookFrame(
+                event_type, timestamp, message_hash, (book.view(
+                    event_type=event_type, timestamp=timestamp,
+                    message_hash=message_hash, now_ms=now_ms
+                ),),
+                exchange_timestamp_ms=exchange_ms,
+                exchange_age_ms=exchange_age_ms,
+                receive_latency_ms=exchange_age_ms,
+            )
 
         if event_type == "price_change":
             changes = message.get("price_changes")
@@ -188,20 +298,24 @@ class OrderBookSet:
             for asset, asset_changes in grouped.items():
                 book = self.books[asset]
                 if self._is_out_of_order(book, timestamp):
-                    book.ready = False
-                    book.reason = "OUT_OF_ORDER"
                     out_of_order = True
-                    updates.append(book.view(
-                        event_type=event_type, timestamp=timestamp, message_hash=message_hash
-                    ))
                     continue
-                if not book.ready:
+                if not book.snapshot_loaded:
                     book.reason = "DELTA_BEFORE_SNAPSHOT"
                     updates.append(book.view(
-                        event_type=event_type, timestamp=timestamp, message_hash=message_hash
+                        event_type=event_type, timestamp=timestamp, message_hash=message_hash, now_ms=now_ms
+                    ))
+                    continue
+                if not book.ready and book.reason not in {
+                    "STALE_EXCHANGE_TIMESTAMP", "BEST_PRICE_MISMATCH",
+                }:
+                    updates.append(book.view(
+                        event_type=event_type, timestamp=timestamp,
+                        message_hash=message_hash, now_ms=now_ms,
                     ))
                     continue
                 malformed = False
+                changed_sides: set[str] = set()
                 for change in asset_changes:
                     side = str(change.get("side") or "").upper()
                     price = decimal_value(change.get("price"))
@@ -210,16 +324,42 @@ class OrderBookSet:
                         malformed = True
                         break
                     levels = book.bids if side == "BUY" else book.asks
+                    changed_sides.add("bids" if side == "BUY" else "asks")
                     if size == 0:
                         levels.pop(price, None)
                     else:
                         levels[price] = size
+                book.invalidate_levels(*changed_sides)
                 if malformed:
                     book.ready = False
                     book.reason = "MALFORMED_DELTA"
                 else:
-                    advertised_bid = decimal_value(asset_changes[-1].get("best_bid"))
-                    advertised_ask = decimal_value(asset_changes[-1].get("best_ask"))
+                    advertised_bid = self._advertised_best(
+                        asset_changes[-1].get("best_bid"), side="bid"
+                    )
+                    advertised_ask = self._advertised_best(
+                        asset_changes[-1].get("best_ask"), side="ask"
+                    )
+                    # CLOB price_change frames may advance top-of-book without
+                    # carrying separate zero-size removals for every displaced
+                    # level. The advertised best values are authoritative; any
+                    # level beyond those boundaries is logically impossible.
+                    if advertised_bid is not None:
+                        impossible_bids = [
+                            price for price in book.bids if price > advertised_bid
+                        ]
+                        for price in impossible_bids:
+                            book.bids.pop(price, None)
+                        if impossible_bids:
+                            book.invalidate_levels("bids")
+                    if advertised_ask is not None:
+                        impossible_asks = [
+                            price for price in book.asks if price < advertised_ask
+                        ]
+                        for price in impossible_asks:
+                            book.asks.pop(price, None)
+                        if impossible_asks:
+                            book.invalidate_levels("asks")
                     if (
                         (advertised_bid is not None and advertised_bid != book.best_bid)
                         or (advertised_ask is not None and advertised_ask != book.best_ask)
@@ -227,15 +367,35 @@ class OrderBookSet:
                         book.ready = False
                         book.reason = "BEST_PRICE_MISMATCH"
                     else:
+                        book.ready = True
                         book.reason = "READY"
                     book.last_timestamp = decimal_value(timestamp) or book.last_timestamp
+                    book.last_exchange_timestamp_ms = exchange_ms or book.last_exchange_timestamp_ms
+                    book.last_received_at_ms = now_ms
+                    book.receive_latency_ms = exchange_age_ms
                     book.last_message_hash = message_hash
                     book.update_number += 1
                 updates.append(book.view(
-                    event_type=event_type, timestamp=timestamp, message_hash=message_hash
+                    event_type=event_type, timestamp=timestamp, message_hash=message_hash, now_ms=now_ms
                 ))
+            if structural_only:
+                for asset in grouped:
+                    book = self.books[asset]
+                    if book.reason == "READY":
+                        book.ready = False
+                        book.reason = "STALE_EXCHANGE_TIMESTAMP"
+                return AtomicBookFrame(
+                    event_type, timestamp, message_hash, (),
+                    rejected_reason="STALE_EXCHANGE_TIMESTAMP",
+                    exchange_timestamp_ms=exchange_ms,
+                    exchange_age_ms=exchange_age_ms,
+                    receive_latency_ms=exchange_age_ms,
+                )
             return AtomicBookFrame(
-                event_type, timestamp, message_hash, tuple(updates), out_of_order=out_of_order
+                event_type, timestamp, message_hash, tuple(updates), out_of_order=out_of_order,
+                rejected_reason=("OUT_OF_ORDER_EXCHANGE_TIMESTAMP" if out_of_order and not updates else ""),
+                exchange_timestamp_ms=exchange_ms, exchange_age_ms=exchange_age_ms,
+                receive_latency_ms=exchange_age_ms,
             )
 
         if event_type == "best_bid_ask":
@@ -244,24 +404,53 @@ class OrderBookSet:
             if not book:
                 return AtomicBookFrame(event_type, timestamp, message_hash, ())
             if self._is_out_of_order(book, timestamp):
-                book.ready = False
-                book.reason = "OUT_OF_ORDER"
-                return AtomicBookFrame(event_type, timestamp, message_hash, (book.view(
-                    event_type=event_type, timestamp=timestamp, message_hash=message_hash
-                ),), out_of_order=True)
-            advertised_bid = decimal_value(message.get("best_bid"))
-            advertised_ask = decimal_value(message.get("best_ask"))
-            if not book.ready:
+                return AtomicBookFrame(
+                    event_type, timestamp, message_hash, (), out_of_order=True,
+                    rejected_reason="OUT_OF_ORDER_EXCHANGE_TIMESTAMP",
+                    exchange_timestamp_ms=exchange_ms, exchange_age_ms=exchange_age_ms,
+                    receive_latency_ms=exchange_age_ms,
+                )
+            advertised_bid = self._advertised_best(message.get("best_bid"), side="bid")
+            advertised_ask = self._advertised_best(message.get("best_ask"), side="ask")
+            accepted = False
+            if not book.snapshot_loaded:
                 book.reason = "BEST_UPDATE_BEFORE_SNAPSHOT"
+            elif not book.ready and book.reason != "STALE_EXCHANGE_TIMESTAMP":
+                pass
             elif advertised_bid != book.best_bid or advertised_ask != book.best_ask:
                 book.ready = False
                 book.reason = "BEST_PRICE_MISMATCH"
-            book.last_timestamp = decimal_value(timestamp) or book.last_timestamp
-            book.last_message_hash = message_hash
-            book.update_number += 1
-            return AtomicBookFrame(event_type, timestamp, message_hash, (book.view(
-                event_type=event_type, timestamp=timestamp, message_hash=message_hash
-            ),))
+            else:
+                book.ready = True
+                book.reason = "READY"
+                accepted = True
+            if accepted:
+                book.last_timestamp = decimal_value(timestamp) or book.last_timestamp
+                book.last_exchange_timestamp_ms = exchange_ms or book.last_exchange_timestamp_ms
+                book.last_received_at_ms = now_ms
+                book.receive_latency_ms = exchange_age_ms
+                book.last_message_hash = message_hash
+                book.update_number += 1
+            if structural_only:
+                if book.reason == "READY":
+                    book.ready = False
+                    book.reason = "STALE_EXCHANGE_TIMESTAMP"
+                return AtomicBookFrame(
+                    event_type, timestamp, message_hash, (),
+                    rejected_reason="STALE_EXCHANGE_TIMESTAMP",
+                    exchange_timestamp_ms=exchange_ms,
+                    exchange_age_ms=exchange_age_ms,
+                    receive_latency_ms=exchange_age_ms,
+                )
+            return AtomicBookFrame(
+                event_type, timestamp, message_hash, (book.view(
+                    event_type=event_type, timestamp=timestamp,
+                    message_hash=message_hash, now_ms=now_ms
+                ),),
+                exchange_timestamp_ms=exchange_ms,
+                exchange_age_ms=exchange_age_ms,
+                receive_latency_ms=exchange_age_ms,
+            )
 
         return AtomicBookFrame(event_type, timestamp, message_hash, ())
 
@@ -280,9 +469,32 @@ class OrderBookSet:
         return result
 
     @staticmethod
+    def _advertised_best(value: Any, *, side: str) -> Decimal | None:
+        """Normalize CLOB empty-side sentinels before integrity comparison."""
+        parsed = decimal_value(value)
+        if parsed is None:
+            return None
+        if (side == "bid" and parsed == 0) or (side == "ask" and parsed == 1):
+            return None
+        return parsed
+
+    @staticmethod
     def _is_out_of_order(book: OrderBookState, timestamp: str | None) -> bool:
         incoming = decimal_value(timestamp)
         return incoming is not None and book.last_timestamp is not None and incoming < book.last_timestamp
+
+    @staticmethod
+    def _exchange_timestamp_ms(timestamp: str | None) -> tuple[int | None, str]:
+        if timestamp is None:
+            return None, "MISSING_EXCHANGE_TIMESTAMP"
+        value = decimal_value(timestamp)
+        if value is None or value <= 0:
+            return None, "INVALID_EXCHANGE_TIMESTAMP"
+        if value < Decimal("10000000000"):
+            value *= 1000
+        if value >= Decimal("100000000000000"):
+            return None, "INVALID_EXCHANGE_TIMESTAMP"
+        return int(value), ""
 
     def _remember_hash(self, message_hash: str) -> None:
         if len(self._recent_hashes) == self._recent_hashes.maxlen:

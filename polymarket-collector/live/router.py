@@ -79,8 +79,10 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         on_atomic_frame=_strategy_runtime.schedule_frame,
         persist_raw_payloads=_config.raw_market_ws_payloads_enabled,
         snapshot_min_interval_seconds=float(_config.snapshot_min_interval_seconds),
+        ingress_queue_capacity=_config.market_ws_ingress_queue_capacity,
         on_reconnect=lambda: _reconciliation.run_once(actor="market_ws_reconnect"),
     )
+    _strategy_runtime.set_market_freshness_provider(_market_ws.event_freshness)
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
         reconciliation=lambda: _reconciliation.run_once(actor="user_ws_reconnect"),

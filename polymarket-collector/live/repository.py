@@ -471,6 +471,37 @@ class LiveRepository:
             conn.commit()
         self.audit(actor, f"set_{key}", "ok", details={"value": value})
 
+    def set_states(self, values: dict[str, str], actor: str = "system") -> None:
+        """Persist coalescible status values and their changed-value audit in one transaction."""
+        if not values:
+            return
+        ts = now_iso()
+        with self.connect() as conn:
+            for key, value in values.items():
+                existing = conn.execute(
+                    "SELECT value FROM live_system_state WHERE key = ?", (key,)
+                ).fetchone()
+                if existing and str(existing["value"]) == str(value):
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO live_system_state (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    (key, str(value), ts),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO live_audit_log
+                        (occurred_at, actor, action, status, reason, details_json)
+                    VALUES (?, ?, ?, 'ok', '', ?)
+                    """,
+                    (ts, actor, f"set_{key}", json_dumps({"value": str(value)})),
+                )
+            conn.commit()
+
     def kill_switch_active(self) -> bool:
         return self.get_state("kill_switch", "true").lower() == "true"
 
@@ -643,29 +674,45 @@ class LiveRepository:
             conn.commit()
 
     def store_market_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any] | None:
-        raw = snapshot.get("raw_message") or snapshot
-        message_hash = snapshot.get("message_hash") or sha256_text(json_dumps(raw))
-        received_at = snapshot.get("received_at") or now_iso()
-        try:
-            with self.connect() as conn:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO live_market_snapshots (
-                        condition_id,event_id,asset_id,outcome,event_type,best_bid,best_ask,
-                        best_bid_size,best_ask_size,bids_json,asks_json,market_timestamp,
-                        received_at,latency_ms,source,message_hash,raw_message
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        snapshot["condition_id"], snapshot.get("event_id"), snapshot["asset_id"],
-                        snapshot.get("outcome"), snapshot.get("event_type", "unknown"),
-                        snapshot.get("best_bid"), snapshot.get("best_ask"),
-                        snapshot.get("best_bid_size"), snapshot.get("best_ask_size"),
-                        json_dumps(snapshot.get("bids") or []), json_dumps(snapshot.get("asks") or []),
-                        snapshot.get("market_timestamp"), received_at, snapshot.get("latency_ms"),
-                        snapshot.get("source", "POLYMARKET_MARKET_WS"), message_hash, json_dumps(raw),
-                    ),
-                )
+        rows = self.store_market_snapshots([snapshot])
+        return rows[0] if rows else None
+
+    def store_market_snapshots(
+        self, snapshots: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Store a coalesced batch in one SQLite transaction."""
+        stored: list[dict[str, Any]] = []
+        if not snapshots:
+            return stored
+        with self.connect() as conn:
+            for snapshot in snapshots:
+                raw = snapshot.get("raw_message") or snapshot
+                message_hash = snapshot.get("message_hash") or sha256_text(json_dumps(raw))
+                received_at = snapshot.get("received_at") or now_iso()
+                try:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO live_market_snapshots (
+                            condition_id,event_id,asset_id,outcome,event_type,best_bid,best_ask,
+                            best_bid_size,best_ask_size,bids_json,asks_json,market_timestamp,
+                            received_at,latency_ms,source,message_hash,raw_message
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            snapshot["condition_id"], snapshot.get("event_id"), snapshot["asset_id"],
+                            snapshot.get("outcome"), snapshot.get("event_type", "unknown"),
+                            snapshot.get("best_bid"), snapshot.get("best_ask"),
+                            snapshot.get("best_bid_size"), snapshot.get("best_ask_size"),
+                            json_dumps(snapshot.get("bids") or []),
+                            json_dumps(snapshot.get("asks") or []),
+                            snapshot.get("market_timestamp"), received_at,
+                            snapshot.get("latency_ms"),
+                            snapshot.get("source", "POLYMARKET_MARKET_WS"),
+                            message_hash, json_dumps(raw),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    continue
                 row = conn.execute(
                     "SELECT * FROM live_market_snapshots WHERE id = ?", (cursor.lastrowid,)
                 ).fetchone()
@@ -674,12 +721,13 @@ class LiveRepository:
                     (snapshot["condition_id"],),
                 ).fetchone()
                 if market:
-                    if str(market["yes_token_id"]) == str(snapshot["asset_id"]):
-                        side_columns = ("yes_best_bid", "yes_best_ask")
-                    elif str(market["no_token_id"]) == str(snapshot["asset_id"]):
-                        side_columns = ("no_best_bid", "no_best_ask")
-                    else:
-                        side_columns = (None, None)
+                    side_columns = (
+                        ("yes_best_bid", "yes_best_ask")
+                        if str(market["yes_token_id"]) == str(snapshot["asset_id"])
+                        else ("no_best_bid", "no_best_ask")
+                        if str(market["no_token_id"]) == str(snapshot["asset_id"])
+                        else (None, None)
+                    )
                     if side_columns[0]:
                         conn.execute(
                             f"""
@@ -693,15 +741,19 @@ class LiveRepository:
                             (
                                 snapshot.get("best_bid"), snapshot.get("best_ask"),
                                 snapshot.get("best_bid"), snapshot.get("best_ask"),
-                                json_dumps({"bids": snapshot.get("bids") or [], "asks": snapshot.get("asks") or []}),
-                                snapshot.get("market_timestamp"), received_at, received_at, received_at,
-                                snapshot["condition_id"],
+                                json_dumps({
+                                    "bids": snapshot.get("bids") or [],
+                                    "asks": snapshot.get("asks") or [],
+                                }),
+                                snapshot.get("market_timestamp"), received_at,
+                                received_at, received_at, snapshot["condition_id"],
                             ),
                         )
-                conn.commit()
-            return row_to_dict(row)
-        except sqlite3.IntegrityError:
-            return None
+                converted = row_to_dict(row)
+                if converted:
+                    stored.append(converted)
+            conn.commit()
+        return stored
 
     def latest_market_snapshot(self, asset_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
