@@ -48,6 +48,13 @@ class PaperTradingTests(unittest.TestCase):
             clock_ms=lambda: 100_000,
         )
 
+        # Direct process_message() unit tests do not run the real Market WS
+        # startup lifecycle. Production preloads market metadata before
+        # consuming frames, so the fixture must mirror that RAM state.
+        market = self.repo.latest_market("condition-next")
+        self.assertIsNotNone(market)
+        self.manager._cache_market(market)
+
     def tearDown(self):
         self.temp.cleanup()
 
