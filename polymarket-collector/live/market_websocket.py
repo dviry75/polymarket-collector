@@ -15,6 +15,7 @@ import os
 import random
 import socket
 import statistics
+import threading
 import time
 from pathlib import Path
 
@@ -106,6 +107,18 @@ class MarketWebSocketManager:
 
         self._markets_by_asset: dict[str, dict[str, Any]] = {}
         self._markets_by_condition: dict[str, dict[str, Any]] = {}
+
+        # Market metadata is read lock-free from RAM by the hot path.
+        # All DB refreshes happen outside the event loop and publish a
+        # complete cache with one atomic reference swap.
+        self._market_cache_refresh_lock = threading.Lock()
+        self._market_cache_refresh_task: asyncio.Task[Any] | None = None
+        self._market_cache_refresh_pending: set[str] = set()
+        self.market_cache_misses = 0
+        self.market_cache_refreshes = 0
+        self.market_cache_refresh_failures = 0
+        self.market_cache_last_error = ""
+
         self.snapshots_coalesced = 0
         self.snapshots_dropped = 0
         self.dynamic_subscriptions = 0
@@ -227,16 +240,21 @@ class MarketWebSocketManager:
         for task in (
             self._event_loop_watchdog_task,
             self._diagnostics_task,
+            self._market_cache_refresh_task,
         ):
             if task:
                 task.cancel()
+
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
         if self._latency_csv is not None:
             await asyncio.to_thread(self._latency_csv.close)
-        self._event_loop_watchdog_task = self._diagnostics_task = None
+        self._event_loop_watchdog_task = None
+        self._diagnostics_task = None
+        self._market_cache_refresh_task = None
+
         self.status.status = "STOPPED"
         self.status.stale = True
 
@@ -752,20 +770,26 @@ class MarketWebSocketManager:
                     message.get("winning_outcome"),
                 )
         else:
-            assets = self.subscribed_asset_ids or list(self._markets_by_asset)
+            assets = (
+                self.subscribed_asset_ids
+                or list(self._markets_by_asset)
+            )
+
             if not assets:
-                assets = self.repo.market_ws_asset_ids()
-                if not assets:
-                    # Direct process_message() callers (tests/smoke tools) do
-                    # not necessarily have a live WS subscription. Fall back
-                    # to the assets explicitly carried by this frame only.
-                    #
-                    # A real Market WS connection always has
-                    # subscribed_asset_ids, so this does not broaden the
-                    # production subscription scope.
-                    assets = self._message_asset_ids(message)
-                self._refresh_market_cache(assets)
-            self.order_books.ensure_assets(assets)
+                # Direct callers may still provide a valid book frame.
+                # We may build the in-memory book, but metadata must be
+                # refreshed asynchronously before strategy evaluation.
+                assets = self._message_asset_ids(
+                    message
+                )
+
+                self._request_market_cache_refresh(
+                    assets
+                )
+
+            self.order_books.ensure_assets(
+                assets
+            )
             frame = self.order_books.apply(
                 message,
                 now_ms=now_ms,
@@ -813,12 +837,32 @@ class MarketWebSocketManager:
                 })
             for view in frame.updates:
                 asset_id = str(view["asset_id"])
-                market = self._markets_by_asset.get(asset_id)
+                market = self._markets_by_asset.get(
+                    asset_id
+                )
+
                 if not market:
-                    market = self.repo.market_for_asset(asset_id)
-                    if market:
-                        self._cache_market(market)
-                if not market:
+                    self.market_cache_misses += 1
+
+                    refresh_assets = (
+                        list(self.subscribed_asset_ids)
+                        or assets
+                        or [asset_id]
+                    )
+
+                    self._request_market_cache_refresh(
+                        refresh_assets
+                    )
+
+                    # Fail closed. Do not let a WebSocket frame wait for
+                    # SQLite metadata during the latency-sensitive path.
+                    self._queue_states({
+                        "strategy_readiness": "NOT_READY",
+                        "strategy_block_reason": (
+                            "MARKET_METADATA_CACHE_MISS"
+                        ),
+                    })
+
                     continue
                 outcome = (
                     "YES" if str(market.get("yes_token_id")) == asset_id
@@ -1238,33 +1282,223 @@ class MarketWebSocketManager:
         temporary.write_text(json.dumps(snapshot, sort_keys=True, default=str))
         temporary.replace(self._diagnostics_path)
 
-    def _cache_market(self, market: dict[str, Any]) -> None:
-        condition_id = str(market.get("condition_id") or "")
+    @staticmethod
+    def _index_market(
+        market: dict[str, Any],
+        by_asset: dict[str, dict[str, Any]],
+        by_condition: dict[str, dict[str, Any]],
+    ) -> None:
+        condition_id = str(
+            market.get("condition_id") or ""
+        )
+
         if condition_id:
-            self._markets_by_condition[condition_id] = market
-        for key in ("yes_token_id", "no_token_id"):
+            by_condition[condition_id] = market
+
+        for key in (
+            "yes_token_id",
+            "no_token_id",
+        ):
             token = str(market.get(key) or "")
+
             if token:
-                self._markets_by_asset[token] = market
+                by_asset[token] = market
 
-    def _refresh_market_cache(self, asset_ids: list[str]) -> None:
-        self._markets_by_asset.clear()
-        self._markets_by_condition.clear()
-        for asset_id in asset_ids:
-            market = self.repo.market_for_asset(asset_id)
-            if market:
-                self._cache_market(market)
+    def _cache_market(
+        self,
+        market: dict[str, Any],
+    ) -> None:
+        """Atomically merge one market into the RAM cache."""
+        with self._market_cache_refresh_lock:
+            by_asset = dict(self._markets_by_asset)
+            by_condition = dict(
+                self._markets_by_condition
+            )
 
-    def market_for_condition(self, condition_id: str) -> dict[str, Any] | None:
-        """Return market metadata from RAM; SQLite is fallback-only on cache miss."""
+            self._index_market(
+                market,
+                by_asset,
+                by_condition,
+            )
+
+            self._markets_by_asset = by_asset
+            self._markets_by_condition = by_condition
+
+    def _refresh_market_cache(
+        self,
+        asset_ids: list[str],
+    ) -> None:
+        """Rebuild the requested market cache off the event loop.
+
+        Readers continue seeing the previous complete cache until every
+        SQLite lookup has finished. The new dictionaries are then published
+        using atomic reference replacement.
+        """
+        normalized = list(dict.fromkeys(
+            str(asset_id)
+            for asset_id in asset_ids
+            if str(asset_id)
+        ))
+
+        with self._market_cache_refresh_lock:
+            by_asset: dict[
+                str, dict[str, Any]
+            ] = {}
+
+            by_condition: dict[
+                str, dict[str, Any]
+            ] = {}
+
+            for asset_id in normalized:
+                market = self.repo.market_for_asset(
+                    asset_id
+                )
+
+                if market:
+                    self._index_market(
+                        market,
+                        by_asset,
+                        by_condition,
+                    )
+
+            self._markets_by_asset = by_asset
+            self._markets_by_condition = by_condition
+            self.market_cache_refreshes += 1
+
+    def _request_market_cache_refresh(
+        self,
+        asset_ids: list[str],
+    ) -> None:
+        """Request an asynchronous metadata refresh.
+
+        This method performs no SQLite I/O itself.
+        """
+        wanted = {
+            str(asset_id)
+            for asset_id in asset_ids
+            if str(asset_id)
+        }
+
+        if not wanted:
+            return
+
+        self._market_cache_refresh_pending.update(
+            wanted
+        )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # A caller outside an event loop cannot start a background
+            # refresh. It still fails closed; no synchronous DB fallback.
+            return
+
+        if (
+            self._market_cache_refresh_task is None
+            or self._market_cache_refresh_task.done()
+        ):
+            self._market_cache_refresh_task = (
+                loop.create_task(
+                    self._market_cache_refresh_worker(),
+                    name="market-metadata-cache-refresh",
+                )
+            )
+
+    async def _market_cache_refresh_worker(
+        self,
+    ) -> None:
+        while (
+            self._market_cache_refresh_pending
+            and not self._stop.is_set()
+        ):
+            pending = set(
+                self._market_cache_refresh_pending
+            )
+            self._market_cache_refresh_pending.clear()
+
+            # A miss should refresh the complete active subscription set,
+            # not accidentally replace the cache with one isolated token.
+            subscribed = {
+                str(asset_id)
+                for asset_id in self.subscribed_asset_ids
+                if str(asset_id)
+            }
+
+            current = set(
+                self._markets_by_asset
+            )
+
+            wanted = sorted(
+                subscribed
+                or (pending | current)
+            )
+
+            if not wanted:
+                continue
+
+            try:
+                await asyncio.to_thread(
+                    self._refresh_market_cache,
+                    wanted,
+                )
+
+            except Exception as exc:
+                self.market_cache_refresh_failures += 1
+                self.market_cache_last_error = (
+                    f"{type(exc).__name__}:{exc}"
+                )[:500]
+
+                self._logger.exception(
+                    "Market metadata cache refresh failed"
+                )
+
+                # Preserve the request for a later retry.
+                self._market_cache_refresh_pending.update(
+                    pending
+                )
+
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(),
+                        0.25,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                continue
+
+            self.market_cache_last_error = ""
+
+    def market_for_condition(
+        self,
+        condition_id: str,
+    ) -> dict[str, Any] | None:
+        """Return market metadata from RAM only.
+
+        A cache miss fails closed and schedules an asynchronous refresh.
+        SQLite is never queried synchronously by the trading hot path.
+        """
         key = str(condition_id)
-        market = self._markets_by_condition.get(key)
+
+        market = self._markets_by_condition.get(
+            key
+        )
+
         if market:
             return market
-        market = self.repo.latest_market(key)
-        if market:
-            self._cache_market(market)
-        return market
+
+        self.market_cache_misses += 1
+
+        refresh_assets = (
+            list(self.subscribed_asset_ids)
+            or list(self._markets_by_asset)
+        )
+
+        self._request_market_cache_refresh(
+            refresh_assets
+        )
+
+        return None
 
     def event_freshness(
         self, condition_id: str, *, now_ms: int | None = None
@@ -1800,6 +2034,23 @@ class MarketWebSocketManager:
             "persistence_last_error": self.persistence_last_error,
             "persistence_connection_open": (
                 self._persistence_connection is not None
+            ),
+            "market_cache_assets": len(
+                self._markets_by_asset
+            ),
+            "market_cache_conditions": len(
+                self._markets_by_condition
+            ),
+            "market_cache_misses": self.market_cache_misses,
+            "market_cache_refreshes": self.market_cache_refreshes,
+            "market_cache_refresh_failures": (
+                self.market_cache_refresh_failures
+            ),
+            "market_cache_refresh_pending": len(
+                self._market_cache_refresh_pending
+            ),
+            "market_cache_last_error": (
+                self.market_cache_last_error
             ),
             "ingress_queue_capacity": self.ingress_queue_capacity,
             "ingress_queue_depth": (

@@ -1514,3 +1514,174 @@ def test_market_persistence_batch_reuses_one_sqlite_connection():
 
     finally:
         temp.cleanup()
+
+
+def test_market_cache_refresh_publishes_atomically():
+    from pathlib import Path
+    from live.market_websocket import (
+        MarketWebSocketManager,
+    )
+
+    old_market = {
+        "condition_id": "old-condition",
+        "yes_token_id": "old-yes",
+        "no_token_id": "old-no",
+    }
+
+    new_market = {
+        "condition_id": "new-condition",
+        "yes_token_id": "new-yes",
+        "no_token_id": "new-no",
+    }
+
+    class FakeRepo:
+        db_path = Path("/tmp/fake-market-cache.sqlite3")
+
+        def market_for_asset(self, asset_id):
+            # While the replacement cache is being constructed,
+            # readers must continue seeing the OLD complete cache.
+            assert (
+                manager._markets_by_condition.get(
+                    "old-condition"
+                )
+                is old_market
+            )
+
+            if asset_id in {
+                "new-yes",
+                "new-no",
+            }:
+                return new_market
+
+            return None
+
+    manager = MarketWebSocketManager(
+        FakeRepo()
+    )
+
+    manager._markets_by_asset = {
+        "old-yes": old_market,
+        "old-no": old_market,
+    }
+
+    manager._markets_by_condition = {
+        "old-condition": old_market,
+    }
+
+    manager._refresh_market_cache([
+        "new-yes",
+        "new-no",
+    ])
+
+    assert set(manager._markets_by_asset) == {
+        "new-yes",
+        "new-no",
+    }
+
+    assert set(manager._markets_by_condition) == {
+        "new-condition",
+    }
+
+
+def test_market_for_condition_never_uses_sqlite_fallback():
+    from pathlib import Path
+    from live.market_websocket import (
+        MarketWebSocketManager,
+    )
+
+    class ExplodingRepo:
+        db_path = Path("/tmp/fake-no-fallback.sqlite3")
+
+        def latest_market(self, *_args, **_kwargs):
+            raise AssertionError(
+                "SQLite fallback must not run"
+            )
+
+        def market_for_asset(
+            self,
+            *_args,
+            **_kwargs,
+        ):
+            raise AssertionError(
+                "SQLite fallback must not run"
+            )
+
+    manager = MarketWebSocketManager(
+        ExplodingRepo()
+    )
+
+    assert (
+        manager.market_for_condition(
+            "missing-condition"
+        )
+        is None
+    )
+
+    assert manager.market_cache_misses == 1
+
+
+def test_market_process_message_has_no_sync_metadata_db_fallback():
+    import inspect
+    from live.market_websocket import (
+        MarketWebSocketManager,
+    )
+
+    source = inspect.getsource(
+        MarketWebSocketManager.process_message
+    )
+
+    forbidden = (
+        "self.repo.market_for_asset(",
+        "self.repo.market_ws_asset_ids(",
+        "self._refresh_market_cache(",
+    )
+
+    for needle in forbidden:
+        assert needle not in source
+
+
+def test_market_cache_miss_schedules_background_refresh():
+    from pathlib import Path
+    from live.market_websocket import (
+        MarketWebSocketManager,
+    )
+
+    class FakeRepo:
+        db_path = Path(
+            "/tmp/fake-background-cache.sqlite3"
+        )
+
+    async def scenario():
+        manager = MarketWebSocketManager(
+            FakeRepo()
+        )
+
+        manager.subscribed_asset_ids = [
+            "yes-token",
+            "no-token",
+        ]
+
+        calls = []
+
+        def fake_refresh(asset_ids):
+            calls.append(tuple(asset_ids))
+
+        manager._refresh_market_cache = (
+            fake_refresh
+        )
+
+        manager._request_market_cache_refresh([
+            "yes-token",
+        ])
+
+        await asyncio.wait_for(
+            manager._market_cache_refresh_task,
+            timeout=1,
+        )
+
+        assert calls == [(
+            "no-token",
+            "yes-token",
+        )]
+
+    asyncio.run(scenario())
