@@ -1685,3 +1685,231 @@ def test_market_cache_miss_schedules_background_refresh():
         )]
 
     asyncio.run(scenario())
+
+
+def test_order_book_preserves_intermediate_exact_ask_transition():
+    from live.order_book import OrderBookSet
+
+    books = OrderBookSet(["token-transition"])
+
+    books.apply({
+        "event_type": "book",
+        "asset_id": "token-transition",
+        "bids": [
+            {"price": "0.70", "size": "10"},
+        ],
+        "asks": [
+            {"price": "0.73", "size": "10"},
+            {"price": "0.74", "size": "10"},
+            {"price": "0.75", "size": "10"},
+        ],
+        "timestamp": "100",
+    })
+
+    frame = books.apply({
+        "event_type": "price_change",
+        "price_changes": [
+            {
+                "asset_id": "token-transition",
+                "side": "SELL",
+                "price": "0.73",
+                "size": "0",
+                "best_bid": "0.70",
+                "best_ask": "0.74",
+            },
+            {
+                "asset_id": "token-transition",
+                "side": "SELL",
+                "price": "0.74",
+                "size": "0",
+                "best_bid": "0.70",
+                "best_ask": "0.75",
+            },
+        ],
+        "timestamp": "101",
+    })
+
+    assert frame.updates[0]["best_ask"] == "0.75"
+
+    assert [
+        item["best_ask"]
+        for item in frame.top_transitions
+    ] == [
+        "0.74",
+        "0.75",
+    ]
+
+
+def test_order_book_preserves_stop_then_emergency_transition_order():
+    from live.order_book import OrderBookSet
+
+    books = OrderBookSet(["token-stop"])
+
+    books.apply({
+        "event_type": "book",
+        "asset_id": "token-stop",
+        "bids": [
+            {"price": "0.67", "size": "10"},
+            {"price": "0.66", "size": "10"},
+            {"price": "0.60", "size": "10"},
+        ],
+        "asks": [
+            {"price": "0.70", "size": "10"},
+        ],
+        "timestamp": "200",
+    })
+
+    frame = books.apply({
+        "event_type": "price_change",
+        "price_changes": [
+            {
+                "asset_id": "token-stop",
+                "side": "BUY",
+                "price": "0.67",
+                "size": "0",
+                "best_bid": "0.66",
+                "best_ask": "0.70",
+            },
+            {
+                "asset_id": "token-stop",
+                "side": "BUY",
+                "price": "0.66",
+                "size": "0",
+                "best_bid": "0.60",
+                "best_ask": "0.70",
+            },
+        ],
+        "timestamp": "201",
+    })
+
+    assert [
+        Decimal(item["best_bid"])
+        for item in frame.top_transitions
+    ] == [
+        Decimal("0.66"),
+        Decimal("0.60"),
+    ]
+
+
+def test_strategy_queues_intra_message_stop_and_emergency_fifo():
+    import asyncio
+    from collections import OrderedDict, deque
+    from types import SimpleNamespace
+
+    from live.strategy_runtime import LiveStrategyRuntime
+
+    class ActiveTask:
+        def done(self):
+            return False
+
+    async def scenario():
+        runtime = LiveStrategyRuntime.__new__(
+            LiveStrategyRuntime
+        )
+
+        runtime.policy = SimpleNamespace(
+            entry_price=Decimal("0.74"),
+            stop_price=Decimal("0.66"),
+            emergency_price=Decimal("0.60"),
+        )
+
+        runtime._critical_price_state = {}
+        runtime._critical_frames = deque()
+        runtime._pending_frames = OrderedDict()
+        runtime._frame_queue_capacity = 64
+        runtime._frame_task = ActiveTask()
+        runtime._frame_event = asyncio.Event()
+
+        runtime.frames_coalesced = 0
+        runtime.frames_dropped = 0
+        runtime.critical_triggers_queued = 0
+        runtime.max_critical_queue_depth = 0
+
+        runtime.enabled = lambda: True
+        runtime._observe_entry_trigger = (
+            lambda _context: None
+        )
+
+        context = {
+            "event_type": "price_change",
+            "message_hash": "ordered-critical",
+            "received_at": "2026-08-08T00:00:00+00:00",
+            "updates": [
+                {
+                    "condition_id": "condition-1",
+                    "asset_id": "token-1",
+                    "best_bid": "0.59",
+                    "best_ask": "0.70",
+                    "exchange_timestamp_ms": 1000,
+                },
+            ],
+            "top_transitions": [
+                {
+                    "condition_id": "condition-1",
+                    "asset_id": "token-1",
+                    "best_bid": "0.66",
+                    "best_ask": "0.70",
+                    "exchange_timestamp_ms": 1000,
+                },
+                {
+                    "condition_id": "condition-1",
+                    "asset_id": "token-1",
+                    "best_bid": "0.60",
+                    "best_ask": "0.70",
+                    "exchange_timestamp_ms": 1000,
+                },
+            ],
+            "event_readiness": {
+                "condition-1": {
+                    "ready": True,
+                    "reason": "READY",
+                },
+            },
+        }
+
+        runtime.schedule_frame(context)
+
+        assert len(runtime._critical_frames) == 1
+
+        critical = runtime._critical_frames[0]
+
+        latched = [
+            update
+            for update in critical["updates"]
+            if update.get(
+                "_critical_trigger_latched"
+            )
+        ]
+
+        assert [
+            update["best_bid"]
+            for update in latched
+        ] == [
+            "0.66",
+            "0.60",
+        ]
+
+        assert (
+            latched[0][
+                "_critical_stop_latched"
+            ]
+            is True
+        )
+
+        assert (
+            latched[1][
+                "_critical_emergency_latched"
+            ]
+            is True
+        )
+
+        assert set(
+            critical[
+                "_critical_trigger_types"
+            ]
+        ) == {
+            "STOP_066",
+            "EMERGENCY_060",
+        }
+
+    asyncio.run(scenario())

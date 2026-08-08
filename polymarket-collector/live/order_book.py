@@ -197,6 +197,11 @@ class AtomicBookFrame:
     exchange_age_ms: int | None = None
     receive_latency_ms: int | None = None
 
+    # Ordered intermediate top-of-book states observed while applying one
+    # raw price_change message. These are strategy-only observations; the
+    # normal updates tuple continues to represent the final atomic book.
+    top_transitions: tuple[dict[str, Any], ...] = ()
+
     def assets_at_exact_ask(self, price: Decimal) -> tuple[str, ...]:
         return tuple(
             str(update["asset_id"])
@@ -372,16 +377,38 @@ class OrderBookSet:
             changes = message.get("price_changes")
             if not isinstance(changes, list):
                 changes = []
-            grouped: dict[str, list[dict[str, Any]]] = {}
-            for change in changes:
+            grouped: dict[
+                str,
+                list[tuple[int, dict[str, Any]]],
+            ] = {}
+
+            for raw_index, change in enumerate(changes):
                 if not isinstance(change, dict):
                     continue
-                asset = str(change.get("asset_id") or message.get("asset_id") or "")
+
+                asset = str(
+                    change.get("asset_id")
+                    or message.get("asset_id")
+                    or ""
+                )
+
                 if asset in self.books:
-                    grouped.setdefault(asset, []).append(change)
+                    grouped.setdefault(
+                        asset,
+                        [],
+                    ).append(
+                        (raw_index, change)
+                    )
+
             updates: list[dict[str, Any]] = []
+            top_transitions: list[dict[str, Any]] = []
             out_of_order = False
-            for asset, asset_changes in grouped.items():
+
+            for asset, indexed_changes in grouped.items():
+                asset_changes = [
+                    change
+                    for _index, change in indexed_changes
+                ]
                 book = self.books[asset]
                 if self._is_out_of_order(book, timestamp):
                     out_of_order = True
@@ -402,16 +429,132 @@ class OrderBookSet:
                     continue
                 malformed = False
                 changed_sides: set[str] = set()
-                for change in asset_changes:
-                    side = str(change.get("side") or "").upper()
-                    price = decimal_value(change.get("price"))
-                    size = decimal_value(change.get("size"))
-                    if side not in {"BUY", "SELL"} or price is None or size is None or price < 0 or size < 0:
+                asset_top_transitions: list[dict[str, Any]] = []
+
+                previous_observed_bid = book.best_bid
+                previous_observed_ask = book.best_ask
+
+                for raw_index, change in indexed_changes:
+                    side = str(
+                        change.get("side") or ""
+                    ).upper()
+                    price = decimal_value(
+                        change.get("price")
+                    )
+                    size = decimal_value(
+                        change.get("size")
+                    )
+
+                    if (
+                        side not in {"BUY", "SELL"}
+                        or price is None
+                        or size is None
+                        or price < 0
+                        or size < 0
+                    ):
                         malformed = True
                         break
+
                     changed_sides.add(
-                        book.apply_level(side=side, price=price, size=size)
+                        book.apply_level(
+                            side=side,
+                            price=price,
+                            size=size,
+                        )
                     )
+
+                    raw_bid_present = (
+                        change.get("best_bid")
+                        not in (None, "")
+                    )
+                    raw_ask_present = (
+                        change.get("best_ask")
+                        not in (None, "")
+                    )
+
+                    advertised_bid_now = (
+                        self._advertised_best(
+                            change.get("best_bid"),
+                            side="bid",
+                        )
+                        if raw_bid_present
+                        else None
+                    )
+
+                    advertised_ask_now = (
+                        self._advertised_best(
+                            change.get("best_ask"),
+                            side="ask",
+                        )
+                        if raw_ask_present
+                        else None
+                    )
+
+                    observed_bid = (
+                        advertised_bid_now
+                        if raw_bid_present
+                        else book.best_bid
+                    )
+
+                    observed_ask = (
+                        advertised_ask_now
+                        if raw_ask_present
+                        else book.best_ask
+                    )
+
+                    if (
+                        observed_bid != previous_observed_bid
+                        or observed_ask != previous_observed_ask
+                    ):
+                        bid_size = (
+                            book.bids.get(observed_bid)
+                            if observed_bid is not None
+                            else None
+                        )
+                        ask_size = (
+                            book.asks.get(observed_ask)
+                            if observed_ask is not None
+                            else None
+                        )
+
+                        asset_top_transitions.append({
+                            "asset_id": asset,
+                            "event_type": event_type,
+                            "best_bid": (
+                                canonical_decimal(observed_bid)
+                                if observed_bid is not None
+                                else None
+                            ),
+                            "best_ask": (
+                                canonical_decimal(observed_ask)
+                                if observed_ask is not None
+                                else None
+                            ),
+                            "best_bid_size": (
+                                canonical_decimal(bid_size)
+                                if bid_size is not None
+                                else None
+                            ),
+                            "best_ask_size": (
+                                canonical_decimal(ask_size)
+                                if ask_size is not None
+                                else None
+                            ),
+                            "market_timestamp": timestamp,
+                            "exchange_timestamp_ms": exchange_ms,
+                            "exchange_age_ms": exchange_age_ms,
+                            "receive_latency_ms": exchange_age_ms,
+                            "book_ready": True,
+                            "readiness_reason": "READY",
+                            "generation": book.generation,
+                            "update_number": book.update_number + 1,
+                            "message_hash": message_hash,
+                            "_raw_change_index": raw_index,
+                            "_intermediate_top_transition": True,
+                        })
+
+                    previous_observed_bid = observed_bid
+                    previous_observed_ask = observed_ask
                 if malformed:
                     book.ready = False
                     book.reason = "MALFORMED_DELTA"
@@ -459,6 +602,12 @@ class OrderBookSet:
                     book.receive_latency_ms = exchange_age_ms
                     book.last_message_hash = message_hash
                     book.update_number += 1
+
+                    if book.reason == "READY":
+                        top_transitions.extend(
+                            asset_top_transitions
+                        )
+
                 updates.append(self._render_book(book, include_depth=include_depth,
                     event_type=event_type, timestamp=timestamp, message_hash=message_hash, now_ms=now_ms
                 ))
@@ -476,10 +625,30 @@ class OrderBookSet:
                     receive_latency_ms=exchange_age_ms,
                 )
             return AtomicBookFrame(
-                event_type, timestamp, message_hash, tuple(updates), out_of_order=out_of_order,
-                rejected_reason=("OUT_OF_ORDER_EXCHANGE_TIMESTAMP" if out_of_order and not updates else ""),
-                exchange_timestamp_ms=exchange_ms, exchange_age_ms=exchange_age_ms,
+                event_type,
+                timestamp,
+                message_hash,
+                tuple(updates),
+                out_of_order=out_of_order,
+                rejected_reason=(
+                    "OUT_OF_ORDER_EXCHANGE_TIMESTAMP"
+                    if out_of_order and not updates
+                    else ""
+                ),
+                exchange_timestamp_ms=exchange_ms,
+                exchange_age_ms=exchange_age_ms,
                 receive_latency_ms=exchange_age_ms,
+                top_transitions=tuple(
+                    sorted(
+                        top_transitions,
+                        key=lambda item: int(
+                            item.get(
+                                "_raw_change_index",
+                                -1,
+                            )
+                        ),
+                    )
+                ),
             )
 
         if event_type == "best_bid_ask":

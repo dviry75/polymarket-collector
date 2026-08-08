@@ -385,7 +385,30 @@ class LiveStrategyRuntime:
         return self.config.execution_mode == "PAPER_TRADING"
 
     def schedule_frame(self, context: dict[str, Any]) -> None:
-        self._observe_entry_trigger(context)
+        final_updates = [
+            item
+            for item in context.get("updates") or []
+            if isinstance(item, dict)
+        ]
+
+        transition_updates = [
+            item
+            for item in context.get("top_transitions") or []
+            if isinstance(item, dict)
+        ]
+
+        # Observability must see historical exact-entry edges as well, even
+        # when the final atomic book already moved away from 0.74.
+        observed_context = {
+            **context,
+            "updates": [
+                *transition_updates,
+                *final_updates,
+            ],
+        }
+        self._observe_entry_trigger(
+            observed_context
+        )
 
         if not self.enabled():
             return
@@ -393,52 +416,146 @@ class LiveStrategyRuntime:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(self.process_atomic_frame(context))
+            asyncio.run(
+                self.process_atomic_frame(
+                    context
+                )
+            )
             return
 
-        if str(context.get("event_type") or "") == "market_resolved":
-            loop.create_task(self.process_atomic_frame(context))
+        if (
+            str(context.get("event_type") or "")
+            == "market_resolved"
+        ):
+            loop.create_task(
+                self.process_atomic_frame(
+                    context
+                )
+            )
             return
 
-        if self._frame_task is None or self._frame_task.done():
+        if (
+            self._frame_task is None
+            or self._frame_task.done()
+        ):
             self._frame_task = loop.create_task(
-                self._frame_worker(), name="strategy-frame-worker"
+                self._frame_worker(),
+                name="strategy-frame-worker",
             )
 
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for update in context.get("updates") or []:
-            if isinstance(update, dict):
-                condition_id = str(update.get("condition_id") or "")
-                if condition_id:
-                    grouped.setdefault(condition_id, []).append(update)
+        grouped_final: dict[
+            str,
+            list[dict[str, Any]],
+        ] = {}
 
-        for condition_id, updates in grouped.items():
+        grouped_observed: dict[
+            str,
+            list[dict[str, Any]],
+        ] = {}
+
+        condition_order: list[str] = []
+
+        for update in final_updates:
+            condition_id = str(
+                update.get("condition_id") or ""
+            )
+
+            if not condition_id:
+                continue
+
+            grouped_final.setdefault(
+                condition_id,
+                [],
+            ).append(update)
+
+        # Intermediate transitions MUST be examined before the final state.
+        # They already carry raw-message ordering from OrderBookSet.
+        for update in [
+            *transition_updates,
+            *final_updates,
+        ]:
+            condition_id = str(
+                update.get("condition_id") or ""
+            )
+
+            if not condition_id:
+                continue
+
+            if condition_id not in grouped_observed:
+                condition_order.append(
+                    condition_id
+                )
+
+            grouped_observed.setdefault(
+                condition_id,
+                [],
+            ).append(update)
+
+        for condition_id in condition_order:
+            updates = grouped_final.get(
+                condition_id,
+                [],
+            )
+
+            observations = grouped_observed.get(
+                condition_id,
+                [],
+            )
+
             readiness = (
-                (context.get("event_readiness") or {}).get(
+                (
+                    context.get(
+                        "event_readiness"
+                    )
+                    or {}
+                ).get(
                     condition_id,
-                    {"ready": False, "reason": "NOT_READY"},
+                    {
+                        "ready": False,
+                        "reason": "NOT_READY",
+                    },
                 )
             )
 
-            latched_updates: list[dict[str, Any]] = []
+            latched_updates: list[
+                dict[str, Any]
+            ] = []
+
             critical_types: set[str] = set()
 
-            for update in updates:
+            for update in observations:
                 item = dict(update)
 
-                asset_id = str(item.get("asset_id") or "")
-                state_key = (condition_id, asset_id)
-
-                previous = self._critical_price_state.get(
-                    state_key,
-                    {"best_ask": None, "best_bid": None},
+                asset_id = str(
+                    item.get("asset_id")
+                    or ""
                 )
 
-                ask = item.get("best_ask")
-                bid = item.get("best_bid")
+                state_key = (
+                    condition_id,
+                    asset_id,
+                )
+
+                previous = (
+                    self._critical_price_state.get(
+                        state_key,
+                        {
+                            "best_ask": None,
+                            "best_bid": None,
+                        },
+                    )
+                )
+
+                ask = item.get(
+                    "best_ask"
+                )
+                bid = item.get(
+                    "best_bid"
+                )
 
                 entry_now = exact_trigger(
-                    ask, self.policy.entry_price
+                    ask,
+                    self.policy.entry_price,
                 )
                 entry_before = exact_trigger(
                     previous.get("best_ask"),
@@ -446,7 +563,8 @@ class LiveStrategyRuntime:
                 )
 
                 stop_now = exact_trigger(
-                    bid, self.policy.stop_price
+                    bid,
+                    self.policy.stop_price,
                 )
                 stop_before = exact_trigger(
                     previous.get("best_bid"),
@@ -454,76 +572,182 @@ class LiveStrategyRuntime:
                 )
 
                 emergency_now = exact_trigger(
-                    bid, self.policy.emergency_price
+                    bid,
+                    self.policy.emergency_price,
                 )
                 emergency_before = exact_trigger(
                     previous.get("best_bid"),
                     self.policy.emergency_price,
                 )
 
-                # Always advance the observed top-of-book state, including
-                # frames which are not themselves critical.
-                self._critical_price_state[state_key] = {
+                # Always advance through every ordered intermediate
+                # observation and finally the atomic final state.
+                self._critical_price_state[
+                    state_key
+                ] = {
                     "best_ask": ask,
                     "best_bid": bid,
                 }
 
-                if entry_now and not entry_before:
-                    item["_critical_trigger_latched"] = True
-                    item["_critical_entry_latched"] = True
-                    critical_types.add("ENTRY_074")
+                latched = False
 
-                if stop_now and not stop_before:
-                    item["_critical_stop_latched"] = True
-                    critical_types.add("STOP_066")
+                if (
+                    entry_now
+                    and not entry_before
+                ):
+                    item[
+                        "_critical_entry_latched"
+                    ] = True
+                    critical_types.add(
+                        "ENTRY_074"
+                    )
+                    latched = True
 
-                if emergency_now and not emergency_before:
-                    item["_critical_emergency_latched"] = True
-                    critical_types.add("EMERGENCY_060")
+                if (
+                    stop_now
+                    and not stop_before
+                ):
+                    item[
+                        "_critical_stop_latched"
+                    ] = True
+                    critical_types.add(
+                        "STOP_066"
+                    )
+                    latched = True
 
-                latched_updates.append(item)
+                if (
+                    emergency_now
+                    and not emergency_before
+                ):
+                    item[
+                        "_critical_emergency_latched"
+                    ] = True
+                    critical_types.add(
+                        "EMERGENCY_060"
+                    )
+                    latched = True
+
+                if latched:
+                    item[
+                        "_critical_trigger_latched"
+                    ] = True
+                    latched_updates.append(
+                        item
+                    )
 
             if critical_types:
-                # Keep the complete atomic condition frame. This preserves
-                # simultaneous YES/NO entry semantics and any other market
-                # context that arrived in the same WebSocket message.
+                # Critical historical states must come first so _process_event
+                # handles STOP 0.66 before EMERGENCY 0.60. Append the latest
+                # atomic frame afterwards for other-side/event context.
+                def signature(
+                    item: dict[str, Any],
+                ) -> tuple[str, str, str, str]:
+                    return (
+                        str(
+                            item.get(
+                                "asset_id"
+                            )
+                            or ""
+                        ),
+                        str(
+                            item.get(
+                                "best_bid"
+                            )
+                        ),
+                        str(
+                            item.get(
+                                "best_ask"
+                            )
+                        ),
+                        str(
+                            item.get(
+                                "exchange_timestamp_ms"
+                            )
+                        ),
+                    )
+
+                latched_signatures = {
+                    signature(item)
+                    for item in latched_updates
+                }
+
+                context_updates = [
+                    *latched_updates,
+                    *[
+                        dict(item)
+                        for item in updates
+                        if signature(item)
+                        not in latched_signatures
+                    ],
+                ]
+
                 critical = {
                     **context,
                     "_critical_trigger": True,
-                    "_critical_trigger_types": sorted(critical_types),
-                    "updates": latched_updates,
-                    "event_readiness": {condition_id: readiness},
+                    "_critical_trigger_types": (
+                        sorted(
+                            critical_types
+                        )
+                    ),
+                    "updates": context_updates,
+                    "event_readiness": {
+                        condition_id: readiness
+                    },
                 }
 
-                # Critical price edges are FIFO and never dropped because of
-                # normal latest-state queue pressure.
-                self._critical_frames.append(critical)
+                # Critical edges are strict FIFO and never dropped because
+                # of normal latest-state queue pressure.
+                self._critical_frames.append(
+                    critical
+                )
+
                 self.critical_triggers_queued += 1
+
                 self.max_critical_queue_depth = max(
                     self.max_critical_queue_depth,
-                    len(self._critical_frames),
+                    len(
+                        self._critical_frames
+                    ),
                 )
+
+                continue
+
+            if not updates:
                 continue
 
             isolated = {
                 **context,
                 "updates": updates,
-                "event_readiness": {condition_id: readiness},
+                "event_readiness": {
+                    condition_id: readiness
+                },
             }
 
-            # Ordinary latest-state traffic is intentionally conflatable.
-            if condition_id in self._pending_frames:
-                self._pending_frames.pop(condition_id)
+            # Ordinary latest-state traffic remains intentionally conflatable.
+            if (
+                condition_id
+                in self._pending_frames
+            ):
+                self._pending_frames.pop(
+                    condition_id
+                )
                 self.frames_coalesced += 1
-            elif len(self._pending_frames) >= self._frame_queue_capacity:
-                self._pending_frames.popitem(last=False)
+
+            elif (
+                len(self._pending_frames)
+                >= self._frame_queue_capacity
+            ):
+                self._pending_frames.popitem(
+                    last=False
+                )
                 self.frames_dropped += 1
 
-            self._pending_frames[condition_id] = isolated
+            self._pending_frames[
+                condition_id
+            ] = isolated
 
-        if grouped:
+        if grouped_observed:
             self._frame_event.set()
-
 
     def _observe_entry_trigger(self, context: dict[str, Any]) -> None:
         """Log the 0.74 decision path, including while execution is READ_ONLY."""

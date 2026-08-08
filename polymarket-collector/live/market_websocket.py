@@ -750,6 +750,7 @@ class MarketWebSocketManager:
         # for market-data freshness or entry authorization.
         received_at = now_iso()
         callback_updates: list[dict[str, Any]] = []
+        top_transition_updates: list[dict[str, Any]] = []
         stored_critical = False
 
         if event_type == "market_resolved":
@@ -910,6 +911,57 @@ class MarketWebSocketManager:
                     self._enqueue_snapshot(
                         persistent_candidate
                     )
+            # Intermediate top transitions are strategy-only. They preserve
+            # exact price edges that occur inside one raw price_change frame,
+            # but they are deliberately excluded from persistence.
+            for transition in frame.top_transitions:
+                asset_id = str(
+                    transition.get("asset_id") or ""
+                )
+
+                market = self._markets_by_asset.get(
+                    asset_id
+                )
+
+                if not market:
+                    self.market_cache_misses += 1
+                    self._request_market_cache_refresh(
+                        list(self.subscribed_asset_ids)
+                        or assets
+                        or [asset_id]
+                    )
+                    continue
+
+                outcome = (
+                    "YES"
+                    if str(
+                        market.get("yes_token_id")
+                    ) == asset_id
+                    else "NO"
+                    if str(
+                        market.get("no_token_id")
+                    ) == asset_id
+                    else None
+                )
+
+                top_transition_updates.append({
+                    **transition,
+                    "condition_id": market[
+                        "condition_id"
+                    ],
+                    "event_id": market.get(
+                        "event_id"
+                    ),
+                    "outcome": outcome,
+                    "received_at": received_at,
+                    "latency_ms": (
+                        frame.receive_latency_ms
+                    ),
+                    "source": (
+                        "POLYMARKET_MARKET_WS"
+                    ),
+                })
+
             integrity_reasons = {
                 str(view.get("readiness_reason") or "") for view in frame.updates
             }
@@ -945,7 +997,7 @@ class MarketWebSocketManager:
         self._queue_states(status_values)
 
         event_readiness: dict[str, dict[str, Any]] = {}
-        for update in callback_updates:
+        for update in [*callback_updates, *top_transition_updates]:
             condition_id = str(update.get("condition_id") or "")
             if condition_id and condition_id not in event_readiness:
                 event_readiness[condition_id] = self.event_freshness(
@@ -965,7 +1017,8 @@ class MarketWebSocketManager:
                 message, timing=timing, frame=frame, event_readiness=event_readiness
             )
         if (
-            self.on_atomic_frame is not None and callback_updates
+            self.on_atomic_frame is not None
+            and (callback_updates or top_transition_updates)
             and not (event_type != "market_resolved" and frame.rejected_reason)
         ):
             context = {
@@ -976,6 +1029,7 @@ class MarketWebSocketManager:
                 ),
                 "received_at": received_at,
                 "updates": callback_updates,
+                "top_transitions": top_transition_updates,
                 "event_readiness": event_readiness,
             }
             timing["strategy_scheduled_monotonic"] = time.perf_counter()
