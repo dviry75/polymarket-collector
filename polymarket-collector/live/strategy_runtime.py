@@ -89,6 +89,29 @@ class LiveStrategyRuntime:
         self._logger = logging.getLogger(__name__)
         self._entry_trigger_log_state: dict[tuple[str, str], str] = {}
 
+        self._hot_state_task: asyncio.Task[Any] | None = None
+        self._hot_state_refresh_interval_seconds = 0.25
+        self._hot_state_max_age_seconds = 1.0
+        self.hot_state_refresh_failures = 0
+
+        try:
+            self._hot_state = self.repo.hot_state_snapshot()
+            self._hot_state_refreshed_monotonic = time.monotonic()
+        except Exception:
+            # Startup failure must be fail-closed.
+            self._hot_state = {
+                "pause_entries": True,
+                "kill_switch": True,
+                "canary_armed": False,
+                "canary_consumed": False,
+                "reconciliation_readiness": "NOT_READY",
+                "locked_event_ids": set(),
+                "active_exposure": self.policy.max_exposure,
+                "loaded_at": "",
+            }
+            self._hot_state_refreshed_monotonic = 0.0
+            self.hot_state_refresh_failures += 1
+
 
     @staticmethod
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
@@ -128,6 +151,117 @@ class LiveStrategyRuntime:
             if market:
                 return market
         return self.base.latest_market(str(condition_id))
+
+    def _entry_state_from_ram(
+        self,
+        event_id: str,
+    ) -> dict[str, Any]:
+        snapshot = self._hot_state
+
+        refreshed = self._hot_state_refreshed_monotonic
+        age_seconds = (
+            time.monotonic() - refreshed
+            if refreshed > 0
+            else float("inf")
+        )
+        stale = age_seconds > self._hot_state_max_age_seconds
+
+        exposure = (
+            decimal_value(snapshot.get("active_exposure"))
+            or Decimal("0")
+        )
+
+        return {
+            "ready": not stale,
+            "stale": stale,
+            "age_seconds": age_seconds,
+            # A stale RAM snapshot is always fail-closed for ENTRY.
+            "paused": (
+                stale
+                or bool(snapshot.get("pause_entries"))
+                or bool(snapshot.get("kill_switch"))
+            ),
+            "pause_entries": bool(snapshot.get("pause_entries")),
+            "kill_switch": bool(snapshot.get("kill_switch")),
+            "canary_armed": bool(snapshot.get("canary_armed")),
+            "canary_consumed": bool(snapshot.get("canary_consumed")),
+            "reconciliation_readiness": str(
+                snapshot.get(
+                    "reconciliation_readiness",
+                    "NOT_READY",
+                )
+            ),
+            "event_locked": event_id in (
+                snapshot.get("locked_event_ids") or set()
+            ),
+            "active_exposure": exposure,
+        }
+
+    async def _refresh_hot_state_once(self) -> None:
+        try:
+            snapshot = await asyncio.to_thread(
+                self.repo.hot_state_snapshot
+            )
+        except Exception as exc:
+            self.hot_state_refresh_failures += 1
+            self.last_error = (
+                f"HOT_STATE_REFRESH:{type(exc).__name__}:{exc}"
+            )[:500]
+            return
+
+        # Atomic reference replacement. Readers never see a half-built state.
+        self._hot_state = snapshot
+        self._hot_state_refreshed_monotonic = time.monotonic()
+
+    async def _hot_state_loop(self) -> None:
+        while not self._stop.is_set():
+            await self._refresh_hot_state_once()
+
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(),
+                    self._hot_state_refresh_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    def _mark_event_locked_ram(self, event_id: str) -> None:
+        current = self._hot_state
+        locked = set(current.get("locked_event_ids") or set())
+        locked.add(str(event_id))
+
+        self._hot_state = {
+            **current,
+            "locked_event_ids": locked,
+        }
+
+    def _durable_entry_gate(
+        self,
+        *,
+        check_pause: bool,
+        require_canary: bool,
+    ) -> tuple[bool, str]:
+        """Durable safety gate used only on an actual entry attempt.
+
+        SQLite is intentionally retained here. This function is not called
+        for ordinary market frames.
+        """
+        if self.base.kill_switch_active():
+            return False, "KILL_SWITCH_ACTIVE"
+
+        if check_pause and self.repo.pause_entries():
+            return False, "PAUSE_ENTRIES"
+
+        if (
+            require_canary
+            and self.base.get_state(
+                "canary_armed",
+                "false",
+            ).lower() != "true"
+        ):
+            return False, "CANARY_NOT_ARMED"
+
+        return True, "READY"
 
     def _freshness(
         self, condition_id: str, update: dict[str, Any] | None = None
@@ -384,24 +518,26 @@ class LiveStrategyRuntime:
             if not triggers:
                 continue
             schedule = self.entry_schedule_status()
+            ram_state = self._entry_state_from_ram(event_id)
+
             paused = (
-                self.repo.pause_entries()
-                or self.base.kill_switch_active()
+                ram_state["paused"]
                 or not schedule["allowed"]
                 or (
                     self.config.execution_mode == "REAL_TRADING"
                     and not self.config.continuous_trading_enabled
-                    and self.base.get_state("canary_armed", "false").lower() != "true"
+                    and not ram_state["canary_armed"]
                 )
             )
+
             decision = choose_entry(
                 updates=updates,
                 yes_token_id=str(market.get("yes_token_id") or ""),
                 no_token_id=str(market.get("no_token_id") or ""),
                 event_ready=bool(readiness.get("ready")),
                 paused=paused,
-                event_locked=self.repo.event_state(event_id) is not None,
-                active_exposure=self.repo.exposure(),
+                event_locked=bool(ram_state["event_locked"]),
+                active_exposure=ram_state["active_exposure"],
                 observed_at=datetime.now(timezone.utc),
                 event_id=event_id,
                 policy=self.policy,
@@ -550,32 +686,44 @@ class LiveStrategyRuntime:
             observed_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
         except ValueError:
             observed_at = datetime.now(timezone.utc)
-        daily_loss_blocked = self._daily_loss_blocked()
+        has_trigger = any(
+            exact_trigger(
+                update.get("best_ask"),
+                self.policy.entry_price,
+            )
+            for update in updates
+        )
+
+        # Daily-loss persistence is entry-path work, not market-frame work.
+        daily_loss_blocked = (
+            self._daily_loss_blocked()
+            if has_trigger
+            else False
+        )
+
         schedule = self.entry_schedule_status()
+        ram_state = self._entry_state_from_ram(event_id)
+
         decision = choose_entry(
             updates=updates,
             yes_token_id=yes_token,
             no_token_id=no_token,
             event_ready=event_ready,
             paused=(
-                self.repo.pause_entries()
-                or self.base.kill_switch_active()
+                ram_state["paused"]
                 or daily_loss_blocked
                 or not schedule["allowed"]
                 or (
                     not self.paper_mode()
                     and not self.config.continuous_trading_enabled
-                    and self.base.get_state("canary_armed", "false").lower() != "true"
+                    and not ram_state["canary_armed"]
                 )
             ),
-            event_locked=self.repo.event_state(event_id) is not None,
-            active_exposure=self.repo.exposure(),
+            event_locked=bool(ram_state["event_locked"]),
+            active_exposure=ram_state["active_exposure"],
             observed_at=observed_at,
             event_id=event_id,
             policy=self.policy,
-        )
-        has_trigger = any(
-            exact_trigger(update.get("best_ask"), self.policy.entry_price) for update in updates
         )
         if not decision.allowed:
             if decision.simultaneous:
@@ -652,6 +800,33 @@ class LiveStrategyRuntime:
                 phase="PRE_INTENT", details=freshness,
             )
             return
+        require_canary = (
+            not self.paper_mode()
+            and not self.config.continuous_trading_enabled
+        )
+
+        if not self.paper_mode():
+            durable_ready, durable_reason = self._durable_entry_gate(
+                check_pause=True,
+                require_canary=require_canary,
+            )
+
+            if not durable_ready:
+                self.repo.timeline(
+                    severity="WARNING",
+                    category="DECISION",
+                    component="strategy",
+                    source="durable_safety_gate",
+                    event_id=event_id,
+                    condition_id=condition_id,
+                    token_id=decision.token_id,
+                    side=decision.side,
+                    requested_action="ENTRY",
+                    reason_code=durable_reason,
+                    result_status="SKIPPED",
+                )
+                return
+
         reservation = self.repo.reserve_event_entry(
             event_id=event_id, condition_id=condition_id,
             token_id=decision.token_id, side=decision.side,
@@ -661,6 +836,9 @@ class LiveStrategyRuntime:
         )
         if reservation.get("_duplicate") or reservation.get("_blocked"):
             return
+
+        self._mark_event_locked_ram(event_id)
+
         intent_id = str(reservation["entry_intent_id"])
         self.repo.timeline(
             severity="INFO", category="ORDER", component="strategy",
@@ -826,7 +1004,42 @@ class LiveStrategyRuntime:
             await self._ensure_take_profit(position)
             return
 
-        self.repo.update_intent(intent_id, state="SUBMITTING", submitted_at=now_iso())
+        durable_ready, durable_reason = self._durable_entry_gate(
+            check_pause=self.config.continuous_trading_enabled,
+            require_canary=False,
+        )
+
+        if not durable_ready:
+            self.repo.update_intent(
+                intent_id,
+                state="REJECTED",
+                reason_code=durable_reason,
+                normalized_error=(
+                    "Blocked by durable safety gate before order submission"
+                ),
+                final_at=now_iso(),
+            )
+            self.repo.timeline(
+                severity="WARNING",
+                category="DECISION",
+                component="strategy",
+                source="durable_safety_gate",
+                event_id=event_id,
+                condition_id=str(market["condition_id"]),
+                token_id=str(update["asset_id"]),
+                side=side,
+                intent_id=intent_id,
+                requested_action="ENTRY",
+                reason_code=durable_reason,
+                result_status="SKIPPED",
+            )
+            return
+
+        self.repo.update_intent(
+            intent_id,
+            state="SUBMITTING",
+            submitted_at=now_iso(),
+        )
         entry_params = AllInBudget(
             self.policy.max_spend, self.policy.max_shares
         ).sdk_buy_parameters(self.policy.entry_max_price)
@@ -1286,7 +1499,18 @@ class LiveStrategyRuntime:
     async def start_heartbeat(self) -> None:
         if self._heartbeat_task and not self._heartbeat_task.done():
             return
+
         self._stop.clear()
+
+        # Refresh once before workers begin consuming market frames.
+        await self._refresh_hot_state_once()
+
+        if self._hot_state_task is None or self._hot_state_task.done():
+            self._hot_state_task = asyncio.create_task(
+                self._hot_state_loop(),
+                name="strategy-hot-state-refresh",
+            )
+
         if self._frame_task is None or self._frame_task.done():
             self._frame_task = asyncio.create_task(
                 self._frame_worker(), name="strategy-frame-worker"
@@ -1297,6 +1521,15 @@ class LiveStrategyRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
+
+        if self._hot_state_task:
+            self._hot_state_task.cancel()
+            try:
+                await self._hot_state_task
+            except asyncio.CancelledError:
+                pass
+            self._hot_state_task = None
+
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
@@ -1347,6 +1580,18 @@ class LiveStrategyRuntime:
             "critical_triggers_processed": self.critical_triggers_processed,
             "critical_triggers_dropped": self.critical_triggers_dropped,
             "max_critical_queue_depth": self.max_critical_queue_depth,
+            "hot_state_age_ms": (
+                max(
+                    0.0,
+                    (
+                        time.monotonic()
+                        - self._hot_state_refreshed_monotonic
+                    ) * 1000,
+                )
+                if self._hot_state_refreshed_monotonic > 0
+                else None
+            ),
+            "hot_state_refresh_failures": self.hot_state_refresh_failures,
             "last_error": self.last_error,
             "entry_schedule": self.entry_schedule_status(),
             **self.repo.strategy_status(),

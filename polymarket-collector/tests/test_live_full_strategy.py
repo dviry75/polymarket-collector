@@ -1190,3 +1190,101 @@ def test_entry_exact_price_is_edge_triggered_not_level_triggered():
         assert runtime.critical_triggers_dropped == 0
 
     asyncio.run(scenario())
+
+
+def test_hot_state_snapshot_combines_safety_lock_and_exposure():
+    temp, base, strategy = build_repo()
+
+    try:
+        base.set_state("pause_entries", "false", "test")
+        base.set_state("kill_switch", "false", "test")
+        base.set_state("canary_armed", "true", "test")
+        base.set_state(
+            "reconciliation_readiness",
+            "READY",
+            "test",
+        )
+
+        reserve_and_open(
+            strategy,
+            event="hot-state-event",
+            shares=Decimal("10"),
+        )
+
+        snapshot = strategy.hot_state_snapshot()
+
+        assert snapshot["pause_entries"] is False
+        assert snapshot["kill_switch"] is False
+        assert snapshot["canary_armed"] is True
+        assert (
+            snapshot["reconciliation_readiness"]
+            == "READY"
+        )
+        assert (
+            "hot-state-event"
+            in snapshot["locked_event_ids"]
+        )
+        assert snapshot["active_exposure"] == Decimal("5")
+
+    finally:
+        temp.cleanup()
+
+
+def test_stale_ram_entry_state_fails_closed():
+    runtime = LiveStrategyRuntime.__new__(
+        LiveStrategyRuntime
+    )
+
+    runtime._hot_state = {
+        "pause_entries": False,
+        "kill_switch": False,
+        "canary_armed": True,
+        "canary_consumed": False,
+        "reconciliation_readiness": "READY",
+        "locked_event_ids": set(),
+        "active_exposure": Decimal("0"),
+    }
+
+    runtime._hot_state_max_age_seconds = 1.0
+    runtime._hot_state_refreshed_monotonic = (
+        __import__("time").monotonic() - 2.0
+    )
+
+    state = runtime._entry_state_from_ram("event-1")
+
+    assert state["stale"] is True
+    assert state["paused"] is True
+    assert state["event_locked"] is False
+    assert state["active_exposure"] == Decimal("0")
+
+
+def test_entry_decision_hot_path_does_not_query_durable_state():
+    inspect = __import__("inspect")
+
+    source = (
+        inspect.getsource(
+            LiveStrategyRuntime._observe_entry_trigger
+        )
+        + inspect.getsource(
+            LiveStrategyRuntime._process_event
+        )
+    )
+
+    forbidden = (
+        "self.repo.pause_entries()",
+        "self.base.kill_switch_active()",
+        'self.base.get_state("canary_armed"',
+        "self.repo.event_state(",
+        "self.repo.exposure()",
+    )
+
+    for item in forbidden:
+        assert item not in source
+
+    # Daily-loss SQLite work is now trigger-only.
+    process_source = inspect.getsource(
+        LiveStrategyRuntime._process_event
+    )
+
+    assert "if has_trigger" in process_source
+    assert "self._daily_loss_blocked()" in process_source

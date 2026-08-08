@@ -284,6 +284,109 @@ class StrategyRepository:
                 )
             conn.commit()
 
+    def hot_state_snapshot(self) -> dict[str, Any]:
+        """Load latency-sensitive strategy state using one SQLite connection.
+
+        This is intended for periodic background refresh. Market-data frames
+        must consume the returned RAM snapshot rather than opening SQLite
+        connections for pause/kill/event-lock/exposure checks.
+        """
+        state_keys = (
+            "pause_entries",
+            "kill_switch",
+            "canary_armed",
+            "canary_consumed",
+            "reconciliation_readiness",
+        )
+
+        with self.base.connect() as conn:
+            placeholders = ",".join("?" for _ in state_keys)
+
+            state_rows = conn.execute(
+                f"""
+                SELECT key,value
+                FROM live_system_state
+                WHERE key IN ({placeholders})
+                """,
+                state_keys,
+            ).fetchall()
+
+            # Only recent event locks are required by the live 5-minute
+            # strategy. This avoids growing an unbounded RAM set over time.
+            event_rows = conn.execute(
+                """
+                SELECT event_id
+                FROM live_event_states
+                ORDER BY locked_at DESC
+                LIMIT 64
+                """
+            ).fetchall()
+
+            position_rows = conn.execute(
+                """
+                SELECT
+                    remaining_shares_text,
+                    acquired_shares_text,
+                    cost_all_in_text
+                FROM live_strategy_positions
+                WHERE state IN (
+                    'OPEN',
+                    'TP_OPEN',
+                    'EXITING',
+                    'EXIT_RECONCILIATION_REQUIRED'
+                )
+                """
+            ).fetchall()
+
+        states = {
+            str(row["key"]): str(row["value"])
+            for row in state_rows
+        }
+
+        exposure = Decimal("0")
+
+        for row in position_rows:
+            remaining = (
+                decimal_value(row["remaining_shares_text"])
+                or Decimal("0")
+            )
+            acquired = (
+                decimal_value(row["acquired_shares_text"])
+                or Decimal("0")
+            )
+            cost = (
+                decimal_value(row["cost_all_in_text"])
+                or Decimal("0")
+            )
+
+            if remaining > 0 and acquired > 0:
+                exposure += cost * remaining / acquired
+
+        return {
+            "pause_entries": (
+                states.get("pause_entries", "true").lower() == "true"
+            ),
+            "kill_switch": (
+                states.get("kill_switch", "true").lower() == "true"
+            ),
+            "canary_armed": (
+                states.get("canary_armed", "false").lower() == "true"
+            ),
+            "canary_consumed": (
+                states.get("canary_consumed", "false").lower() == "true"
+            ),
+            "reconciliation_readiness": states.get(
+                "reconciliation_readiness",
+                "NOT_READY",
+            ),
+            "locked_event_ids": {
+                str(row["event_id"])
+                for row in event_rows
+            },
+            "active_exposure": exposure,
+            "loaded_at": now_iso(),
+        }
+
     def pause_entries(self) -> bool:
         return self.base.get_state("pause_entries", "true").lower() == "true"
 
