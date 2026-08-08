@@ -74,7 +74,12 @@ class LiveStrategyRuntime:
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
         instant = at or datetime.now(timezone.utc)
         local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
-        inactive = local.weekday() < 5 and 14 <= local.hour < 23
+        friday_exception = local.date().isoformat() == "2026-08-07"
+        inactive = (
+            local.weekday() < 5
+            and 14 <= local.hour < 23
+            and not friday_exception
+        )
         return {
             "allowed": not inactive,
             "reason": "ENTRY_SCHEDULE_INACTIVE" if inactive else "ENTRY_SCHEDULE_ACTIVE",
@@ -182,15 +187,18 @@ class LiveStrategyRuntime:
             if isinstance(update, dict) and update.get("condition_id"):
                 grouped.setdefault(str(update["condition_id"]), []).append(update)
         for condition_id, updates in grouped.items():
+            triggers = [
+                update for update in updates
+                if exact_trigger(update.get("best_ask"), self.policy.entry_price)
+            ]
+            if not triggers:
+                continue
+
             market = self.base.latest_market(condition_id)
             if not market:
                 continue
             event_id = str(market.get("event_id") or "")
             readiness = (context.get("event_readiness") or {}).get(condition_id) or {}
-            triggers = [
-                update for update in updates
-                if exact_trigger(update.get("best_ask"), self.policy.entry_price)
-            ]
             active_tokens = {str(update.get("asset_id") or "") for update in triggers}
             for key in [key for key in self._entry_trigger_log_state if key[0] == event_id]:
                 if key[1] not in active_tokens:

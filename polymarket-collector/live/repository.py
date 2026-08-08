@@ -629,15 +629,23 @@ class LiveRepository:
         return row_to_dict(row) or {}
 
     def market_ws_asset_ids(self) -> list[str]:
+        now_epoch = int(datetime.now(timezone.utc).timestamp())
+        current_event_start = (now_epoch // 300) * 300
+        current_event_id = f"btc-updown-5m-{current_event_start}"
+
         with self.connect() as conn:
             rows = conn.execute(
                 """
                 SELECT yes_token_id, no_token_id
                 FROM live_markets
-                WHERE market_resolved = 0 AND accepting_orders = 1
-                ORDER BY id DESC LIMIT 2
-                """
+                WHERE event_id = ?
+                  AND market_resolved = 0
+                  AND accepting_orders = 1
+                LIMIT 1
+                """,
+                (current_event_id,),
             ).fetchall()
+
         return list(dict.fromkeys(
             str(asset_id)
             for row in rows
