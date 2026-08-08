@@ -1186,14 +1186,21 @@ class MarketWebSocketManager:
             if market:
                 self._cache_market(market)
 
+    def market_for_condition(self, condition_id: str) -> dict[str, Any] | None:
+        """Return market metadata from RAM; SQLite is fallback-only on cache miss."""
+        key = str(condition_id)
+        market = self._markets_by_condition.get(key)
+        if market:
+            return market
+        market = self.repo.latest_market(key)
+        if market:
+            self._cache_market(market)
+        return market
+
     def event_freshness(
         self, condition_id: str, *, now_ms: int | None = None
     ) -> dict[str, Any]:
-        market = self._markets_by_condition.get(str(condition_id))
-        if not market:
-            market = self.repo.latest_market(str(condition_id))
-            if market:
-                self._cache_market(market)
+        market = self.market_for_condition(str(condition_id))
         if not market:
             return {"ready": False, "reason": "UNKNOWN_EVENT"}
         asset_ids = [

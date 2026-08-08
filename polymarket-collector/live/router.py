@@ -83,6 +83,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         on_reconnect=lambda: _reconciliation.run_once(actor="market_ws_reconnect"),
     )
     _strategy_runtime.set_market_freshness_provider(_market_ws.event_freshness)
+    _strategy_runtime.set_market_provider(_market_ws.market_for_condition)
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
         reconciliation=lambda: _reconciliation.run_once(actor="user_ws_reconnect"),

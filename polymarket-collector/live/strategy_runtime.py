@@ -66,6 +66,7 @@ class LiveStrategyRuntime:
         self.frames_processed = 0
         self.last_error = ""
         self._market_freshness: Callable[[str], dict[str, Any]] | None = None
+        self._market_provider: Callable[[str], dict[str, Any] | None] | None = None
         self._logger = logging.getLogger(__name__)
         self._entry_trigger_log_state: dict[tuple[str, str], str] = {}
 
@@ -91,6 +92,23 @@ class LiveStrategyRuntime:
         self, provider: Callable[[str], dict[str, Any]]
     ) -> None:
         self._market_freshness = provider
+
+    def set_market_provider(
+        self, provider: Callable[[str], dict[str, Any] | None]
+    ) -> None:
+        self._market_provider = provider
+
+    def _market(self, condition_id: str) -> dict[str, Any] | None:
+        """Use the in-memory market cache on the hot path.
+
+        SQLite remains a fail-safe fallback for startup/tests or an unexpected
+        cache miss, but normal Market WS strategy processing should stay in RAM.
+        """
+        if self._market_provider is not None:
+            market = self._market_provider(str(condition_id))
+            if market:
+                return market
+        return self.base.latest_market(str(condition_id))
 
     def _freshness(
         self, condition_id: str, update: dict[str, Any] | None = None
@@ -194,7 +212,7 @@ class LiveStrategyRuntime:
             if not triggers:
                 continue
 
-            market = self.base.latest_market(condition_id)
+            market = self._market(condition_id)
             if not market:
                 continue
             event_id = str(market.get("event_id") or "")
@@ -279,7 +297,7 @@ class LiveStrategyRuntime:
             if condition_id:
                 grouped.setdefault(condition_id, []).append(update)
         for condition_id, condition_updates in grouped.items():
-            market = self.base.latest_market(condition_id)
+            market = self._market(condition_id)
             if not market:
                 continue
             event_id = str(market.get("event_id") or "")
@@ -770,7 +788,7 @@ class LiveStrategyRuntime:
         fill = simulate_sell_fak(
             update.get("bids") or [], shares=shares,
             min_price=self.policy.take_profit_price,
-            fee_rate=self._fee_rate(self.base.latest_market(position["condition_id"]) or {}),
+            fee_rate=self._fee_rate(self._market(position["condition_id"]) or {}),
         )
         if fill.filled_shares <= 0:
             return
@@ -848,7 +866,7 @@ class LiveStrategyRuntime:
                 update.get("bids") or [],
                 shares=shares,
                 min_price=self.policy.stop_min_price,
-                fee_rate=self._fee_rate(self.base.latest_market(position["condition_id"]) or {}),
+                fee_rate=self._fee_rate(self._market(position["condition_id"]) or {}),
             )
             if fill.filled_shares <= 0:
                 self.repo.update_intent(str(intent["intent_id"]), state="LIVE")
@@ -970,7 +988,7 @@ class LiveStrategyRuntime:
         if self.paper_mode():
             fill = simulate_sell_fak(
                 update.get("bids") or [], shares=shares, min_price=min_price,
-                fee_rate=self._fee_rate(self.base.latest_market(position["condition_id"]) or {}),
+                fee_rate=self._fee_rate(self._market(position["condition_id"]) or {}),
             )
             updated = self.repo.apply_exit_fill(
                 position_id=position["position_id"], intent_id=intent["intent_id"],
@@ -1048,7 +1066,7 @@ class LiveStrategyRuntime:
                 self.repo.mark_position_redeemed(position["position_id"], "paper-resolution")
 
     def _min_order(self, condition_id: str) -> Decimal:
-        market = self.base.latest_market(condition_id) or {}
+        market = self._market(condition_id) or {}
         return decimal_value(market.get("min_order_size")) or Decimal("0.000001")
 
     async def _reconcile(self, reason: str) -> dict[str, Any]:
