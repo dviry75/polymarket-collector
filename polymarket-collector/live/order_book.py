@@ -34,6 +34,8 @@ class OrderBookState:
     generation: int = 0
     bids: dict[Decimal, Decimal] = field(default_factory=dict)
     asks: dict[Decimal, Decimal] = field(default_factory=dict)
+    _best_bid_cache: Decimal | None = field(default=None, repr=False)
+    _best_ask_cache: Decimal | None = field(default=None, repr=False)
     ready: bool = False
     snapshot_loaded: bool = False
     reason: str = "AWAITING_SNAPSHOT"
@@ -51,6 +53,8 @@ class OrderBookState:
         self.generation = generation
         self.bids.clear()
         self.asks.clear()
+        self._best_bid_cache = None
+        self._best_ask_cache = None
         self._levels_cache.clear()
         self.ready = False
         self.snapshot_loaded = False
@@ -64,11 +68,60 @@ class OrderBookState:
 
     @property
     def best_bid(self) -> Decimal | None:
-        return max(self.bids) if self.bids else None
+        return self._best_bid_cache
 
     @property
     def best_ask(self) -> Decimal | None:
-        return min(self.asks) if self.asks else None
+        return self._best_ask_cache
+
+    def refresh_best_prices(self) -> None:
+        """Rebuild cached top-of-book after a full snapshot or structural prune."""
+        self._best_bid_cache = max(self.bids) if self.bids else None
+        self._best_ask_cache = min(self.asks) if self.asks else None
+
+    def apply_level(
+        self, *, side: str, price: Decimal, size: Decimal
+    ) -> str:
+        """Apply one L2 mutation while keeping top-of-book cached.
+
+        Normal inserts/updates are O(1). A side is scanned only when the
+        currently cached best level itself is removed.
+        """
+        if side == "BUY":
+            levels = self.bids
+            cache_name = "_best_bid_cache"
+            changed_side = "bids"
+            better = lambda candidate, current: candidate > current
+            fallback = max
+        elif side == "SELL":
+            levels = self.asks
+            cache_name = "_best_ask_cache"
+            changed_side = "asks"
+            better = lambda candidate, current: candidate < current
+            fallback = min
+        else:
+            raise ValueError("invalid order-book side")
+
+        current = getattr(self, cache_name)
+
+        if size == 0:
+            existed = price in levels
+            levels.pop(price, None)
+
+            if existed and current == price:
+                setattr(
+                    self,
+                    cache_name,
+                    fallback(levels) if levels else None,
+                )
+        else:
+            levels[price] = size
+
+            if current is None or better(price, current):
+                setattr(self, cache_name, price)
+
+        self.invalidate_levels(changed_side)
+        return changed_side
 
     def levels(self, side: str) -> list[dict[str, str]]:
         cached = self._levels_cache.get(side)
@@ -247,6 +300,7 @@ class OrderBookSet:
                     if book is not None and not book.snapshot_loaded:
                         book.bids = self._parse_levels(message.get("bids"))
                         book.asks = self._parse_levels(message.get("asks"))
+                        book.refresh_best_prices()
                         book.invalidate_levels("bids", "asks")
                         book.snapshot_loaded = True
                         book.ready = False
@@ -293,6 +347,7 @@ class OrderBookSet:
             asks = self._parse_levels(message.get("asks"))
             book.bids = bids
             book.asks = asks
+            book.refresh_best_prices()
             book.invalidate_levels("bids", "asks")
             book.ready = True
             book.snapshot_loaded = True
@@ -354,13 +409,9 @@ class OrderBookSet:
                     if side not in {"BUY", "SELL"} or price is None or size is None or price < 0 or size < 0:
                         malformed = True
                         break
-                    levels = book.bids if side == "BUY" else book.asks
-                    changed_sides.add("bids" if side == "BUY" else "asks")
-                    if size == 0:
-                        levels.pop(price, None)
-                    else:
-                        levels[price] = size
-                book.invalidate_levels(*changed_sides)
+                    changed_sides.add(
+                        book.apply_level(side=side, price=price, size=size)
+                    )
                 if malformed:
                     book.ready = False
                     book.reason = "MALFORMED_DELTA"
@@ -382,6 +433,7 @@ class OrderBookSet:
                         for price in impossible_bids:
                             book.bids.pop(price, None)
                         if impossible_bids:
+                            book.refresh_best_prices()
                             book.invalidate_levels("bids")
                     if advertised_ask is not None:
                         impossible_asks = [
@@ -390,6 +442,7 @@ class OrderBookSet:
                         for price in impossible_asks:
                             book.asks.pop(price, None)
                         if impossible_asks:
+                            book.refresh_best_prices()
                             book.invalidate_levels("asks")
                     if (
                         (advertised_bid is not None and advertised_bid != book.best_bid)
