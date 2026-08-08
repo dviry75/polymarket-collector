@@ -87,8 +87,13 @@ class OrderBookState:
         for side in sides:
             self._levels_cache.pop(side, None)
 
-    def view(self, *, event_type: str, timestamp: str | None, message_hash: str,
-             now_ms: int | None = None) -> dict[str, Any]:
+    def top_view(self, *, event_type: str, timestamp: str | None, message_hash: str,
+                 now_ms: int | None = None) -> dict[str, Any]:
+        """Lightweight view for latency-sensitive trading decisions.
+
+        Full depth is deliberately excluded so normal market updates do not
+        sort and serialize the entire order book.
+        """
         best_bid = self.best_bid
         best_ask = self.best_ask
         return {
@@ -98,8 +103,6 @@ class OrderBookState:
             "best_ask": canonical_decimal(best_ask) if best_ask is not None else None,
             "best_bid_size": canonical_decimal(self.bids[best_bid]) if best_bid is not None else None,
             "best_ask_size": canonical_decimal(self.asks[best_ask]) if best_ask is not None else None,
-            "bids": self.levels("bids"),
-            "asks": self.levels("asks"),
             "market_timestamp": timestamp,
             "exchange_timestamp_ms": self.last_exchange_timestamp_ms,
             "exchange_age_ms": (
@@ -113,6 +116,19 @@ class OrderBookState:
             "update_number": self.update_number,
             "message_hash": message_hash,
         }
+
+    def view(self, *, event_type: str, timestamp: str | None, message_hash: str,
+             now_ms: int | None = None) -> dict[str, Any]:
+        """Full-depth view for persistence, diagnostics and paper execution."""
+        result = self.top_view(
+            event_type=event_type,
+            timestamp=timestamp,
+            message_hash=message_hash,
+            now_ms=now_ms,
+        )
+        result["bids"] = self.levels("bids")
+        result["asks"] = self.levels("asks")
+        return result
 
 
 @dataclass(frozen=True)
@@ -178,9 +194,24 @@ class OrderBookSet:
                 return False, "MISSING_EXCHANGE_TIMESTAMP"
         return True, "READY"
 
+    @staticmethod
+    def _render_book(
+        book: OrderBookState, *, include_depth: bool,
+        event_type: str, timestamp: str | None,
+        message_hash: str, now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        renderer = book.view if include_depth else book.top_view
+        return renderer(
+            event_type=event_type,
+            timestamp=timestamp,
+            message_hash=message_hash,
+            now_ms=now_ms,
+        )
+
     def apply(
         self, message: dict[str, Any], *, now_ms: int | None = None,
         max_age_ms: int | None = None, future_tolerance_ms: int = 0,
+        include_depth: bool = True,
     ) -> AtomicBookFrame:
         event_type = str(message.get("event_type") or message.get("type") or "").lower()
         identity = json.dumps(message, sort_keys=True, separators=(",", ":"), default=str)
@@ -273,7 +304,7 @@ class OrderBookSet:
             book.last_message_hash = message_hash
             book.update_number += 1
             return AtomicBookFrame(
-                event_type, timestamp, message_hash, (book.view(
+                event_type, timestamp, message_hash, (self._render_book(book, include_depth=include_depth,
                     event_type=event_type, timestamp=timestamp,
                     message_hash=message_hash, now_ms=now_ms
                 ),),
@@ -302,14 +333,14 @@ class OrderBookSet:
                     continue
                 if not book.snapshot_loaded:
                     book.reason = "DELTA_BEFORE_SNAPSHOT"
-                    updates.append(book.view(
+                    updates.append(self._render_book(book, include_depth=include_depth,
                         event_type=event_type, timestamp=timestamp, message_hash=message_hash, now_ms=now_ms
                     ))
                     continue
                 if not book.ready and book.reason not in {
                     "STALE_EXCHANGE_TIMESTAMP", "BEST_PRICE_MISMATCH",
                 }:
-                    updates.append(book.view(
+                    updates.append(self._render_book(book, include_depth=include_depth,
                         event_type=event_type, timestamp=timestamp,
                         message_hash=message_hash, now_ms=now_ms,
                     ))
@@ -375,7 +406,7 @@ class OrderBookSet:
                     book.receive_latency_ms = exchange_age_ms
                     book.last_message_hash = message_hash
                     book.update_number += 1
-                updates.append(book.view(
+                updates.append(self._render_book(book, include_depth=include_depth,
                     event_type=event_type, timestamp=timestamp, message_hash=message_hash, now_ms=now_ms
                 ))
             if structural_only:
@@ -443,7 +474,7 @@ class OrderBookSet:
                     receive_latency_ms=exchange_age_ms,
                 )
             return AtomicBookFrame(
-                event_type, timestamp, message_hash, (book.view(
+                event_type, timestamp, message_hash, (self._render_book(book, include_depth=include_depth,
                     event_type=event_type, timestamp=timestamp,
                     message_hash=message_hash, now_ms=now_ms
                 ),),

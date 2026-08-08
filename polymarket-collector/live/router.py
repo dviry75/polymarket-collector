@@ -80,6 +80,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         persist_raw_payloads=_config.raw_market_ws_payloads_enabled,
         snapshot_min_interval_seconds=float(_config.snapshot_min_interval_seconds),
         ingress_queue_capacity=_config.market_ws_ingress_queue_capacity,
+        include_depth_in_callback=(_config.execution_mode == "PAPER_TRADING"),
         on_reconnect=lambda: _reconciliation.run_once(actor="market_ws_reconnect"),
     )
     _strategy_runtime.set_market_freshness_provider(_market_ws.event_freshness)

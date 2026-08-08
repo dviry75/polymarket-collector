@@ -47,6 +47,7 @@ class MarketWebSocketManager:
         on_reconnect: Callable[[], Awaitable[Any]] | None = None,
         persistence_queue_capacity: int = 64,
         ingress_queue_capacity: int = 32,
+        include_depth_in_callback: bool = True,
         future_tolerance_ms: int = 1_000,
         clock_ms: Callable[[], int] | None = None,
     ):
@@ -76,6 +77,7 @@ class MarketWebSocketManager:
         )
         self.persistence_queue_capacity = max(2, int(persistence_queue_capacity))
         self.ingress_queue_capacity = max(2, int(ingress_queue_capacity))
+        self.include_depth_in_callback = bool(include_depth_in_callback)
         self._ingress_queue: asyncio.Queue[Any] | None = None
         self.max_ingress_queue_depth = 0
         self.ingress_frames_enqueued = 0
@@ -716,6 +718,15 @@ class MarketWebSocketManager:
             assets = self.subscribed_asset_ids or list(self._markets_by_asset)
             if not assets:
                 assets = self.repo.market_ws_asset_ids()
+                if not assets:
+                    # Direct process_message() callers (tests/smoke tools) do
+                    # not necessarily have a live WS subscription. Fall back
+                    # to the assets explicitly carried by this frame only.
+                    #
+                    # A real Market WS connection always has
+                    # subscribed_asset_ids, so this does not broaden the
+                    # production subscription scope.
+                    assets = self._message_asset_ids(message)
                 self._refresh_market_cache(assets)
             self.order_books.ensure_assets(assets)
             frame = self.order_books.apply(
@@ -723,6 +734,7 @@ class MarketWebSocketManager:
                 now_ms=now_ms,
                 max_age_ms=self.stale_after_seconds * 1000,
                 future_tolerance_ms=self.future_tolerance_ms,
+                include_depth=self.include_depth_in_callback,
             )
             timing["message_hash"] = frame.message_hash
             timing["book_update_monotonic"] = time.perf_counter()
@@ -796,7 +808,16 @@ class MarketWebSocketManager:
                 }
                 callback_updates.append(candidate)
                 if self._should_persist_snapshot(candidate):
-                    self._enqueue_snapshot(candidate)
+                    persistent_candidate = candidate
+                    if not self.include_depth_in_callback:
+                        book = self.order_books.books.get(asset_id)
+                        if book is not None:
+                            persistent_candidate = {
+                                **candidate,
+                                "bids": book.levels("bids"),
+                                "asks": book.levels("asks"),
+                            }
+                    self._enqueue_snapshot(persistent_candidate)
             integrity_reasons = {
                 str(view.get("readiness_reason") or "") for view in frame.updates
             }
@@ -1342,14 +1363,17 @@ class MarketWebSocketManager:
         previous = self._last_snapshot_monotonic.get(asset_id)
         if previous is not None and now - previous < self.snapshot_min_interval_seconds:
             return False
-        signature = json.dumps(
-            {
-                "bids": snapshot.get("bids") or [],
-                "asks": snapshot.get("asks") or [],
-                "ready": snapshot.get("book_ready"),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+        signature = "|".join(
+            str(snapshot.get(key) if snapshot.get(key) is not None else "")
+            for key in (
+                "best_bid",
+                "best_ask",
+                "best_bid_size",
+                "best_ask_size",
+                "book_ready",
+                "generation",
+                "update_number",
+            )
         )
         if signature == self._last_snapshot_signature.get(asset_id):
             return False
