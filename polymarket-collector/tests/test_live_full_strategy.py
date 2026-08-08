@@ -866,6 +866,7 @@ def test_critical_074_frame_survives_regular_frame_conflation():
         runtime.policy = StrategyPolicy()
         runtime._pending_frames = __import__("collections").OrderedDict()
         runtime._critical_frames = __import__("collections").deque()
+        runtime._critical_price_state = {}
         runtime._frame_queue_capacity = 32
         runtime.frames_coalesced = 0
         runtime.frames_dropped = 0
@@ -996,3 +997,196 @@ def test_latched_critical_trigger_is_not_rejected_as_frame_superseded():
 
     assert regular["ready"] is False
     assert regular["reason"] == "FRAME_SUPERSEDED"
+
+
+
+def test_stop_and_emergency_exact_prices_survive_conflation():
+    async def scenario():
+        runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+
+        runtime.policy = StrategyPolicy()
+        runtime._pending_frames = __import__("collections").OrderedDict()
+        runtime._critical_frames = __import__("collections").deque()
+        runtime._critical_price_state = {}
+        runtime._frame_queue_capacity = 32
+
+        runtime.frames_coalesced = 0
+        runtime.frames_dropped = 0
+
+        runtime.critical_triggers_queued = 0
+        runtime.critical_triggers_processed = 0
+        runtime.critical_triggers_dropped = 0
+        runtime.max_critical_queue_depth = 0
+
+        runtime._frame_event = asyncio.Event()
+        runtime._frame_task = None
+        runtime._stop = asyncio.Event()
+
+        runtime._observe_entry_trigger = lambda _context: None
+        runtime.enabled = lambda: True
+
+        processed = []
+
+        async def fake_process(context):
+            processed.append(context)
+
+        runtime.process_atomic_frame = fake_process
+
+        def frame(bid, number):
+            return {
+                "event_type": "price_change",
+                "message_hash": f"frame-{number}",
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "updates": [{
+                    "condition_id": "condition-1",
+                    "asset_id": "yes-token",
+                    "outcome": "YES",
+                    "best_ask": "0.80",
+                    "best_bid": bid,
+                    "generation": 1,
+                    "update_number": number,
+                    "exchange_timestamp_ms": int(
+                        datetime.now(timezone.utc).timestamp() * 1000
+                    ),
+                }],
+                "event_readiness": {
+                    "condition-1": {
+                        "ready": True,
+                        "reason": "READY",
+                    }
+                },
+            }
+
+        # No awaits: recreate an ingress burst.
+        runtime.schedule_frame(frame("0.67", 1))
+        runtime.schedule_frame(frame("0.66", 2))
+
+        # Still 0.66: must NOT create another critical edge.
+        runtime.schedule_frame(frame("0.66", 3))
+
+        runtime.schedule_frame(frame("0.65", 4))
+        runtime.schedule_frame(frame("0.60", 5))
+        runtime.schedule_frame(frame("0.59", 6))
+
+        runtime._stop.set()
+        runtime._frame_event.set()
+
+        await asyncio.wait_for(runtime._frame_task, timeout=1)
+
+        critical = [
+            context for context in processed
+            if context.get("_critical_trigger")
+        ]
+
+        assert len(critical) == 2
+
+        assert critical[0]["_critical_trigger_types"] == [
+            "STOP_066"
+        ]
+        assert (
+            critical[0]["updates"][0]["_critical_stop_latched"]
+            is True
+        )
+
+        assert critical[1]["_critical_trigger_types"] == [
+            "EMERGENCY_060"
+        ]
+        assert (
+            critical[1]["updates"][0][
+                "_critical_emergency_latched"
+            ]
+            is True
+        )
+
+        # Exact 0.66 appearing on two consecutive frames is one edge,
+        # not two critical queue entries.
+        assert runtime.critical_triggers_queued == 2
+        assert runtime.critical_triggers_processed == 2
+        assert runtime.critical_triggers_dropped == 0
+
+        # Latest ordinary state still survives independently.
+        assert processed[-1]["updates"][0]["best_bid"] == "0.59"
+
+    asyncio.run(scenario())
+
+
+def test_entry_exact_price_is_edge_triggered_not_level_triggered():
+    async def scenario():
+        runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+
+        runtime.policy = StrategyPolicy()
+        runtime._pending_frames = __import__("collections").OrderedDict()
+        runtime._critical_frames = __import__("collections").deque()
+        runtime._critical_price_state = {}
+        runtime._frame_queue_capacity = 32
+
+        runtime.frames_coalesced = 0
+        runtime.frames_dropped = 0
+
+        runtime.critical_triggers_queued = 0
+        runtime.critical_triggers_processed = 0
+        runtime.critical_triggers_dropped = 0
+        runtime.max_critical_queue_depth = 0
+
+        runtime._frame_event = asyncio.Event()
+        runtime._frame_task = None
+        runtime._stop = asyncio.Event()
+
+        runtime._observe_entry_trigger = lambda _context: None
+        runtime.enabled = lambda: True
+
+        processed = []
+
+        async def fake_process(context):
+            processed.append(context)
+
+        runtime.process_atomic_frame = fake_process
+
+        def frame(ask, number):
+            return {
+                "event_type": "price_change",
+                "message_hash": f"entry-{number}",
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "updates": [{
+                    "condition_id": "condition-1",
+                    "asset_id": "yes-token",
+                    "outcome": "YES",
+                    "best_ask": ask,
+                    "best_bid": "0.73",
+                    "generation": 1,
+                    "update_number": number,
+                    "exchange_timestamp_ms": int(
+                        datetime.now(timezone.utc).timestamp() * 1000
+                    ),
+                }],
+                "event_readiness": {
+                    "condition-1": {
+                        "ready": True,
+                        "reason": "READY",
+                    }
+                },
+            }
+
+        runtime.schedule_frame(frame("0.73", 1))
+        runtime.schedule_frame(frame("0.74", 2))
+        runtime.schedule_frame(frame("0.74", 3))
+        runtime.schedule_frame(frame("0.74", 4))
+
+        runtime._stop.set()
+        runtime._frame_event.set()
+
+        await asyncio.wait_for(runtime._frame_task, timeout=1)
+
+        critical = [
+            context for context in processed
+            if context.get("_critical_trigger")
+        ]
+
+        assert len(critical) == 1
+        assert critical[0]["_critical_trigger_types"] == [
+            "ENTRY_074"
+        ]
+        assert runtime.critical_triggers_queued == 1
+        assert runtime.critical_triggers_dropped == 0
+
+    asyncio.run(scenario())

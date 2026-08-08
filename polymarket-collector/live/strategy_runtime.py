@@ -73,6 +73,14 @@ class LiveStrategyRuntime:
         self.critical_triggers_processed = 0
         self.critical_triggers_dropped = 0
         self.max_critical_queue_depth = 0
+
+        # Last observed top-of-book prices per condition/token.
+        # Critical signals are latched only when price ENTERS an exact
+        # trigger level, not on every frame while it remains there.
+        self._critical_price_state: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
+
         self._stop = asyncio.Event()
         self.frames_processed = 0
         self.last_error = ""
@@ -245,33 +253,83 @@ class LiveStrategyRuntime:
                 )
             )
 
-            triggered = any(
-                exact_trigger(update.get("best_ask"), self.policy.entry_price)
-                for update in updates
-            )
+            latched_updates: list[dict[str, Any]] = []
+            critical_types: set[str] = set()
 
-            if triggered:
-                # Preserve the complete condition frame so simultaneous
-                # YES/NO exact triggers retain their existing fail-closed
-                # semantics. Only exact-trigger updates get the latch marker.
-                latched_updates = []
-                for update in updates:
-                    item = dict(update)
-                    if exact_trigger(
-                        item.get("best_ask"), self.policy.entry_price
-                    ):
-                        item["_critical_trigger_latched"] = True
-                    latched_updates.append(item)
+            for update in updates:
+                item = dict(update)
 
+                asset_id = str(item.get("asset_id") or "")
+                state_key = (condition_id, asset_id)
+
+                previous = self._critical_price_state.get(
+                    state_key,
+                    {"best_ask": None, "best_bid": None},
+                )
+
+                ask = item.get("best_ask")
+                bid = item.get("best_bid")
+
+                entry_now = exact_trigger(
+                    ask, self.policy.entry_price
+                )
+                entry_before = exact_trigger(
+                    previous.get("best_ask"),
+                    self.policy.entry_price,
+                )
+
+                stop_now = exact_trigger(
+                    bid, self.policy.stop_price
+                )
+                stop_before = exact_trigger(
+                    previous.get("best_bid"),
+                    self.policy.stop_price,
+                )
+
+                emergency_now = exact_trigger(
+                    bid, self.policy.emergency_price
+                )
+                emergency_before = exact_trigger(
+                    previous.get("best_bid"),
+                    self.policy.emergency_price,
+                )
+
+                # Always advance the observed top-of-book state, including
+                # frames which are not themselves critical.
+                self._critical_price_state[state_key] = {
+                    "best_ask": ask,
+                    "best_bid": bid,
+                }
+
+                if entry_now and not entry_before:
+                    item["_critical_trigger_latched"] = True
+                    item["_critical_entry_latched"] = True
+                    critical_types.add("ENTRY_074")
+
+                if stop_now and not stop_before:
+                    item["_critical_stop_latched"] = True
+                    critical_types.add("STOP_066")
+
+                if emergency_now and not emergency_before:
+                    item["_critical_emergency_latched"] = True
+                    critical_types.add("EMERGENCY_060")
+
+                latched_updates.append(item)
+
+            if critical_types:
+                # Keep the complete atomic condition frame. This preserves
+                # simultaneous YES/NO entry semantics and any other market
+                # context that arrived in the same WebSocket message.
                 critical = {
                     **context,
                     "_critical_trigger": True,
+                    "_critical_trigger_types": sorted(critical_types),
                     "updates": latched_updates,
                     "event_readiness": {condition_id: readiness},
                 }
 
-                # Intentionally unbounded/non-lossy. A critical entry trigger
-                # must never be discarded because normal market data is busy.
+                # Critical price edges are FIFO and never dropped because of
+                # normal latest-state queue pressure.
                 self._critical_frames.append(critical)
                 self.critical_triggers_queued += 1
                 self.max_critical_queue_depth = max(
@@ -1284,6 +1342,11 @@ class LiveStrategyRuntime:
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
             "frames_dropped": self.frames_dropped,
+            "critical_queue_depth": len(self._critical_frames),
+            "critical_triggers_queued": self.critical_triggers_queued,
+            "critical_triggers_processed": self.critical_triggers_processed,
+            "critical_triggers_dropped": self.critical_triggers_dropped,
+            "max_critical_queue_depth": self.max_critical_queue_depth,
             "last_error": self.last_error,
             "entry_schedule": self.entry_schedule_status(),
             **self.repo.strategy_status(),
