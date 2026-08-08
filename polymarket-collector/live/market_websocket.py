@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -93,6 +94,16 @@ class MarketWebSocketManager:
         self._pending_snapshots: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._persistence_event = asyncio.Event()
         self._persistence_task: asyncio.Task[Any] | None = None
+
+        # One dedicated thread owns the long-lived SQLite writer connection.
+        # It never competes with the event loop or the default asyncio
+        # thread pool used by unrelated background operations.
+        self._persistence_executor: ThreadPoolExecutor | None = None
+        self._persistence_connection: Any | None = None
+        self.persistence_batches = 0
+        self.persistence_failures = 0
+        self.persistence_last_error = ""
+
         self._markets_by_asset: dict[str, dict[str, Any]] = {}
         self._markets_by_condition: dict[str, dict[str, Any]] = {}
         self.snapshots_coalesced = 0
@@ -187,10 +198,36 @@ class MarketWebSocketManager:
             self._persistence_event.set()
         if self._persistence_task:
             try:
-                await asyncio.wait_for(self._persistence_task, 5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    self._persistence_task,
+                    5,
+                )
+            except (
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+            ):
                 self._persistence_task.cancel()
-        for task in (self._event_loop_watchdog_task, self._diagnostics_task):
+
+        if self._persistence_executor is not None:
+            executor = self._persistence_executor
+
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    executor,
+                    self._close_persistence_connection_sync,
+                )
+            finally:
+                self._persistence_executor = None
+                await asyncio.to_thread(
+                    executor.shutdown,
+                    True,
+                )
+
+        for task in (
+            self._event_loop_watchdog_task,
+            self._diagnostics_task,
+        ):
             if task:
                 task.cancel()
                 try:
@@ -812,12 +849,23 @@ class MarketWebSocketManager:
                     if not self.include_depth_in_callback:
                         book = self.order_books.books.get(asset_id)
                         if book is not None:
+                            # Copy is intentionally performed while still on
+                            # the event-loop-owned order book. The expensive
+                            # sort + canonical level construction is deferred
+                            # to the dedicated persistence thread.
                             persistent_candidate = {
                                 **candidate,
-                                "bids": book.levels("bids"),
-                                "asks": book.levels("asks"),
+                                "_persistence_bid_items": tuple(
+                                    book.bids.items()
+                                ),
+                                "_persistence_ask_items": tuple(
+                                    book.asks.items()
+                                ),
                             }
-                    self._enqueue_snapshot(persistent_candidate)
+
+                    self._enqueue_snapshot(
+                        persistent_candidate
+                    )
             integrity_reasons = {
                 str(view.get("readiness_reason") or "") for view in frame.updates
             }
@@ -1280,11 +1328,122 @@ class MarketWebSocketManager:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
-        if self._persistence_task is None or self._persistence_task.done():
-            self._persistence_task = loop.create_task(
-                self._persistence_writer(), name="market-ws-persistence-writer"
+
+        if self._persistence_executor is None:
+            self._persistence_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="market-db-writer",
             )
+
+        if (
+            self._persistence_task is None
+            or self._persistence_task.done()
+        ):
+            self._persistence_task = loop.create_task(
+                self._persistence_writer(),
+                name="market-ws-persistence-writer",
+            )
+
         return True
+
+    @staticmethod
+    def _materialize_persistence_snapshot(
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build sorted full L2 depth outside the event loop."""
+        result = dict(snapshot)
+
+        bid_items = result.pop(
+            "_persistence_bid_items",
+            None,
+        )
+        ask_items = result.pop(
+            "_persistence_ask_items",
+            None,
+        )
+
+        if bid_items is not None:
+            result["bids"] = [
+                {
+                    "price": canonical_decimal(price),
+                    "size": canonical_decimal(size),
+                }
+                for price, size in sorted(
+                    bid_items,
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+            ]
+
+        if ask_items is not None:
+            result["asks"] = [
+                {
+                    "price": canonical_decimal(price),
+                    "size": canonical_decimal(size),
+                }
+                for price, size in sorted(
+                    ask_items,
+                    key=lambda item: item[0],
+                )
+            ]
+
+        return result
+
+    def _persistence_batch_sync(
+        self,
+        snapshots: list[dict[str, Any]],
+        states: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Run one complete persistence batch on one dedicated thread."""
+        if self._persistence_connection is None:
+            self._persistence_connection = self.repo.connect()
+
+        conn = self._persistence_connection
+
+        materialized = [
+            self._materialize_persistence_snapshot(snapshot)
+            for snapshot in snapshots
+        ]
+
+        try:
+            stored = (
+                self.repo.store_market_snapshots_on_connection(
+                    conn,
+                    materialized,
+                )
+                if materialized
+                else []
+            )
+
+            if states:
+                self.repo.set_states_on_connection(
+                    conn,
+                    states,
+                    "market_ws",
+                )
+
+            conn.commit()
+            self.persistence_batches += 1
+            return stored
+
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+            self.persistence_failures += 1
+            raise
+
+    def _close_persistence_connection_sync(self) -> None:
+        conn = self._persistence_connection
+        self._persistence_connection = None
+
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _enqueue_snapshot(self, snapshot: dict[str, Any]) -> None:
         if not self._ensure_persistence_writer():
@@ -1334,28 +1493,99 @@ class MarketWebSocketManager:
         self._persistence_event.set()
 
     async def _persistence_writer(self) -> None:
-        while not self._stop.is_set() or self._pending_snapshots or self._pending_states:
-            if not self._pending_snapshots and not self._pending_states:
+        while (
+            not self._stop.is_set()
+            or self._pending_snapshots
+            or self._pending_states
+        ):
+            if (
+                not self._pending_snapshots
+                and not self._pending_states
+            ):
                 self._persistence_event.clear()
+
                 try:
-                    await asyncio.wait_for(self._persistence_event.wait(), 0.25)
+                    await asyncio.wait_for(
+                        self._persistence_event.wait(),
+                        0.25,
+                    )
                 except asyncio.TimeoutError:
                     continue
-            await asyncio.sleep(0.01)
-            snapshots = list(self._pending_snapshots.values())
+
+            # Small batching window. Telemetry may wait a few milliseconds;
+            # market decisions never wait for this worker.
+            await asyncio.sleep(0.02)
+
+            snapshots = list(
+                self._pending_snapshots.values()
+            )
             states = dict(self._pending_states)
+
             self._pending_snapshots.clear()
             self._pending_states.clear()
-            if snapshots:
-                stored = await asyncio.to_thread(
-                    self.repo.store_market_snapshots, snapshots
+
+            if not snapshots and not states:
+                continue
+
+            executor = self._persistence_executor
+
+            if executor is None:
+                self.persistence_failures += 1
+                self.persistence_last_error = (
+                    "PERSISTENCE_EXECUTOR_UNAVAILABLE"
                 )
-                self.snapshots_received += len(stored)
-                if self.on_snapshot is not None:
-                    for snapshot in stored:
-                        await asyncio.to_thread(self.on_snapshot, snapshot)
-            if states:
-                await asyncio.to_thread(self.repo.set_states, states, "market_ws")
+                continue
+
+            loop = asyncio.get_running_loop()
+
+            try:
+                stored = await loop.run_in_executor(
+                    executor,
+                    self._persistence_batch_sync,
+                    snapshots,
+                    states,
+                )
+
+            except Exception as exc:
+                self.persistence_last_error = (
+                    f"{type(exc).__name__}:{exc}"
+                )[:500]
+
+                self._logger.exception(
+                    "Market persistence batch failed"
+                )
+
+                # Requeue latest telemetry. It is still lossy/coalescible,
+                # but a transient DB failure must not silently kill the
+                # writer task.
+                for snapshot in snapshots:
+                    key = str(
+                        snapshot.get("asset_id") or ""
+                    )
+                    if key:
+                        self._pending_snapshots[key] = snapshot
+
+                self._pending_states.update(states)
+
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(),
+                        0.25,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                continue
+
+            self.persistence_last_error = ""
+            self.snapshots_received += len(stored)
+
+            if self.on_snapshot is not None:
+                for snapshot in stored:
+                    await asyncio.to_thread(
+                        self.on_snapshot,
+                        snapshot,
+                    )
 
     def _should_persist_snapshot(self, snapshot: dict[str, Any]) -> bool:
         asset_id = str(snapshot["asset_id"])
@@ -1565,6 +1795,12 @@ class MarketWebSocketManager:
             "max_message_processing_ms": self.max_message_processing_ms,
             "persistence_queue_depth": len(self._pending_snapshots),
             "max_persistence_queue_depth": self.max_persistence_queue_depth,
+            "persistence_batches": self.persistence_batches,
+            "persistence_failures": self.persistence_failures,
+            "persistence_last_error": self.persistence_last_error,
+            "persistence_connection_open": (
+                self._persistence_connection is not None
+            ),
             "ingress_queue_capacity": self.ingress_queue_capacity,
             "ingress_queue_depth": (
                 self._ingress_queue.qsize() if self._ingress_queue is not None else 0

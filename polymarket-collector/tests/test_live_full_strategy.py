@@ -1405,3 +1405,112 @@ def test_manage_position_has_no_unconditional_position_db_reads():
 
     for item in forbidden:
         assert item not in source
+
+
+def test_persistence_depth_materialization_is_sorted_off_hot_path():
+    from live.market_websocket import MarketWebSocketManager
+
+    snapshot = {
+        "asset_id": "token-1",
+        "_persistence_bid_items": (
+            (Decimal("0.68"), Decimal("2")),
+            (Decimal("0.70"), Decimal("1")),
+            (Decimal("0.69"), Decimal("3")),
+        ),
+        "_persistence_ask_items": (
+            (Decimal("0.74"), Decimal("5")),
+            (Decimal("0.72"), Decimal("4")),
+            (Decimal("0.73"), Decimal("6")),
+        ),
+    }
+
+    result = (
+        MarketWebSocketManager
+        ._materialize_persistence_snapshot(snapshot)
+    )
+
+    assert result["bids"] == [
+        {"price": "0.7", "size": "1"},
+        {"price": "0.69", "size": "3"},
+        {"price": "0.68", "size": "2"},
+    ]
+
+    assert result["asks"] == [
+        {"price": "0.72", "size": "4"},
+        {"price": "0.73", "size": "6"},
+        {"price": "0.74", "size": "5"},
+    ]
+
+    assert "_persistence_bid_items" not in result
+    assert "_persistence_ask_items" not in result
+
+
+def test_market_process_message_does_not_build_full_depth_for_persistence():
+    import inspect
+    from live.market_websocket import MarketWebSocketManager
+
+    source = inspect.getsource(
+        MarketWebSocketManager.process_message
+    )
+
+    assert 'book.levels("bids")' not in source
+    assert 'book.levels("asks")' not in source
+    assert "_persistence_bid_items" in source
+    assert "_persistence_ask_items" in source
+
+
+def test_market_persistence_batch_reuses_one_sqlite_connection():
+    from live.market_websocket import MarketWebSocketManager
+
+    temp, base, _strategy = build_repo()
+
+    try:
+        connection_calls = 0
+        real_connect = base.connect
+
+        def counted_connect():
+            nonlocal connection_calls
+            connection_calls += 1
+            return real_connect()
+
+        base.connect = counted_connect
+
+        manager = MarketWebSocketManager(base)
+
+        first = {
+            "condition_id": "condition-persist",
+            "event_id": "event-persist",
+            "asset_id": "token-persist",
+            "outcome": "YES",
+            "event_type": "best_bid_ask",
+            "best_bid": "0.70",
+            "best_ask": "0.71",
+            "message_hash": "persist-1",
+            "raw_message": {"sequence": 1},
+        }
+
+        second = {
+            **first,
+            "best_bid": "0.71",
+            "best_ask": "0.72",
+            "message_hash": "persist-2",
+            "raw_message": {"sequence": 2},
+        }
+
+        manager._persistence_batch_sync(
+            [first],
+            {"market_ws_status": "CONNECTED"},
+        )
+
+        manager._persistence_batch_sync(
+            [second],
+            {"strategy_readiness": "READY"},
+        )
+
+        # The dedicated writer owns exactly one SQLite connection.
+        assert connection_calls == 1
+
+        manager._close_persistence_connection_sync()
+
+    finally:
+        temp.cleanup()
