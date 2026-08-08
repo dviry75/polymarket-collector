@@ -318,6 +318,12 @@ class PaperTradingTests(unittest.TestCase):
             clock_ms=lambda: 100_000,
         )
 
+        # This test exercises the continuous WS lifecycle with a fake socket,
+        # not real-time BTC event discovery. Production market_ws_asset_ids()
+        # intentionally selects only the current 5-minute event, while this
+        # fixture uses the synthetic "btc-updown-5m-next" market.
+        manager.repo.market_ws_asset_ids = lambda: ["yes-token", "no-token"]
+
         async def scenario():
             await manager.run("wss://fixture", connect=lambda *_args, **_kwargs: FakeSocket())
 
