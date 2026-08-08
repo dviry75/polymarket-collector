@@ -325,16 +325,21 @@ class StrategyRepository:
             position_rows = conn.execute(
                 """
                 SELECT
-                    remaining_shares_text,
-                    acquired_shares_text,
-                    cost_all_in_text
-                FROM live_strategy_positions
-                WHERE state IN (
+                    p.*,
+                    tp.state AS tp_intent_state,
+                    active_i.state AS active_exit_intent_state
+                FROM live_strategy_positions AS p
+                LEFT JOIN live_strategy_intents AS tp
+                    ON tp.intent_id = p.tp_intent_id
+                LEFT JOIN live_strategy_intents AS active_i
+                    ON active_i.intent_id = p.active_exit_intent_id
+                WHERE p.state IN (
                     'OPEN',
                     'TP_OPEN',
                     'EXITING',
                     'EXIT_RECONCILIATION_REQUIRED'
                 )
+                ORDER BY p.created_at
                 """
             ).fetchall()
 
@@ -344,18 +349,38 @@ class StrategyRepository:
         }
 
         exposure = Decimal("0")
+        positions_by_token: dict[
+            str, list[dict[str, Any]]
+        ] = {}
 
         for row in position_rows:
+            position = row_to_dict(row) or {}
+
+            token_id = str(
+                position.get("token_id") or ""
+            )
+
+            if token_id:
+                positions_by_token.setdefault(
+                    token_id, []
+                ).append(position)
+
             remaining = (
-                decimal_value(row["remaining_shares_text"])
+                decimal_value(
+                    position.get("remaining_shares_text")
+                )
                 or Decimal("0")
             )
             acquired = (
-                decimal_value(row["acquired_shares_text"])
+                decimal_value(
+                    position.get("acquired_shares_text")
+                )
                 or Decimal("0")
             )
             cost = (
-                decimal_value(row["cost_all_in_text"])
+                decimal_value(
+                    position.get("cost_all_in_text")
+                )
                 or Decimal("0")
             )
 
@@ -384,6 +409,7 @@ class StrategyRepository:
                 for row in event_rows
             },
             "active_exposure": exposure,
+            "positions_by_token": positions_by_token,
             "loaded_at": now_iso(),
         }
 

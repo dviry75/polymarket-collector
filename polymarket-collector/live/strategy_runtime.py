@@ -107,6 +107,7 @@ class LiveStrategyRuntime:
                 "reconciliation_readiness": "NOT_READY",
                 "locked_event_ids": set(),
                 "active_exposure": self.policy.max_exposure,
+                "positions_by_token": {},
                 "loaded_at": "",
             }
             self._hot_state_refreshed_monotonic = 0.0
@@ -196,6 +197,38 @@ class LiveStrategyRuntime:
             ),
             "active_exposure": exposure,
         }
+
+    def _positions_from_ram(
+        self,
+        token_id: str,
+    ) -> list[dict[str, Any]]:
+        positions = (
+            self._hot_state.get("positions_by_token")
+            or {}
+        ).get(str(token_id), [])
+
+        # Return shallow copies so strategy code cannot mutate the
+        # immutable snapshot currently visible to other readers.
+        return [
+            dict(position)
+            for position in positions
+            if isinstance(position, dict)
+        ]
+
+    def _position_from_ram(
+        self,
+        token_id: str,
+        position_id: str,
+    ) -> dict[str, Any] | None:
+        for position in self._positions_from_ram(
+            token_id
+        ):
+            if str(
+                position.get("position_id") or ""
+            ) == str(position_id):
+                return position
+
+        return None
 
     async def _refresh_hot_state_once(self) -> None:
         try:
@@ -1001,7 +1034,14 @@ class LiveStrategyRuntime:
                 fees_text=canonical_decimal(fill.fee),
                 remaining_shares_text=canonical_decimal(fill.remaining_request),
             )
+            # Make the newly opened position visible in RAM before any
+            # queued STOP/EMERGENCY critical frame can be processed.
+            await self._refresh_hot_state_once()
+
             await self._ensure_take_profit(position)
+
+            # TP creation changes position + intent state as well.
+            await self._refresh_hot_state_once()
             return
 
         durable_ready, durable_reason = self._durable_entry_gate(
@@ -1076,10 +1116,30 @@ class LiveStrategyRuntime:
                 normalized_error=response.get("message"),
             )
         reconciled = await self._reconcile("entry_submission")
+
         if reconciled.get("status") == "ok":
-            recovered = self.repo.position_for_token(str(update["asset_id"]))
+            recovered = self.repo.position_for_token(
+                str(update["asset_id"])
+            )
+
             if recovered:
-                await self._ensure_take_profit(recovered)
+                # Position recovery is durable action-path work. Publish it
+                # into RAM before creating/observing its TP.
+                await self._refresh_hot_state_once()
+
+                recovered = (
+                    self._position_from_ram(
+                        str(update["asset_id"]),
+                        str(recovered["position_id"]),
+                    )
+                    or recovered
+                )
+
+                await self._ensure_take_profit(
+                    recovered
+                )
+
+                await self._refresh_hot_state_once()
 
     async def _ensure_take_profit(self, position: dict[str, Any]) -> None:
         remaining = decimal_value(position.get("sellable_shares_text")) or Decimal("0")
@@ -1128,43 +1188,107 @@ class LiveStrategyRuntime:
         frame_hash: str,
     ) -> None:
         token_id = str(update.get("asset_id") or "")
-        positions = self.repo.active_positions(token_id)
+        positions = self._positions_from_ram(token_id)
+
         if not positions or not event_ready:
             return
+
         bid = decimal_value(update.get("best_bid"))
+
         if bid is None:
             return
+
+        reconciliation_ready = (
+            self.paper_mode()
+            or str(
+                self._hot_state.get(
+                    "reconciliation_readiness",
+                    "NOT_READY",
+                )
+            ) == "READY"
+        )
+
         for position in positions:
             if (
                 not position.get("tp_intent_id")
                 and not position.get("active_exit_intent_id")
                 and position.get("state") == "OPEN"
-                and (
-                    self.paper_mode()
-                    or self.base.get_state("reconciliation_readiness", "NOT_READY") == "READY"
-                )
+                and reconciliation_ready
             ):
+                # Creating a TP is an actual durable action, so a RAM
+                # refresh afterwards is appropriate and keeps the next
+                # critical STOP frame synchronized with the new TP.
                 await self._ensure_take_profit(position)
-                position = self.repo.position_for_token(token_id) or position
-            tp_intent = (
-                self.repo.intent(str(position.get("tp_intent_id")))
-                if position.get("tp_intent_id") else None
-            )
-            if tp_intent and tp_intent.get("state") == "LIVE" and bid >= self.policy.take_profit_price:
-                await self._paper_tp_fill(position, tp_intent, update, frame_hash)
-                continue
-            if exact_trigger(bid, self.policy.stop_price):
-                await self._place_stop_loss(
-                    position, update, frame_hash=frame_hash
+                await self._refresh_hot_state_once()
+
+                position = (
+                    self._position_from_ram(
+                        token_id,
+                        str(position["position_id"]),
+                    )
+                    or position
                 )
-            elif exact_trigger(bid, self.policy.emergency_price):
+
+            tp_intent = None
+
+            if position.get("tp_intent_id"):
+                tp_intent = {
+                    "intent_id": str(
+                        position["tp_intent_id"]
+                    ),
+                    "state": str(
+                        position.get("tp_intent_state")
+                        or ""
+                    ),
+                }
+
+            if (
+                tp_intent
+                and tp_intent.get("state") == "LIVE"
+                and bid >= self.policy.take_profit_price
+            ):
+                await self._paper_tp_fill(
+                    position,
+                    tp_intent,
+                    update,
+                    frame_hash,
+                )
+
+                # Durable position/fill state changed.
+                await self._refresh_hot_state_once()
+                continue
+
+            if exact_trigger(
+                bid,
+                self.policy.stop_price,
+            ):
+                await self._place_stop_loss(
+                    position,
+                    update,
+                    frame_hash=frame_hash,
+                )
+
+                # STOP reservation/cancel/fill is rare action-path work.
+                await self._refresh_hot_state_once()
+
+            elif exact_trigger(
+                bid,
+                self.policy.emergency_price,
+            ):
                 await self._emergency_exit(
-                    position, update, purpose="EMERGENCY_060",
+                    position,
+                    update,
+                    purpose="EMERGENCY_060",
                     min_price=max(
                         self.policy.emergency_min_price,
-                        self.policy.emergency_price - self.config.max_exit_slippage,
-                    ), frame_hash=frame_hash,
+                        self.policy.emergency_price
+                        - self.config.max_exit_slippage,
+                    ),
+                    frame_hash=frame_hash,
                 )
+
+                # Emergency execution changed durable state.
+                await self._refresh_hot_state_once()
 
     async def _paper_tp_fill(
         self,

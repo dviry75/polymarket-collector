@@ -1288,3 +1288,120 @@ def test_entry_decision_hot_path_does_not_query_durable_state():
 
     assert "if has_trigger" in process_source
     assert "self._daily_loss_blocked()" in process_source
+
+
+def test_hot_state_snapshot_contains_active_position_and_tp_state():
+    temp, base, strategy = build_repo()
+
+    try:
+        position = reserve_and_open(
+            strategy,
+            event="ram-position-event",
+            shares=Decimal("10"),
+        )
+
+        intent = strategy.reserve_position_intent(
+            position,
+            action="TP",
+            purpose="TAKE_PROFIT",
+            order_type="GTC",
+            shares=Decimal("10"),
+            price_limit=Decimal("0.96"),
+            book_hash="ram-test",
+        )
+
+        strategy.update_intent(
+            str(intent["intent_id"]),
+            state="LIVE",
+        )
+
+        snapshot = strategy.hot_state_snapshot()
+
+        positions = snapshot[
+            "positions_by_token"
+        ]["token-ram-position-event"]
+
+        assert len(positions) == 1
+
+        cached = positions[0]
+
+        assert (
+            cached["position_id"]
+            == position["position_id"]
+        )
+        assert (
+            cached["tp_intent_id"]
+            == intent["intent_id"]
+        )
+        assert cached["tp_intent_state"] == "LIVE"
+
+    finally:
+        temp.cleanup()
+
+
+def test_manage_position_neutral_frame_uses_ram_only():
+    runtime = LiveStrategyRuntime.__new__(
+        LiveStrategyRuntime
+    )
+
+    runtime.policy = StrategyPolicy()
+
+    runtime._hot_state = {
+        "reconciliation_readiness": "READY",
+        "positions_by_token": {
+            "token-1": [{
+                "position_id": "position-1",
+                "event_id": "event-1",
+                "condition_id": "condition-1",
+                "token_id": "token-1",
+                "outcome": "YES",
+                "state": "TP_OPEN",
+                "remaining_shares_text": "5",
+                "sellable_shares_text": "5",
+                "stop_stage": 0,
+                "tp_intent_id": "tp-1",
+                "tp_intent_state": "LIVE",
+                "active_exit_intent_id": None,
+            }]
+        },
+    }
+
+    runtime.paper_mode = lambda: False
+
+    class ExplodingRepo:
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"Unexpected DB repository read: {name}"
+            )
+
+    runtime.repo = ExplodingRepo()
+
+    asyncio.run(
+        runtime._manage_position(
+            market={},
+            update={
+                "asset_id": "token-1",
+                "best_bid": "0.70",
+            },
+            event_ready=True,
+            frame_hash="neutral-frame",
+        )
+    )
+
+
+def test_manage_position_has_no_unconditional_position_db_reads():
+    inspect = __import__("inspect")
+
+    source = inspect.getsource(
+        LiveStrategyRuntime._manage_position
+    )
+
+    forbidden = (
+        "self.repo.active_positions(",
+        "self.repo.position_for_token(",
+        "self.repo.intent(",
+        'self.base.get_state("reconciliation_readiness"',
+    )
+
+    for item in forbidden:
+        assert item not in source
