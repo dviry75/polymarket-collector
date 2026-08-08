@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
@@ -59,9 +59,20 @@ class LiveStrategyRuntime:
         self._frame_task: asyncio.Task[Any] | None = None
         self._frame_event = asyncio.Event()
         self._pending_frames: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+        # Exact entry triggers are never placed in the lossy/conflated queue.
+        # Regular market state may be replaced by newer state, but an observed
+        # exact 0.74 trigger must survive until the strategy evaluates it.
+        self._critical_frames: deque[dict[str, Any]] = deque()
+
         self._frame_queue_capacity = 32
         self.frames_coalesced = 0
         self.frames_dropped = 0
+
+        self.critical_triggers_queued = 0
+        self.critical_triggers_processed = 0
+        self.critical_triggers_dropped = 0
+        self.max_critical_queue_depth = 0
         self._stop = asyncio.Event()
         self.frames_processed = 0
         self.last_error = ""
@@ -122,6 +133,48 @@ class LiveStrategyRuntime:
             return result
         if update is not None:
             token_id = str(update.get("asset_id") or "")
+
+            if update.get("_critical_trigger_latched"):
+                # A newer market frame must not erase the historical fact that
+                # best ask was exactly 0.74. Instead of requiring the latched
+                # frame to still be the latest book version, enforce a strict
+                # age bound on the trigger itself.
+                exchange_timestamp_ms = update.get("exchange_timestamp_ms")
+                try:
+                    trigger_ms = int(exchange_timestamp_ms)
+                except (TypeError, ValueError):
+                    return {
+                        **result,
+                        "ready": False,
+                        "reason": "MISSING_CRITICAL_TRIGGER_TIMESTAMP",
+                    }
+
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                trigger_age_ms = now_ms - trigger_ms
+                max_age_ms = int(self.config.max_market_data_age_seconds * 1000)
+
+                if trigger_age_ms < -1000:
+                    return {
+                        **result,
+                        "ready": False,
+                        "reason": "FUTURE_CRITICAL_TRIGGER_TIMESTAMP",
+                        "critical_trigger_age_ms": trigger_age_ms,
+                    }
+
+                if trigger_age_ms > max_age_ms:
+                    return {
+                        **result,
+                        "ready": False,
+                        "reason": "CRITICAL_TRIGGER_EXPIRED",
+                        "critical_trigger_age_ms": trigger_age_ms,
+                    }
+
+                return {
+                    **result,
+                    "critical_trigger_latched": True,
+                    "critical_trigger_age_ms": trigger_age_ms,
+                }
+
             expected_generation = update.get("generation")
             expected_number = update.get("update_number")
             version = (result.get("book_versions") or {}).get(token_id) or {}
@@ -158,45 +211,94 @@ class LiveStrategyRuntime:
 
     def schedule_frame(self, context: dict[str, Any]) -> None:
         self._observe_entry_trigger(context)
+
         if not self.enabled():
             return
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             asyncio.run(self.process_atomic_frame(context))
             return
+
         if str(context.get("event_type") or "") == "market_resolved":
             loop.create_task(self.process_atomic_frame(context))
             return
+
         if self._frame_task is None or self._frame_task.done():
             self._frame_task = loop.create_task(
                 self._frame_worker(), name="strategy-frame-worker"
             )
+
         grouped: dict[str, list[dict[str, Any]]] = {}
         for update in context.get("updates") or []:
             if isinstance(update, dict):
                 condition_id = str(update.get("condition_id") or "")
                 if condition_id:
                     grouped.setdefault(condition_id, []).append(update)
+
         for condition_id, updates in grouped.items():
+            readiness = (
+                (context.get("event_readiness") or {}).get(
+                    condition_id,
+                    {"ready": False, "reason": "NOT_READY"},
+                )
+            )
+
+            triggered = any(
+                exact_trigger(update.get("best_ask"), self.policy.entry_price)
+                for update in updates
+            )
+
+            if triggered:
+                # Preserve the complete condition frame so simultaneous
+                # YES/NO exact triggers retain their existing fail-closed
+                # semantics. Only exact-trigger updates get the latch marker.
+                latched_updates = []
+                for update in updates:
+                    item = dict(update)
+                    if exact_trigger(
+                        item.get("best_ask"), self.policy.entry_price
+                    ):
+                        item["_critical_trigger_latched"] = True
+                    latched_updates.append(item)
+
+                critical = {
+                    **context,
+                    "_critical_trigger": True,
+                    "updates": latched_updates,
+                    "event_readiness": {condition_id: readiness},
+                }
+
+                # Intentionally unbounded/non-lossy. A critical entry trigger
+                # must never be discarded because normal market data is busy.
+                self._critical_frames.append(critical)
+                self.critical_triggers_queued += 1
+                self.max_critical_queue_depth = max(
+                    self.max_critical_queue_depth,
+                    len(self._critical_frames),
+                )
+                continue
+
             isolated = {
                 **context,
                 "updates": updates,
-                "event_readiness": {
-                    condition_id: (context.get("event_readiness") or {}).get(
-                        condition_id, {"ready": False, "reason": "NOT_READY"}
-                    )
-                },
+                "event_readiness": {condition_id: readiness},
             }
+
+            # Ordinary latest-state traffic is intentionally conflatable.
             if condition_id in self._pending_frames:
                 self._pending_frames.pop(condition_id)
                 self.frames_coalesced += 1
             elif len(self._pending_frames) >= self._frame_queue_capacity:
                 self._pending_frames.popitem(last=False)
                 self.frames_dropped += 1
+
             self._pending_frames[condition_id] = isolated
+
         if grouped:
             self._frame_event.set()
+
 
     def _observe_entry_trigger(self, context: dict[str, Any]) -> None:
         """Log the 0.74 decision path, including while execution is READ_ONLY."""
@@ -266,15 +368,30 @@ class LiveStrategyRuntime:
                 )
 
     async def _frame_worker(self) -> None:
-        while not self._stop.is_set() or self._pending_frames:
-            if not self._pending_frames:
+        while (
+            not self._stop.is_set()
+            or self._critical_frames
+            or self._pending_frames
+        ):
+            if not self._critical_frames and not self._pending_frames:
                 self._frame_event.clear()
                 try:
                     await asyncio.wait_for(self._frame_event.wait(), 0.25)
                 except asyncio.TimeoutError:
                     continue
+
             await asyncio.sleep(0)
-            _condition_id, context = self._pending_frames.popitem(last=False)
+
+            if self._critical_frames:
+                context = self._critical_frames.popleft()
+                self.critical_triggers_processed += 1
+            elif self._pending_frames:
+                _condition_id, context = self._pending_frames.popitem(
+                    last=False
+                )
+            else:
+                continue
+
             timing = context.get("_latency_timing")
             if isinstance(timing, dict):
                 strategy_started = time.perf_counter()
@@ -284,9 +401,12 @@ class LiveStrategyRuntime:
                     timing["strategy_queue_delay_ms"] = (
                         strategy_started - scheduled
                     ) * 1000
+
             await self.process_atomic_frame(context)
+
             if isinstance(timing, dict):
                 timing["strategy_finished_monotonic"] = time.perf_counter()
+
 
     async def process_atomic_frame(self, context: dict[str, Any]) -> None:
         self.frames_processed += 1

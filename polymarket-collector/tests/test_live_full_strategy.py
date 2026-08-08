@@ -857,3 +857,142 @@ def test_continuous_entry_slot_is_atomic_for_intents_and_positions():
         assert blocked_by_position["reason"] == "ACTIVE_ENTRY_SLOT_OCCUPIED"
     finally:
         temporary.cleanup()
+
+
+def test_critical_074_frame_survives_regular_frame_conflation():
+    async def scenario():
+        runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+
+        runtime.policy = StrategyPolicy()
+        runtime._pending_frames = __import__("collections").OrderedDict()
+        runtime._critical_frames = __import__("collections").deque()
+        runtime._frame_queue_capacity = 32
+        runtime.frames_coalesced = 0
+        runtime.frames_dropped = 0
+        runtime.critical_triggers_queued = 0
+        runtime.critical_triggers_processed = 0
+        runtime.critical_triggers_dropped = 0
+        runtime.max_critical_queue_depth = 0
+        runtime._frame_event = asyncio.Event()
+        runtime._frame_task = None
+        runtime._stop = asyncio.Event()
+
+        runtime._observe_entry_trigger = lambda _context: None
+        runtime.enabled = lambda: True
+
+        processed = []
+
+        async def fake_process(context):
+            processed.append(context)
+
+        runtime.process_atomic_frame = fake_process
+
+        def frame(ask, number):
+            return {
+                "event_type": "price_change",
+                "message_hash": f"frame-{number}",
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "updates": [{
+                    "condition_id": "condition-1",
+                    "asset_id": "yes-token",
+                    "outcome": "YES",
+                    "best_ask": ask,
+                    "best_bid": "0.73",
+                    "generation": 1,
+                    "update_number": number,
+                    "exchange_timestamp_ms": int(
+                        datetime.now(timezone.utc).timestamp() * 1000
+                    ),
+                }],
+                "event_readiness": {
+                    "condition-1": {
+                        "ready": True,
+                        "reason": "READY",
+                    }
+                },
+            }
+
+        # No await between these calls: this recreates a burst in which the
+        # normal queue would otherwise collapse 0.73 -> 0.74 -> 0.75.
+        runtime.schedule_frame(frame("0.73", 1))
+        runtime.schedule_frame(frame("0.74", 2))
+        runtime.schedule_frame(frame("0.75", 3))
+
+        runtime._stop.set()
+        runtime._frame_event.set()
+
+        await asyncio.wait_for(runtime._frame_task, timeout=1)
+
+        asks = [
+            context["updates"][0]["best_ask"]
+            for context in processed
+        ]
+
+        # Critical 0.74 is evaluated first and survives; ordinary state
+        # collapses to the latest 0.75 frame.
+        assert asks == ["0.74", "0.75"]
+        assert processed[0]["_critical_trigger"] is True
+        assert (
+            processed[0]["updates"][0]["_critical_trigger_latched"]
+            is True
+        )
+
+        assert runtime.critical_triggers_queued == 1
+        assert runtime.critical_triggers_processed == 1
+        assert runtime.critical_triggers_dropped == 0
+        assert runtime.frames_coalesced == 1
+
+    asyncio.run(scenario())
+
+
+def test_latched_critical_trigger_is_not_rejected_as_frame_superseded():
+    runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+
+    runtime.config = type(
+        "CriticalTriggerConfig",
+        (),
+        {"max_market_data_age_seconds": 2},
+    )()
+
+    runtime._market_freshness = lambda _condition_id: {
+        "ready": True,
+        "reason": "READY",
+        "book_versions": {
+            "yes-token": {
+                "generation": 1,
+                "update_number": 3,
+            }
+        },
+    }
+
+    runtime.paper_mode = lambda: False
+
+    trigger_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    latched = runtime._freshness(
+        "condition-1",
+        {
+            "asset_id": "yes-token",
+            "generation": 1,
+            "update_number": 2,
+            "exchange_timestamp_ms": trigger_ms,
+            "_critical_trigger_latched": True,
+        },
+    )
+
+    assert latched["ready"] is True
+    assert latched["critical_trigger_latched"] is True
+    assert latched["critical_trigger_age_ms"] <= 2000
+
+    regular = runtime._freshness(
+        "condition-1",
+        {
+            "asset_id": "yes-token",
+            "generation": 1,
+            "update_number": 2,
+            "exchange_timestamp_ms": trigger_ms,
+        },
+    )
+
+    assert regular["ready"] is False
+    assert regular["reason"] == "FRAME_SUPERSEDED"
