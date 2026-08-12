@@ -10,7 +10,7 @@
 
 ה־trader הושבת בצורה מבוקרת ונשאר `inactive` ו־`disabled`. ארבעת flags התפעוליים בסיום הם: trading=false, submission=false, kill=true, pause=true. לא נשלחה או בוטלה פקודה, לא נסגרה או נפדתה פוזיציה ולא בוצעה עסקת בדיקה.
 
-הפריסה עברה 212 בדיקות Backend ועוד 9 subtests, 5 בדיקות Frontend, lint ו־production build. בדיקת עומס של 20 טאבים השלימה 100/100 requests ב־200 עם p95 של 956.62ms וללא שגיאת lock/busy שנצפתה. `PRAGMA quick_check` לאחר migrations החזיר `ok`.
+הפריסה עברה 213 בדיקות Backend ועוד 9 subtests, 5 בדיקות Frontend, lint ו־production build. בדיקת עומס של 20 טאבים השלימה 100/100 requests ב־200 עם p95 של 956.62ms וללא שגיאת lock/busy שנצפתה. `PRAGMA quick_check` לאחר migrations החזיר `ok`.
 
 ## 2. מצב לפני העבודה
 
@@ -25,7 +25,7 @@
 
 | Repository | Remote | Branch | Commit |
 |---|---|---|---|
-| Backend | `dviry75/polymarket-collector` | `feature/complete-live-dashboard-real-data-20260812` | `dfa57c8` — API, provenance, tests, deployment; `e030a16` — rollout report |
+| Backend | `dviry75/polymarket-collector` | `feature/complete-live-dashboard-real-data-20260812` | `dfa57c8` — API, provenance, tests, deployment; `d77b259` — initial rollout report |
 | Frontend | `dviry75/polymarket-dashboard` | `feature/complete-live-dashboard-real-data-20260812` | `cdbb7ad` — real-data UI, tests, static export |
 
 ## 4. הארכיטקטורה הסופית
@@ -215,7 +215,7 @@ Public `/health` מחזיר רק `{"status":"ok|degraded"}`.
 
 ## 19. בדיקות
 
-Backend סופי: `212 passed, 9 subtests passed`, 7 warnings deprecation בלבד. 14 בדיקות dashboard ממוקדות: provenance, idempotency, UPDATE/upsert, isolation, partial fill, stale bid, missing fee, claimable exclusivity, false-zero, DST, auth, GET-only, pagination, rate/query bounds ו־single-flight.
+Backend סופי: `213 passed, 9 subtests passed`, 7 warnings deprecation בלבד. 14 בדיקות dashboard ממוקדות: provenance, idempotency, UPDATE/upsert, isolation, partial fill, stale bid, missing fee, claimable exclusivity, false-zero, DST, auth, GET-only, pagination, rate/query bounds ו־single-flight.
 
 Frontend:
 

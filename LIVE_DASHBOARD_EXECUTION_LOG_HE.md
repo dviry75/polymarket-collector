@@ -29,7 +29,7 @@
 7. Dashboard API v1: 14 GET endpoints, auth, pagination, query bounds/deadline, stable errors, short single-flight cache.
 8. Frontend חובר ל־API בלבד; אין Mock; כל controls מסחריים disabled.
 9. nginx protected static; legacy `/live` מפנה לדאשבורד הקנוני לאחר auth.
-10. בדיקות: Backend 212 passed + 9 subtests; Frontend 5/5, lint, build.
+10. בדיקות: Backend 213 passed + 9 subtests; Frontend 5/5, lint, build.
 11. Polymarket authenticated read-only: cash 44.326404, open orders 0, trades 5, positions 1; 0 write methods.
 12. load: 1/5/20 tabs; 130/130 HTTP 200; p95 66.92/148.33/956.62 ms; no observed DB lock/busy.
 
