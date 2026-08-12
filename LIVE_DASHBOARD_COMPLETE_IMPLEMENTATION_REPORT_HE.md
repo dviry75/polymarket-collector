@@ -379,3 +379,44 @@ Rollback summary: stop dashboard; restore nginx/unit/env from protected backup; 
 - dashboard: active על 127.0.0.1:8001; לא הופעל מחדש.
 - לא נשלחה, בוטלה, נסגרה או נפדתה שום פעולה מסחרית.
 - לא בוצע שינוי ב־nginx, ב־flags או בסודות בסבב v5.
+
+
+## 29. מטריצת תנאי הצלחה סופית מול מסמך המקור
+
+### הוכח PASS
+
+- /live-status זמין ומוגן: בקשה ללא session מחזירה redirect ל־login; overview ללא session מחזיר AUTHENTICATION_REQUIRED.
+- Backend API ייעודי: 16 חוזי GET בקוד, typed response, auth, bounds, pagination ו־stable errors.
+- provenance/cutover/isolation: migrations 1–5, constraints, indexes ו־fail-closed UNKNOWN ללא backfill.
+- מודל פיננסי: fill-based, partial fills, weighted remaining cost, fees, conservative bid, claimable ו־double-count prevention מכוסים בבדיקות.
+- Frontend: מקור API יחיד, no Mock, null אינו 0, מצבי quality, polling bounded, pagination, filters וכל ששת controls disabled.
+- אבטחה: same-origin, protected static/API, cookie/CSRF/logout contract, no-store, rate limit, masked identifiers וללא browser-to-Polymarket.
+- staging/backup/rollback: backup עקבי עם checksum, staging migration ו־production migration, quick_check=ok.
+- ביצועים: 1/5/20 tabs synthetic load, 130/130 HTTP 200, ללא DB busy/lock.
+- Git: backend c676ae9 ו־frontend cdbb7ad קיימים ב־GitHub.
+- בטיחות מסחר: trader inactive+disabled, kill=true, pause=true, canary=false; אין order/cancel/close/redeem.
+
+### חסום — תנאי הצלחה קריטיים שלא ניתן להוכיח תחת ההרשאות הנוכחיות
+
+1. טעינת קוד v5 בתהליך production:
+   - schema v5 פעיל והקוד בדיסק/Git.
+   - freshness מחזיר 404 מבחוץ, משום שהתהליך הפעיל נטען לפני commit v5.
+   - הפעולה המינימלית: אישור מפורש ל־restart יחיד של polymarket-dashboard.service בלבד. אין צורך לגעת ב־trader.
+   - ההוראה הנוכחית אוסרת כל restart/reload ולכן הפעולה לא בוצעה.
+
+2. בדיקת דפדפן אמיתית עם session:
+   - לא קיים Chromium/Firefox/Playwright/Puppeteer/Selenium/browser connector.
+   - אין session מחובר שניתן להשתמש בו בלי לחשוף credential או secret.
+   - הפעולה המינימלית: לספק browser connector מאושר או דפדפן headless מותקן מראש ודרך התחברות מאובטחת שאינה חושפת credentials.
+   - curl/TestClient אינם תחליף ל־JavaScript console, mobile/desktop, click-through ו־cookie inspection בדפדפן.
+
+3. clean-branch full Backend suite:
+   - dashboard suite על clean index: 19/19.
+   - full clean suite: 175 passed + 9 subtests, כשל baseline יחיד ב־fixture שתלוי בשעת schedule.
+   - working tree המלא: 218 passed + 9 subtests, מפני שכבר קיים בו תיקון fixture בן ארבע שורות.
+   - כלי האישור דחה commit של שינוי מקומי קיים שאינו חלק מובהק מהדאשבורד.
+   - הפעולה המינימלית: אישור מפורש לצרף את תיקון ה־fixture הקיים כ־commit נפרד, או החלטה להשאירו מחוץ לענף ולסווג את הכשל כ־baseline.
+
+### מסקנת audit
+
+לפי תנאי ההצלחה במסמך המקור אסור לסווג את המשימה כמלאה כל עוד שלושת השערים לעיל אינם מוכחים. יתר הפעולות הבטוחות שניתן לבצע ללא restart, דפדפן או הרחבת הרשאה הושלמו.
