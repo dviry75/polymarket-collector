@@ -33,6 +33,10 @@ def _decimal_env(name: str, default: str) -> Decimal:
 class LiveConfig:
     trading_mode: str = "DEMO"
     execution_mode: str = "READ_ONLY"
+    environment: str = "LIVE"
+    strategy_id: str = "btc-updown-5m"
+    strategy_version: str = "strategy-v1"
+    provenance_source: str = "TRADER"
     paper_trading_enabled: bool = False
     market_ws_enabled: bool = False
     market_discovery_interval_seconds: int = 5
@@ -88,6 +92,7 @@ class LiveConfig:
     login_rate_limit_per_minute: int = 5
     public_base_url: str = "https://live-poly.dvirtechnologies.com"
     live_db_path: str = "/opt/polymarket-btc-live/poly_live.sqlite3"
+    trader_socket_path: str = "/run/polymarket/trader.sock"
     backup_dir: str = "/opt/polymarket-btc-live/backups"
     backup_retention_days: int = 7
     backup_max_total_bytes: int = 1_073_741_824
@@ -118,6 +123,10 @@ class LiveConfig:
         return cls(
             trading_mode=_env("TRADING_MODE", "DEMO").upper(),
             execution_mode=_env("LIVE_EXECUTION_MODE", "READ_ONLY").upper(),
+            environment=_env("LIVE_ENVIRONMENT", "LIVE").upper(),
+            strategy_id=_env("LIVE_STRATEGY_ID", "btc-updown-5m"),
+            strategy_version=_env("LIVE_STRATEGY_VERSION", "strategy-v1"),
+            provenance_source=_env("LIVE_PROVENANCE_SOURCE", "TRADER").upper(),
             paper_trading_enabled=_bool_env("LIVE_PAPER_TRADING_ENABLED", False),
             market_ws_enabled=_bool_env("POLYMARKET_MARKET_WS_ENABLED", False),
             market_discovery_interval_seconds=int(_env("LIVE_MARKET_DISCOVERY_INTERVAL_SECONDS", "5") or "5"),
@@ -175,6 +184,7 @@ class LiveConfig:
             login_rate_limit_per_minute=int(_env("LIVE_LOGIN_RATE_LIMIT_PER_MINUTE", "5") or "5"),
             public_base_url=_env("LIVE_PUBLIC_BASE_URL", "https://live-poly.dvirtechnologies.com"),
             live_db_path=_env("LIVE_DB_PATH", "/opt/polymarket-btc-live/poly_live.sqlite3"),
+            trader_socket_path=_env("LIVE_TRADER_SOCKET_PATH", "/run/polymarket/trader.sock"),
             backup_dir=_env("LIVE_BACKUP_DIR", "/opt/polymarket-btc-live/backups"),
             backup_retention_days=int(_env("LIVE_BACKUP_RETENTION_DAYS", "7") or "7"),
             backup_max_total_bytes=int(_env("LIVE_BACKUP_MAX_TOTAL_BYTES", "1073741824") or "1073741824"),
@@ -211,6 +221,10 @@ class LiveConfig:
             errors.append("TRADING_MODE must be DEMO or LIVE")
         if self.execution_mode not in {"READ_ONLY", "PAPER_TRADING", "REAL_TRADING"}:
             errors.append("LIVE_EXECUTION_MODE must be READ_ONLY, PAPER_TRADING or REAL_TRADING")
+        if self.environment not in {"LIVE", "STAGING", "TEST", "DEMO"}:
+            errors.append("LIVE_ENVIRONMENT must be LIVE, STAGING, TEST or DEMO")
+        if not self.strategy_id or not self.strategy_version or not self.provenance_source:
+            errors.append("dashboard provenance identifiers must be configured")
         if self.paper_trading_enabled and self.execution_mode != "PAPER_TRADING":
             errors.append("LIVE_PAPER_TRADING_ENABLED requires LIVE_EXECUTION_MODE=PAPER_TRADING")
         if self.paper_trading_enabled and (
@@ -306,6 +320,10 @@ class LiveConfig:
         return {
             "trading_mode": self.trading_mode,
             "execution_mode": self.execution_mode,
+            "environment": self.environment,
+            "strategy_id": self.strategy_id,
+            "strategy_version": self.strategy_version,
+            "provenance_source": self.provenance_source,
             "paper_trading_enabled": self.paper_trading_enabled,
             "paper_trading_active": self.paper_trading_active(),
             "market_ws_enabled": self.market_ws_enabled,
@@ -353,6 +371,7 @@ class LiveConfig:
             "session_persistent_until_logout": self.session_ttl_seconds <= 0,
             "public_base_url": self.public_base_url,
             "live_db_path_configured": bool(self.live_db_path),
+            "trader_socket_configured": bool(self.trader_socket_path),
             "backup_dir_configured": bool(self.backup_dir),
             "profile_address_configured": bool(self.profile_address),
             "account_login_type": self.account_login_type,

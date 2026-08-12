@@ -1,0 +1,42 @@
+[Unit]
+Description=Polymarket LIVE Dashboard (read-only DB)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
+EnvironmentFile=/etc/polymarket-live/dashboard.env
+ExecStart=/opt/polymarket-btc-live/.venv/bin/uvicorn dashboard_app:app --host 127.0.0.1 --port 8001
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=20
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+ReadWritePaths=/opt/polymarket-btc-live
+ReadOnlyPaths=/opt/polymarket-btc-live/repo /opt/polymarket-btc-live/.venv /opt/polymarket-btc-live/backups /opt/polymarket-btc-live/deployment-backups /opt/polymarket-btc-live/poly_live.sqlite3
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

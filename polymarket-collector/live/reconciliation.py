@@ -6,6 +6,7 @@ from typing import Any
 from .adapters.base import TradingAdapter
 from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso
+from .dashboard_schema import mark_reconciled_provenance
 from .strategy_repository import StrategyRepository, sanitize
 
 
@@ -297,6 +298,8 @@ class ReconciliationWorker:
 
             status = "ok" if not gaps else "gaps"
             self.repo.finish_reconciliation(run_id, status, sanitize(gaps))
+            if not gaps:
+                mark_reconciled_provenance(self.repo)
             if self.strategy_repo:
                 self.strategy_repo.set_reconciliation_state(
                     ready=not gaps,
