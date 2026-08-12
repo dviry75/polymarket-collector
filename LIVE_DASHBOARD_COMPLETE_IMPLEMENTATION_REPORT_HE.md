@@ -10,7 +10,7 @@
 
 ה־trader הושבת בצורה מבוקרת ונשאר `inactive` ו־`disabled`. ארבעת flags התפעוליים בסיום הם: trading=false, submission=false, kill=true, pause=true. לא נשלחה או בוטלה פקודה, לא נסגרה או נפדתה פוזיציה ולא בוצעה עסקת בדיקה.
 
-הפריסה עברה 213 בדיקות Backend ועוד 9 subtests, 5 בדיקות Frontend, lint ו־production build. בדיקת עומס של 20 טאבים השלימה 100/100 requests ב־200 עם p95 של 956.62ms וללא שגיאת lock/busy שנצפתה. `PRAGMA quick_check` לאחר migrations החזיר `ok`.
+הפריסה עברה 218 בדיקות Backend ועוד 9 subtests, 5 בדיקות Frontend, lint ו־production build. בדיקת עומס של 20 טאבים השלימה 100/100 requests ב־200 עם p95 של 956.62ms וללא שגיאת lock/busy שנצפתה. `PRAGMA quick_check` לאחר migrations החזיר `ok`.
 
 ## 2. מצב לפני העבודה
 
@@ -215,7 +215,7 @@ Public `/health` מחזיר רק `{"status":"ok|degraded"}`.
 
 ## 19. בדיקות
 
-Backend סופי: `213 passed, 9 subtests passed`, 7 warnings deprecation בלבד. 14 בדיקות dashboard ממוקדות: provenance, idempotency, UPDATE/upsert, isolation, partial fill, stale bid, missing fee, claimable exclusivity, false-zero, DST, auth, GET-only, pagination, rate/query bounds ו־single-flight.
+Backend סופי: `218 passed, 9 subtests passed`, 7 warnings deprecation בלבד. 19 בדיקות dashboard ממוקדות: provenance, idempotency, UPDATE/upsert, isolation, partial fill, stale bid, missing fee, claimable exclusivity, false-zero, DST, auth, GET-only, pagination, rate/query bounds ו־single-flight.
 
 Frontend:
 
@@ -228,7 +228,7 @@ Frontend:
 
 - UI קורא רק 5 requests מרוכזים: overview, timeseries, trades, infrastructure, session.
 - API meta: LIVE / REAL_TRADING / cutover נכון.
-- DB: 4 migrations, 28 triggers, legacy counts תואמים את ההחרגה.
+- DB: 5 migrations, 72 dashboard triggers, legacy counts תואמים את ההחרגה.
 - Polymarket read-only balance `44.326404` תואם DB latest snapshot.
 - Polymarket open orders=0 תואם reconciliation האחרון, אבל API post-cutover נשאר UNAVAILABLE עד reconciliation חדש — fail-closed.
 - positions remote=1 תואם public_positions_count=1; הרשומה המקומית legacy מוחרגת.
@@ -313,3 +313,69 @@ Rollback summary: stop dashboard; restore nginx/unit/env from protected backup; 
 - לא נחשף secret, private key, token, session או כתובת מלאה.
 - כפתורי שליטה לא חוברו.
 - מערכת המסחר לא הופעלה מחדש ונשארה כבויה/חסומה.
+
+
+## 28. עדכון ביקורת עומק והקשחת v5 — 2026-08-12
+
+סעיף זה מאוחר וגובר על מספרים או ניסוחים סותרים בסעיפים הקודמים.
+
+### שינויים שהושלמו
+
+- נוסף migration 5 בשם dashboard_provenance_constraints_v5.
+- נוספו ישויות provenance מפורשות: live_strategy_runs, live_position_events, live_redemptions.
+- נוספו validation triggers ל־INSERT ול־UPDATE עבור execution mode, environment, reconciliation status ו־verification status.
+- כל עליית trader עתידית יוצרת run_id חדש ומסמנת run קודם INTERRUPTED; ה־cutover נשאר immutable. ה־trader לא הופעל במסגרת העבודה.
+- position lifecycle עתידי יוצר אירועי position/redemption ללא backfill של legacy. לאחר migration מספר הרשומות בשלוש הטבלאות החדשות הוא 0, כמצופה.
+- נוספו GET /live/dashboard/v1/trade-statistics ו־GET /live/dashboard/v1/freshness; סך חוזי ה־API הוא 16.
+- metadata כולל freshness_seconds ו־stale.
+- session חדש כולל nonce אקראי, תוך תאימות זמנית לטוקנים הישנים.
+- תוקן פער חשבונאי: fee_rate_bps אינו נשמר עוד כסכום כסף. סכום העמלה הוא:
+  shares × price × (1-price) × (fee_rate_bps / 10000).
+  נשמרים גם fee_source ו־fee_verification_status; deal מקבל fee מאומת רק אם כל fills הרלוונטיים מאומתים.
+- LiveRepository במצב query_only נכלל כעת ב־branch עצמו, ולכן ה־commit אינו תלוי בשינוי מקומי חיצוני לצורך read-only DB access.
+
+### migration וגיבוי
+
+- staging DB מלא: migrations 1–5, שלוש הטבלאות החדשות ריקות, PRAGMA quick_check=ok.
+- גיבוי עקבי לפני v5:
+  /opt/polymarket-btc-live/backups/live-dashboard-complete-20260812/poly_live.pre-v5.sqlite3
+- SHA-256: 3367d235b7cfaf2490e2829d05330f478dae7665bf2a0bfa93dcf9a66a5345ed.
+- production DB: migrations 1–5, 72 triggers ששמם כולל dashboard ועוד 12 lifecycle triggers, PRAGMA quick_check=ok.
+- ה־cutover נשאר 2026-08-12T17:19:24.026757+00:00; לא בוצע backfill.
+- אין strategy runs, position events או redemptions חדשים, מפני שה־trader נשאר כבוי.
+
+### בדיקות עדכניות
+
+- working tree המלא הקיים: 218 passed, 9 subtests passed, 7 warnings מסוג deprecation בלבד.
+- dashboard suite: 19 passed.
+- clean staged index של commit 26d46f7: 19 passed.
+- clean staged full suite: 175 passed, 9 subtests passed, וכשל יחיד בבדיקת baseline קיימת התלויה בשעת schedule בשם test_read_only_logs_exact_074_blocker_without_creating_intent. ב־working tree כבר קיים תיקון fixture מקומי בן 4 שורות, ולכן החבילה המלאה שם עוברת. השינוי המקומי לא צורף ל־commit משום שהיה קיים לפני עבודת הדאשבורד.
+- Frontend: 5/5, lint עבר, production build עבר.
+- endpoints החדשים נבדקו read-only מול production DB בתהליך TestClient מבודד: overview, trade-statistics, freshness ו־health החזירו 200.
+
+### Git
+
+- Backend commit: 26d46f7 — Harden dashboard provenance and live fee accounting.
+- ה־commit נדחף אל origin/feature/complete-live-dashboard-real-data-20260812.
+- Frontend נשאר ב־cdbb7ad, clean.
+- שינויים מקומיים ותיקים ב־Backend נשארו ללא staging וללא שינוי מכוון.
+
+### מגבלת restart והפעלה בפועל
+
+לפי ההוראה המפורשת לא לבצע restart או reload:
+
+- לא בוצע restart/reload לשום שירות בסבב v5.
+- schema v5 פעיל ב־production והקוד החדש נמצא בדיסק וב־Git.
+- תהליך polymarket-dashboard.service הפעיל ממשיך להריץ את הקוד שנטען לפני commit v5. לכן שני endpoints החדשים, nonce החדש ושינויי קוד runtime ייטענו חיצונית רק לאחר restart עתידי ומאושר של שירות הדאשבורד בלבד.
+- אין לבצע restart זה בלי אישור מפורש. אין צורך להפעיל את ה־trader לצורך טעינת הדאשבורד.
+
+### אימות דפדפן
+
+בוצע חיפוש ממצה ובטוח ב־PATH, /usr, /opt, /snap, caches, Node modules, dpkg, Docker/Podman images וכלי העבודה הזמינים. לא נמצא Chromium, Chrome, Firefox, Playwright, Puppeteer, Selenium או browser connector אינטראקטיבי. לא הותקנה חבילה. לכן עדיין לא ניתן היה לבצע screenshot, console inspection או click-through אמיתי.
+
+### מצב בטיחות לאחר v5
+
+- trader: inactive, disabled, פורט 8002 סגור.
+- dashboard: active על 127.0.0.1:8001; לא הופעל מחדש.
+- לא נשלחה, בוטלה, נסגרה או נפדתה שום פעולה מסחרית.
+- לא בוצע שינוי ב־nginx, ב־flags או בסודות בסבב v5.

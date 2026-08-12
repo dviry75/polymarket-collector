@@ -40,3 +40,15 @@
 - Market/User WS ו־trading-loop latency אינם ניתנים למדידה כשה־trader כבוי.
 
 המשך בטוח: אין להפעיל את trader. יש להשלים Git/report, ולאחר מכן audit סופי של services/flags/status.
+
+
+## עדכון v5 — 2026-08-12
+
+- גיבוי pre-v5 נוצר ונבדק: poly_live.pre-v5.sqlite3, SHA-256 3367d235b7cfaf2490e2829d05330f478dae7665bf2a0bfa93dcf9a66a5345ed.
+- migration 5 עבר staging ו־production; בשניהם quick_check=ok.
+- נוספו strategy runs, position events, redemptions, constraints, freshness/statistics endpoints, session nonce ותיקון fee_rate_bps.
+- Backend working tree: 218 passed + 9 subtests; dashboard: 19 passed.
+- Frontend: 5/5, lint, build.
+- commit 26d46f7 נדחף לענף ה־feature.
+- לא בוצע restart/reload. קוד v5 ייטען בתהליך dashboard החיצוני רק לאחר restart עתידי ומאושר של dashboard בלבד.
+- trader נשאר inactive+disabled; לא בוצעה שום פעולת מסחר.
