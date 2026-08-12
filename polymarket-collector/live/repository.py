@@ -30,8 +30,9 @@ def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 
 class LiveRepository:
-    def __init__(self, db_path: Path | str):
+    def __init__(self, db_path: Path | str, *, query_only: bool = False):
         self.db_path = Path(db_path)
+        self.query_only = bool(query_only)
 
     def connect(self) -> sqlite3.Connection:
         class ClosingConnection(sqlite3.Connection):
@@ -40,18 +41,29 @@ class LiveRepository:
                 self.close()
                 return result
 
+        target = (
+            f"file:{self.db_path}?mode=ro"
+            if self.query_only
+            else str(self.db_path)
+        )
         conn = sqlite3.connect(
-            self.db_path, factory=ClosingConnection, timeout=30.0
+            target, factory=ClosingConnection, timeout=30.0,
+            uri=self.query_only,
         )
         conn.row_factory = sqlite3.Row
         # A bounded wait avoids transient writer contention surfacing as an
         # application error. NORMAL is durable with WAL while avoiding one
         # filesystem sync for every high-frequency market-data transaction.
         conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA synchronous = NORMAL")
+        if self.query_only:
+            conn.execute("PRAGMA query_only = ON")
+        else:
+            conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     def migrate(self, kill_switch_default: bool = True) -> None:
+        if self.query_only:
+            raise RuntimeError("query-only repository cannot run migrations")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             # WAL permits readers while the single writer commits market frames.

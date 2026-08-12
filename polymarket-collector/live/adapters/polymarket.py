@@ -16,6 +16,7 @@ from ..secrets import (
     PrivateKeySecretProvider,
     SecretProvider,
 )
+from ..strategy import fee_amount
 from ..strategy_repository import sanitize
 
 
@@ -537,6 +538,14 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         payload = _dump(value)
         maker_orders = payload.get("maker_orders") or []
         order_id = payload.get("taker_order_id")
+        fee_rate_bps = decimal_value(payload.get("fee_rate_bps"))
+        price = decimal_value(payload.get("price"))
+        size = decimal_value(payload.get("size"))
+        fee = (
+            fee_amount(size, price, fee_rate_bps / Decimal("10000"))
+            if fee_rate_bps is not None and price is not None and size is not None
+            else None
+        )
         return {
             "polymarket_trade_id": payload.get("id"),
             "polymarket_order_id": order_id,
@@ -545,7 +554,10 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             "side": str(payload.get("side") or "").lower(),
             "price": payload.get("price"),
             "size": payload.get("size"),
-            "fee": payload.get("fee_rate_bps") or "0",
+            "fee": canonical_decimal(fee) if fee is not None else None,
+            "fee_rate_bps": canonical_decimal(fee_rate_bps) if fee_rate_bps is not None else None,
+            "fee_source": "polymarket_fee_rate_bps" if fee is not None else None,
+            "fee_verification_status": "VERIFIED" if fee is not None else "UNKNOWN",
             "status": str(payload.get("status") or "matched").lower(),
             "matched_at": payload.get("matched_at"),
             "transaction_hash": payload.get("transaction_hash"),

@@ -27,6 +27,8 @@ class DashboardMeta(BaseModel):
     cutover_at: str | None = None
     source: str
     verified: bool
+    freshness_seconds: float = 0.0
+    stale: bool = False
     api_version: str = "v1"
 
 
@@ -226,6 +228,17 @@ def trades(
     return _response(_response_cache.get(key, 2.0, lambda: model.trade_history(window, page=page, page_size=page_size)))
 
 
+
+@router.get("/trade-statistics", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def trade_statistics(
+    range: str = Query("today", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> DashboardResponse:
+    model, _infra, _auth_value = _services()
+    return _response(model.pnl_summary(_window(range, from_date, to_date)))
+
+
 @router.get("/positions", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def positions() -> DashboardResponse:
     model, _infra, _auth_value = _services()
@@ -269,6 +282,12 @@ def infrastructure() -> DashboardResponse:
 def health() -> DashboardResponse:
     model, _infra, _auth_value = _services()
     return _response(model.health(_trader_status()))
+
+
+@router.get("/freshness", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def freshness() -> DashboardResponse:
+    model, _infra, _auth_value = _services()
+    return _response(model.freshness(_trader_status()))
 
 
 @router.get("/session", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])

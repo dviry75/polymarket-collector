@@ -119,6 +119,8 @@ class StrategyRepository:
                     shares_text TEXT NOT NULL,
                     price_text TEXT NOT NULL,
                     fee_text TEXT NOT NULL DEFAULT '0',
+                    fee_verification_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    fee_source TEXT,
                     status TEXT NOT NULL,
                     transaction_hash TEXT,
                     matched_at TEXT,
@@ -166,6 +168,8 @@ class StrategyRepository:
                     trigger_price_text TEXT,
                     entry_intent_id TEXT,
                     total_fees_text TEXT NOT NULL DEFAULT '0',
+                    fee_verification_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    fee_source TEXT,
                     realized_pnl_text TEXT NOT NULL DEFAULT '0',
                     final_reason TEXT,
                     opened_at TEXT,
@@ -632,6 +636,8 @@ class StrategyRepository:
         price: Decimal,
         fee: Decimal,
         status: str,
+        fee_verification_status: str = "UNKNOWN",
+        fee_source: str | None = None,
         transaction_hash: str | None = None,
         matched_at: str | None = None,
         raw: dict[str, Any] | None = None,
@@ -644,13 +650,13 @@ class StrategyRepository:
                     """
                     INSERT INTO live_strategy_fills(
                         fill_id,intent_id,remote_trade_id,shares_text,price_text,fee_text,
-                        status,transaction_hash,matched_at,raw_json,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        fee_verification_status,fee_source,status,transaction_hash,matched_at,raw_json,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         fill_id, intent_id, remote_trade_id, canonical_decimal(shares),
-                        canonical_decimal(price), canonical_decimal(fee), status,
-                        transaction_hash, matched_at, json.dumps(sanitize(raw or {}), sort_keys=True),
+                        canonical_decimal(price), canonical_decimal(fee),
+                        fee_verification_status, fee_source, status, transaction_hash, matched_at, json.dumps(sanitize(raw or {}), sort_keys=True),
                         ts, ts,
                     ),
                 )

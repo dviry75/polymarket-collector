@@ -59,7 +59,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _repo.migrate(_config.live_kill_switch_default)
     _strategy_repo = StrategyRepository(_repo)
     _strategy_repo.migrate(pause_entries_default=_config.pause_entries_default)
-    migrate_dashboard_schema(_repo, _config, environment=_config.environment)
+    migrate_dashboard_schema(_repo, _config, environment=_config.environment, rotate_runtime_run=True)
     _adapter = MockTradingAdapter(_config.adapter_scenario) if _config.live_adapter == "mock" else RealPolymarketTradingAdapter(_config)
     _risk = RiskManager(_config, _repo)
     _orders = OrderManager(_repo, _risk, _adapter)

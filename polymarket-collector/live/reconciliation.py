@@ -123,6 +123,8 @@ class ReconciliationWorker:
                             shares=decimal_value(trade.get("size")) or Decimal("0"),
                             price=decimal_value(trade.get("price")) or Decimal("0"),
                             fee=decimal_value(trade.get("fee")) or Decimal("0"),
+                            fee_verification_status=str(trade.get("fee_verification_status") or "UNKNOWN"),
+                            fee_source=trade.get("fee_source"),
                             status=str(trade.get("status") or "MATCHED").upper(),
                             transaction_hash=trade.get("transaction_hash"),
                             matched_at=trade.get("matched_at"),

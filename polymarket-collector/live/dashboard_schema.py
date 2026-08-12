@@ -8,7 +8,7 @@ from typing import Any
 
 from .repository import LiveRepository, now_iso
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 UNKNOWN = "UNKNOWN"
 
 
@@ -51,6 +51,9 @@ PROVENANCE_TABLES: dict[str, tuple[str, str, str]] = {
     "live_strategy_positions": ("position_id", "created_at", "'DERIVED'"),
     "live_strategy_deals": ("deal_id", "created_at", "'DERIVED'"),
     "live_audit_timeline": ("id", "occurred_at", "'OBSERVED'"),
+    "live_strategy_runs": ("run_id", "started_at", "'VERIFIED'"),
+    "live_position_events": ("position_event_id", "occurred_at", "'DERIVED_VERIFIED'"),
+    "live_redemptions": ("redemption_id", "requested_at", "'DERIVED_VERIFIED'"),
 }
 
 PROVENANCE_COLUMNS: dict[str, str] = {
@@ -174,6 +177,7 @@ def migrate_dashboard_schema(
     cutover_at: str | None = None,
     environment: str | None = None,
     run_id: str | None = None,
+    rotate_runtime_run: bool = False,
 ) -> ProvenanceContext:
     """Apply the additive dashboard/provenance schema without classifying legacy rows.
 
@@ -216,6 +220,35 @@ def migrate_dashboard_schema(
             );
             CREATE INDEX IF NOT EXISTS idx_dashboard_history_verification_status
             ON live_dashboard_history_verification(entity_type, verification_status, verified_at);
+            CREATE TABLE IF NOT EXISTS live_strategy_runs (
+                run_id TEXT PRIMARY KEY, state TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT,
+                execution_mode TEXT NOT NULL DEFAULT 'UNKNOWN', environment TEXT NOT NULL DEFAULT 'UNKNOWN',
+                strategy_id TEXT NOT NULL DEFAULT 'UNKNOWN', strategy_version TEXT NOT NULL DEFAULT 'UNKNOWN',
+                provenance_source TEXT NOT NULL DEFAULT 'UNKNOWN', source_timestamp TEXT, ingested_at TEXT,
+                reconciliation_status TEXT NOT NULL DEFAULT 'NOT_RECONCILED',
+                verification_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+            );
+            CREATE TABLE IF NOT EXISTS live_position_events (
+                position_event_id TEXT PRIMARY KEY, position_id TEXT NOT NULL, event_id TEXT, event_type TEXT NOT NULL,
+                previous_state TEXT, new_state TEXT, shares_text TEXT, amount_text TEXT, occurred_at TEXT NOT NULL,
+                execution_mode TEXT NOT NULL DEFAULT 'UNKNOWN', environment TEXT NOT NULL DEFAULT 'UNKNOWN',
+                run_id TEXT NOT NULL DEFAULT 'UNKNOWN', strategy_id TEXT NOT NULL DEFAULT 'UNKNOWN',
+                strategy_version TEXT NOT NULL DEFAULT 'UNKNOWN', provenance_source TEXT NOT NULL DEFAULT 'UNKNOWN',
+                source_timestamp TEXT, ingested_at TEXT, reconciliation_status TEXT NOT NULL DEFAULT 'NOT_RECONCILED',
+                verification_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+            );
+            CREATE TABLE IF NOT EXISTS live_redemptions (
+                redemption_id TEXT PRIMARY KEY, position_id TEXT NOT NULL, event_id TEXT, token_id TEXT, state TEXT NOT NULL,
+                shares_text TEXT, amount_text TEXT, transaction_hash TEXT, requested_at TEXT NOT NULL, completed_at TEXT,
+                execution_mode TEXT NOT NULL DEFAULT 'UNKNOWN', environment TEXT NOT NULL DEFAULT 'UNKNOWN',
+                run_id TEXT NOT NULL DEFAULT 'UNKNOWN', strategy_id TEXT NOT NULL DEFAULT 'UNKNOWN',
+                strategy_version TEXT NOT NULL DEFAULT 'UNKNOWN', provenance_source TEXT NOT NULL DEFAULT 'UNKNOWN',
+                source_timestamp TEXT, ingested_at TEXT, reconciliation_status TEXT NOT NULL DEFAULT 'NOT_RECONCILED',
+                verification_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+            );
+            CREATE INDEX IF NOT EXISTS idx_live_strategy_runs_environment ON live_strategy_runs(environment,execution_mode,started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_live_position_events_position ON live_position_events(position_id,occurred_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_live_redemptions_position ON live_redemptions(position_id,requested_at DESC);
             """
         )
         conn.execute(
@@ -241,7 +274,7 @@ def migrate_dashboard_schema(
         context = ProvenanceContext(
             execution_mode=str(stored["execution_mode"]),
             environment=str(stored["environment"]),
-            run_id=str(stored["run_id"]),
+            run_id=context.run_id if rotate_runtime_run else str(stored["run_id"]),
             strategy_id=str(stored["strategy_id"]),
             strategy_version=str(stored["strategy_version"]),
             source=str(stored["source"]),
@@ -265,6 +298,23 @@ def migrate_dashboard_schema(
                 """,
                 (key, value, now_iso()),
             )
+        if rotate_runtime_run:
+            started_at = now_iso()
+            conn.execute(
+                "UPDATE live_strategy_runs SET state='INTERRUPTED',ended_at=? "
+                "WHERE environment=? AND execution_mode=? AND state='RUNNING'",
+                (started_at, context.environment, context.execution_mode),
+            )
+            conn.execute(
+                """
+                INSERT INTO live_strategy_runs(
+                    run_id,state,started_at,execution_mode,environment,strategy_id,strategy_version,
+                    provenance_source,source_timestamp,ingested_at,reconciliation_status,verification_status
+                ) VALUES(?,'RUNNING',?,?,?,?,?,?,?,?,'PENDING','VERIFIED')
+                """,
+                (context.run_id, started_at, context.execution_mode, context.environment,
+                 context.strategy_id, context.strategy_version, context.source, started_at, started_at),
+            )
         existing_tables = {
             str(row[0]) for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -278,6 +328,95 @@ def migrate_dashboard_schema(
                 if column not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             _create_trigger(conn, table, primary_key, source_timestamp, verification_expression)
+        conn.executescript(
+            f"""
+            DROP TRIGGER IF EXISTS trg_live_strategy_positions_position_event_insert;
+            CREATE TRIGGER trg_live_strategy_positions_position_event_insert
+            AFTER INSERT ON live_strategy_positions
+            BEGIN
+                INSERT OR IGNORE INTO live_position_events(
+                    position_event_id,position_id,event_id,event_type,new_state,shares_text,amount_text,occurred_at,
+                    execution_mode,environment,run_id,strategy_id,strategy_version,provenance_source,
+                    source_timestamp,ingested_at,reconciliation_status,verification_status
+                ) VALUES(
+                    NEW.position_id || ':create:' || NEW.created_at, NEW.position_id, NEW.event_id, 'CREATED', NEW.state,
+                    NEW.remaining_shares_text,NEW.cost_all_in_text,NEW.created_at,
+                    CASE WHEN NEW.execution_mode='UNKNOWN' THEN {_state_value_sql('provenance_execution_mode')} ELSE NEW.execution_mode END,
+                    CASE WHEN NEW.environment='UNKNOWN' THEN {_state_value_sql('provenance_environment')} ELSE NEW.environment END,
+                    CASE WHEN NEW.run_id='UNKNOWN' THEN {_state_value_sql('provenance_run_id')} ELSE NEW.run_id END,
+                    CASE WHEN NEW.strategy_id='UNKNOWN' THEN {_state_value_sql('provenance_strategy_id')} ELSE NEW.strategy_id END,
+                    CASE WHEN NEW.strategy_version='UNKNOWN' THEN {_state_value_sql('provenance_strategy_version')} ELSE NEW.strategy_version END,
+                    CASE WHEN NEW.provenance_source='UNKNOWN' THEN {_state_value_sql('provenance_source')} ELSE NEW.provenance_source END,
+                    NEW.created_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NEW.reconciliation_status,
+                    CASE WHEN NEW.verification_status='UNKNOWN' THEN 'DERIVED' ELSE NEW.verification_status END
+                );
+            END;
+            DROP TRIGGER IF EXISTS trg_live_strategy_positions_position_event_update;
+            CREATE TRIGGER trg_live_strategy_positions_position_event_update
+            AFTER UPDATE ON live_strategy_positions
+            WHEN OLD.state IS NOT NEW.state OR OLD.remaining_shares_text IS NOT NEW.remaining_shares_text
+                 OR OLD.realized_pnl_text IS NOT NEW.realized_pnl_text
+            BEGIN
+                INSERT OR IGNORE INTO live_position_events(
+                    position_event_id,position_id,event_id,event_type,previous_state,new_state,shares_text,amount_text,occurred_at,
+                    execution_mode,environment,run_id,strategy_id,strategy_version,provenance_source,source_timestamp,ingested_at,
+                    reconciliation_status,verification_status
+                ) VALUES(
+                    NEW.position_id || ':update:' || NEW.updated_at || ':' || NEW.state,NEW.position_id,NEW.event_id,'STATE_OR_BALANCE_CHANGED',
+                    OLD.state,NEW.state,NEW.remaining_shares_text,NEW.realized_pnl_text,NEW.updated_at,NEW.execution_mode,NEW.environment,
+                    NEW.run_id,NEW.strategy_id,NEW.strategy_version,NEW.provenance_source,NEW.updated_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),NEW.reconciliation_status,NEW.verification_status
+                );
+            END;
+            DROP TRIGGER IF EXISTS trg_live_strategy_positions_redemption_insert;
+            CREATE TRIGGER trg_live_strategy_positions_redemption_insert
+            AFTER INSERT ON live_strategy_positions
+            WHEN NEW.state IN ('REDEEM_PENDING','REDEEMED')
+            BEGIN
+                INSERT OR IGNORE INTO live_redemptions(
+                    redemption_id,position_id,event_id,token_id,state,shares_text,amount_text,requested_at,completed_at,
+                    execution_mode,environment,run_id,strategy_id,strategy_version,provenance_source,source_timestamp,ingested_at,
+                    reconciliation_status,verification_status
+                ) VALUES(
+                    NEW.position_id || ':redemption',NEW.position_id,NEW.event_id,NEW.token_id,NEW.state,NEW.remaining_shares_text,
+                    CASE WHEN NEW.resolved_winner=1 THEN NEW.remaining_shares_text ELSE NULL END,NEW.updated_at,
+                    CASE WHEN NEW.state='REDEEMED' THEN NEW.updated_at ELSE NULL END,
+                    CASE WHEN NEW.execution_mode='UNKNOWN' THEN {_state_value_sql('provenance_execution_mode')} ELSE NEW.execution_mode END,
+                    CASE WHEN NEW.environment='UNKNOWN' THEN {_state_value_sql('provenance_environment')} ELSE NEW.environment END,
+                    CASE WHEN NEW.run_id='UNKNOWN' THEN {_state_value_sql('provenance_run_id')} ELSE NEW.run_id END,
+                    CASE WHEN NEW.strategy_id='UNKNOWN' THEN {_state_value_sql('provenance_strategy_id')} ELSE NEW.strategy_id END,
+                    CASE WHEN NEW.strategy_version='UNKNOWN' THEN {_state_value_sql('provenance_strategy_version')} ELSE NEW.strategy_version END,
+                    CASE WHEN NEW.provenance_source='UNKNOWN' THEN {_state_value_sql('provenance_source')} ELSE NEW.provenance_source END,
+                    NEW.updated_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'),NEW.reconciliation_status,NEW.verification_status
+                );
+            END;
+            DROP TRIGGER IF EXISTS trg_live_strategy_positions_redemption_update;
+            CREATE TRIGGER trg_live_strategy_positions_redemption_update
+            AFTER UPDATE OF state ON live_strategy_positions
+            WHEN NEW.state IN ('REDEEM_PENDING','REDEEMED') AND OLD.state IS NOT NEW.state
+            BEGIN
+                INSERT INTO live_redemptions(
+                    redemption_id,position_id,event_id,token_id,state,shares_text,amount_text,requested_at,completed_at,
+                    execution_mode,environment,run_id,strategy_id,strategy_version,provenance_source,source_timestamp,ingested_at,
+                    reconciliation_status,verification_status
+                ) VALUES(
+                    NEW.position_id || ':redemption',NEW.position_id,NEW.event_id,NEW.token_id,NEW.state,NEW.remaining_shares_text,
+                    CASE WHEN NEW.resolved_winner=1 THEN NEW.remaining_shares_text ELSE NULL END,NEW.updated_at,
+                    CASE WHEN NEW.state='REDEEMED' THEN NEW.updated_at ELSE NULL END,CASE WHEN NEW.execution_mode='UNKNOWN' THEN {_state_value_sql('provenance_execution_mode')} ELSE NEW.execution_mode END,
+                    CASE WHEN NEW.environment='UNKNOWN' THEN {_state_value_sql('provenance_environment')} ELSE NEW.environment END,
+                    CASE WHEN NEW.run_id='UNKNOWN' THEN {_state_value_sql('provenance_run_id')} ELSE NEW.run_id END,
+                    CASE WHEN NEW.strategy_id='UNKNOWN' THEN {_state_value_sql('provenance_strategy_id')} ELSE NEW.strategy_id END,
+                    CASE WHEN NEW.strategy_version='UNKNOWN' THEN {_state_value_sql('provenance_strategy_version')} ELSE NEW.strategy_version END,
+                    CASE WHEN NEW.provenance_source='UNKNOWN' THEN {_state_value_sql('provenance_source')} ELSE NEW.provenance_source END,NEW.updated_at,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'),NEW.reconciliation_status,NEW.verification_status
+                ) ON CONFLICT(redemption_id) DO UPDATE SET
+                    state=excluded.state,shares_text=excluded.shares_text,amount_text=excluded.amount_text,
+                    completed_at=excluded.completed_at,source_timestamp=excluded.source_timestamp,
+                    ingested_at=excluded.ingested_at,reconciliation_status=excluded.reconciliation_status,
+                    verification_status=excluded.verification_status;
+            END;
+            """
+        )
         for table in ("live_order_fills", "live_strategy_fills", "live_strategy_deals"):
             if table not in existing_tables:
                 continue
@@ -331,6 +470,61 @@ def migrate_dashboard_schema(
             """,
             (now_iso(),),
         )
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_dashboard_cutover_validate_insert
+            BEFORE INSERT ON live_dashboard_cutovers
+            WHEN NEW.environment NOT IN ('LIVE','STAGING','TEST','DEMO')
+              OR NEW.execution_mode NOT IN ('READ_ONLY','PAPER_TRADING','REAL_TRADING')
+              OR NEW.run_id='' OR NEW.strategy_id='' OR NEW.strategy_version='' OR NEW.source=''
+            BEGIN SELECT RAISE(ABORT, 'invalid dashboard cutover provenance'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_dashboard_cutover_validate_update
+            BEFORE UPDATE ON live_dashboard_cutovers
+            WHEN NEW.environment NOT IN ('LIVE','STAGING','TEST','DEMO')
+              OR NEW.execution_mode NOT IN ('READ_ONLY','PAPER_TRADING','REAL_TRADING')
+              OR NEW.run_id='' OR NEW.strategy_id='' OR NEW.strategy_version='' OR NEW.source=''
+            BEGIN SELECT RAISE(ABORT, 'invalid dashboard cutover provenance'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_dashboard_history_validate_insert
+            BEFORE INSERT ON live_dashboard_history_verification
+            WHEN NEW.verification_status NOT IN ('UNKNOWN','UNVERIFIED','PENDING','OBSERVED','DERIVED','VERIFIED','RECONCILED','DERIVED_VERIFIED')
+              OR NEW.evidence_source=''
+            BEGIN SELECT RAISE(ABORT, 'invalid dashboard history verification'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_dashboard_history_validate_update
+            BEFORE UPDATE ON live_dashboard_history_verification
+            WHEN NEW.verification_status NOT IN ('UNKNOWN','UNVERIFIED','PENDING','OBSERVED','DERIVED','VERIFIED','RECONCILED','DERIVED_VERIFIED')
+              OR NEW.evidence_source=''
+            BEGIN SELECT RAISE(ABORT, 'invalid dashboard history verification'); END;
+            """
+        )
+        for table in PROVENANCE_TABLES:
+            if table not in existing_tables:
+                continue
+            conn.executescript(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{table}_dashboard_validate_insert
+                BEFORE INSERT ON {table}
+                WHEN NEW.execution_mode NOT IN ('UNKNOWN','READ_ONLY','PAPER_TRADING','REAL_TRADING')
+                  OR NEW.environment NOT IN ('UNKNOWN','LIVE','STAGING','TEST','DEMO')
+                  OR NEW.verification_status NOT IN ('UNKNOWN','UNVERIFIED','PENDING','PARTIAL','OBSERVED','DERIVED','VERIFIED','RECONCILED','DERIVED_VERIFIED')
+                  OR NEW.reconciliation_status NOT IN ('NOT_RECONCILED','PENDING','RECONCILED','GAPS','FAILED')
+                BEGIN SELECT RAISE(ABORT, 'invalid dashboard provenance'); END;
+                CREATE TRIGGER IF NOT EXISTS trg_{table}_dashboard_validate_update
+                BEFORE UPDATE ON {table}
+                WHEN NEW.execution_mode NOT IN ('UNKNOWN','READ_ONLY','PAPER_TRADING','REAL_TRADING')
+                  OR NEW.environment NOT IN ('UNKNOWN','LIVE','STAGING','TEST','DEMO')
+                  OR NEW.verification_status NOT IN ('UNKNOWN','UNVERIFIED','PENDING','PARTIAL','OBSERVED','DERIVED','VERIFIED','RECONCILED','DERIVED_VERIFIED')
+                  OR NEW.reconciliation_status NOT IN ('NOT_RECONCILED','PENDING','RECONCILED','GAPS','FAILED')
+                BEGIN SELECT RAISE(ABORT, 'invalid dashboard provenance'); END;
+                """
+            )
+        conn.execute(
+            """
+            INSERT INTO live_schema_migrations(version,name,applied_at,checksum)
+            VALUES(5,'dashboard_provenance_constraints_v5',?,'dashboard-provenance-constraints-v5')
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (now_iso(),),
+        )
         conn.commit()
     return context
 
@@ -378,7 +572,24 @@ def mark_reconciled_provenance(repo: LiveRepository) -> dict[str, int]:
             ),
             "deals": (
                 """UPDATE live_strategy_deals AS d
-                   SET reconciliation_status='RECONCILED',verification_status='DERIVED_VERIFIED'
+                   SET reconciliation_status='RECONCILED',verification_status='DERIVED_VERIFIED',
+                       fee_verification_status=CASE
+                           WHEN EXISTS (
+                               SELECT 1 FROM live_strategy_intents fi
+                               JOIN live_strategy_fills ff ON ff.intent_id=fi.intent_id
+                               WHERE fi.event_id=d.event_id
+                           ) AND NOT EXISTS (
+                               SELECT 1 FROM live_strategy_intents fi
+                               JOIN live_strategy_fills ff ON ff.intent_id=fi.intent_id
+                               WHERE fi.event_id=d.event_id
+                                 AND ff.fee_verification_status!='VERIFIED'
+                           ) THEN 'VERIFIED' ELSE 'UNKNOWN' END,
+                       fee_source=CASE
+                           WHEN EXISTS (
+                               SELECT 1 FROM live_strategy_intents fi
+                               JOIN live_strategy_fills ff ON ff.intent_id=fi.intent_id
+                               WHERE fi.event_id=d.event_id AND ff.fee_verification_status='VERIFIED'
+                           ) THEN 'polymarket_fee_rate_bps_formula' ELSE NULL END
                    WHERE d.environment='LIVE' AND d.execution_mode='REAL_TRADING'
                      AND COALESCE(d.ingested_at,d.created_at)>=?
                      AND EXISTS (

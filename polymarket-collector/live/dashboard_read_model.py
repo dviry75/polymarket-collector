@@ -564,6 +564,37 @@ class DashboardReadModel:
             "quality": "REAL", "as_of": self.metadata()["as_of"],
         }
 
+    def freshness(self, trader_status: dict[str, Any] | None = None) -> dict[str, Any]:
+        health = self.health(trader_status)
+        now = datetime.now(timezone.utc)
+        sources = {
+            "account": self._one("SELECT sampled_at AS as_of FROM live_account_snapshots ORDER BY id DESC LIMIT 1"),
+            "market": self._one("SELECT COALESCE(market_timestamp,market_received_at,updated_at) AS as_of FROM live_markets ORDER BY updated_at DESC LIMIT 1"),
+            "reconciliation": {"as_of": health.get("last_reconciliation")},
+        }
+        limits = {"account": 60.0, "market": self.market_stale_seconds, "reconciliation": 30.0}
+        items: dict[str, Any] = {}
+        for name, row in sources.items():
+            as_of = (row or {}).get("as_of")
+            stale, age = quality_for_timestamp(as_of, stale_after_seconds=limits[name], now=now)
+            available = age is not None
+            items[name] = {
+                "as_of": as_of, "freshness_seconds": age,
+                "stale": stale if available else True,
+                "quality": "STALE" if available and stale else "REAL" if available else "UNAVAILABLE",
+                "verified": available, "source": f"{name}_state",
+            }
+        if not trader_status:
+            for name in ("market", "reconciliation"):
+                items[name]["stale"] = True
+                items[name]["quality"] = "STALE" if items[name]["as_of"] else "UNAVAILABLE"
+        quality = (
+            "REAL" if all(item["quality"] == "REAL" for item in items.values())
+            else "STALE" if any(item["quality"] == "STALE" for item in items.values())
+            else "UNAVAILABLE"
+        )
+        return {"items": items, "quality": quality, "as_of": now.isoformat(), "stale": quality != "REAL"}
+
     def overview(self, window: DateWindow, *, trader_status: dict[str, Any] | None = None) -> dict[str, Any]:
         account = self.account_equity(); pnl = self.pnl_summary(window)
         cutover_at = self._cutover_at()

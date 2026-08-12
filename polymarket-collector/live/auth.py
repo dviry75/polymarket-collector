@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -63,7 +64,8 @@ class LiveAuthManager:
     def create_session(self, username: str) -> str:
         issued = int(time.time())
         version = str(self._session_version_getter())
-        payload = f"{username}:{issued}:{version}"
+        nonce = secrets.token_urlsafe(18)
+        payload = f"{username}:{issued}:{version}:{nonce}"
         signature = hmac.new(self.config.session_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
         return base64.urlsafe_b64encode(f"{payload}:{signature}".encode("utf-8")).decode("ascii")
 
@@ -72,7 +74,15 @@ class LiveAuthManager:
             return False
         try:
             decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-            username, issued_raw, version, signature = decoded.rsplit(":", 3)
+            fields = decoded.rsplit(":", 4)
+            if len(fields) == 5:
+                username, issued_raw, version, nonce, signature = fields
+                payload = f"{username}:{issued_raw}:{version}:{nonce}"
+            elif len(fields) == 4:  # Backward compatibility during rollout.
+                username, issued_raw, version, signature = fields
+                payload = f"{username}:{issued_raw}:{version}"
+            else:
+                return False
             issued = int(issued_raw)
         except Exception:
             return False
@@ -82,7 +92,6 @@ class LiveAuthManager:
             return False
         if version != str(self._session_version_getter()):
             return False
-        payload = f"{username}:{issued}:{version}"
         expected = hmac.new(self.config.session_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(signature, expected)
 

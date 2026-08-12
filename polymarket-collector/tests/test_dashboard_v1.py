@@ -50,8 +50,8 @@ def seed_verified_lifecycle(repo: LiveRepository) -> None:
                         VALUES('btc-updown-5m-1786529400','condition','OPEN','YES','token','TEST','intent','2026-08-12T10:00:01+00:00','2026-08-12T10:00:01+00:00')""")
         conn.execute("""INSERT INTO live_strategy_intents(intent_id,correlation_id,event_id,condition_id,position_id,action,purpose,token_id,side,state,order_type,requested_amount_text,requested_shares_text,price_limit_text,max_spend_text,filled_shares_text,average_price_text,fee_text,remaining_shares_text,remote_order_id,created_at,updated_at)
                         VALUES('intent','corr','btc-updown-5m-1786529400','condition','position','ENTRY','ENTRY','token','YES','PARTIAL','FAK','5','10','0.5','5','4','0.5','0.2','6','remote-order','2026-08-12T10:00:02+00:00','2026-08-12T10:00:02+00:00')""")
-        conn.execute("""INSERT INTO live_strategy_fills(fill_id,intent_id,remote_trade_id,shares_text,price_text,fee_text,status,matched_at,created_at,updated_at)
-                        VALUES('fill','intent','remote-trade','4','0.5','0.2','MATCHED','2026-08-12T10:00:03+00:00','2026-08-12T10:00:03+00:00','2026-08-12T10:00:03+00:00')""")
+        conn.execute("""INSERT INTO live_strategy_fills(fill_id,intent_id,remote_trade_id,shares_text,price_text,fee_text,fee_verification_status,fee_source,status,matched_at,created_at,updated_at)
+                        VALUES('fill','intent','remote-trade','4','0.5','0.2','VERIFIED','test_formula','MATCHED','2026-08-12T10:00:03+00:00','2026-08-12T10:00:03+00:00','2026-08-12T10:00:03+00:00')""")
         conn.execute("""INSERT INTO live_strategy_positions(position_id,event_id,condition_id,token_id,outcome,state,acquired_shares_text,remaining_shares_text,sellable_shares_text,average_entry_price_text,cost_all_in_text,entry_fees_text,created_at,updated_at)
                         VALUES('position','btc-updown-5m-1786529400','condition','token','YES','OPEN','10','4','4','1','10','0.2','2026-08-12T10:00:04+00:00','2026-08-12T10:00:04+00:00')""")
         conn.execute("""INSERT INTO live_strategy_deals(deal_id,event_id,position_id,state,outcome,total_fees_text,realized_pnl_text,fee_verification_status,fee_source,final_reason,opened_at,closed_at,created_at,updated_at)
@@ -78,7 +78,7 @@ def test_migration_is_idempotent_and_does_not_invent_legacy_provenance():
             legacy = conn.execute("SELECT execution_mode,environment,verification_status FROM live_strategy_positions WHERE position_id='legacy'").fetchone()
             migrations = conn.execute("SELECT count(*) FROM live_schema_migrations").fetchone()[0]
         assert tuple(legacy) == ("UNKNOWN", "UNKNOWN", "UNKNOWN")
-        assert migrations == 4
+        assert migrations == 5
         with repo.connect() as conn:
             conn.execute("UPDATE live_strategy_positions SET updated_at=? WHERE position_id='legacy'", (NOW.isoformat(),))
             updated = conn.execute("SELECT execution_mode,environment,run_id FROM live_strategy_positions WHERE position_id='legacy'").fetchone()
@@ -270,3 +270,122 @@ def test_empty_positions_and_orders_require_post_cutover_reconciliation():
         equity = model.account_equity(now=NOW)
         assert equity["positions"]["value"] is None
         assert equity["positions"]["quality"] == "UNAVAILABLE"
+
+
+def test_runtime_run_rotation_preserves_cutover_and_interrupts_previous_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, config = build_db(tmp)
+        first = migrate_dashboard_schema(
+            repo, config, run_id="runtime-one", rotate_runtime_run=True
+        )
+        second = migrate_dashboard_schema(
+            repo, config, run_id="runtime-two", rotate_runtime_run=True
+        )
+        with repo.connect() as conn:
+            rows = conn.execute(
+                "SELECT run_id,state,ended_at FROM live_strategy_runs ORDER BY started_at,run_id"
+            ).fetchall()
+            cutover = conn.execute(
+                "SELECT cutover_at,run_id FROM live_dashboard_cutovers WHERE environment=\x27LIVE\x27"
+            ).fetchone()
+        assert first.cutover_at == second.cutover_at == CUTOVER
+        assert tuple(cutover) == (CUTOVER, "test-run")
+        assert [(row["run_id"], row["state"]) for row in rows] == [
+            ("runtime-one", "INTERRUPTED"), ("runtime-two", "RUNNING")
+        ]
+        assert rows[0]["ended_at"] is not None
+
+
+def test_provenance_constraints_reject_invalid_insert_and_update():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        with repo.connect() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO live_account_snapshots(sampled_at,status,environment) VALUES(?,?,?)",
+                    (NOW.isoformat(), "ok", "INVALID"),
+                )
+                assert False, "invalid provenance insert should be rejected"
+            except sqlite3.IntegrityError:
+                pass
+            conn.execute(
+                "INSERT INTO live_account_snapshots(sampled_at,status) VALUES(?,?)",
+                (NOW.isoformat(), "ok"),
+            )
+            row_id = conn.execute(
+                "SELECT id FROM live_account_snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+            try:
+                conn.execute(
+                    "UPDATE live_account_snapshots SET verification_status=? WHERE id=?",
+                    ("INVENTED", row_id),
+                )
+                assert False, "invalid provenance update should be rejected"
+            except sqlite3.IntegrityError:
+                pass
+
+
+def test_position_and_redemption_events_receive_runtime_provenance():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        with repo.connect() as conn:
+            conn.execute(
+                """INSERT INTO live_strategy_positions(
+                    position_id,event_id,condition_id,token_id,outcome,state,
+                    acquired_shares_text,remaining_shares_text,sellable_shares_text,
+                    average_entry_price_text,cost_all_in_text,resolved_winner,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "redeem-position", "redeem-event", "condition", "token", "YES",
+                    "REDEEM_PENDING", "2", "2", "0", "0.5", "1", 1,
+                    NOW.isoformat(), NOW.isoformat(),
+                ),
+            )
+            event = conn.execute(
+                "SELECT environment,execution_mode,run_id,position_id FROM live_position_events"
+            ).fetchone()
+            redemption = conn.execute(
+                "SELECT environment,execution_mode,run_id,state FROM live_redemptions"
+            ).fetchone()
+        assert tuple(event) == ("LIVE", "REAL_TRADING", "test-run", "redeem-position")
+        assert tuple(redemption) == ("LIVE", "REAL_TRADING", "test-run", "REDEEM_PENDING")
+
+
+def test_session_nonce_and_explicit_statistics_and_freshness_endpoints():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, config = build_db(tmp)
+        configure_dashboard_api(repo.db_path, config, trader_status_provider=lambda: None)
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app, base_url="https://testserver")
+        from live.auth import LiveAuthManager
+
+        auth = LiveAuthManager(config)
+        first = auth.create_session(config.login_username)
+        second = auth.create_session(config.login_username)
+        assert first != second
+        assert auth.verify_session(first) and auth.verify_session(second)
+        client.cookies.set("live_session", first)
+        statistics = client.get("/live/dashboard/v1/trade-statistics?range=today")
+        freshness = client.get("/live/dashboard/v1/freshness")
+        assert statistics.status_code == 200
+        assert freshness.status_code == 200
+        assert freshness.json()["data"]["stale"] is True
+        assert "freshness_seconds" in statistics.json()["meta"]
+        assert "stale" in statistics.json()["meta"]
+
+
+def test_polymarket_fee_rate_is_converted_from_bps_to_currency_amount():
+    from live.adapters.polymarket import RealPolymarketTradingAdapter
+
+    normalized = RealPolymarketTradingAdapter._normalize_trade(
+        {
+            "id": "trade", "taker_order_id": "order", "market": "condition",
+            "token_id": "token", "side": "BUY", "price": "0.5", "size": "10",
+            "fee_rate_bps": "100", "status": "MATCHED",
+        }
+    )
+    assert normalized["fee_rate_bps"] == "100"
+    assert normalized["fee"] == "0.025"
+    assert normalized["fee_verification_status"] == "VERIFIED"
+    assert normalized["fee_source"] == "polymarket_fee_rate_bps"
