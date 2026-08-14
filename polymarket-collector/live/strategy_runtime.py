@@ -138,7 +138,7 @@ class LiveStrategyRuntime:
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
         instant = at or datetime.now(timezone.utc)
         local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
-        friday_exception = local.date().isoformat() == "2026-08-07"
+        friday_exception = local.date().isoformat() == "2026-08-14"
         inactive = (
             local.weekday() < 5
             and 14 <= local.hour < 23
