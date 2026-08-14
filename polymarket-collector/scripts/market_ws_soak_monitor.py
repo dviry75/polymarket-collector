@@ -13,7 +13,7 @@ EXPECTED={"kill_switch":"true","pause_entries":"true","canary_armed":"false"}
 def now(): return datetime.now(timezone.utc).isoformat()
 def israel(): return datetime.now(ZoneInfo("Asia/Jerusalem")).isoformat()
 def service():
- r=subprocess.run(["systemctl","show","polymarket-live.service","-p","ActiveState","-p","MainPID"],capture_output=True,text=True)
+ r=subprocess.run(["systemctl","show","polymarket-trader.service","-p","ActiveState","-p","MainPID"],capture_output=True,text=True)
  return dict(line.split("=",1) for line in r.stdout.splitlines() if "=" in line)
 def db(path):
  c=sqlite3.connect(f"file:{path}?mode=ro",uri=True,timeout=5); c.row_factory=sqlite3.Row

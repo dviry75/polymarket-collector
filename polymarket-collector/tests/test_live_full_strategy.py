@@ -25,7 +25,13 @@ def build_repo():
     return temporary, base, strategy
 
 
-def reserve_and_open(strategy, event="event-1", shares=Decimal("10"), minimum=Decimal("5")):
+def reserve_and_open(
+    strategy,
+    event="event-1",
+    shares=Decimal("10"),
+    minimum=Decimal("5"),
+    sellable=None,
+):
     strategy.reserve_event_entry(
         event_id=event, condition_id=f"condition-{event}", token_id=f"token-{event}",
         side="YES", simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
@@ -33,7 +39,8 @@ def reserve_and_open(strategy, event="event-1", shares=Decimal("10"), minimum=De
     return strategy.open_position(
         event_id=event, condition_id=f"condition-{event}", token_id=f"token-{event}",
         outcome="YES", shares=shares, average_price=Decimal("0.74"),
-        cost_all_in=Decimal("5"), fees=Decimal("0.05"), min_sellable=minimum,
+        cost_all_in=Decimal("5"), fees=Decimal("0.05"),
+        sellable_shares=sellable, min_sellable=minimum,
     )
 
 
@@ -149,25 +156,45 @@ def test_five_dollar_all_in_rounding_fees_and_minimum():
         maximum_fee_fraction=Decimal("0.07"),
     ) == (False, "MINIMUM_ORDER_EXCEEDS_5_TOKEN_CAP")
 
-def test_event_lock_zero_fill_survives_restart_and_is_unique():
+def test_zero_fill_allows_new_unique_entry_attempt_and_preserves_history():
     temp, base, strategy = build_repo()
     try:
         first = strategy.reserve_event_entry(
             event_id="e", condition_id="c", token_id="yes", side="YES",
             simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
         )
-        assert not first.get("_duplicate")
-        strategy.mark_zero_fill("e", "FAK_ZERO_FILL")
+        strategy.mark_zero_fill(
+            "e", "FAK_ZERO_FILL", intent_id=first["entry_intent_id"]
+        )
         restarted = StrategyRepository(LiveRepository(base.db_path))
         restarted.migrate()
-        duplicate = restarted.reserve_event_entry(
-            event_id="e", condition_id="c", token_id="no", side="NO",
-            simultaneous=False, reason_code="SECOND_SIDE",
+        second = restarted.reserve_event_entry(
+            event_id="e", condition_id="c", token_id="yes", side="YES",
+            simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
         )
-        assert duplicate["_duplicate"] and duplicate["locked_side"] == "YES"
+        assert not second.get("_duplicate")
+        assert second["entry_intent_id"] != first["entry_intent_id"]
         assert restarted.intent(first["entry_intent_id"])["state"] == "ZERO_FILL"
+        with base.connect() as conn:
+            intents = conn.execute(
+                "SELECT intent_id,state FROM live_strategy_intents "
+                "WHERE event_id='e' ORDER BY created_at"
+            ).fetchall()
+            indexes = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA index_list('live_strategy_intents')"
+                ).fetchall()
+            }
+        assert [(row["intent_id"], row["state"]) for row in intents] == [
+            (first["entry_intent_id"], "ZERO_FILL"),
+            (second["entry_intent_id"], "RESERVED"),
+        ]
+        assert "idx_live_strategy_one_entry" not in indexes
+        assert "idx_live_strategy_one_unresolved_entry" in indexes
     finally:
         temp.cleanup()
+
+
 def test_canary_reservation_consumes_and_disarms_atomically_across_restart():
     temp, base, strategy = build_repo()
     try:
@@ -242,6 +269,242 @@ def test_partial_tp_cancel_race_no_oversell_and_dust():
     finally:
         temp.cleanup()
 
+
+
+def test_reconciled_exit_fill_is_idempotent_and_preserves_true_dust():
+    temp, _base, strategy = build_repo()
+    try:
+        position = reserve_and_open(
+            strategy, shares=Decimal("5.066664"), minimum=Decimal("5")
+        )
+        intent = strategy.reserve_position_intent(
+            position, action="EXIT", purpose="STOP_066", order_type="FAK",
+            shares=Decimal("5.0666"), price_limit=Decimal("0.55"), book_hash="stop",
+        )
+        kwargs = dict(
+            position_id=position["position_id"], intent_id=intent["intent_id"],
+            sold_shares=Decimal("5.06"), average_price=Decimal("0.8"),
+            fees=Decimal("0"), final_state="PARTIAL_FINAL",
+            min_sellable=Decimal("5"), purpose="STOP_066",
+            book_hash="account-reconciliation",
+            cumulative_filled_shares=Decimal("5.06"),
+            cumulative_notional=Decimal("4.048"),
+            cumulative_fees=Decimal("0"),
+        )
+        first = strategy.apply_exit_fill(**kwargs)
+        repeated = strategy.apply_exit_fill(**kwargs)
+        assert first["remaining_shares_text"] == "0.006664"
+        assert repeated["remaining_shares_text"] == "0.006664"
+        assert repeated["exit_value_text"] == "4.048"
+        assert repeated["state"] == "DUST"
+        assert repeated["tp_intent_id"] is None
+        assert repeated["active_exit_intent_id"] is None
+    finally:
+        temp.cleanup()
+
+
+def test_stale_remote_position_after_confirmed_sell_never_resurrects_local():
+    temp, base, strategy = build_repo()
+    try:
+        event = "stale-after-sell"
+        condition = "condition-stale-after-sell"
+        token = "token-stale-after-sell"
+        base.upsert_market({
+            "event_id": event, "condition_id": condition,
+            "yes_token_id": token, "no_token_id": "other-token",
+            "token_mapping_status": "verified", "accepting_orders": True,
+            "min_order_size": "5",
+        })
+        position = reserve_and_open(
+            strategy, event=event, shares=Decimal("5.066664"),
+            minimum=Decimal("5"), sellable=Decimal("5.066664"),
+        )
+        intent = strategy.reserve_position_intent(
+            position, action="EXIT", purpose="STOP_066", order_type="FAK",
+            shares=Decimal("5.0666"), price_limit=Decimal("0.55"), book_hash="stop",
+        )
+        strategy.apply_exit_fill(
+            position_id=position["position_id"], intent_id=intent["intent_id"],
+            sold_shares=Decimal("5.06"), average_price=Decimal("0.8"), fees=Decimal("0"),
+            final_state="PARTIAL_FINAL", min_sellable=Decimal("5"),
+            purpose="STOP_066", book_hash="stop",
+        )
+        adapter = MockTradingAdapter()
+        adapter.positions = [{
+            "condition_id": condition, "token_id": token, "outcome": "YES",
+            "size": "5.066664", "average_price": "0.75", "current_value": "4",
+        }]
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert result["status"] == "ok"
+        current = strategy.position_for_token(token)
+        assert current["remaining_shares_text"] == "0.006664"
+        assert current["state"] == "DUST"
+    finally:
+        temp.cleanup()
+
+
+def test_remote_zero_after_sell_grace_keeps_dust_and_reconciliation_ready():
+    temp, base, strategy = build_repo()
+    try:
+        position = reserve_and_open(
+            strategy, event="remote-zero-after-sell",
+            shares=Decimal("5.066664"), minimum=Decimal("5"),
+            sellable=Decimal("5.066664"),
+        )
+        intent = strategy.reserve_position_intent(
+            position, action="EXIT", purpose="STOP_066", order_type="FAK",
+            shares=Decimal("5.0666"), price_limit=Decimal("0.55"), book_hash="stop",
+        )
+        strategy.apply_exit_fill(
+            position_id=position["position_id"], intent_id=intent["intent_id"],
+            sold_shares=Decimal("5.06"), average_price=Decimal("0.8"), fees=Decimal("0"),
+            final_state="PARTIAL_FINAL", min_sellable=Decimal("5"),
+            purpose="STOP_066", book_hash="stop",
+        )
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions SET updated_at='2000-01-01T00:00:00+00:00' "
+                "WHERE position_id=?", (position["position_id"],),
+            )
+            conn.commit()
+        result = asyncio.run(
+            ReconciliationWorker(base, MockTradingAdapter(), strategy).run_once("test")
+        )
+        assert result["status"] == "ok"
+        assert base.get_state("reconciliation_readiness") == "READY"
+        current = strategy.position_for_token(position["token_id"])
+        assert current["remaining_shares_text"] == "0.006664"
+        assert current["state"] == "DUST"
+    finally:
+        temp.cleanup()
+
+
+def test_stop_success_never_recreates_take_profit():
+    class RecordingAdapter(MockTradingAdapter):
+        def __init__(self):
+            super().__init__()
+            self.create_calls = []
+
+        async def create_order(self, order):
+            self.create_calls.append(order)
+            return await super().create_order(order)
+
+    temp, base, strategy = build_repo()
+    try:
+        position = reserve_and_open(
+            strategy, event="no-tp-after-stop", shares=Decimal("12"),
+            minimum=Decimal("5"), sellable=Decimal("12"),
+        )
+        stop = strategy.reserve_position_intent(
+            position, action="EXIT", purpose="STOP_066", order_type="FAK",
+            shares=Decimal("12"), price_limit=Decimal("0.55"), book_hash="stop",
+        )
+        stopped = strategy.apply_exit_fill(
+            position_id=position["position_id"], intent_id=stop["intent_id"],
+            sold_shares=Decimal("6"), average_price=Decimal("0.8"), fees=Decimal("0"),
+            final_state="PARTIAL_FINAL", min_sellable=Decimal("5"),
+            purpose="STOP_066", book_hash="stop",
+        )
+        assert stopped["state"] == "OPEN"
+        assert stopped["stop_stage"] == 1
+        adapter = RecordingAdapter()
+        runtime = LiveStrategyRuntime(
+            LiveConfig(execution_mode="REAL_TRADING"), base, strategy, adapter
+        )
+        asyncio.run(runtime._ensure_take_profit(stopped))
+        assert adapter.create_calls == []
+        assert strategy.position_for_token(position["token_id"])["tp_intent_id"] is None
+    finally:
+        temp.cleanup()
+
+
+def test_persistent_remote_position_after_sell_grace_is_real_gap():
+    temp, base, strategy = build_repo()
+    try:
+        event = "persistent-stale-after-sell"
+        condition = "condition-persistent-stale-after-sell"
+        token = "token-persistent-stale-after-sell"
+        base.upsert_market({
+            "event_id": event, "condition_id": condition,
+            "yes_token_id": token, "no_token_id": "other-token",
+            "token_mapping_status": "verified", "accepting_orders": True,
+            "min_order_size": "5",
+        })
+        position = reserve_and_open(
+            strategy, event=event, shares=Decimal("5.066664"),
+            minimum=Decimal("5"), sellable=Decimal("5.066664"),
+        )
+        stop = strategy.reserve_position_intent(
+            position, action="EXIT", purpose="STOP_066", order_type="FAK",
+            shares=Decimal("5.0666"), price_limit=Decimal("0.55"), book_hash="stop",
+        )
+        strategy.apply_exit_fill(
+            position_id=position["position_id"], intent_id=stop["intent_id"],
+            sold_shares=Decimal("5.06"), average_price=Decimal("0.8"), fees=Decimal("0"),
+            final_state="PARTIAL_FINAL", min_sellable=Decimal("5"),
+            purpose="STOP_066", book_hash="stop",
+        )
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions SET updated_at='2000-01-01T00:00:00+00:00' "
+                "WHERE position_id=?", (position["position_id"],),
+            )
+            conn.commit()
+        adapter = MockTradingAdapter()
+        adapter.positions = [{
+            "condition_id": condition, "token_id": token, "outcome": "YES",
+            "size": "5.066664", "average_price": "0.75", "current_value": "4",
+        }]
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert result["status"] == "gaps"
+        assert result["gaps"] == [{
+            "type": "remote_position_after_confirmed_exit",
+            "position_id": position["position_id"], "token_id": token,
+            "local_shares": "0.006664", "remote_shares": "5.066664",
+        }]
+        assert base.get_state("reconciliation_readiness") == "NOT_READY"
+        assert strategy.pause_entries()
+        assert strategy.position_for_token(token)["remaining_shares_text"] == "0.006664"
+    finally:
+        temp.cleanup()
+
+
+def test_transient_rate_limit_backs_off_without_financial_correction_then_recovers():
+    class ToggleRateLimitAdapter(MockTradingAdapter):
+        def __init__(self):
+            super().__init__()
+            self.rate_limited = True
+            self.balance_calls = 0
+
+        async def get_balance(self):
+            self.balance_calls += 1
+            if self.rate_limited:
+                raise RuntimeError("HTTP 429 too many requests: rate limit")
+            return await super().get_balance()
+
+    temp, base, strategy = build_repo()
+    try:
+        base.set_state("kill_switch", "false", "test")
+        strategy.set_pause_entries(False, "test", "READY")
+        adapter = ToggleRateLimitAdapter()
+        worker = ReconciliationWorker(base, adapter, strategy)
+        failed = asyncio.run(worker.run_once("test"))
+        assert failed["status"] == "failed" and failed["rate_limited"]
+        assert failed["retry_after_seconds"] > 0
+        assert base.get_state("reconciliation_auto_recovery_pending") == "true"
+        backed_off = asyncio.run(worker.run_once("test"))
+        assert backed_off["status"] == "backoff"
+        assert adapter.balance_calls == 1
+        assert strategy.active_positions() == []
+        adapter.rate_limited = False
+        worker._rate_limit_retry_after = 0
+        clean = asyncio.run(worker.run_once("test"))
+        assert clean["status"] == "ok"
+        assert base.get_state("reconciliation_readiness") == "READY"
+        assert base.get_state("kill_switch") == "false"
+        assert not strategy.pause_entries()
+    finally:
+        temp.cleanup()
 
 def test_partial_emergency_allows_new_book_only_and_never_parallel():
     temp, _base, strategy = build_repo()
@@ -754,6 +1017,44 @@ def test_reconciliation_failure_forces_kill_pause_and_disarms_canary():
         assert base.get_state("kill_switch") == "true"
         assert base.get_state("canary_armed") == "false"
         assert strategy.pause_entries()
+        assert base.get_state("reconciliation_auto_recovery_pending", "false") == "false"
+
+        recovered = asyncio.run(
+            ReconciliationWorker(base, MockTradingAdapter(), strategy).run_once("test")
+        )
+        assert recovered["status"] == "ok"
+        assert base.get_state("reconciliation_readiness") == "READY"
+        assert base.get_state("kill_switch") == "true"
+        assert strategy.pause_entries()
+        assert base.get_state("reconciliation_auto_recovery_pending", "false") == "false"
+    finally:
+        temp.cleanup()
+
+
+def test_manual_pause_cancels_reconciliation_auto_recovery():
+    class FailingAdapter(MockTradingAdapter):
+        async def get_balance(self):
+            raise RuntimeError("HTTP 429 rate limit exceeded")
+
+    temp, base, strategy = build_repo()
+    try:
+        base.set_state("kill_switch", "false", "test")
+        strategy.set_pause_entries(False, "test", "READY")
+        failed = asyncio.run(
+            ReconciliationWorker(base, FailingAdapter(), strategy).run_once("test")
+        )
+        assert failed["status"] == "failed"
+        assert base.get_state("reconciliation_auto_recovery_pending") == "true"
+
+        strategy.set_pause_entries(True, "operator", "OPERATOR_PAUSE")
+        clean = asyncio.run(
+            ReconciliationWorker(base, MockTradingAdapter(), strategy).run_once("test")
+        )
+        assert clean["status"] == "ok"
+        assert base.get_state("reconciliation_readiness") == "READY"
+        assert base.get_state("kill_switch") == "true"
+        assert strategy.pause_entries()
+        assert base.get_state("reconciliation_auto_recovery_pending") == "false"
     finally:
         temp.cleanup()
 
@@ -1170,7 +1471,8 @@ def test_entry_exact_price_is_edge_triggered_not_level_triggered():
         runtime.schedule_frame(frame("0.73", 1))
         runtime.schedule_frame(frame("0.74", 2))
         runtime.schedule_frame(frame("0.74", 3))
-        runtime.schedule_frame(frame("0.74", 4))
+        runtime.schedule_frame(frame("0.75", 4))
+        runtime.schedule_frame(frame("0.74", 5))
 
         runtime._stop.set()
         runtime._frame_event.set()
@@ -1182,11 +1484,12 @@ def test_entry_exact_price_is_edge_triggered_not_level_triggered():
             if context.get("_critical_trigger")
         ]
 
-        assert len(critical) == 1
-        assert critical[0]["_critical_trigger_types"] == [
-            "ENTRY_074"
-        ]
-        assert runtime.critical_triggers_queued == 1
+        assert len(critical) == 2
+        assert all(
+            context["_critical_trigger_types"] == ["ENTRY_074"]
+            for context in critical
+        )
+        assert runtime.critical_triggers_queued == 2
         assert runtime.critical_triggers_dropped == 0
 
     asyncio.run(scenario())
@@ -1913,3 +2216,685 @@ def test_strategy_queues_intra_message_stop_and_emergency_fifo():
         }
 
     asyncio.run(scenario())
+
+
+def test_adapter_fak_no_match_exception_is_deterministic_zero_fill():
+    fake = FakeResponseClient(
+        RuntimeError(
+            "No orders found to match with FAK order. "
+            "FAK orders are partially filled or killed if no match is found."
+        )
+    )
+    result = asyncio.run(
+        RealPolymarketTradingAdapter(armed_config(), secure_client=fake).create_order(
+            _adapter_entry_order()
+        )
+    )
+    assert result["success"] is False
+    assert result["status"] == "rejected"
+    assert result["failure_reason"] == "FAK_NOT_FILLED"
+    assert len(fake.posted) == 1
+
+
+def test_zero_fill_without_remote_id_is_terminal_and_reconciliation_clean():
+    temp, base, strategy = build_repo()
+    try:
+        strategy.set_pause_entries(False, "test", "PRECONDITION")
+        attempt = strategy.reserve_event_entry(
+            event_id="zero-event", condition_id="zero-condition",
+            token_id="zero-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        strategy.mark_zero_fill(
+            "zero-event", "FAK_ZERO_FILL", intent_id=attempt["entry_intent_id"]
+        )
+        result = asyncio.run(
+            ReconciliationWorker(base, MockTradingAdapter(), strategy).run_once("test")
+        )
+        assert result["status"] == "ok"
+        assert result["gaps"] == []
+        assert not strategy.pause_entries()
+        intent = strategy.intent(attempt["entry_intent_id"])
+        assert intent["state"] == "ZERO_FILL"
+        assert intent["remote_order_id"] is None
+    finally:
+        temp.cleanup()
+
+
+def test_two_zero_fills_then_partial_fill_locks_event_and_opposite_side():
+    temp, _base, strategy = build_repo()
+    try:
+        event_id = "three-attempt-event"
+        attempts = []
+        for _ in range(2):
+            attempt = strategy.reserve_event_entry(
+                event_id=event_id, condition_id="three-condition",
+                token_id="yes-token", side="YES", simultaneous=False,
+                reason_code="ENTRY_PRICE_EXACT",
+            )
+            attempts.append(attempt["entry_intent_id"])
+            strategy.mark_zero_fill(
+                event_id, "FAK_ZERO_FILL", intent_id=attempt["entry_intent_id"]
+            )
+        third = strategy.reserve_event_entry(
+            event_id=event_id, condition_id="three-condition",
+            token_id="yes-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        attempts.append(third["entry_intent_id"])
+        strategy.add_fill(
+            intent_id=third["entry_intent_id"], remote_trade_id="partial-trade",
+            shares=Decimal("2"), price=Decimal("0.74"), fee=Decimal("0"),
+            status="MATCHED",
+        )
+        strategy.open_position(
+            event_id=event_id, condition_id="three-condition", token_id="yes-token",
+            outcome="YES", shares=Decimal("2"), average_price=Decimal("0.74"),
+            cost_all_in=Decimal("1.48"), fees=Decimal("0"),
+            min_sellable=Decimal("5"), entry_intent_id=third["entry_intent_id"],
+        )
+        fourth = strategy.reserve_event_entry(
+            event_id=event_id, condition_id="three-condition",
+            token_id="no-token", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        assert fourth["_duplicate"]
+        assert strategy.intent(third["entry_intent_id"])["state"] == "FILLED"
+        assert len(set(attempts)) == 3
+    finally:
+        temp.cleanup()
+
+
+def test_positive_partial_fill_below_five_tokens_still_locks_event():
+    temp, _base, strategy = build_repo()
+    try:
+        attempt = strategy.reserve_event_entry(
+            event_id="small-partial", condition_id="small-condition",
+            token_id="small-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        intent_id = attempt["entry_intent_id"]
+        strategy.add_fill(
+            intent_id=intent_id, remote_trade_id="small-trade",
+            shares=Decimal("0.01"), price=Decimal("0.74"), fee=Decimal("0"),
+            status="MATCHED",
+        )
+        rejected_zero_fill = False
+        try:
+            strategy.mark_zero_fill(
+                "small-partial", "FAK_ZERO_FILL", intent_id=intent_id
+            )
+        except RuntimeError:
+            rejected_zero_fill = True
+        assert rejected_zero_fill
+        strategy.open_position(
+            event_id="small-partial", condition_id="small-condition",
+            token_id="small-token", outcome="YES", shares=Decimal("0.01"),
+            average_price=Decimal("0.74"), cost_all_in=Decimal("0.0074"),
+            fees=Decimal("0"), min_sellable=Decimal("5"),
+            entry_intent_id=intent_id,
+        )
+        retry = strategy.reserve_event_entry(
+            event_id="small-partial", condition_id="small-condition",
+            token_id="other-token", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        assert retry["_duplicate"]
+    finally:
+        temp.cleanup()
+
+
+def test_unresolved_entry_blocks_retry_and_is_not_treated_as_zero_fill():
+    temp, _base, strategy = build_repo()
+    try:
+        first = strategy.reserve_event_entry(
+            event_id="unknown-event", condition_id="unknown-condition",
+            token_id="unknown-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        strategy.update_intent(
+            first["entry_intent_id"], state="RECONCILIATION_REQUIRED",
+            normalized_error="transport timeout with unknown exchange state",
+        )
+        retry = strategy.reserve_event_entry(
+            event_id="unknown-event", condition_id="unknown-condition",
+            token_id="other-token", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        assert retry["_duplicate"]
+        assert strategy.intent(first["entry_intent_id"])["state"] == "RECONCILIATION_REQUIRED"
+    finally:
+        temp.cleanup()
+
+
+def test_real_reconciliation_gap_still_pauses_entries():
+    temp, base, strategy = build_repo()
+    try:
+        strategy.set_pause_entries(False, "test", "PRECONDITION")
+        attempt = strategy.reserve_event_entry(
+            event_id="gap-event", condition_id="gap-condition",
+            token_id="gap-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        strategy.update_intent(
+            attempt["entry_intent_id"], state="RECONCILIATION_REQUIRED"
+        )
+        result = asyncio.run(
+            ReconciliationWorker(base, MockTradingAdapter(), strategy).run_once("test")
+        )
+        assert result["status"] == "gaps"
+        assert any(
+            gap["type"] == "durable_intent_without_remote_id"
+            and gap["intent_id"] == attempt["entry_intent_id"]
+            for gap in result["gaps"]
+        )
+        assert strategy.pause_entries()
+        assert base.get_state("reconciliation_readiness") == "NOT_READY"
+    finally:
+        temp.cleanup()
+
+
+def test_zero_fill_in_event_a_does_not_block_entry_in_event_b():
+    temp, _base, strategy = build_repo()
+    try:
+        first = strategy.reserve_event_entry(
+            event_id="event-a", condition_id="condition-a", token_id="token-a",
+            side="YES", simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
+            require_empty_slot=True,
+        )
+        strategy.mark_zero_fill(
+            "event-a", "FAK_ZERO_FILL", intent_id=first["entry_intent_id"]
+        )
+        second = strategy.reserve_event_entry(
+            event_id="event-b", condition_id="condition-b", token_id="token-b",
+            side="NO", simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
+            require_empty_slot=True,
+        )
+        assert not second.get("_blocked")
+        assert not second.get("_duplicate")
+        assert second["entry_intent_id"] != first["entry_intent_id"]
+    finally:
+        temp.cleanup()
+
+
+def test_manage_position_threshold_exit_priority():
+    cases = (
+        ("0.65", "STOP_066"),
+        ("0.61", "STOP_066"),
+        ("0.60", "EMERGENCY_060"),
+        ("0.58", "EMERGENCY_060"),
+        ("0.40", "EMERGENCY_060"),
+    )
+
+    for bid_text, expected in cases:
+        runtime = LiveStrategyRuntime.__new__(
+            LiveStrategyRuntime
+        )
+
+        runtime.policy = StrategyPolicy()
+        runtime.config = LiveConfig(
+            execution_mode="READ_ONLY",
+        )
+
+        runtime._hot_state = {
+            "reconciliation_readiness": "READY",
+            "positions_by_token": {
+                "token-threshold": [{
+                    "position_id": "position-threshold",
+                    "event_id": "event-threshold",
+                    "condition_id": "condition-threshold",
+                    "token_id": "token-threshold",
+                    "outcome": "YES",
+                    "state": "TP_OPEN",
+                    "remaining_shares_text": "5",
+                    "sellable_shares_text": "5",
+                    "stop_stage": 0,
+                    "tp_intent_id": "tp-threshold",
+                    "tp_intent_state": "LIVE",
+                    "active_exit_intent_id": None,
+                    "active_exit_intent_state": None,
+                }]
+            },
+        }
+
+        runtime.paper_mode = lambda: False
+
+        calls = []
+
+        async def fake_resume(
+            position,
+            update,
+            *,
+            bid,
+            frame_hash,
+            reconciliation_ready,
+        ):
+            return False
+
+        async def fake_stop(
+            position,
+            update,
+            *,
+            frame_hash,
+        ):
+            calls.append("STOP_066")
+
+        async def fake_emergency(
+            position,
+            update,
+            *,
+            purpose,
+            min_price,
+            frame_hash,
+        ):
+            calls.append(purpose)
+
+        async def fake_refresh():
+            return None
+
+        runtime._resume_waiting_sellable_intent = fake_resume
+        runtime._place_stop_loss = fake_stop
+        runtime._emergency_exit = fake_emergency
+        runtime._refresh_hot_state_once = fake_refresh
+
+        asyncio.run(
+            runtime._manage_position(
+                market={},
+                update={
+                    "asset_id": "token-threshold",
+                    "best_bid": bid_text,
+                },
+                event_ready=True,
+                frame_hash=f"threshold-{bid_text}",
+            )
+        )
+
+        assert calls == [expected], (
+            f"bid={bid_text}: expected {expected}, got {calls}"
+        )
+
+
+def test_waiting_sellable_exit_priority_and_resume():
+    async def run_case(
+        *,
+        bid_text,
+        active_purpose=None,
+        tp_waiting=False,
+        expected,
+    ):
+        runtime = LiveStrategyRuntime.__new__(
+            LiveStrategyRuntime
+        )
+
+        runtime.policy = StrategyPolicy()
+        runtime.config = LiveConfig(
+            execution_mode="READ_ONLY",
+        )
+        runtime.paper_mode = lambda: False
+
+        active_id = (
+            "exit-waiting"
+            if active_purpose
+            else None
+        )
+
+        tp_id = (
+            "tp-waiting"
+            if tp_waiting
+            else None
+        )
+
+        position = {
+            "position_id": "position-waiting",
+            "event_id": "event-waiting",
+            "condition_id": "condition-waiting",
+            "token_id": "token-waiting",
+            "outcome": "YES",
+            "state": (
+                "EXITING"
+                if active_id
+                else "TP_OPEN"
+                if tp_id
+                else "OPEN"
+            ),
+            "remaining_shares_text": "5",
+            # Emulate reconciliation having restored sellability.
+            "sellable_shares_text": "5",
+            "stop_stage": 0,
+            "tp_intent_id": tp_id,
+            "tp_intent_state": (
+                "WAITING_SELLABLE"
+                if tp_id
+                else None
+            ),
+            "active_exit_intent_id": active_id,
+            "active_exit_intent_state": (
+                "WAITING_SELLABLE"
+                if active_id
+                else None
+            ),
+        }
+
+        runtime._hot_state = {
+            "reconciliation_readiness": "READY",
+            "positions_by_token": {
+                "token-waiting": [position],
+            },
+        }
+
+        intents = {}
+
+        if active_id:
+            intents[active_id] = {
+                "intent_id": active_id,
+                "state": "WAITING_SELLABLE",
+                "remote_order_id": None,
+                "purpose": active_purpose,
+                "price_limit_text": "0.55",
+            }
+
+        if tp_id:
+            intents[tp_id] = {
+                "intent_id": tp_id,
+                "state": "WAITING_SELLABLE",
+                "remote_order_id": None,
+                "purpose": "TAKE_PROFIT",
+                "price_limit_text": "0.96",
+            }
+
+        class FakeRepo:
+            def intent(self, intent_id):
+                return intents.get(str(intent_id))
+
+        runtime.repo = FakeRepo()
+
+        calls = []
+
+        def fake_clear(intent_id, *, reason):
+            calls.append(
+                ("CLEAR", str(intent_id), reason)
+            )
+            return True
+
+        async def fake_refresh():
+            return None
+
+        async def fake_stop(
+            position,
+            update,
+            *,
+            frame_hash,
+        ):
+            calls.append(("STOP_066",))
+
+        async def fake_emergency(
+            position,
+            update,
+            *,
+            purpose,
+            min_price,
+            frame_hash,
+        ):
+            calls.append(
+                (
+                    purpose,
+                    str(min_price),
+                )
+            )
+
+        async def fake_tp(position):
+            calls.append(("TAKE_PROFIT",))
+
+        runtime._clear_local_waiting_intent = (
+            fake_clear
+        )
+        runtime._refresh_hot_state_once = (
+            fake_refresh
+        )
+        runtime._place_stop_loss = fake_stop
+        runtime._emergency_exit = fake_emergency
+        runtime._ensure_take_profit = fake_tp
+
+        await runtime._manage_position(
+            market={},
+            update={
+                "asset_id": "token-waiting",
+                "best_bid": bid_text,
+            },
+            event_ready=True,
+            frame_hash=f"waiting-{bid_text}",
+        )
+
+        action_calls = [
+            item[0]
+            for item in calls
+            if item[0] in {
+                "STOP_066",
+                "EMERGENCY_060",
+                "TAKE_PROFIT",
+            }
+        ]
+
+        assert action_calls == [expected], (
+            f"bid={bid_text}, "
+            f"active={active_purpose}, "
+            f"tp_waiting={tp_waiting}: "
+            f"expected {expected}, got {calls}"
+        )
+
+    # STOP was already triggered. Once sellability returns,
+    # retry it even though price is no longer exactly 0.66.
+    asyncio.run(
+        run_case(
+            bid_text="0.64",
+            active_purpose="STOP_066",
+            expected="STOP_066",
+        )
+    )
+
+    # A new Emergency threshold always supersedes
+    # an older waiting STOP.
+    asyncio.run(
+        run_case(
+            bid_text="0.58",
+            active_purpose="STOP_066",
+            expected="EMERGENCY_060",
+        )
+    )
+
+    # A pending TP must not be retried while STOP
+    # threshold is already breached.
+    asyncio.run(
+        run_case(
+            bid_text="0.65",
+            tp_waiting=True,
+            expected="STOP_066",
+        )
+    )
+
+    # Once Emergency was triggered, it remains pending.
+    # Sellability returning executes it even if price
+    # has moved back above the trigger threshold.
+    asyncio.run(
+        run_case(
+            bid_text="0.70",
+            active_purpose="EMERGENCY_060",
+            expected="EMERGENCY_060",
+        )
+    )
+
+def test_tp_waits_for_full_actual_fill_sellability_then_retries_once():
+    class RecordingAdapter(MockTradingAdapter):
+        def __init__(self):
+            super().__init__(scenario="live")
+            self.create_calls = []
+
+        async def create_order(self, order):
+            self.create_calls.append(order)
+            return await super().create_order(order)
+
+    temp, base, strategy = build_repo()
+    try:
+        shares = Decimal("5.4285")
+        position = reserve_and_open(
+            strategy,
+            event="tp-propagation",
+            shares=shares,
+            minimum=Decimal("0.0001"),
+            sellable=Decimal("0"),
+        )
+        adapter = RecordingAdapter()
+        runtime = LiveStrategyRuntime(
+            LiveConfig(execution_mode="READ_ONLY"),
+            base,
+            strategy,
+            adapter,
+        )
+
+        asyncio.run(runtime._ensure_take_profit(position))
+
+        waiting_position = strategy.position_for_token("token-tp-propagation")
+        waiting = strategy.intent(waiting_position["tp_intent_id"])
+        assert waiting["state"] == "WAITING_SELLABLE"
+        assert waiting["requested_shares_text"] == "5.4285"
+        assert adapter.create_calls == []
+
+        strategy.reconcile_remote_position(
+            event_id="tp-propagation",
+            condition_id="condition-tp-propagation",
+            token_id="token-tp-propagation",
+            outcome="YES",
+            remote_shares=shares,
+            average_price=Decimal("0.74"),
+        )
+        strategy.set_reconciliation_state(
+            ready=True, reason="", actor="test"
+        )
+        asyncio.run(runtime._refresh_hot_state_once())
+        asyncio.run(runtime._manage_position(
+            market={},
+            update={
+                "asset_id": "token-tp-propagation",
+                "best_bid": "0.70",
+            },
+            event_ready=True,
+            frame_hash="tp-sellable-returned",
+        ))
+
+        assert len(adapter.create_calls) == 1
+        order = adapter.create_calls[0]
+        assert order["purpose"] == "TAKE_PROFIT"
+        assert order["order_type"] == "GTC"
+        assert order["requested_price"] == "0.96"
+        assert order["requested_size"] == "5.4285"
+        current = strategy.position_for_token("token-tp-propagation")
+        assert current["tp_intent_id"] != waiting["intent_id"]
+        assert strategy.intent(current["tp_intent_id"])["state"] == "LIVE"
+    finally:
+        temp.cleanup()
+
+def test_open_position_below_emergency_never_submits_tp_first():
+    runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+    runtime.policy = StrategyPolicy()
+    runtime.config = LiveConfig(execution_mode="READ_ONLY")
+    runtime.paper_mode = lambda: False
+    runtime._hot_state = {
+        "reconciliation_readiness": "READY",
+        "positions_by_token": {
+            "priority-token": [{
+                "position_id": "priority-position",
+                "event_id": "priority-event",
+                "condition_id": "priority-condition",
+                "token_id": "priority-token",
+                "outcome": "YES",
+                "state": "OPEN",
+                "remaining_shares_text": "5",
+                "sellable_shares_text": "5",
+                "stop_stage": 0,
+                "tp_intent_id": None,
+                "active_exit_intent_id": None,
+            }],
+        },
+    }
+    calls = []
+
+    async def fake_resume(*_args, **_kwargs):
+        return False
+
+    async def fake_tp(_position):
+        calls.append("TAKE_PROFIT")
+
+    async def fake_stop(*_args, **_kwargs):
+        calls.append("STOP_066")
+
+    async def fake_emergency(*_args, **kwargs):
+        calls.append(kwargs["purpose"])
+
+    async def fake_refresh():
+        return None
+
+    runtime._resume_waiting_sellable_intent = fake_resume
+    runtime._ensure_take_profit = fake_tp
+    runtime._place_stop_loss = fake_stop
+    runtime._emergency_exit = fake_emergency
+    runtime._refresh_hot_state_once = fake_refresh
+
+    asyncio.run(runtime._manage_position(
+        market={},
+        update={"asset_id": "priority-token", "best_bid": "0.58"},
+        event_ready=True,
+        frame_hash="direct-emergency",
+    ))
+
+    assert calls == ["EMERGENCY_060"]
+
+
+def test_unknown_tp_without_remote_id_is_not_cancelled_or_parallel_sold():
+    class RecordingAdapter(MockTradingAdapter):
+        def __init__(self):
+            super().__init__()
+            self.cancel_calls = []
+            self.create_calls = []
+
+        async def cancel_order(self, order_id):
+            self.cancel_calls.append(order_id)
+            return await super().cancel_order(order_id)
+
+        async def create_order(self, order):
+            self.create_calls.append(order)
+            return await super().create_order(order)
+
+    temp, base, strategy = build_repo()
+    try:
+        position = reserve_and_open(
+            strategy, event="unknown-tp", shares=Decimal("5"),
+            minimum=Decimal("1"),
+        )
+        tp = strategy.reserve_position_intent(
+            position, action="TP", purpose="TAKE_PROFIT",
+            order_type="GTC", shares=Decimal("5"),
+            price_limit=Decimal("0.96"), book_hash="tp-unknown",
+        )
+        strategy.update_intent(
+            tp["intent_id"], state="RECONCILIATION_REQUIRED"
+        )
+        adapter = RecordingAdapter()
+        runtime = LiveStrategyRuntime(
+            LiveConfig(execution_mode="READ_ONLY"),
+            base, strategy, adapter,
+        )
+
+        asyncio.run(runtime._place_stop_loss(
+            strategy.position_for_token("token-unknown-tp"),
+            {"asset_id": "token-unknown-tp", "best_bid": "0.65"},
+            frame_hash="unknown-tp-stop",
+        ))
+
+        assert adapter.cancel_calls == []
+        assert adapter.create_calls == []
+        assert strategy.intent(tp["intent_id"])["state"] == "RECONCILIATION_REQUIRED"
+        assert strategy.position_for_token("token-unknown-tp")[
+            "active_exit_intent_id"
+        ] is None
+    finally:
+        temp.cleanup()

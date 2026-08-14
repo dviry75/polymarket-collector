@@ -17,6 +17,7 @@ from .backup import LiveBackupManager
 from .config import LiveConfig, redact_mapping
 from .dry_run import DryRunService
 from .market_websocket import MarketWebSocketManager, UserWebSocketManager
+from .order_attempts import OrderAttemptRecorder
 from .order_manager import OrderManager
 from .paper_trading import PaperTradingEngine
 from .public_client import MockPublicClobClient, PublicClobClient
@@ -28,6 +29,11 @@ from .secrets import EnvSecretProvider, GoogleSecretManagerProvider, secret_read
 from .strategy_repository import StrategyRepository, sanitize
 from .strategy_runtime import LiveStrategyRuntime
 from .dashboard_schema import migrate_dashboard_schema
+from .dashboard_facades import (
+    RemoteDryRun, RemoteHealth, RemoteReconciliation, RemoteStrategyRuntime,
+    TraderStatusCache, named_service,
+)
+from .ipc import TraderIPCClient, TraderIPCError
 
 
 router = APIRouter(prefix="/live", tags=["live"])
@@ -47,10 +53,16 @@ _paper: PaperTradingEngine | None = None
 _strategy_repo: StrategyRepository | None = None
 _strategy_runtime: LiveStrategyRuntime | None = None
 _export_state: dict[str, Any] = {"status": "idle", "path": None, "error": None, "row_counts": None}
+_ipc_client: TraderIPCClient | None = None
+_status_cache: TraderStatusCache | None = None
+_dashboard_mode = False
 
 
 def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
-    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime, _ipc_client, _status_cache, _dashboard_mode
+    _ipc_client = None
+    _status_cache = None
+    _dashboard_mode = False
     _config = config or LiveConfig.from_env()
     errors = _config.validation_errors()
     if errors:
@@ -60,7 +72,13 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _strategy_repo = StrategyRepository(_repo)
     _strategy_repo.migrate(pause_entries_default=_config.pause_entries_default)
     migrate_dashboard_schema(_repo, _config, environment=_config.environment, rotate_runtime_run=True)
-    _adapter = MockTradingAdapter(_config.adapter_scenario) if _config.live_adapter == "mock" else RealPolymarketTradingAdapter(_config)
+    _adapter = (
+        MockTradingAdapter(_config.adapter_scenario)
+        if _config.live_adapter == "mock"
+        else RealPolymarketTradingAdapter(
+            _config, attempt_recorder=OrderAttemptRecorder(_repo)
+        )
+    )
     _risk = RiskManager(_config, _repo)
     _orders = OrderManager(_repo, _risk, _adapter)
     _reconciliation = ReconciliationWorker(_repo, _adapter, _strategy_repo)
@@ -90,10 +108,65 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
         reconciliation=lambda: _reconciliation.run_once(actor="user_ws_reconnect"),
+        condition_ids_provider=_market_ws.cached_condition_ids,
+        market_provider=_market_ws.market_for_condition,
     )
     _engine = TradingEngine(_repo, _orders)
     _auth = LiveAuthManager(_config, session_version_getter=lambda: _repo.get_state("session_version", "1") if _repo else "1")
     _dry_run = DryRunService(_repo, _risk)
+
+
+def configure_dashboard(db_path: Path | str, config: LiveConfig | None = None) -> None:
+    """Configure a credential-free, query-only Dashboard process."""
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime, _ipc_client, _status_cache, _dashboard_mode
+    _config = config or LiveConfig.from_env()
+    _repo = LiveRepository(db_path, query_only=True)
+    _ipc_client = TraderIPCClient(_config.trader_socket_path)
+    _status_cache = TraderStatusCache(_ipc_client)
+    _adapter = named_service(_config.live_adapter)
+    _risk = RiskManager(_config, _repo)
+    _orders = named_service("remote-orders")
+    _reconciliation = RemoteReconciliation(_ipc_client)
+    _market_ws = RemoteHealth(_status_cache, "market_ws")
+    _user_ws = RemoteHealth(_status_cache, "user_ws")
+    _engine = named_service("remote-engine")
+    _auth = LiveAuthManager(_config, session_version_getter=lambda: _repo.get_state("session_version", "1"))
+    _dry_run = RemoteDryRun(_ipc_client)
+    _paper = RemoteHealth(_status_cache, "paper")
+    _strategy_repo = StrategyRepository(_repo)
+    _strategy_runtime = RemoteStrategyRuntime(_status_cache, "strategy")
+    _dashboard_mode = True
+
+
+def trader_command(command: str, payload: dict[str, Any] | None = None) -> Any:
+    if _ipc_client is None:
+        raise RuntimeError("Trader IPC is not configured")
+    try:
+        result = _ipc_client.call(command, payload)
+        if _status_cache is not None:
+            _status_cache.invalidate()
+        return result
+    except TraderIPCError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+async def trader_command_async(command: str, payload: dict[str, Any] | None = None) -> Any:
+    if _ipc_client is None:
+        raise RuntimeError("Trader IPC is not configured")
+    try:
+        result = await _ipc_client.call_async(command, payload)
+        if _status_cache is not None:
+            _status_cache.invalidate()
+        return result
+    except TraderIPCError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def audit_event(repo: LiveRepository, actor: str, action: str, status: str, reason: str = "", details: dict[str, Any] | None = None) -> None:
+    if _dashboard_mode:
+        trader_command("AUDIT", {"actor": actor, "action": action, "status": status, "reason": reason, "details": details or {}})
+    else:
+        repo.audit(actor, action, status, reason, details)
 
 
 def services() -> tuple[LiveConfig, LiveRepository, TradingAdapter, RiskManager, OrderManager, ReconciliationWorker, MarketWebSocketManager, UserWebSocketManager, TradingEngine, LiveAuthManager, DryRunService]:
@@ -117,7 +190,7 @@ def paper_service() -> PaperTradingEngine:
 def require_live_session(request: Request) -> None:
     config, repo, *_rest, auth, _dry = services()
     if not auth.configured():
-        repo.audit("anonymous", "live_login", "blocked", "LIVE login is not configured")
+        audit_event(repo, "anonymous", "live_login", "blocked", "LIVE login is not configured")
         raise HTTPException(status_code=503, detail="LIVE login is not configured; all /live routes are blocked")
     if not auth.verify_session(request.cookies.get(COOKIE_NAME)):
         raise HTTPException(status_code=401, detail="LIVE login required")
@@ -134,17 +207,17 @@ def require_operator(request: Request, x_live_operator_token: Optional[str] = He
     require_csrf(request, x_live_csrf_token)
     config, repo, *_ = services()
     if not config.operator_token:
-        repo.audit("anonymous", "operator_auth", "blocked", "LIVE_OPERATOR_TOKEN is not configured")
+        audit_event(repo, "anonymous", "operator_auth", "blocked", "LIVE_OPERATOR_TOKEN is not configured")
         raise HTTPException(status_code=403, detail="LIVE operator token is not configured; write actions are blocked")
     if x_live_operator_token != config.operator_token:
-        repo.audit("anonymous", "operator_auth", "blocked", "Invalid operator token")
+        audit_event(repo, "anonymous", "operator_auth", "blocked", "Invalid operator token")
         raise HTTPException(status_code=403, detail="Invalid LIVE operator token")
 
 
 def require_reauth(request: Request, x_live_reauth_password: Optional[str] = Header(default=None)) -> None:
     _config, repo, *_rest, auth, _dry = services()
     if not auth.verify_password(str(x_live_reauth_password or "")):
-        repo.audit("operator", "reauth", "blocked", "INVALID_REAUTH")
+        audit_event(repo, "operator", "reauth", "blocked", "INVALID_REAUTH")
         raise HTTPException(status_code=403, detail="Password re-authentication required")
 
 
@@ -163,21 +236,21 @@ def login(request: Request, payload: dict[str, Any] = Body(...)) -> JSONResponse
     config, repo, *_rest, auth, _dry = services()
     key = request.client.host if request.client else "unknown"
     if not auth.configured():
-        repo.audit("anonymous", "live_login", "blocked", "LOGIN_NOT_CONFIGURED")
+        audit_event(repo, "anonymous", "live_login", "blocked", "LOGIN_NOT_CONFIGURED")
         raise HTTPException(status_code=503, detail="LIVE login is not configured")
     if auth.rate_limited(key):
-        repo.audit("anonymous", "live_login", "blocked", "RATE_LIMIT")
+        audit_event(repo, "anonymous", "live_login", "blocked", "RATE_LIMIT")
         raise HTTPException(status_code=429, detail="Too many login attempts")
     if payload.get("username") != config.login_username or not auth.verify_password(str(payload.get("password") or "")):
         auth.record_failure(key)
-        repo.audit("anonymous", "live_login", "blocked", "INVALID_LOGIN")
+        audit_event(repo, "anonymous", "live_login", "blocked", "INVALID_LOGIN")
         raise HTTPException(status_code=401, detail="Invalid login")
     token = auth.create_session(config.login_username)
     csrf_token = auth.csrf_token(token)
     response = JSONResponse({"ok": True})
     response.set_cookie(COOKIE_NAME, token, httponly=True, secure=True, samesite="strict", max_age=config.session_ttl_seconds if config.session_ttl_seconds > 0 else None)
     response.headers["X-Live-CSRF-Token"] = csrf_token
-    repo.audit(config.login_username, "live_login", "ok")
+    audit_event(repo, config.login_username, "live_login", "ok")
     return response
 
 
@@ -187,7 +260,7 @@ def logout(request: Request, x_live_csrf_token: Optional[str] = Header(default=N
     require_csrf(request, x_live_csrf_token)
     response = JSONResponse({"ok": True})
     response.delete_cookie(COOKIE_NAME)
-    services()[1].audit("operator", "live_logout", "ok")
+    audit_event(services()[1], "operator", "live_logout", "ok")
     return response
 
 
@@ -196,7 +269,10 @@ def revoke_all_sessions(request: Request, x_live_operator_token: Optional[str] =
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
     require_reauth(request, x_live_reauth_password)
-    version = services()[1].revoke_all_sessions("operator")
+    version = (
+        trader_command("REVOKE_SESSIONS")["session_version"]
+        if _dashboard_mode else services()[1].revoke_all_sessions("operator")
+    )
     response = JSONResponse({"ok": True, "session_version": version})
     response.delete_cookie(COOKIE_NAME)
     return response
@@ -617,7 +693,7 @@ def dashboard_content(view: str = "overview") -> str:
 def live_dashboard(request: Request) -> Any:
     config, repo, *_rest, auth, _dry = services()
     if not auth.configured():
-        repo.audit("anonymous", "live_login", "blocked", "LIVE login is not configured")
+        audit_event(repo, "anonymous", "live_login", "blocked", "LIVE login is not configured")
         raise HTTPException(
             status_code=503,
             detail="LIVE login is not configured; all /live routes are blocked",
@@ -983,6 +1059,8 @@ def pause_entries(
 ) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return trader_command("PAUSE_ENTRIES")
     strategy_repo, _runtime = strategy_services()
     strategy_repo.set_pause_entries(True, "operator", "OPERATOR_PAUSE")
     return {"ok": True, "pause_entries": True}
@@ -998,6 +1076,11 @@ def resume_entries(
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
     require_reauth(request, x_live_reauth_password)
+    if _dashboard_mode:
+        result = trader_command("RESUME_ENTRIES")
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=result)
+        return result
     config, repo, *_ = services()
     strategy_repo, runtime = strategy_services()
     status = runtime.health()
@@ -1007,7 +1090,10 @@ def resume_entries(
     if status.get("reconciliation_readiness") != "READY":
         blockers.append("RECONCILIATION_NOT_READY")
     if config.execution_mode == "REAL_TRADING":
-        if repo.get_state("canary_armed", "false").lower() != "true":
+        if (
+            not config.continuous_trading_enabled
+            and repo.get_state("canary_armed", "false").lower() != "true"
+        ):
             blockers.append("CANARY_NOT_ARMED")
         if services()[7].health().get("status") != "CONNECTED":
             blockers.append("USER_WS_NOT_CONNECTED")
@@ -1032,6 +1118,9 @@ def emergency_close_preview(
 ) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        result = trader_command("EMERGENCY_CLOSE_PREVIEW")
+        return sanitize({**result, "sell_floor": "0.01", "global_cancel": False, "confirmation_required": "EMERGENCY CLOSE"})
     strategy_repo, _runtime = strategy_services()
     positions = strategy_repo.active_positions()
     relevant_orders = [
@@ -1069,6 +1158,8 @@ async def emergency_close_execute(
     require_reauth(request, x_live_reauth_password)
     if payload.get("confirmation") != "EMERGENCY CLOSE":
         raise HTTPException(status_code=409, detail="Exact emergency confirmation is required")
+    if _dashboard_mode:
+        return sanitize(await trader_command_async("EMERGENCY_CLOSE_EXECUTE", {"actor": "operator"}))
     strategy_repo, runtime = strategy_services()
     result = await runtime.emergency_close_all(services()[6].order_books, actor="operator")
     strategy_repo.timeline(
@@ -1158,7 +1249,11 @@ def acknowledge_alert(
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
     try:
-        return sanitize(strategy_services()[0].acknowledge_alert(alert_id, "operator"))
+        return sanitize(
+            trader_command("ACK_ALERT", {"alert_id": alert_id})
+            if _dashboard_mode
+            else strategy_services()[0].acknowledge_alert(alert_id, "operator")
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Alert not found") from exc
 
@@ -1167,7 +1262,10 @@ def acknowledge_alert(
 def activate_kill_switch(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
-    services()[1].set_state("kill_switch", "true", "operator")
+    if _dashboard_mode:
+        trader_command("KILL_SWITCH_SET", {"active": True})
+    else:
+        services()[1].set_state("kill_switch", "true", "operator")
     return RedirectResponse("/live", status_code=303)
 
 
@@ -1176,7 +1274,10 @@ def deactivate_kill_switch(request: Request, x_live_operator_token: Optional[str
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
     require_reauth(request, x_live_reauth_password)
-    services()[1].set_state("kill_switch", "false", "operator")
+    if _dashboard_mode:
+        trader_command("KILL_SWITCH_SET", {"active": False})
+    else:
+        services()[1].set_state("kill_switch", "false", "operator")
     return RedirectResponse("/live", status_code=303)
 
 
@@ -1184,7 +1285,10 @@ def deactivate_kill_switch(request: Request, x_live_operator_token: Optional[str
 async def run_reconciliation(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> RedirectResponse:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
-    await services()[5].run_once(actor="operator")
+    if _dashboard_mode:
+        await trader_command_async("RECONCILIATION_RUN", {"actor": "operator"})
+    else:
+        await services()[5].run_once(actor="operator")
     return RedirectResponse("/live", status_code=303)
 
 
@@ -1223,7 +1327,7 @@ def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_li
     if amount <= 0 or amount > float(config.max_trade_amount_usd):
         raise HTTPException(status_code=400, detail="requested_amount_usd exceeds Paper limit")
     latest_market = repo.latest_market()
-    rule = repo.create_rule({
+    rule_payload = {
         "name": str(payload.get("name") or "").strip() or "live rule",
         "entry_price": entry,
         "stop_loss_price": sl,
@@ -1245,8 +1349,11 @@ def create_live_rule(request: Request, payload: dict[str, Any] = Body(...), x_li
         "inactive_windows": payload.get("inactive_windows") or [],
         "source_demo_rule_id": payload.get("source_demo_rule_id"),
         "source_rule_snapshot": payload.get("source_rule_snapshot") or {},
-    })
-    return rule
+    }
+    return (
+        trader_command("CREATE_RULE", {"rule": rule_payload})
+        if _dashboard_mode else repo.create_rule(rule_payload)
+    )
 
 
 @router.post("/paper/rules/{rule_id}/status")
@@ -1276,7 +1383,10 @@ def update_paper_rule_status(
             and repo.counts().get("active_paper_rules", 0) >= config.max_active_rules
         ):
             raise HTTPException(status_code=409, detail="Maximum active Paper Rules reached")
-    return repo.update_rule_status(rule_id, status)
+    return (
+        trader_command("UPDATE_RULE_STATUS", {"rule_id": rule_id, "status": status})
+        if _dashboard_mode else repo.update_rule_status(rule_id, status)
+    )
 
 
 @router.post("/orders/mock")
@@ -1286,8 +1396,7 @@ async def create_mock_order(request: Request, payload: dict[str, Any] = Body(...
     config, repo, _adapter, _risk, _orders, reconciliation, _market_ws, _user_ws, engine, _auth, _dry = services()
     if config.live_adapter != "mock":
         raise HTTPException(status_code=403, detail="This endpoint is mock-only")
-    await reconciliation.run_once(actor="operator")
-    return await engine.entry_intent({
+    order_payload = {
         "idempotency_key": payload.get("idempotency_key") or f"manual-{now_iso()}",
         "live_rule_id": payload.get("live_rule_id"),
         "event_id": payload.get("event_id", "manual-mock-event"),
@@ -1298,13 +1407,19 @@ async def create_mock_order(request: Request, payload: dict[str, Any] = Body(...
         "requested_amount_usd": payload.get("requested_amount_usd", config.default_trade_amount_usd),
         "order_type": payload.get("order_type", config.entry_order_type),
         "mock_scenario": payload.get("mock_scenario"),
-    }, actor="operator")
+    }
+    if _dashboard_mode:
+        return await trader_command_async("MOCK_ORDER", {"payload": order_payload})
+    await reconciliation.run_once(actor="operator")
+    return await engine.entry_intent(order_payload, actor="operator")
 
 
 @router.post("/market-ws/fixture")
 def process_market_ws_fixture(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return trader_command("MARKET_WS_FIXTURE", {"payload": payload})
     stored = services()[6].process_message(payload)
     return {"stored": stored, "status": services()[6].health()}
 
@@ -1313,6 +1428,8 @@ def process_market_ws_fixture(request: Request, payload: dict[str, Any] = Body(.
 def process_user_ws_fixture(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return trader_command("USER_WS_FIXTURE", {"payload": payload})
     stored = services()[7].process_message(payload)
     return {"stored": stored, "status": services()[7].health()}
 
@@ -1375,6 +1492,8 @@ def download_live_export(request: Request):
 async def refresh_account_identity(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None), use_mock: bool = False) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return await trader_command_async("ACCOUNT_REFRESH", {"use_mock": use_mock})
     config, repo, *_ = services()
     client = MockPublicAccountIdentityClient() if use_mock else PublicAccountIdentityClient()
     result = await client.resolve(config.profile_address)
@@ -1383,7 +1502,7 @@ async def refresh_account_identity(request: Request, x_live_operator_token: Opti
     payload["account_login_type"] = config.account_login_type
     payload["account_identity_status"] = result.status
     repo.store_account_snapshot(payload)
-    repo.audit("operator", "public_account_identity_refresh", "ok" if result.status != "UNAVAILABLE" else "blocked", result.error, {"status": result.status})
+    audit_event(repo, "operator", "public_account_identity_refresh", "ok" if result.status != "UNAVAILABLE" else "blocked", result.error, {"status": result.status})
     return {k: v for k, v in payload.items() if k != "raw_public_payload"}
 
 
@@ -1391,6 +1510,8 @@ async def refresh_account_identity(request: Request, x_live_operator_token: Opti
 def create_dry_run(request: Request, payload: dict[str, Any] = Body(...), x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return trader_command("DRY_RUN", {"payload": payload, "actor": "operator"})
     return services()[-1].preview(payload, actor="operator")
 
 
@@ -1402,6 +1523,8 @@ async def market_ws_smoke(request: Request, payload: dict[str, Any] = Body(...),
     asset_ids = [str(item) for item in payload.get("asset_ids") or []]
     if not asset_ids:
         raise HTTPException(status_code=400, detail="asset_ids are required for bounded public Market WS smoke test")
+    if _dashboard_mode:
+        return await trader_command_async("MARKET_WS_SMOKE", {"asset_ids": asset_ids, "max_messages": int(payload.get("max_messages", 1)), "timeout_seconds": float(payload.get("timeout_seconds", 20))})
     return await market_ws.connect_for_messages(config.market_ws_url, asset_ids, max_messages=int(payload.get("max_messages", 1)), timeout_seconds=float(payload.get("timeout_seconds", 20)))
 
 
@@ -1415,20 +1538,28 @@ def maintenance_status(request: Request) -> dict[str, Any]:
 def maintenance_drain(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
-    return JSONResponse(services()[1].request_maintenance_drain("operator"))
+    return JSONResponse(
+        trader_command("MAINTENANCE_DRAIN") if _dashboard_mode
+        else services()[1].request_maintenance_drain("operator")
+    )
 
 
 @router.post("/maintenance/cancel")
 def maintenance_cancel(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
-    return JSONResponse(services()[1].cancel_maintenance_drain("operator"))
+    return JSONResponse(
+        trader_command("MAINTENANCE_CANCEL") if _dashboard_mode
+        else services()[1].cancel_maintenance_drain("operator")
+    )
 
 
 @router.post("/maintenance/readiness")
 async def maintenance_readiness(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> JSONResponse:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return JSONResponse(await trader_command_async("MAINTENANCE_READINESS"))
     await services()[5].run_once(actor="maintenance")
     return JSONResponse(services()[1].refresh_maintenance_readiness("operator"))
 
@@ -1437,6 +1568,8 @@ async def maintenance_readiness(request: Request, x_live_operator_token: Optiona
 def create_live_backup(request: Request, x_live_operator_token: Optional[str] = Header(default=None), x_live_csrf_token: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_live_session(request)
     require_operator(request, x_live_operator_token, x_live_csrf_token)
+    if _dashboard_mode:
+        return trader_command("BACKUP_CREATE")
     config, repo, *_ = services()
     result = LiveBackupManager(config, repo).create_backup("manual")
     return result.__dict__
@@ -1445,6 +1578,8 @@ def create_live_backup(request: Request, x_live_operator_token: Optional[str] = 
 @router.get("/secrets/readiness")
 def secrets_status(request: Request) -> dict[str, Any]:
     require_live_session(request)
+    if _dashboard_mode:
+        return trader_command("SECRETS_READINESS")
     config = services()[0]
     provider = GoogleSecretManagerProvider(config.google_project_id, config.google_secret_prefix) if config.google_project_id else EnvSecretProvider()
     return secret_readiness(provider)
@@ -1460,5 +1595,5 @@ async def refresh_public_market_metadata(condition_id: str, event_id: str | None
         gamma_no_token_id=no_token_id,
     )
     repo.upsert_market(metadata)
-    repo.audit("system", "refresh_public_market_metadata", "ok", details={"condition_id": condition_id, "source": metadata.get("source")})
+    audit_event(repo, "system", "refresh_public_market_metadata", "ok", details={"condition_id": condition_id, "source": metadata.get("source")})
     return metadata

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
+import random
+import time
 from typing import Any
 
 from .adapters.base import TradingAdapter
@@ -8,6 +12,54 @@ from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso
 from .dashboard_schema import mark_reconciled_provenance
 from .strategy_repository import StrategyRepository, sanitize
+
+
+
+POSITION_PROPAGATION_GRACE_SECONDS = 15.0
+RATE_LIMIT_BACKOFF_BASE_SECONDS = 15.0
+RATE_LIMIT_BACKOFF_CAP_SECONDS = 120.0
+
+
+def _within_position_propagation_grace(
+    created_at: str | None,
+) -> bool:
+    if not created_at:
+        return False
+
+    try:
+        created = datetime.fromisoformat(
+            str(created_at).replace("Z", "+00:00")
+        )
+
+        if created.tzinfo is None:
+            created = created.replace(
+                tzinfo=timezone.utc
+            )
+
+        age = (
+            datetime.now(timezone.utc) - created
+        ).total_seconds()
+
+        return (
+            0
+            <= age
+            <= POSITION_PROPAGATION_GRACE_SECONDS
+        )
+
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        "ratelimit" in name
+        or "rate limit" in message
+        or "too many requests" in message
+        or "http 429" in message
+        or "status 429" in message
+    )
 
 
 class ReconciliationWorker:
@@ -26,8 +78,26 @@ class ReconciliationWorker:
         self.repo = repo
         self.adapter = adapter
         self.strategy_repo = strategy_repo
+        self._run_lock = asyncio.Lock()
+        self._consecutive_rate_limits = 0
+        self._rate_limit_retry_after = 0.0
 
     async def run_once(self, actor: str = "system") -> dict[str, Any]:
+        async with self._run_lock:
+            now = time.monotonic()
+            if now < self._rate_limit_retry_after:
+                return {
+                    "run_id": None,
+                    "status": "backoff",
+                    "gaps": [],
+                    "reason": "RECONCILIATION_RATE_LIMIT_BACKOFF",
+                    "retry_after_seconds": round(
+                        self._rate_limit_retry_after - now, 3
+                    ),
+                }
+            return await self._run_once_serialized(actor)
+
+    async def _run_once_serialized(self, actor: str) -> dict[str, Any]:
         run_id = self.repo.start_reconciliation()
         gaps: list[dict[str, Any]] = []
         try:
@@ -135,6 +205,15 @@ class ReconciliationWorker:
                 for intent in self.strategy_repo.unresolved_intents():
                     remote_id = str(intent.get("remote_order_id") or "")
                     if not remote_id:
+                        if (
+                            str(intent.get("state") or "").upper()
+                            == "WAITING_SELLABLE"
+                        ):
+                            # This state is only created after a confirmed
+                            # pre-submission balance failure. No remote order
+                            # exists, so absence of remote_order_id is expected.
+                            continue
+
                         gaps.append({
                             "type": "durable_intent_without_remote_id",
                             "intent_id": intent["intent_id"],
@@ -167,14 +246,18 @@ class ReconciliationWorker:
                             average_price=summary["average_price"],
                             cost_all_in=summary["notional"] + summary["fees"],
                             fees=summary["fees"],
+                            sellable_shares=Decimal("0"),
                             min_sellable=(
                                 decimal_value(market.get("min_order_size")) or Decimal("0")
                             ),
+                            entry_intent_id=str(intent["intent_id"]),
                         )
                         continue
                     if intent.get("action") == "ENTRY" and terminal:
                         self.strategy_repo.mark_zero_fill(
-                            str(intent["event_id"]), f"REMOTE_{status.upper()}_ZERO_FILL"
+                            str(intent["event_id"]),
+                            f"REMOTE_{status.upper()}_ZERO_FILL",
+                            intent_id=str(intent["intent_id"]),
                         )
                         continue
                     if intent.get("action") in {"EXIT", "TP"} and filled > 0:
@@ -186,13 +269,8 @@ class ReconciliationWorker:
                             })
                             continue
                         prior_shares = decimal_value(intent.get("filled_shares_text")) or Decimal("0")
-                        prior_average = decimal_value(intent.get("average_price_text")) or Decimal("0")
-                        prior_fees = decimal_value(intent.get("fee_text")) or Decimal("0")
                         delta = max(Decimal("0"), filled - prior_shares)
                         if delta > 0:
-                            delta_notional = max(
-                                Decimal("0"), summary["notional"] - prior_shares * prior_average
-                            )
                             requested = decimal_value(intent.get("requested_shares_text")) or filled
                             final_state = (
                                 "PARTIAL" if is_open else
@@ -203,8 +281,8 @@ class ReconciliationWorker:
                                 position_id=str(position["position_id"]),
                                 intent_id=str(intent["intent_id"]),
                                 sold_shares=delta,
-                                average_price=delta_notional / delta,
-                                fees=max(Decimal("0"), summary["fees"] - prior_fees),
+                                average_price=summary["average_price"],
+                                fees=summary["fees"],
                                 final_state=final_state,
                                 min_sellable=(
                                     decimal_value(market.get("min_order_size"))
@@ -212,12 +290,9 @@ class ReconciliationWorker:
                                 ),
                                 purpose=str(intent.get("purpose") or "RECONCILED_EXIT"),
                                 book_hash="account-reconciliation",
-                            )
-                            self.strategy_repo.update_intent(
-                                str(intent["intent_id"]),
-                                filled_shares_text=canonical_decimal(filled),
-                                average_price_text=canonical_decimal(summary["average_price"]),
-                                fee_text=canonical_decimal(summary["fees"]),
+                                cumulative_filled_shares=filled,
+                                cumulative_notional=summary["notional"],
+                                cumulative_fees=summary["fees"],
                             )
                         continue
                     if intent.get("action") in {"EXIT", "TP"} and terminal:
@@ -266,6 +341,32 @@ class ReconciliationWorker:
                     outcome = self.repo.outcome_for_asset(condition_id, token_id) or str(
                         remote.get("outcome") or "UNKNOWN"
                     ).upper()
+                    existing_position = self.strategy_repo.position_for_token(token_id)
+                    if existing_position is not None:
+                        local_remaining = (
+                            decimal_value(existing_position.get("remaining_shares_text"))
+                            or Decimal("0")
+                        )
+                        confirmed_exit_value = (
+                            decimal_value(existing_position.get("exit_value_text"))
+                            or Decimal("0")
+                        )
+                        if shares > local_remaining and confirmed_exit_value > 0:
+                            if _within_position_propagation_grace(
+                                existing_position.get("updated_at")
+                            ):
+                                # A confirmed SELL is execution truth. The public
+                                # positions endpoint may briefly return its old
+                                # snapshot, but must never resurrect those shares.
+                                continue
+                            gaps.append({
+                                "type": "remote_position_after_confirmed_exit",
+                                "position_id": existing_position["position_id"],
+                                "token_id": token_id,
+                                "local_shares": canonical_decimal(local_remaining),
+                                "remote_shares": canonical_decimal(shares),
+                            })
+                            continue
                     position, changed = self.strategy_repo.reconcile_remote_position(
                         event_id=str(market.get("event_id") or condition_id),
                         condition_id=condition_id,
@@ -289,8 +390,36 @@ class ReconciliationWorker:
                             redeem_pending=current_value > 0,
                         )
                 for local in self.strategy_repo.active_positions():
-                    remaining = decimal_value(local.get("remaining_shares_text")) or Decimal("0")
-                    if remaining > 0 and str(local.get("token_id")) not in remote_tokens:
+                    remaining = (
+                        decimal_value(
+                            local.get("remaining_shares_text")
+                        )
+                        or Decimal("0")
+                    )
+
+                    sellable = (
+                        decimal_value(
+                            local.get("sellable_shares_text")
+                        )
+                        or Decimal("0")
+                    )
+
+                    if (
+                        remaining > 0
+                        and str(local.get("token_id"))
+                        not in remote_tokens
+                    ):
+                        if (
+                            sellable <= 0
+                            and _within_position_propagation_grace(
+                                local.get("created_at")
+                            )
+                        ):
+                            # The trade fill is already authoritative locally,
+                            # but Polymarket's position/balance views can lag
+                            # briefly. Exits remain blocked because sellable=0.
+                            continue
+
                         gaps.append({
                             "type": "local_position_missing_remote",
                             "position_id": local["position_id"],
@@ -299,6 +428,8 @@ class ReconciliationWorker:
                         })
 
             status = "ok" if not gaps else "gaps"
+            self._consecutive_rate_limits = 0
+            self._rate_limit_retry_after = 0.0
             self.repo.finish_reconciliation(run_id, status, sanitize(gaps))
             if not gaps:
                 mark_reconciled_provenance(self.repo)
@@ -336,12 +467,59 @@ class ReconciliationWorker:
             return {"run_id": run_id, "status": status, "gaps": sanitize(gaps)}
         except Exception as exc:
             safe_error = f"{type(exc).__name__}: {exc}"[:500]
+            rate_limited = _is_rate_limit_error(exc)
+            retry_after_seconds = 0.0
+            if rate_limited:
+                self._consecutive_rate_limits += 1
+                base_delay = min(
+                    RATE_LIMIT_BACKOFF_CAP_SECONDS,
+                    RATE_LIMIT_BACKOFF_BASE_SECONDS
+                    * (2 ** (self._consecutive_rate_limits - 1)),
+                )
+                retry_after_seconds = min(
+                    RATE_LIMIT_BACKOFF_CAP_SECONDS,
+                    base_delay * random.uniform(0.8, 1.2),
+                )
+                self._rate_limit_retry_after = time.monotonic() + retry_after_seconds
+            else:
+                self._consecutive_rate_limits = 0
+                self._rate_limit_retry_after = 0.0
+                # An unknown failure revokes any earlier transient-rate-limit
+                # ownership. A later clean pass must not auto-open safety gates.
+                self.repo.set_state(
+                    "reconciliation_auto_recovery_pending", "false", actor
+                )
             self.repo.finish_reconciliation(run_id, "failed", sanitize(gaps), safe_error)
+            recovery_pending = (
+                self.repo.get_state(
+                    "reconciliation_auto_recovery_pending", "false"
+                ).lower()
+                == "true"
+            )
+            if (
+                not recovery_pending
+                and rate_limited
+                and not self.repo.kill_switch_active()
+                and self.strategy_repo is not None
+                and not self.strategy_repo.pause_entries()
+            ):
+                # Remember that reconciliation owns both safety gates. A later
+                # clean pass may only release gates acquired here; it must not
+                # override an operator/risk pause that predated the failure.
+                self.repo.set_state(
+                    "reconciliation_auto_recovery_pending", "true", actor
+                )
             self.repo.set_state("kill_switch", "true", actor)
             self.repo.set_state("canary_armed", "false", actor)
             if self.strategy_repo:
                 self.strategy_repo.set_reconciliation_state(
-                    ready=False, reason="RECONCILIATION_FAILED", actor=actor
+                    ready=False,
+                    reason=(
+                        "RECONCILIATION_RATE_LIMITED"
+                        if rate_limited
+                        else "RECONCILIATION_FAILED"
+                    ),
+                    actor=actor,
                 )
                 self.strategy_repo.alert(
                     alert_type="RECONCILIATION", severity="CRITICAL",
@@ -356,4 +534,6 @@ class ReconciliationWorker:
                 "status": "failed",
                 "gaps": sanitize(gaps),
                 "error": safe_error,
+                "rate_limited": rate_limited,
+                "retry_after_seconds": round(retry_after_seconds, 3),
             }

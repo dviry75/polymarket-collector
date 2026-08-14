@@ -20,7 +20,8 @@ OPEN_POSITION_STATES = {"OPEN", "TP_OPEN", "EXITING", "EXIT_RECONCILIATION_REQUI
 SENSITIVE_KEYS = {
     "private_key", "apikey", "api_key", "api_secret", "secret", "passphrase",
     "signature", "authorization", "cookie", "operator_token", "session_secret",
-    "csrf_token", "x_live_operator_token", "x_live_csrf_token",
+    "csrf_token", "x_live_operator_token", "x_live_csrf_token", "password",
+    "credential", "credentials", "token_secret", "signing_secret", "mnemonic",
 }
 
 
@@ -40,7 +41,7 @@ def sanitize(value: Any) -> Any:
         return canonical_decimal(value)
     if isinstance(value, str):
         return re.sub(
-            r"(?i)(private[_ -]?key|api[_ -]?secret|passphrase|authorization|signature|operator[_ -]?token|session[_ -]?secret|cookie|csrf[_ -]?token)(\s*[=:]\s*|\s+)[^\s,;]+",
+            r"(?i)(private[_ -]?key|api[_ -]?secret|passphrase|authorization|signature|operator[_ -]?token|session[_ -]?secret|cookie|csrf[_ -]?token|password|credentials?|token[_ -]?secret|signing[_ -]?secret|mnemonic)(\s*[=:]\s*|\s+)[^\s,;]+",
             lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
             value,
         )
@@ -104,13 +105,64 @@ class StrategyRepository:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(event_id) REFERENCES live_event_states(event_id)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_live_strategy_one_entry
+                DROP INDEX IF EXISTS idx_live_strategy_one_entry;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_live_strategy_one_unresolved_entry
                 ON live_strategy_intents(event_id)
-                WHERE action = 'ENTRY';
+                WHERE action = 'ENTRY'
+                  AND state NOT IN (
+                    'FILLED','PARTIAL_FINAL','ZERO_FILL','CANCELED','REJECTED',
+                    'FAILED','SETTLED','REDEEMED'
+                  );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_live_strategy_one_active_exit
                 ON live_strategy_intents(position_id)
                 WHERE action = 'EXIT'
                   AND state NOT IN ('FILLED','ZERO_FILL','CANCELED','REJECTED','FAILED','SETTLED');
+
+                CREATE TABLE IF NOT EXISTS live_order_attempts (
+                    record_id TEXT PRIMARY KEY,
+                    attempt_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    event_id TEXT,
+                    condition_id TEXT,
+                    token_id TEXT,
+                    intent_id TEXT,
+                    position_id TEXT,
+                    deal_id TEXT,
+                    operation TEXT NOT NULL,
+                    purpose TEXT,
+                    side TEXT,
+                    order_type TEXT,
+                    requested_price_text TEXT,
+                    requested_size_text TEXT,
+                    requested_amount_text TEXT,
+                    max_price_text TEXT,
+                    max_spend_text TEXT,
+                    intent_state_before TEXT,
+                    intent_state_after TEXT,
+                    result_status TEXT NOT NULL,
+                    success INTEGER,
+                    remote_order_id TEXT,
+                    transaction_hash TEXT,
+                    exception_type TEXT,
+                    exception_message TEXT,
+                    error_code TEXT,
+                    http_status INTEGER,
+                    request_json TEXT NOT NULL DEFAULT '{}',
+                    normalized_json TEXT,
+                    response_json TEXT,
+                    error_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_order_attempts_attempt
+                ON live_order_attempts(attempt_id, occurred_at, record_id);
+                CREATE INDEX IF NOT EXISTS idx_live_order_attempts_event
+                ON live_order_attempts(event_id, occurred_at, record_id);
+                CREATE INDEX IF NOT EXISTS idx_live_order_attempts_intent
+                ON live_order_attempts(intent_id, occurred_at, record_id);
+                CREATE INDEX IF NOT EXISTS idx_live_order_attempts_remote
+                ON live_order_attempts(remote_order_id, occurred_at, record_id);
 
                 CREATE TABLE IF NOT EXISTS live_strategy_fills (
                     fill_id TEXT PRIMARY KEY,
@@ -321,6 +373,7 @@ class StrategyRepository:
                 """
                 SELECT event_id
                 FROM live_event_states
+                WHERE status != 'ENTRY_ZERO_FILL'
                 ORDER BY locked_at DESC
                 LIMIT 64
                 """
@@ -422,6 +475,15 @@ class StrategyRepository:
 
     def set_pause_entries(self, paused: bool, actor: str, reason: str) -> None:
         previous = self.pause_entries()
+        if paused and reason not in {
+            "RECONCILIATION_FAILED",
+            "RECONCILIATION_RATE_LIMITED",
+        }:
+            # Any independently-owned pause cancels reconciliation's right to
+            # auto-release the safety gates on a later clean pass.
+            self.base.set_state(
+                "reconciliation_auto_recovery_pending", "false", actor
+            )
         self.base.set_state("pause_entries", "true" if paused else "false", actor)
         self.timeline(
             severity="WARNING" if paused else "INFO",
@@ -448,8 +510,6 @@ class StrategyRepository:
         require_empty_slot: bool = False,
     ) -> dict[str, Any]:
         ts = now_iso()
-        intent_id = stable_id("entry", event_id)
-        correlation_id = stable_id("correlation", event_id)
         status = "SKIPPED_SIMULTANEOUS_TRIGGER" if simultaneous else "ENTRY_INTENT_RESERVED"
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -457,8 +517,70 @@ class StrategyRepository:
                 "SELECT * FROM live_event_states WHERE event_id = ?", (event_id,)
             ).fetchone()
             if existing is not None:
-                conn.rollback()
-                return {**(row_to_dict(existing) or {}), "_duplicate": True}
+                if simultaneous and existing["status"] == "ENTRY_ZERO_FILL":
+                    conn.execute(
+                        """
+                        UPDATE live_event_states
+                        SET status='SKIPPED_SIMULTANEOUS_TRIGGER',locked_side=NULL,
+                            locked_token_id=NULL,lock_reason=?,entry_intent_id=NULL,
+                            locked_at=?,updated_at=?
+                        WHERE event_id=?
+                        """,
+                        (reason_code, ts, ts, event_id),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM live_event_states WHERE event_id=?", (event_id,)
+                    ).fetchone()
+                    conn.commit()
+                    return row_to_dict(row) or {}
+                prior_non_zero_fill = conn.execute(
+                    """
+                    SELECT 1 FROM live_strategy_intents
+                    WHERE event_id=? AND action='ENTRY' AND state!='ZERO_FILL'
+                    LIMIT 1
+                    """,
+                    (event_id,),
+                ).fetchone()
+                positive_fill = conn.execute(
+                    """
+                    SELECT 1
+                    FROM live_strategy_intents AS i
+                    WHERE i.event_id=? AND i.action='ENTRY'
+                      AND (
+                        CAST(COALESCE(i.filled_shares_text,'0') AS REAL) > 0
+                        OR EXISTS (
+                          SELECT 1 FROM live_strategy_fills AS f
+                          WHERE f.intent_id=i.intent_id
+                            AND CAST(COALESCE(f.shares_text,'0') AS REAL) > 0
+                        )
+                      )
+                    LIMIT 1
+                    """,
+                    (event_id,),
+                ).fetchone()
+                position = conn.execute(
+                    "SELECT 1 FROM live_strategy_positions WHERE event_id=? LIMIT 1",
+                    (event_id,),
+                ).fetchone()
+                if (
+                    simultaneous
+                    or existing["status"] != "ENTRY_ZERO_FILL"
+                    or prior_non_zero_fill is not None
+                    or positive_fill is not None
+                    or position is not None
+                ):
+                    conn.rollback()
+                    return {**(row_to_dict(existing) or {}), "_duplicate": True}
+            attempt_number = int(conn.execute(
+                "SELECT COUNT(*) FROM live_strategy_intents WHERE event_id=? AND action='ENTRY'",
+                (event_id,),
+            ).fetchone()[0]) + 1
+            attempt_identity = (
+                event_id if attempt_number == 1
+                else f"{event_id}:attempt:{attempt_number}"
+            )
+            intent_id = stable_id("entry", attempt_identity)
+            correlation_id = stable_id("correlation", attempt_identity)
             if require_empty_slot:
                 unresolved = conn.execute(
                     "SELECT 1 FROM live_strategy_intents "
@@ -488,30 +610,44 @@ class StrategyRepository:
                 ):
                     conn.rollback()
                     return {"_blocked": True, "reason": "CANARY_NOT_AVAILABLE"}
-            conn.execute(
-                """
-                INSERT INTO live_event_states(
-                    event_id,condition_id,status,locked_side,locked_token_id,lock_reason,
-                    entry_intent_id,locked_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    event_id, condition_id, status, side, token_id, reason_code,
-                    None if simultaneous else intent_id, ts, ts,
-                ),
-            )
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO live_event_states(
+                        event_id,condition_id,status,locked_side,locked_token_id,lock_reason,
+                        entry_intent_id,locked_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event_id, condition_id, status, side, token_id, reason_code,
+                        None if simultaneous else intent_id, ts, ts,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE live_event_states
+                    SET condition_id=?,status=?,locked_side=?,locked_token_id=?,
+                        lock_reason=?,entry_intent_id=?,locked_at=?,updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (
+                        condition_id, status, side, token_id, reason_code,
+                        intent_id, ts, ts, event_id,
+                    ),
+                )
             if not simultaneous:
                 conn.execute(
                     """
                     INSERT INTO live_strategy_intents(
                         intent_id,correlation_id,event_id,condition_id,action,purpose,
                         token_id,side,state,order_type,requested_amount_text,requested_shares_text,
-                        price_limit_text,max_spend_text,reason_code,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,'FAK','3.8','5','0.76','5',?,?,?)
+                        price_limit_text,max_spend_text,retry_count,reason_code,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,'FAK','3.8','5','0.76','5',?,?,?,?)
                     """,
                     (
                         intent_id, correlation_id, event_id, condition_id, "ENTRY", "ENTRY",
-                        token_id, side, "RESERVED", reason_code, ts, ts,
+                        token_id, side, "RESERVED", attempt_number - 1, reason_code, ts, ts,
                     ),
                 )
                 conn.execute(
@@ -520,6 +656,12 @@ class StrategyRepository:
                         deal_id,event_id,state,outcome,trigger_price_text,entry_intent_id,
                         created_at,updated_at
                     ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        state='ENTRY_PENDING',outcome=excluded.outcome,
+                        trigger_price_text=excluded.trigger_price_text,
+                        entry_intent_id=excluded.entry_intent_id,
+                        position_id=NULL,final_reason=NULL,opened_at=NULL,closed_at=NULL,
+                        updated_at=excluded.updated_at
                     """,
                     (
                         stable_id("deal", event_id), event_id, "ENTRY_PENDING", side,
@@ -701,11 +843,12 @@ class StrategyRepository:
         fees: Decimal,
         sellable_shares: Decimal | None = None,
         min_sellable: Decimal = Decimal("0"),
+        entry_intent_id: str | None = None,
     ) -> dict[str, Any]:
         position_id = stable_id("position", event_id)
         deal_id = stable_id("deal", event_id)
         sellable = shares if sellable_shares is None else sellable_shares
-        is_dust = shares > 0 and min_sellable > 0 and sellable < min_sellable
+        is_dust = shares > 0 and min_sellable > 0 and shares < min_sellable
         if is_dust:
             sellable = Decimal("0")
         position_state = "DUST" if is_dust else "OPEN"
@@ -713,6 +856,19 @@ class StrategyRepository:
         ts = now_iso()
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if entry_intent_id is None:
+                event_row = conn.execute(
+                    "SELECT entry_intent_id FROM live_event_states WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()
+                entry_intent_id = (
+                    str(event_row["entry_intent_id"])
+                    if event_row is not None and event_row["entry_intent_id"]
+                    else None
+                )
+            if not entry_intent_id:
+                conn.rollback()
+                raise RuntimeError(f"missing entry intent for event {event_id}")
             conn.execute(
                 """
                 INSERT INTO live_strategy_positions(
@@ -748,7 +904,7 @@ class StrategyRepository:
                 """,
                 (
                     position_id, canonical_decimal(shares), canonical_decimal(average_price),
-                    canonical_decimal(fees), ts, ts, stable_id("entry", event_id),
+                    canonical_decimal(fees), ts, ts, entry_intent_id,
                 ),
             )
             conn.execute(
@@ -772,17 +928,49 @@ class StrategyRepository:
             conn.commit()
         return row_to_dict(row) or {}
 
-    def mark_zero_fill(self, event_id: str, reason: str) -> None:
+    def mark_zero_fill(
+        self, event_id: str, reason: str, *, intent_id: str | None = None
+    ) -> None:
         ts = now_iso()
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if intent_id is None:
+                event_row = conn.execute(
+                    "SELECT entry_intent_id FROM live_event_states WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()
+                intent_id = (
+                    str(event_row["entry_intent_id"])
+                    if event_row is not None and event_row["entry_intent_id"]
+                    else None
+                )
+            intent = conn.execute(
+                "SELECT * FROM live_strategy_intents WHERE intent_id=? AND event_id=?",
+                (intent_id, event_id),
+            ).fetchone()
+            if intent is None:
+                conn.rollback()
+                raise KeyError(intent_id)
+            fill_total = conn.execute(
+                """
+                SELECT COALESCE(SUM(CAST(shares_text AS REAL)),0)
+                FROM live_strategy_fills WHERE intent_id=?
+                """,
+                (intent_id,),
+            ).fetchone()[0]
+            if (
+                (decimal_value(intent["filled_shares_text"]) or Decimal("0")) > 0
+                or float(fill_total or 0) > 0
+            ):
+                conn.rollback()
+                raise RuntimeError("positive fill cannot be finalized as ZERO_FILL")
             conn.execute(
                 """
                 UPDATE live_strategy_intents
                 SET state='ZERO_FILL',reason_code=?,final_at=?,updated_at=?
                 WHERE intent_id=?
                 """,
-                (reason, ts, ts, stable_id("entry", event_id)),
+                (reason, ts, ts, intent_id),
             )
             conn.execute(
                 "UPDATE live_event_states SET status='ENTRY_ZERO_FILL',updated_at=? WHERE event_id=?",
@@ -833,8 +1021,9 @@ class StrategyRepository:
         book_hash: str,
     ) -> dict[str, Any]:
         position_id = str(position["position_id"])
-        identity = f"{position_id}:{purpose}:{position.get('stop_stage', 0)}:{book_hash}"
-        intent_id = stable_id("intent", identity)
+        base_identity = (
+            f"{position_id}:{purpose}:{position.get('stop_stage', 0)}:{book_hash}"
+        )
         ts = now_iso()
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -850,6 +1039,26 @@ class StrategyRepository:
             if active is not None:
                 conn.rollback()
                 return {**(row_to_dict(active) or {}), "_duplicate": True}
+
+            prior_attempts = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM live_strategy_intents
+                    WHERE position_id=? AND action=? AND purpose=?
+                    """,
+                    (position_id, action, purpose),
+                ).fetchone()[0]
+                or 0
+            )
+
+            identity = (
+                base_identity
+                if prior_attempts == 0
+                else f"{base_identity}:retry:{prior_attempts}"
+            )
+            intent_id = stable_id("intent", identity)
+
             conn.execute(
                 """
                 INSERT INTO live_strategy_intents(
@@ -876,6 +1085,190 @@ class StrategyRepository:
             ).fetchone()
             conn.commit()
         return row_to_dict(row) or {}
+
+    def mark_waiting_sellable(
+        self,
+        intent_id: str,
+        *,
+        reason: str,
+        normalized_error: str | None = None,
+    ) -> dict[str, Any]:
+        """Keep a local-only SELL intent pending until token balance is sellable.
+
+        This state is valid only when there is no known live remote order.
+        sellable_shares is reset to zero so the runtime will not repeatedly
+        submit from stale local sellability.
+        """
+        ts = now_iso()
+
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                """
+                SELECT position_id,purpose,remote_order_id
+                FROM live_strategy_intents
+                WHERE intent_id=?
+                """,
+                (intent_id,),
+            ).fetchone()
+
+            if row is None:
+                conn.rollback()
+                raise KeyError(intent_id)
+
+            if row["remote_order_id"]:
+                conn.rollback()
+                raise RuntimeError(
+                    "WAITING_SELLABLE cannot be applied to a remote order"
+                )
+
+            conn.execute(
+                """
+                UPDATE live_strategy_intents
+                SET state='WAITING_SELLABLE',
+                    reason_code=?,
+                    normalized_error=COALESCE(?,normalized_error),
+                    updated_at=?
+                WHERE intent_id=?
+                """,
+                (reason, normalized_error, ts, intent_id),
+            )
+
+            if row["position_id"]:
+                position_state = (
+                    "TP_OPEN"
+                    if row["purpose"] == "TAKE_PROFIT"
+                    else "EXITING"
+                )
+                conn.execute(
+                    """
+                    UPDATE live_strategy_positions
+                    SET sellable_shares_text='0',
+                        state=?,
+                        updated_at=?
+                    WHERE position_id=?
+                    """,
+                    (position_state, ts, row["position_id"]),
+                )
+
+            updated = conn.execute(
+                "SELECT * FROM live_strategy_intents WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+
+            conn.commit()
+
+        return row_to_dict(updated) or {}
+
+    def finalize_position_intent_failure(
+        self,
+        intent_id: str,
+        *,
+        state: str,
+        reason: str | None,
+        normalized_error: str | None = None,
+    ) -> None:
+        """Finalize a definitively non-live local position order attempt.
+
+        This must never be used for UNKNOWN_AFTER_SUBMISSION because a remote
+        order may exist in that case.
+        """
+        if state not in {"FAILED", "REJECTED", "ZERO_FILL"}:
+            raise ValueError(
+                f"invalid terminal position intent state: {state}"
+            )
+
+        ts = now_iso()
+
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            row = conn.execute(
+                """
+                SELECT position_id,purpose,remote_order_id
+                FROM live_strategy_intents
+                WHERE intent_id=?
+                """,
+                (intent_id,),
+            ).fetchone()
+
+            if row is None:
+                conn.rollback()
+                raise KeyError(intent_id)
+
+            if row["remote_order_id"]:
+                conn.rollback()
+                raise RuntimeError(
+                    "cannot terminalize local-only failure with remote_order_id"
+                )
+
+            conn.execute(
+                """
+                UPDATE live_strategy_intents
+                SET state=?,
+                    reason_code=?,
+                    normalized_error=COALESCE(?,normalized_error),
+                    final_at=?,
+                    updated_at=?
+                WHERE intent_id=?
+                """,
+                (
+                    state,
+                    reason,
+                    normalized_error,
+                    ts,
+                    ts,
+                    intent_id,
+                ),
+            )
+
+            if row["position_id"]:
+                column = (
+                    "tp_intent_id"
+                    if row["purpose"] == "TAKE_PROFIT"
+                    else "active_exit_intent_id"
+                )
+
+                position = conn.execute(
+                    f"""
+                    SELECT {column},remaining_shares_text
+                    FROM live_strategy_positions
+                    WHERE position_id=?
+                    """,
+                    (row["position_id"],),
+                ).fetchone()
+
+                if (
+                    position is not None
+                    and str(position[column] or "") == intent_id
+                ):
+                    remaining = (
+                        decimal_value(
+                            position["remaining_shares_text"]
+                        )
+                        or Decimal("0")
+                    )
+
+                    conn.execute(
+                        f"""
+                        UPDATE live_strategy_positions
+                        SET {column}=NULL,
+                            state=CASE
+                                WHEN ? > 0 THEN 'OPEN'
+                                ELSE state
+                            END,
+                            updated_at=?
+                        WHERE position_id=?
+                        """,
+                        (
+                            1 if remaining > 0 else 0,
+                            ts,
+                            row["position_id"],
+                        ),
+                    )
+
+            conn.commit()
 
     def cancel_tp(self, position_id: str, reason: str) -> dict[str, Any] | None:
         ts = now_iso()
@@ -966,6 +1359,9 @@ class StrategyRepository:
         min_sellable: Decimal,
         purpose: str,
         book_hash: str,
+        cumulative_filled_shares: Decimal | None = None,
+        cumulative_notional: Decimal | None = None,
+        cumulative_fees: Decimal | None = None,
     ) -> dict[str, Any]:
         ts = now_iso()
         with self.base.connect() as conn:
@@ -977,15 +1373,60 @@ class StrategyRepository:
                 conn.rollback()
                 raise KeyError(position_id)
             intent_row = conn.execute(
-                "SELECT order_type FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
+                "SELECT * FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
             ).fetchone()
+            if intent_row is None:
+                conn.rollback()
+                raise KeyError(intent_id)
             remaining_before = decimal_value(row["remaining_shares_text"]) or Decimal("0")
-            actual_sold = min(max(Decimal("0"), sold_shares), remaining_before)
+            prior_intent_filled = (
+                decimal_value(intent_row["filled_shares_text"]) or Decimal("0")
+            )
+            prior_intent_average = (
+                decimal_value(intent_row["average_price_text"]) or Decimal("0")
+            )
+            prior_intent_fees = (
+                decimal_value(intent_row["fee_text"]) or Decimal("0")
+            )
+            prior_intent_notional = prior_intent_filled * prior_intent_average
+            if cumulative_filled_shares is not None:
+                target_filled = max(prior_intent_filled, cumulative_filled_shares)
+                target_notional = max(
+                    prior_intent_notional,
+                    cumulative_notional
+                    if cumulative_notional is not None
+                    else target_filled * average_price,
+                )
+                target_fees = max(
+                    prior_intent_fees,
+                    cumulative_fees
+                    if cumulative_fees is not None
+                    else prior_intent_fees + fees,
+                )
+                delta_shares = target_filled - prior_intent_filled
+                delta_notional = target_notional - prior_intent_notional
+                delta_fees = target_fees - prior_intent_fees
+            else:
+                delta_shares = max(Decimal("0"), sold_shares)
+                delta_notional = delta_shares * average_price
+                delta_fees = max(Decimal("0"), fees)
+                target_filled = prior_intent_filled + delta_shares
+                target_notional = prior_intent_notional + delta_notional
+                target_fees = prior_intent_fees + delta_fees
+            actual_sold = min(delta_shares, remaining_before)
             remaining = remaining_before - actual_sold
             exit_value_before = decimal_value(row["exit_value_text"]) or Decimal("0")
             exit_fees_before = decimal_value(row["exit_fees_text"]) or Decimal("0")
-            exit_value = exit_value_before + actual_sold * average_price
-            exit_fees = exit_fees_before + fees
+            applied_notional = (
+                delta_notional * actual_sold / delta_shares
+                if delta_shares > 0 else Decimal("0")
+            )
+            applied_fees = (
+                delta_fees * actual_sold / delta_shares
+                if delta_shares > 0 else Decimal("0")
+            )
+            exit_value = exit_value_before + applied_notional
+            exit_fees = exit_fees_before + applied_fees
             cost = decimal_value(row["cost_all_in_text"]) or Decimal("0")
             acquired = decimal_value(row["acquired_shares_text"]) or Decimal("0")
             allocated_cost = cost * (acquired - remaining) / acquired if acquired > 0 else Decimal("0")
@@ -1017,9 +1458,13 @@ class StrategyRepository:
                 UPDATE live_strategy_positions SET
                     remaining_shares_text=?,sellable_shares_text=?,dust_shares_text=?,
                     exit_value_text=?,exit_fees_text=?,realized_pnl_text=?,state=?,
-                    stop_stage=?,active_exit_intent_id=CASE WHEN ? THEN active_exit_intent_id ELSE NULL END,
-                    tp_intent_id=CASE WHEN ?='TAKE_PROFIT' AND ?=1 THEN tp_intent_id
-                                      WHEN ?='TAKE_PROFIT' THEN NULL ELSE tp_intent_id END,
+                    stop_stage=?,active_exit_intent_id=CASE
+                        WHEN ? IN ('CLOSED','DUST') THEN NULL
+                        WHEN ? THEN active_exit_intent_id ELSE NULL END,
+                    tp_intent_id=CASE
+                        WHEN ? IN ('CLOSED','DUST') THEN NULL
+                        WHEN ?='TAKE_PROFIT' AND ?=1 THEN tp_intent_id
+                        WHEN ?='TAKE_PROFIT' THEN NULL ELSE tp_intent_id END,
                     last_exit_book_hash=?,
                     updated_at=?,closed_at=CASE WHEN ?='CLOSED' THEN ? ELSE closed_at END
                 WHERE position_id=?
@@ -1028,7 +1473,8 @@ class StrategyRepository:
                     canonical_decimal(remaining), canonical_decimal(max(Decimal("0"), remaining-dust)),
                     canonical_decimal(dust), canonical_decimal(exit_value),
                     canonical_decimal(exit_fees), canonical_decimal(pnl), position_state,
-                    stop_stage, 1 if keep_active else 0, purpose, 1 if remaining > 0 else 0, purpose, book_hash,
+                    stop_stage, position_state, 1 if keep_active else 0,
+                    position_state, purpose, 1 if remaining > 0 else 0, purpose, book_hash,
                     ts, position_state, ts, position_id,
                 ),
             )
@@ -1039,8 +1485,12 @@ class StrategyRepository:
                     final_at=?,updated_at=? WHERE intent_id=?
                 """,
                 (
-                    final_state, canonical_decimal(actual_sold), canonical_decimal(average_price),
-                    canonical_decimal(fees), canonical_decimal(remaining),
+                    final_state, canonical_decimal(target_filled),
+                    canonical_decimal(
+                        target_notional / target_filled
+                        if target_filled > 0 else Decimal("0")
+                    ),
+                    canonical_decimal(target_fees), canonical_decimal(remaining),
                     ts if final_state in FINAL_INTENT_STATES else None, ts, intent_id,
                 ),
             )
@@ -1265,6 +1715,11 @@ class StrategyRepository:
             else:
                 position_id = str(existing["position_id"])
                 local = decimal_value(existing["remaining_shares_text"]) or Decimal("0")
+                local_sellable = (
+                    decimal_value(existing["sellable_shares_text"])
+                    or Decimal("0")
+                )
+
                 if local != remote_shares:
                     changed = True
                     acquired = max(
@@ -1284,6 +1739,22 @@ class StrategyRepository:
                             ts,position_id,
                         ),
                     )
+                elif local_sellable != remote_shares:
+                    # Same financial position, but remote account truth now
+                    # confirms that the tokens are visible for SELL.
+                    conn.execute(
+                        """
+                        UPDATE live_strategy_positions
+                        SET sellable_shares_text=?,
+                            updated_at=?
+                        WHERE position_id=?
+                        """,
+                        (
+                            canonical_decimal(remote_shares),
+                            ts,
+                            position_id,
+                        ),
+                    )
             row = conn.execute(
                 "SELECT * FROM live_strategy_positions WHERE position_id=?", (position_id,)
             ).fetchone()
@@ -1301,6 +1772,12 @@ class StrategyRepository:
         return row_to_dict(row) or {}, changed
 
     def set_reconciliation_state(self, *, ready: bool, reason: str, actor: str) -> None:
+        recovery_pending = (
+            self.base.get_state(
+                "reconciliation_auto_recovery_pending", "false"
+            ).lower()
+            == "true"
+        )
         self.base.set_state(
             "reconciliation_readiness", "READY" if ready else "NOT_READY", actor
         )
@@ -1312,7 +1789,22 @@ class StrategyRepository:
         )
         if ready:
             self.base.set_state("last_successful_reconciliation_at", now_iso(), actor)
+            if recovery_pending:
+                self.base.set_state("kill_switch", "false", actor)
+                self.base.set_state(
+                    "reconciliation_auto_recovery_pending", "false", actor
+                )
+                self.set_pause_entries(
+                    False, actor, "RECONCILIATION_RECOVERED"
+                )
         else:
+            if reason not in {
+                "RECONCILIATION_FAILED",
+                "RECONCILIATION_RATE_LIMITED",
+            }:
+                self.base.set_state(
+                    "reconciliation_auto_recovery_pending", "false", actor
+                )
             self.set_pause_entries(True, actor, reason)
 
     def unresolved_intents(self) -> list[dict[str, Any]]:

@@ -1,0 +1,44 @@
+[Unit]
+Description=Polymarket Trading Core
+After=network-online.target
+Wants=network-online.target
+Before=polymarket-dashboard.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
+EnvironmentFile=/etc/polymarket-live/trader.env
+RuntimeDirectory=polymarket
+RuntimeDirectoryMode=0750
+ExecStart=/opt/polymarket-btc-live/.venv/bin/uvicorn trader_app:app --loop uvloop --host 127.0.0.1 --port 8002 --no-access-log
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+ReadWritePaths=/opt/polymarket-btc-live /run/polymarket
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

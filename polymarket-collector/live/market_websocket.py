@@ -17,6 +17,7 @@ import socket
 import statistics
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from .repository import LiveRepository, now_iso
@@ -74,6 +75,17 @@ class MarketWebSocketManager:
         self._ws = None
         self._lock = asyncio.Lock()
         self.future_tolerance_ms = max(0, int(future_tolerance_ms))
+        self.library_queue_high_water = max(
+            16,
+            int(os.getenv("LIVE_MARKET_WS_LIBRARY_QUEUE_HIGH_WATER", "256")),
+        )
+        self.library_queue_low_water = max(
+            4,
+            min(
+                self.library_queue_high_water // 2,
+                int(os.getenv("LIVE_MARKET_WS_LIBRARY_QUEUE_LOW_WATER", "64")),
+            ),
+        )
         self._clock_ms = clock_ms or (
             lambda: int(datetime.now(timezone.utc).timestamp() * 1000)
         )
@@ -144,6 +156,8 @@ class MarketWebSocketManager:
         self._event_loop_lag_samples: deque[float] = deque(maxlen=10_000)
         self._event_loop_lag_ms = 0.0
         self._event_loop_lag_max_ms = 0.0
+        self._event_loop_stalls: deque[dict[str, Any]] = deque(maxlen=100)
+        self._last_stall_capture_monotonic = 0.0
         self._event_loop_watchdog_task: asyncio.Task[Any] | None = None
         self._diagnostics_task: asyncio.Task[Any] | None = None
         self._last_handler_end_monotonic: float | None = None
@@ -284,7 +298,13 @@ class MarketWebSocketManager:
                     url,
                     ping_interval=None,
                     close_timeout=5,
-                    max_queue=(4, 1),
+                    # Keep transport buffering bounded while absorbing short
+                    # event-loop stalls that previously paused reads after
+                    # only four frames and propagated 1013 backpressure.
+                    max_queue=(
+                        self.library_queue_high_water,
+                        self.library_queue_low_water,
+                    ),
                     max_size=2 * 1024 * 1024,
                     compression=None,
                 ) as ws:
@@ -1267,6 +1287,31 @@ class MarketWebSocketManager:
             self._event_loop_lag_ms = lag_ms
             self._event_loop_lag_max_ms = max(self._event_loop_lag_max_ms, lag_ms)
             self._event_loop_lag_samples.append(lag_ms)
+            if (
+                lag_ms >= 50.0
+                and current - self._last_stall_capture_monotonic >= 1.0
+            ):
+                self._last_stall_capture_monotonic = current
+                task_stacks = []
+                for task in asyncio.all_tasks():
+                    if task.done():
+                        continue
+                    frames = task.get_stack(limit=12)
+                    task_stacks.append({
+                        "task": task.get_name(),
+                        "stack": [
+                            line.strip()
+                            for frame in frames
+                            for line in traceback.format_list(
+                                traceback.extract_stack(frame, limit=1)
+                            )
+                        ],
+                    })
+                self._event_loop_stalls.append({
+                    "captured_at": now_iso(),
+                    "lag_ms": round(lag_ms, 4),
+                    "tasks": task_stacks,
+                })
             expected = current + interval
 
     @staticmethod
@@ -1318,6 +1363,7 @@ class MarketWebSocketManager:
             "metrics": metrics,
             "by_event_type": by_type,
             "event_loop_lag_max_lifetime_ms": round(self._event_loop_lag_max_ms, 4),
+            "event_loop_stalls": list(self._event_loop_stalls),
             "recent_records": records[-2_000:],
         }
 
@@ -1394,27 +1440,17 @@ class MarketWebSocketManager:
             if str(asset_id)
         ))
 
+        # SQLite may block behind another writer. Never hold the short
+        # publication lock while doing those lookups.
+        by_asset: dict[str, dict[str, Any]] = {}
+        by_condition: dict[str, dict[str, Any]] = {}
+
+        for asset_id in normalized:
+            market = self.repo.market_for_asset(asset_id)
+            if market:
+                self._index_market(market, by_asset, by_condition)
+
         with self._market_cache_refresh_lock:
-            by_asset: dict[
-                str, dict[str, Any]
-            ] = {}
-
-            by_condition: dict[
-                str, dict[str, Any]
-            ] = {}
-
-            for asset_id in normalized:
-                market = self.repo.market_for_asset(
-                    asset_id
-                )
-
-                if market:
-                    self._index_market(
-                        market,
-                        by_asset,
-                        by_condition,
-                    )
-
             self._markets_by_asset = by_asset
             self._markets_by_condition = by_condition
             self.market_cache_refreshes += 1
@@ -1553,6 +1589,10 @@ class MarketWebSocketManager:
         )
 
         return None
+
+    def cached_condition_ids(self) -> list[str]:
+        """Return the immutable RAM metadata index used by User WS."""
+        return list(self._markets_by_condition)
 
     def event_freshness(
         self, condition_id: str, *, now_ms: int | None = None
@@ -1720,6 +1760,8 @@ class MarketWebSocketManager:
             except Exception:
                 pass
 
+            # Discard a possibly poisoned long-lived connection.
+            self._close_persistence_connection_sync()
             self.persistence_failures += 1
             raise
 
@@ -1851,9 +1893,10 @@ class MarketWebSocketManager:
                         snapshot.get("asset_id") or ""
                     )
                     if key:
-                        self._pending_snapshots[key] = snapshot
+                        self._pending_snapshots.setdefault(key, snapshot)
 
-                self._pending_states.update(states)
+                for key, value in states.items():
+                    self._pending_states.setdefault(key, value)
 
                 try:
                     await asyncio.wait_for(
@@ -2154,7 +2197,10 @@ class UserWebSocketManager:
     AUTH_KEYS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
 
     def __init__(self, repo: LiveRepository, stale_after_seconds: int = 25,
-                 reconciliation: Callable[[], Awaitable[Any]] | None = None):
+                 reconciliation: Callable[[], Awaitable[Any]] | None = None,
+                 condition_ids_provider: Callable[[], list[str]] | None = None,
+                 market_provider: Callable[[str], dict[str, Any] | None] | None = None,
+                 event_queue_capacity: int = 1024):
         self.repo, self.stale_after_seconds = repo, stale_after_seconds
         self.status = WebSocketStatus(channel="user", status="DISABLED")
         self.connected_at = self.last_ping_at = self.last_pong_at = None
@@ -2165,6 +2211,13 @@ class UserWebSocketManager:
         self._ws = None
         self._lock = asyncio.Lock()
         self._reconciliation = reconciliation
+        self._condition_ids_provider = condition_ids_provider
+        self._market_provider = market_provider
+        self._event_queue_capacity = max(16, int(event_queue_capacity))
+        self._event_queue: asyncio.Queue[tuple[str, Any]] | None = None
+        self._event_worker_task: asyncio.Task[Any] | None = None
+        self.event_queue_dropped = 0
+        self.event_persistence_failures = 0
         self._authenticated_signal = False
         self._silent_failures = 0
         self._logger = logging.getLogger("live.user_ws")
@@ -2184,11 +2237,33 @@ class UserWebSocketManager:
         values = [os.getenv(name, "").strip() for name in self.AUTH_KEYS]
         return {"apiKey": values[0], "secret": values[1], "passphrase": values[2]} if all(values) else None
 
+    def _condition_ids(self) -> list[str]:
+        if self._condition_ids_provider is not None:
+            return list(dict.fromkeys(self._condition_ids_provider()))
+        return self.repo.user_ws_condition_ids()
+
+    def _outcome_from_ram(self, condition_id: Any, asset_id: Any) -> str | None:
+        if self._market_provider is None:
+            return self.repo.outcome_for_asset(condition_id, asset_id)
+        market = self._market_provider(str(condition_id or ""))
+        if not market:
+            return None
+        token = str(asset_id or "")
+        if token == str(market.get("yes_token_id") or ""):
+            return "YES"
+        if token == str(market.get("no_token_id") or ""):
+            return "NO"
+        return None
+
     async def start(self, url):
         async with self._lock:
             if self._task and not self._task.done():
                 return
             self._stop.clear()
+            self._event_queue = asyncio.Queue(maxsize=self._event_queue_capacity)
+            self._event_worker_task = asyncio.create_task(
+                self._event_worker(), name="polymarket-user-ws-persistence"
+            )
             self._task = asyncio.create_task(self.run(url), name="polymarket-user-ws")
 
     async def stop(self):
@@ -2200,6 +2275,13 @@ class UserWebSocketManager:
                 await asyncio.wait_for(self._task, 5)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
+        if self._event_worker_task:
+            try:
+                await asyncio.wait_for(self._event_worker_task, 5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._event_worker_task.cancel()
+        self._event_worker_task = None
+        self._event_queue = None
         self._set_state("STOPPED")
 
     async def run(self, url, connect=None):
@@ -2214,7 +2296,7 @@ class UserWebSocketManager:
             return
         connector, attempt = connect or websockets.connect, 0
         while not self._stop.is_set():
-            condition_ids = self.repo.user_ws_condition_ids()
+            condition_ids = self._condition_ids()
             if not condition_ids:
                 self._set_state("DISABLED", "No managed BTC 5m condition IDs available")
                 await asyncio.sleep(2)
@@ -2279,7 +2361,7 @@ class UserWebSocketManager:
     async def _subscription_loop(self, ws):
         while not self._stop.is_set():
             await asyncio.sleep(2)
-            wanted = self.repo.user_ws_condition_ids()
+            wanted = self._condition_ids()
             add = [x for x in wanted if x not in self.subscribed_condition_ids]
             remove = [x for x in self.subscribed_condition_ids if x not in wanted]
             if add:
@@ -2306,7 +2388,48 @@ class UserWebSocketManager:
                 self._silent_failures = 0
                 if self._is_auth_error(json.dumps(message)):
                     raise PermissionError("authentication failed")
-                self.process_message(message)
+                if self._event_queue is not None and self._event_worker_task is not None:
+                    self.status.status = "CONNECTED"
+                    self.status.last_message_at = now_iso()
+                    self.status.stale = False
+                    try:
+                        self._event_queue.put_nowait(("event", message))
+                    except asyncio.QueueFull:
+                        self.event_queue_dropped += 1
+                        await asyncio.to_thread(
+                            self.repo.set_state, "pause_entries", "true", "user_ws_queue"
+                        )
+                        raise RuntimeError("USER_WS_PERSISTENCE_QUEUE_FULL")
+                else:
+                    self.process_message(message)
+
+    async def _event_worker(self) -> None:
+        while not self._stop.is_set() or (self._event_queue is not None and not self._event_queue.empty()):
+            queue = self._event_queue
+            if queue is None:
+                return
+            try:
+                kind, value = await asyncio.wait_for(queue.get(), 0.25)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                if kind == "state":
+                    await asyncio.to_thread(
+                        self.repo.set_states, value, "user_ws"
+                    )
+                    continue
+                stored = await asyncio.to_thread(self.process_message, value)
+                event_type = str(value.get("event_type") or value.get("type") or "").lower()
+                if stored and event_type in {"order", "trade"} and self._reconciliation:
+                    await self._reconciliation()
+            except Exception as exc:
+                self.event_persistence_failures += 1
+                self._logger.exception("User WS persistence failed: %s", exc)
+                await asyncio.to_thread(
+                    self.repo.set_state, "pause_entries", "true", "user_ws_persistence"
+                )
+            finally:
+                queue.task_done()
 
     def process_message(self, message):
         normalized = self.normalize(message)
@@ -2339,7 +2462,7 @@ class UserWebSocketManager:
         trade_id = clean.get("trade_id") or (clean.get("id") if event_type == "trade" else None)
         return {"event_type": event_type, "message_type": status, "message_status": status,
                 "order_id": order_id, "trade_id": trade_id, "condition_id": condition_id, "asset_id": asset_id,
-                "outcome": clean.get("outcome") or self.repo.outcome_for_asset(condition_id, asset_id),
+                "outcome": clean.get("outcome") or self._outcome_from_ram(condition_id, asset_id),
                 "side": str(clean.get("side") or "").upper() or None, "price": self._number(clean.get("price")),
                 "original_size": original, "matched_size": matched, "remaining_size": remaining,
                 "liquidity_role": clean.get("trader_side") or clean.get("liquidity_role"),
@@ -2384,8 +2507,22 @@ class UserWebSocketManager:
         self._persist_state()
 
     def _persist_state(self):
-        self.repo.set_state("user_ws_status", self.status.status, "user_ws")
-        self.repo.set_state("user_ws_health", json.dumps(self.health(), sort_keys=True), "user_ws")
+        values = {
+            "user_ws_status": self.status.status,
+            "user_ws_health": json.dumps(self.health(), sort_keys=True),
+        }
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.repo.set_states(values, "user_ws")
+            return
+        if self._event_queue is not None and self._event_worker_task is not None:
+            try:
+                self._event_queue.put_nowait(("state", values))
+                return
+            except asyncio.QueueFull:
+                self.event_queue_dropped += 1
+        self.repo.set_states(values, "user_ws")
 
     def health(self):
         return {"connected": self.status.status == "CONNECTED", "status": self.status.status,
@@ -2395,4 +2532,7 @@ class UserWebSocketManager:
                 "reconnect_attempts": self.status.reconnect_attempts,
                 "subscribed_condition_ids": list(self.subscribed_condition_ids),
                 "messages_received": self.messages_received, "order_events_received": self.order_events_received,
-                "trade_events_received": self.trade_events_received, "stale": self.status.stale}
+                "trade_events_received": self.trade_events_received, "stale": self.status.stale,
+                "event_queue_depth": self._event_queue.qsize() if self._event_queue else 0,
+                "event_queue_dropped": self.event_queue_dropped,
+                "event_persistence_failures": self.event_persistence_failures}

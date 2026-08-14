@@ -47,6 +47,11 @@ class TradingAdapter(ABC):
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def cancel_order_with_context(
+        self, order_id: str | None, context: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return await self.cancel_order(str(order_id or ""))
+
     @abstractmethod
     async def cancel_orders(self, order_ids: list[str]) -> dict[str, Any]:
         raise NotImplementedError

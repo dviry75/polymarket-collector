@@ -32,12 +32,12 @@ async def run() -> dict[str, object]:
         strategy.migrate()
         adapter = MockTradingAdapter()
         reconciliation = ReconciliationWorker(base, adapter, strategy)
+        base.set_state("kill_switch", "false", "soak")
+        strategy.set_pause_entries(False, "soak", "DETERMINISTIC_FIXTURE")
         runtime = LiveStrategyRuntime(
             config, base, strategy, adapter,
             reconciliation=lambda reason: reconciliation.run_once(f"soak:{reason}"),
         )
-        base.set_state("kill_switch", "false", "soak")
-        strategy.set_pause_entries(False, "soak", "DETERMINISTIC_FIXTURE")
         processed = 0
         for index in range(12):
             start = 2_000_000_000 + index * 300

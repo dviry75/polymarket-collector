@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 import asyncio
+import logging
 from typing import Any, Protocol
 
 from eth_account import Account
 
 from .base import TradingAdapter
 from ..config import LiveConfig
+from ..order_attempts import OrderAttemptRecorder, StartedAttempt
 from ..order_book import canonical_decimal, decimal_value
 from ..secrets import (
     EnvSecretProvider,
@@ -18,6 +20,9 @@ from ..secrets import (
 )
 from ..strategy import fee_amount
 from ..strategy_repository import sanitize
+
+
+logger = logging.getLogger(__name__)
 
 
 PUSD_SCALE = Decimal("1000000")
@@ -43,6 +48,22 @@ def _dump(value: Any) -> Any:
 
 def _d(value: Any) -> Decimal:
     return decimal_value(value) or Decimal("0")
+
+
+def _is_confirmed_fak_zero_fill(message: str) -> bool:
+    lowered = " ".join(str(message).lower().replace("_", " ").split())
+    if "fak" not in lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "no orders found to match",
+            "no match",
+            "not filled",
+            "zero fill",
+            "zero execution",
+        )
+    )
 
 
 class SecureClientLike(Protocol):
@@ -76,6 +97,7 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         secret_provider: SecretProvider | None = None,
         secure_client: SecureClientLike | None = None,
         public_client: Any | None = None,
+        attempt_recorder: OrderAttemptRecorder | None = None,
     ):
         self.config = config
         self.secret_provider = secret_provider or (
@@ -92,6 +114,7 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         )
         self._secure_client = secure_client
         self._public_client = public_client
+        self.attempt_recorder = attempt_recorder
         self._client_lock = asyncio.Lock()
         self.identity: dict[str, Any] = {
             "status": "NOT_INITIALIZED",
@@ -99,6 +122,113 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             "wallet": None,
             "wallet_type": None,
         }
+
+    @staticmethod
+    def _attempt_result_status(result: dict[str, Any]) -> str:
+        if result.get("success") is True:
+            return "SUCCESS"
+        status = str(result.get("status") or "").lower()
+        if status == "rejected":
+            return "REJECTED"
+        if status in {"unknown", "uncertain", "delayed", "pending"}:
+            return "UNKNOWN"
+        return "FAILED"
+
+    @staticmethod
+    def _safe_journal_value(value: Any) -> str:
+        return str(sanitize(value if value is not None else ""))[:500]
+
+    def _start_attempt(
+        self, operation: str, request: dict[str, Any]
+    ) -> StartedAttempt | None:
+        if self.attempt_recorder is None:
+            return None
+        try:
+            return self.attempt_recorder.start(operation, request)
+        except Exception as exc:
+            logger.critical(
+                "POLYMARKET_AUDIT_PERSISTENCE_FAILED operation=%s event=%s "
+                "intent=%s purpose=%s exception=%s message=%s",
+                operation,
+                self._safe_journal_value(request.get("event_id")),
+                self._safe_journal_value(
+                    request.get("intent_id") or request.get("idempotency_key")
+                ),
+                self._safe_journal_value(request.get("purpose")),
+                type(exc).__name__,
+                self._safe_journal_value(str(exc)),
+            )
+            return None
+
+    def _finish_attempt(
+        self,
+        started: StartedAttempt | None,
+        *,
+        result: dict[str, Any],
+        response: Any = None,
+        exception: BaseException | None = None,
+        result_status: str | None = None,
+    ) -> None:
+        if started is None or self.attempt_recorder is None:
+            return
+        try:
+            hashes = result.get("transaction_hashes") or []
+            self.attempt_recorder.result(
+                started,
+                result_status=result_status or self._attempt_result_status(result),
+                success=result.get("success"),
+                normalized=result,
+                response=response,
+                exception=exception,
+                error_code=result.get("failure_reason"),
+                remote_order_id=result.get("polymarket_order_id"),
+                transaction_hash=(
+                    result.get("transaction_hash")
+                    or (hashes[0] if hashes else None)
+                ),
+            )
+        except Exception as exc:
+            logger.critical(
+                "POLYMARKET_AUDIT_PERSISTENCE_FAILED operation=%s event=%s "
+                "intent=%s purpose=%s exception=%s message=%s",
+                started.operation,
+                self._safe_journal_value(started.request.get("event_id")),
+                self._safe_journal_value(
+                    started.request.get("intent_id")
+                    or started.request.get("idempotency_key")
+                ),
+                self._safe_journal_value(started.request.get("purpose")),
+                type(exc).__name__,
+                self._safe_journal_value(str(exc)),
+            )
+
+    def _journal_failed_operation(
+        self,
+        operation: str,
+        request: dict[str, Any],
+        result: dict[str, Any],
+        exception: BaseException | None = None,
+    ) -> None:
+        logger.error(
+            "POLYMARKET_ORDER_FAILED operation=%s event=%s intent=%s position=%s "
+            "purpose=%s remote_order_id=%s exception=%s message=%s",
+            operation,
+            self._safe_journal_value(request.get("event_id")),
+            self._safe_journal_value(
+                request.get("intent_id") or request.get("idempotency_key")
+            ),
+            self._safe_journal_value(request.get("position_id")),
+            self._safe_journal_value(request.get("purpose")),
+            self._safe_journal_value(
+                result.get("polymarket_order_id") or request.get("remote_order_id")
+            ),
+            type(exception).__name__ if exception is not None else "",
+            self._safe_journal_value(
+                str(exception)
+                if exception is not None
+                else result.get("message") or result.get("failure_reason")
+            ),
+        )
 
     def _secret(self, name: str) -> str:
         try:
@@ -341,6 +471,8 @@ class RealPolymarketTradingAdapter(TradingAdapter):
                     "status": "blocked",
                     "failure_reason": "CANARY_EXPOSURE_CAP_EXCEEDED",
                 }
+        attempt = self._start_attempt("CREATE_ORDER", order)
+        post_started = False
         try:
             await self._assert_allowance(
                 side=side,
@@ -391,63 +523,222 @@ class RealPolymarketTradingAdapter(TradingAdapter):
                 )
             else:
                 raise ValueError("unsupported order contract")
+            post_started = True
             response = await client.post_order(signed)
-            return self._normalize_response(response)
+            normalized = self._normalize_response(response)
+            normalized["submission_state"] = "RESPONSE_RECEIVED"
+            if (
+                order_type == "FAK"
+                and normalized.get("status") == "rejected"
+                and not normalized.get("polymarket_order_id")
+                and _is_confirmed_fak_zero_fill(
+                    f"{normalized.get('failure_reason') or ''} "
+                    f"{normalized.get('message') or ''}"
+                )
+            ):
+                normalized["failure_reason"] = "FAK_NOT_FILLED"
+            self._finish_attempt(
+                attempt, result=normalized, response=_dump(response)
+            )
+            if not normalized.get("success"):
+                self._journal_failed_operation(
+                    "CREATE_ORDER", order, normalized
+                )
+            return normalized
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
-            status = "blocked" if "ALLOWANCE" in message or "BALANCE" in message else "unknown"
-            return {
-                "success": False,
-                "status": status,
-                "failure_reason": message[:300],
-            }
+            if order_type == "FAK" and _is_confirmed_fak_zero_fill(message):
+                result = {
+                    "success": False,
+                    "status": "rejected",
+                    "failure_reason": "FAK_NOT_FILLED",
+                    "message": message[:300],
+                    "submission_state": "CONFIRMED_TERMINAL",
+                }
+            else:
+                status = (
+                    "blocked"
+                    if (
+                        not post_started
+                        and ("ALLOWANCE" in message or "BALANCE" in message)
+                    )
+                    else "unknown"
+                )
+                result = {
+                    "success": False,
+                    "status": status,
+                    "failure_reason": message[:300],
+                    "submission_state": (
+                        "NOT_SUBMITTED"
+                        if not post_started
+                        else "UNKNOWN_AFTER_SUBMISSION"
+                    ),
+                }
+            self._finish_attempt(
+                attempt, result=result, exception=exc
+            )
+            self._journal_failed_operation(
+                "CREATE_ORDER", order, result, exception=exc
+            )
+            return result
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
+        return await self.cancel_order_with_context(order_id)
+
+    async def cancel_order_with_context(
+        self, order_id: str | None, context: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         if not self.config.real_submission_armed():
-            return {"success": False, "status": "blocked", "failure_reason": "REAL_MANAGEMENT_NOT_ARMED"}
+            return {
+                "success": False,
+                "status": "blocked",
+                "failure_reason": "REAL_MANAGEMENT_NOT_ARMED",
+            }
+        request = {**(context or {}), "remote_order_id": order_id}
+        attempt = self._start_attempt("CANCEL_ORDER", request)
+        if not order_id:
+            result = {
+                "success": False,
+                "status": "failed_precondition",
+                "failure_reason": "REMOTE_ORDER_ID_MISSING",
+            }
+            self._finish_attempt(
+                attempt, result=result,
+                result_status="FAILED_PRECONDITION",
+            )
+            self._journal_failed_operation(
+                "CANCEL_ORDER", request, result
+            )
+            return result
         try:
-            response = await (await self._client()).cancel_order(order_id=order_id)
+            response = await (await self._client()).cancel_order(
+                order_id=order_id
+            )
             payload = _dump(response)
             canceled = set(payload.get("canceled") or [])
             not_canceled = payload.get("not_canceled") or {}
-            return {
+            result = {
                 "success": order_id in canceled and not not_canceled,
-                "status": "cancelled" if order_id in canceled else "uncertain",
+                "status": (
+                    "cancelled" if order_id in canceled else "uncertain"
+                ),
                 "canceled": sorted(canceled),
                 "not_canceled": not_canceled,
             }
+            self._finish_attempt(
+                attempt, result=result, response=payload
+            )
+            if not result.get("success"):
+                self._journal_failed_operation(
+                    "CANCEL_ORDER", request, result
+                )
+            return result
         except Exception as exc:
-            return {
+            result = {
                 "success": False,
                 "status": "uncertain",
                 "failure_reason": f"{type(exc).__name__}: {exc}"[:300],
             }
+            self._finish_attempt(
+                attempt, result=result, exception=exc
+            )
+            self._journal_failed_operation(
+                "CANCEL_ORDER", request, result, exception=exc
+            )
+            return result
 
     async def cancel_orders(self, order_ids: list[str]) -> dict[str, Any]:
         if not self.config.real_submission_armed():
-            return {"success": False, "status": "blocked", "failure_reason": "REAL_MANAGEMENT_NOT_ARMED"}
-        response = await (await self._client()).cancel_orders(order_ids=order_ids)
-        payload = _dump(response)
-        return {
-            "success": not bool(payload.get("not_canceled")),
-            "status": "cancelled" if not payload.get("not_canceled") else "partial",
-            **payload,
+            return {
+                "success": False,
+                "status": "blocked",
+                "failure_reason": "REAL_MANAGEMENT_NOT_ARMED",
+            }
+        request = {
+            "purpose": "BATCH_CANCEL",
+            "remote_order_ids": list(order_ids),
         }
+        attempt = self._start_attempt("CANCEL_ORDERS", request)
+        try:
+            response = await (await self._client()).cancel_orders(
+                order_ids=order_ids
+            )
+            payload = _dump(response)
+            result = {
+                "success": not bool(payload.get("not_canceled")),
+                "status": (
+                    "cancelled"
+                    if not payload.get("not_canceled")
+                    else "partial"
+                ),
+                **payload,
+            }
+            self._finish_attempt(attempt, result=result, response=payload)
+            if not result.get("success"):
+                self._journal_failed_operation(
+                    "CANCEL_ORDERS", request, result
+                )
+            return result
+        except Exception as exc:
+            result = {
+                "success": False,
+                "status": "unknown",
+                "failure_reason": f"{type(exc).__name__}: {exc}"[:300],
+            }
+            self._finish_attempt(attempt, result=result, exception=exc)
+            self._journal_failed_operation(
+                "CANCEL_ORDERS", request, result, exception=exc
+            )
+            raise
 
     async def cancel_market_orders(
         self, condition_id: str, token_id: str | None = None
     ) -> dict[str, Any]:
         if not self.config.real_submission_armed():
-            return {"success": False, "status": "blocked", "failure_reason": "REAL_MANAGEMENT_NOT_ARMED"}
-        response = await (await self._client()).cancel_market_orders(
-            market=condition_id, token_id=token_id
-        )
-        payload = _dump(response)
-        return {
-            "success": not bool(payload.get("not_canceled")),
-            "status": "cancelled" if not payload.get("not_canceled") else "partial",
-            **payload,
+            return {
+                "success": False,
+                "status": "blocked",
+                "failure_reason": "REAL_MANAGEMENT_NOT_ARMED",
+            }
+        request = {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "purpose": "MARKET_CANCEL",
         }
+        attempt = self._start_attempt(
+            "CANCEL_MARKET_ORDERS", request
+        )
+        try:
+            response = await (await self._client()).cancel_market_orders(
+                market=condition_id, token_id=token_id
+            )
+            payload = _dump(response)
+            result = {
+                "success": not bool(payload.get("not_canceled")),
+                "status": (
+                    "cancelled"
+                    if not payload.get("not_canceled")
+                    else "partial"
+                ),
+                **payload,
+            }
+            self._finish_attempt(attempt, result=result, response=payload)
+            if not result.get("success"):
+                self._journal_failed_operation(
+                    "CANCEL_MARKET_ORDERS", request, result
+                )
+            return result
+        except Exception as exc:
+            result = {
+                "success": False,
+                "status": "unknown",
+                "failure_reason": f"{type(exc).__name__}: {exc}"[:300],
+            }
+            self._finish_attempt(attempt, result=result, exception=exc)
+            self._journal_failed_operation(
+                "CANCEL_MARKET_ORDERS", request, result, exception=exc
+            )
+            raise
 
     async def cancel_all_orders(self) -> dict[str, Any]:
         return {

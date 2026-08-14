@@ -253,6 +253,56 @@ def test_price_change_authoritative_best_prunes_displaced_levels():
     assert Decimal("0.07") not in books.books["yes"].asks
 
 
+
+def test_exact_transition_survives_final_best_price_mismatch_fail_closed():
+    books = OrderBookSet(["yes"])
+    books.apply({
+        "event_type": "book", "asset_id": "yes", "timestamp": NOW_MS - 200,
+        "bids": [{"price": "0.70", "size": "5"}],
+        "asks": [
+            {"price": "0.73", "size": "5"},
+            {"price": "0.74", "size": "5"},
+            {"price": "0.76", "size": "5"},
+        ],
+    }, now_ms=NOW_MS, max_age_ms=1_000)
+
+    frame = books.apply({
+        "event_type": "price_change", "timestamp": NOW_MS - 100,
+        "price_changes": [
+            {
+                "asset_id": "yes", "side": "SELL", "price": "0.73", "size": "0",
+                "best_bid": "0.70", "best_ask": "0.74",
+            },
+            {
+                "asset_id": "yes", "side": "SELL", "price": "0.74", "size": "0",
+                "best_bid": "0.70", "best_ask": "0.75",
+            },
+        ],
+    }, now_ms=NOW_MS, max_age_ms=1_000)
+
+    assert frame.updates[0]["readiness_reason"] == "BEST_PRICE_MISMATCH"
+    assert not frame.updates[0]["book_ready"]
+    assert [item["best_ask"] for item in frame.top_transitions] == ["0.74", "0.75"]
+
+
+def test_market_ws_transport_queue_is_bounded_but_burst_tolerant(monkeypatch):
+    temp, repo = make_repo()
+    try:
+        monkeypatch.delenv("LIVE_MARKET_WS_LIBRARY_QUEUE_HIGH_WATER", raising=False)
+        monkeypatch.delenv("LIVE_MARKET_WS_LIBRARY_QUEUE_LOW_WATER", raising=False)
+        manager = MarketWebSocketManager(repo)
+        assert manager.library_queue_high_water == 256
+        assert manager.library_queue_low_water == 64
+
+        monkeypatch.setenv("LIVE_MARKET_WS_LIBRARY_QUEUE_HIGH_WATER", "80")
+        monkeypatch.setenv("LIVE_MARKET_WS_LIBRARY_QUEUE_LOW_WATER", "20")
+        configured = MarketWebSocketManager(repo)
+        assert configured.library_queue_high_water == 80
+        assert configured.library_queue_low_water == 20
+    finally:
+        temp.cleanup()
+
+
 def test_out_of_order_one_side_and_reconnect_warmup():
     books = OrderBookSet(["yes", "no"])
     books.apply(book("yes", NOW_MS - 100), now_ms=NOW_MS, max_age_ms=5_000)
@@ -413,6 +463,10 @@ def test_read_only_logs_exact_074_blocker_without_creating_intent(caplog):
         LiveConfig(execution_mode="READ_ONLY"), base, strategy, MockTradingAdapter()
     )
     try:
+        runtime.entry_schedule_status = lambda: {
+            "allowed": True, "reason": "TEST_SCHEDULE_ACTIVE",
+            "local_time": "fixed-test-time",
+        }
         with caplog.at_level("WARNING", logger="live.strategy_runtime"):
             runtime.schedule_frame({
                 "event_type": "price_change",

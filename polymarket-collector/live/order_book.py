@@ -603,10 +603,13 @@ class OrderBookSet:
                     book.last_message_hash = message_hash
                     book.update_number += 1
 
-                    if book.reason == "READY":
-                        top_transitions.extend(
-                            asset_top_transitions
-                        )
+                    # Preserve the ordered, server-advertised top transitions
+                    # even when the final reconstructed depth fails integrity.
+                    # Event readiness remains NOT_READY, so these observations
+                    # can only reach a fail-closed terminal strategy decision.
+                    top_transitions.extend(
+                        asset_top_transitions
+                    )
 
                 updates.append(self._render_book(book, include_depth=include_depth,
                     event_type=event_type, timestamp=timestamp, message_hash=message_hash, now_ms=now_ms

@@ -55,7 +55,20 @@ class OrderManager:
     async def cancel_order(self, local_order_id: int, *, actor: str = "operator") -> dict[str, Any]:
         order = self.repo.update_order(local_order_id, {"status": "cancel_requested", "cancel_requested_at": now_iso()})
         remote_id = order.get("polymarket_order_id") or str(local_order_id)
-        response = await self.adapter.cancel_order(str(remote_id))
+        response = await self.adapter.cancel_order_with_context(
+            str(remote_id) if remote_id is not None else None,
+            {
+                "event_id": order.get("event_id"),
+                "condition_id": order.get("condition_id"),
+                "token_id": order.get("token_id"),
+                "intent_id": order.get("intent_id"),
+                "position_id": order.get("position_id"),
+                "deal_id": order.get("live_deal_id"),
+                "purpose": order.get("purpose") or "LEGACY_ORDER_CANCEL",
+                "side": order.get("side"),
+                "order_type": order.get("order_type"),
+            },
+        )
         status = "cancelled" if response.get("success") else "failed"
         updated = self.repo.update_order(local_order_id, {
             "status": status,
