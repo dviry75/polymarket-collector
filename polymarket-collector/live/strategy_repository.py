@@ -322,6 +322,10 @@ class StrategyRepository:
             )
             defaults = {
                 "pause_entries": "true" if pause_entries_default else "false",
+                "pause_owner": "STARTUP" if pause_entries_default else "NONE",
+                "pause_reason": "CONFIGURED_STARTUP_PAUSE" if pause_entries_default else "",
+                "pause_auto_recoverable": "false",
+                "pause_last_release_reason": "",
                 "canary_armed": "false",
                 "canary_consumed": "false",
                 "strategy_readiness": "NOT_READY",
@@ -473,21 +477,53 @@ class StrategyRepository:
     def pause_entries(self) -> bool:
         return self.base.get_state("pause_entries", "true").lower() == "true"
 
-    def set_pause_entries(self, paused: bool, actor: str, reason: str) -> None:
-        previous = self.pause_entries()
-        if paused and reason not in {
-            "RECONCILIATION_FAILED",
-            "RECONCILIATION_RATE_LIMITED",
-        }:
-            # Any independently-owned pause cancels reconciliation's right to
-            # auto-release the safety gates on a later clean pass.
-            self.base.set_state(
-                "reconciliation_auto_recovery_pending", "false", actor
-            )
-        self.base.set_state("pause_entries", "true" if paused else "false", actor)
+    def set_pause_entries(
+        self, paused: bool, actor: str, reason: str, *,
+        owner: str | None = None, auto_recoverable: bool = False,
+    ) -> None:
+        resolved_owner = (owner or ("OPERATOR" if actor == "operator" else "MACHINE")).upper()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT key,value FROM live_system_state "
+                "WHERE key IN ('pause_entries','pause_owner','pause_auto_recoverable')"
+            ).fetchall()
+            current = {str(row["key"]): str(row["value"]) for row in rows}
+            previous = current.get("pause_entries", "true").lower() == "true"
+            current_owner = current.get("pause_owner", "NONE").upper()
+            current_auto = current.get("pause_auto_recoverable", "false").lower() == "true"
+            if paused:
+                if current_owner in {"OPERATOR", "STARTUP"} and resolved_owner in {"MACHINE", "RECONCILIATION"}:
+                    conn.rollback()
+                    return
+                if previous and not current_auto and resolved_owner in {"MACHINE", "RECONCILIATION"}:
+                    conn.rollback()
+                    return
+                values = {
+                    "pause_entries": "true", "pause_owner": resolved_owner,
+                    "pause_reason": reason,
+                    "pause_auto_recoverable": "true" if auto_recoverable else "false",
+                }
+            else:
+                if actor not in {"operator", "pause_recovery"}:
+                    conn.rollback()
+                    return
+                if current_owner in {"OPERATOR", "STARTUP"} and actor != "operator":
+                    conn.rollback()
+                    return
+                if actor == "pause_recovery" and (not owner or owner.upper() != current_owner):
+                    conn.rollback()
+                    return
+                values = {
+                    "pause_entries": "false", "pause_owner": "NONE",
+                    "pause_reason": "", "pause_auto_recoverable": "false",
+                    "pause_last_release_reason": reason,
+                }
+            self.base.set_states_on_connection(conn, values, actor)
+            conn.commit()
         self.timeline(
             severity="WARNING" if paused else "INFO",
-            category="OPERATOR",
+            category="OPERATOR" if resolved_owner in {"OPERATOR", "STARTUP"} else "SAFETY",
             component="strategy",
             source=actor,
             requested_action="PAUSE_ENTRIES" if paused else "RESUME_ENTRIES",
@@ -671,6 +707,9 @@ class StrategyRepository:
             if consume_canary:
                 for key, value in {
                     "pause_entries": "true",
+                    "pause_owner": "MACHINE",
+                    "pause_reason": "CANARY_CONSUMED",
+                    "pause_auto_recoverable": "false",
                     "canary_armed": "false",
                     "canary_consumed": "true",
                 }.items():
@@ -691,6 +730,9 @@ class StrategyRepository:
             conn.execute("BEGIN IMMEDIATE")
             for key, value in {
                 "pause_entries": "true",
+                "pause_owner": "MACHINE",
+                "pause_reason": "CANARY_CONSUMED",
+                "pause_auto_recoverable": "false",
                 "canary_armed": "false",
                 "canary_consumed": "true",
             }.items():
@@ -1772,12 +1814,6 @@ class StrategyRepository:
         return row_to_dict(row) or {}, changed
 
     def set_reconciliation_state(self, *, ready: bool, reason: str, actor: str) -> None:
-        recovery_pending = (
-            self.base.get_state(
-                "reconciliation_auto_recovery_pending", "false"
-            ).lower()
-            == "true"
-        )
         self.base.set_state(
             "reconciliation_readiness", "READY" if ready else "NOT_READY", actor
         )
@@ -1789,23 +1825,14 @@ class StrategyRepository:
         )
         if ready:
             self.base.set_state("last_successful_reconciliation_at", now_iso(), actor)
-            if recovery_pending:
-                self.base.set_state("kill_switch", "false", actor)
-                self.base.set_state(
-                    "reconciliation_auto_recovery_pending", "false", actor
-                )
-                self.set_pause_entries(
-                    False, actor, "RECONCILIATION_RECOVERED"
-                )
         else:
-            if reason not in {
-                "RECONCILIATION_FAILED",
-                "RECONCILIATION_RATE_LIMITED",
-            }:
-                self.base.set_state(
-                    "reconciliation_auto_recovery_pending", "false", actor
-                )
-            self.set_pause_entries(True, actor, reason)
+            self.set_pause_entries(
+                True, actor, reason, owner="RECONCILIATION",
+                auto_recoverable=reason in {
+                    "RECONCILIATION_RATE_LIMITED",
+                    "RECONCILIATION_TEMPORARY_ERROR",
+                },
+            )
 
     def unresolved_intents(self) -> list[dict[str, Any]]:
         with self.base.connect() as conn:
@@ -1996,6 +2023,11 @@ class StrategyRepository:
             ).fetchone()
         return {
             "pause_entries": self.pause_entries(),
+            "pause_owner": self.base.get_state("pause_owner", "NONE"),
+            "pause_reason": self.base.get_state("pause_reason", ""),
+            "pause_auto_recoverable": self.base.get_state(
+                "pause_auto_recoverable", "false"
+            ).lower() == "true",
             "canary_armed": self.base.get_state("canary_armed", "false").lower() == "true",
             "canary_consumed": self.base.get_state("canary_consumed", "false").lower() == "true",
             "readiness": (

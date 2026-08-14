@@ -16,6 +16,7 @@ from live.config import LiveConfig
 from live.geographic import geographic_preflight
 from live.ipc import TraderIPCServer
 from live.market_discovery import refresh_btc_5m_markets
+from live.pause_recovery import PauseRecoveryCoordinator
 from live.router import configure, services, strategy_services
 from live.trader_commands import TraderCommandHandler
 
@@ -24,6 +25,7 @@ app = FastAPI(title="Polymarket Trading Core", docs_url=None, redoc_url=None)
 _discovery_task: asyncio.Task[None] | None = None
 _reconciliation_task: asyncio.Task[None] | None = None
 _metrics_task: asyncio.Task[None] | None = None
+_pause_recovery_task: asyncio.Task[None] | None = None
 _ipc_server: TraderIPCServer | None = None
 
 
@@ -51,6 +53,23 @@ async def reconciliation_loop(config: LiveConfig) -> None:
         await services()[5].run_once(actor="periodic_reconciliation")
 
 
+async def pause_recovery_loop(coordinator: PauseRecoveryCoordinator) -> None:
+    while True:
+        await asyncio.sleep(1)
+        try:
+            await asyncio.to_thread(coordinator.tick)
+        except Exception as exc:
+            strategy_repo, _runtime = strategy_services()
+            strategy_repo.set_pause_entries(
+                True, "pause_recovery", "RECOVERY_MONITOR_TEMPORARY_ERROR",
+                owner="MACHINE", auto_recoverable=True,
+            )
+            services()[1].audit(
+                "pause_recovery", "pause_recovery_tick", "error",
+                f"{type(exc).__name__}: {exc}"[:500],
+            )
+
+
 async def metrics_loop(config: LiveConfig) -> None:
     manager = SnapshotArchiveManager(config, services()[1], strategy_services()[0])
     while True:
@@ -60,12 +79,17 @@ async def metrics_loop(config: LiveConfig) -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _discovery_task, _reconciliation_task, _metrics_task, _ipc_server
+    global _discovery_task, _reconciliation_task, _metrics_task, _pause_recovery_task, _ipc_server
     config = LiveConfig.from_env()
     configure(Path(config.live_db_path), config)
     repo = services()[1]
     strategy_repo, runtime = strategy_services()
-    strategy_repo.set_pause_entries(True, "startup", "STARTUP_RECONCILIATION_REQUIRED")
+    strategy_repo.set_pause_entries(
+        True, "startup",
+        "CONFIGURED_STARTUP_PAUSE" if config.pause_entries_default else "STARTUP_RECONCILIATION_REQUIRED",
+        owner="STARTUP" if config.pause_entries_default else "MACHINE",
+        auto_recoverable=not config.pause_entries_default,
+    )
 
     _ipc_server = TraderIPCServer(config.trader_socket_path, TraderCommandHandler())
     await _ipc_server.start()
@@ -97,19 +121,25 @@ async def startup() -> None:
     if config.user_ws_enabled:
         await services()[7].start(config.user_ws_url)
     await runtime.start_heartbeat()
+    coordinator = PauseRecoveryCoordinator(
+        repo, strategy_repo, services()[6], services()[7], freshness_limit_ms=1000
+    )
+    _pause_recovery_task = asyncio.create_task(
+        pause_recovery_loop(coordinator), name="live-pause-recovery"
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _discovery_task, _reconciliation_task, _metrics_task, _ipc_server
-    for task in (_discovery_task, _reconciliation_task, _metrics_task):
+    global _discovery_task, _reconciliation_task, _metrics_task, _pause_recovery_task, _ipc_server
+    for task in (_discovery_task, _reconciliation_task, _metrics_task, _pause_recovery_task):
         if task is not None:
             task.cancel()
             try:
                 await asyncio.wait_for(task, 5)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
-    _discovery_task = _reconciliation_task = _metrics_task = None
+    _discovery_task = _reconciliation_task = _metrics_task = _pause_recovery_task = None
     for stop in (
         strategy_services()[1].stop,
         services()[6].stop,

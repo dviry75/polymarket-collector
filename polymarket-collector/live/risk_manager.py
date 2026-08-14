@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import LiveConfig
 from .repository import LiveRepository
+from .strategy_repository import StrategyRepository
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,11 @@ class RiskManager:
         self.config = config
         self.repo = repo
 
+    def _pause_nonrecoverable(self, reason: str) -> None:
+        StrategyRepository(self.repo).set_pause_entries(
+            True, "risk_manager", reason, owner="MACHINE", auto_recoverable=False
+        )
+
     def check_order(self, order: dict[str, Any]) -> RiskResult:
         errors = self.config.validation_errors()
         if errors:
@@ -70,13 +76,13 @@ class RiskManager:
         daily = self.repo.current_daily_limit(self._day_key(), "Asia/Jerusalem")
         realized = _dec(daily.get("realized_pnl_usd"))
         if realized <= -abs(self.config.max_daily_realized_loss_usd):
-            self.repo.set_state("kill_switch", "true", "risk_manager")
+            self._pause_nonrecoverable("DAILY_LOSS_LIMIT")
             return RiskResult(False, "DAILY_LOSS_LIMIT", "Daily realized loss limit reached")
         if int(daily.get("consecutive_failed_orders") or 0) >= self.config.max_consecutive_failed_orders:
-            self.repo.set_state("kill_switch", "true", "risk_manager")
+            self._pause_nonrecoverable("CONSECUTIVE_FAILED_ORDERS")
             return RiskResult(False, "CONSECUTIVE_FAILED_ORDERS", "Too many consecutive failed orders")
         if int(daily.get("consecutive_losing_deals") or 0) >= self.config.max_consecutive_losing_deals:
-            self.repo.set_state("kill_switch", "true", "risk_manager")
+            self._pause_nonrecoverable("CONSECUTIVE_LOSING_DEALS")
             return RiskResult(False, "CONSECUTIVE_LOSING_DEALS", "Too many consecutive losing deals")
 
         market = self.repo.latest_market(str(order.get("condition_id") or "")) if order.get("condition_id") else None

@@ -62,6 +62,15 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _is_temporary_network_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
+        token in name or token in message
+        for token in ("timeout", "temporar", "connection", "network", "http 502", "http 503", "http 504")
+    )
+
+
 class ReconciliationWorker:
     """Reconciles both the legacy control tables and the durable strategy state.
 
@@ -484,32 +493,10 @@ class ReconciliationWorker:
             else:
                 self._consecutive_rate_limits = 0
                 self._rate_limit_retry_after = 0.0
-                # An unknown failure revokes any earlier transient-rate-limit
-                # ownership. A later clean pass must not auto-open safety gates.
-                self.repo.set_state(
-                    "reconciliation_auto_recovery_pending", "false", actor
-                )
             self.repo.finish_reconciliation(run_id, "failed", sanitize(gaps), safe_error)
-            recovery_pending = (
-                self.repo.get_state(
-                    "reconciliation_auto_recovery_pending", "false"
-                ).lower()
-                == "true"
-            )
-            if (
-                not recovery_pending
-                and rate_limited
-                and not self.repo.kill_switch_active()
-                and self.strategy_repo is not None
-                and not self.strategy_repo.pause_entries()
-            ):
-                # Remember that reconciliation owns both safety gates. A later
-                # clean pass may only release gates acquired here; it must not
-                # override an operator/risk pause that predated the failure.
-                self.repo.set_state(
-                    "reconciliation_auto_recovery_pending", "true", actor
-                )
-            self.repo.set_state("kill_switch", "true", actor)
+            temporary_error = rate_limited or _is_temporary_network_error(exc)
+            # Kill switch is operator-owned. Machine failures acquire only an
+            # explicitly-owned entry pause.
             self.repo.set_state("canary_armed", "false", actor)
             if self.strategy_repo:
                 self.strategy_repo.set_reconciliation_state(
@@ -517,7 +504,11 @@ class ReconciliationWorker:
                     reason=(
                         "RECONCILIATION_RATE_LIMITED"
                         if rate_limited
-                        else "RECONCILIATION_FAILED"
+                        else (
+                            "RECONCILIATION_TEMPORARY_ERROR"
+                            if temporary_error
+                            else "RECONCILIATION_FAILED"
+                        )
                     ),
                     actor=actor,
                 )

@@ -21,6 +21,7 @@ import traceback
 from pathlib import Path
 
 from .repository import LiveRepository, now_iso
+from .strategy_repository import StrategyRepository
 from .order_book import OrderBookSet, canonical_decimal, decimal_value
 from .market_ws_latency_csv import (
     MarketWsLatencyCsvDiagnostic, normalize_exchange_timestamp,
@@ -2397,7 +2398,7 @@ class UserWebSocketManager:
                     except asyncio.QueueFull:
                         self.event_queue_dropped += 1
                         await asyncio.to_thread(
-                            self.repo.set_state, "pause_entries", "true", "user_ws_queue"
+                            self._hold_for_unknown_user_event, "USER_WS_QUEUE_LOSS"
                         )
                         raise RuntimeError("USER_WS_PERSISTENCE_QUEUE_FULL")
                 else:
@@ -2426,10 +2427,15 @@ class UserWebSocketManager:
                 self.event_persistence_failures += 1
                 self._logger.exception("User WS persistence failed: %s", exc)
                 await asyncio.to_thread(
-                    self.repo.set_state, "pause_entries", "true", "user_ws_persistence"
+                    self._hold_for_unknown_user_event, "USER_WS_PERSISTENCE_UNCERTAIN"
                 )
             finally:
                 queue.task_done()
+
+    def _hold_for_unknown_user_event(self, reason: str) -> None:
+        StrategyRepository(self.repo).set_pause_entries(
+            True, "user_ws", reason, owner="MACHINE", auto_recoverable=False
+        )
 
     def process_message(self, message):
         normalized = self.normalize(message)

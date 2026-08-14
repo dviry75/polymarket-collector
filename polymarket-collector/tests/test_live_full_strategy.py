@@ -200,7 +200,7 @@ def test_canary_reservation_consumes_and_disarms_atomically_across_restart():
     try:
         base.set_state("canary_armed", "true", "test")
         base.set_state("canary_consumed", "false", "test")
-        base.set_state("kill_switch", "false", "test")
+        base.set_state("kill_switch", "false", "operator")
         base.set_state("pause_entries", "false", "test")
         first = strategy.reserve_event_entry(
             event_id="canary-event", condition_id="c", token_id="yes", side="YES",
@@ -484,14 +484,15 @@ def test_transient_rate_limit_backs_off_without_financial_correction_then_recove
 
     temp, base, strategy = build_repo()
     try:
-        base.set_state("kill_switch", "false", "test")
-        strategy.set_pause_entries(False, "test", "READY")
+        base.set_state("kill_switch", "false", "operator")
+        strategy.set_pause_entries(False, "operator", "READY")
         adapter = ToggleRateLimitAdapter()
         worker = ReconciliationWorker(base, adapter, strategy)
         failed = asyncio.run(worker.run_once("test"))
         assert failed["status"] == "failed" and failed["rate_limited"]
         assert failed["retry_after_seconds"] > 0
-        assert base.get_state("reconciliation_auto_recovery_pending") == "true"
+        assert base.get_state("pause_owner") == "RECONCILIATION"
+        assert base.get_state("pause_auto_recoverable") == "true"
         backed_off = asyncio.run(worker.run_once("test"))
         assert backed_off["status"] == "backoff"
         assert adapter.balance_calls == 1
@@ -502,7 +503,8 @@ def test_transient_rate_limit_backs_off_without_financial_correction_then_recove
         assert clean["status"] == "ok"
         assert base.get_state("reconciliation_readiness") == "READY"
         assert base.get_state("kill_switch") == "false"
-        assert not strategy.pause_entries()
+        assert strategy.pause_entries()
+        assert base.get_state("pause_owner") == "RECONCILIATION"
     finally:
         temp.cleanup()
 
@@ -603,7 +605,7 @@ def test_reconciliation_clean_then_missing_remote_position_fails_closed():
         clean = asyncio.run(worker.run_once("test"))
         assert clean["status"] == "ok"
         assert base.get_state("reconciliation_readiness") == "READY"
-        strategy.set_pause_entries(False, "test", "READY")
+        strategy.set_pause_entries(False, "operator", "READY")
         reserve_and_open(strategy, shares=Decimal("6"))
         gap = asyncio.run(worker.run_once("test"))
         assert gap["status"] == "gaps"
@@ -1000,33 +1002,33 @@ def test_reconciliation_settles_entry_fill_and_position_across_restart():
         temp.cleanup()
 
 
-def test_reconciliation_failure_forces_kill_pause_and_disarms_canary():
+def test_reconciliation_failure_pauses_without_mutating_operator_kill_switch():
     class FailingAdapter(MockTradingAdapter):
         async def get_balance(self):
             raise RuntimeError("Secret Manager unavailable")
 
     temp, base, strategy = build_repo()
     try:
-        base.set_state("kill_switch", "false", "test")
+        base.set_state("kill_switch", "false", "operator")
         base.set_state("canary_armed", "true", "test")
-        strategy.set_pause_entries(False, "test", "test")
+        strategy.set_pause_entries(False, "operator", "test")
         result = asyncio.run(
             ReconciliationWorker(base, FailingAdapter(), strategy).run_once("test")
         )
         assert result["status"] == "failed"
-        assert base.get_state("kill_switch") == "true"
+        assert base.get_state("kill_switch") == "false"
         assert base.get_state("canary_armed") == "false"
         assert strategy.pause_entries()
-        assert base.get_state("reconciliation_auto_recovery_pending", "false") == "false"
+        assert base.get_state("pause_auto_recoverable") == "false"
 
         recovered = asyncio.run(
             ReconciliationWorker(base, MockTradingAdapter(), strategy).run_once("test")
         )
         assert recovered["status"] == "ok"
         assert base.get_state("reconciliation_readiness") == "READY"
-        assert base.get_state("kill_switch") == "true"
+        assert base.get_state("kill_switch") == "false"
         assert strategy.pause_entries()
-        assert base.get_state("reconciliation_auto_recovery_pending", "false") == "false"
+        assert base.get_state("pause_auto_recoverable") == "false"
     finally:
         temp.cleanup()
 
@@ -1038,13 +1040,14 @@ def test_manual_pause_cancels_reconciliation_auto_recovery():
 
     temp, base, strategy = build_repo()
     try:
-        base.set_state("kill_switch", "false", "test")
-        strategy.set_pause_entries(False, "test", "READY")
+        base.set_state("kill_switch", "false", "operator")
+        strategy.set_pause_entries(False, "operator", "READY")
         failed = asyncio.run(
             ReconciliationWorker(base, FailingAdapter(), strategy).run_once("test")
         )
         assert failed["status"] == "failed"
-        assert base.get_state("reconciliation_auto_recovery_pending") == "true"
+        assert base.get_state("pause_owner") == "RECONCILIATION"
+        assert base.get_state("pause_auto_recoverable") == "true"
 
         strategy.set_pause_entries(True, "operator", "OPERATOR_PAUSE")
         clean = asyncio.run(
@@ -1052,9 +1055,10 @@ def test_manual_pause_cancels_reconciliation_auto_recovery():
         )
         assert clean["status"] == "ok"
         assert base.get_state("reconciliation_readiness") == "READY"
-        assert base.get_state("kill_switch") == "true"
+        assert base.get_state("kill_switch") == "false"
         assert strategy.pause_entries()
-        assert base.get_state("reconciliation_auto_recovery_pending") == "false"
+        assert base.get_state("pause_owner") == "OPERATOR"
+        assert base.get_state("pause_auto_recoverable") == "false"
     finally:
         temp.cleanup()
 
@@ -1072,11 +1076,11 @@ def test_strategy_daily_loss_limit_locks_real_entry_path():
                 (day_key,),
             )
             conn.commit()
-        base.set_state("kill_switch", "false", "test")
+        base.set_state("kill_switch", "false", "operator")
         base.set_state("canary_armed", "true", "test")
-        strategy.set_pause_entries(False, "test", "test")
+        strategy.set_pause_entries(False, "operator", "test")
         assert runtime._daily_loss_blocked()
-        assert base.get_state("kill_switch") == "true"
+        assert base.get_state("kill_switch") == "false"
         assert base.get_state("canary_armed") == "false"
         assert strategy.pause_entries()
     finally:
@@ -1500,7 +1504,7 @@ def test_hot_state_snapshot_combines_safety_lock_and_exposure():
 
     try:
         base.set_state("pause_entries", "false", "test")
-        base.set_state("kill_switch", "false", "test")
+        base.set_state("kill_switch", "false", "operator")
         base.set_state("canary_armed", "true", "test")
         base.set_state(
             "reconciliation_readiness",
@@ -2239,7 +2243,7 @@ def test_adapter_fak_no_match_exception_is_deterministic_zero_fill():
 def test_zero_fill_without_remote_id_is_terminal_and_reconciliation_clean():
     temp, base, strategy = build_repo()
     try:
-        strategy.set_pause_entries(False, "test", "PRECONDITION")
+        strategy.set_pause_entries(False, "operator", "PRECONDITION")
         attempt = strategy.reserve_event_entry(
             event_id="zero-event", condition_id="zero-condition",
             token_id="zero-token", side="YES", simultaneous=False,
@@ -2370,7 +2374,7 @@ def test_unresolved_entry_blocks_retry_and_is_not_treated_as_zero_fill():
 def test_real_reconciliation_gap_still_pauses_entries():
     temp, base, strategy = build_repo()
     try:
-        strategy.set_pause_entries(False, "test", "PRECONDITION")
+        strategy.set_pause_entries(False, "operator", "PRECONDITION")
         attempt = strategy.reserve_event_entry(
             event_id="gap-event", condition_id="gap-condition",
             token_id="gap-token", side="YES", simultaneous=False,

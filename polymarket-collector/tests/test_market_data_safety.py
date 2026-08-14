@@ -403,8 +403,8 @@ def test_pre_submission_recheck_blocks_aged_data_without_adapter_call():
         base.set_states({
             "kill_switch": "false", "canary_armed": "true",
             "canary_consumed": "false", "pause_entries": "false",
-        }, "test")
-        strategy.set_pause_entries(False, "test", "TEST_READY")
+        }, "operator")
+        strategy.set_pause_entries(False, "operator", "TEST_READY")
         runtime = LiveStrategyRuntime(
             LiveConfig(execution_mode="REAL_TRADING"), base, strategy, adapter
         )

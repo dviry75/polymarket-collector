@@ -1257,10 +1257,12 @@ class LiveStrategyRuntime:
         daily = self.base.current_daily_limit(day_key, "Asia/Jerusalem")
         realized = decimal_value(daily.get("realized_pnl_usd")) or Decimal("0")
         blocked = realized <= -abs(self.config.max_daily_realized_loss_usd)
-        if blocked and not self.base.kill_switch_active():
-            self.base.set_state("kill_switch", "true", "strategy_daily_loss")
+        if blocked:
             self.base.set_state("canary_armed", "false", "strategy_daily_loss")
-            self.repo.set_pause_entries(True, "strategy_daily_loss", "DAILY_LOSS_LIMIT")
+            self.repo.set_pause_entries(
+                True, "strategy_daily_loss", "DAILY_LOSS_LIMIT",
+                owner="MACHINE", auto_recoverable=False,
+            )
             self.repo.alert(
                 alert_type="RISK",
                 severity="CRITICAL",
@@ -1318,7 +1320,9 @@ class LiveStrategyRuntime:
                 phase="PRE_SUBMISSION", details=freshness,
             )
             if not self.paper_mode():
-                self.repo.set_pause_entries(True, "strategy", reason)
+                self.repo.set_pause_entries(
+                    True, "strategy", reason, owner="MACHINE", auto_recoverable=True
+                )
                 self.base.set_states({
                     "canary_armed": "false",
                     "strategy_readiness": "NOT_READY",
@@ -2690,7 +2694,10 @@ class LiveStrategyRuntime:
                     "order_heartbeat_status", "OK" if success else "FAILED", "heartbeat"
                 )
                 if not success:
-                    self.repo.set_pause_entries(True, "heartbeat", "HEARTBEAT_FAILURE")
+                    self.repo.set_pause_entries(
+                        True, "heartbeat", "HEARTBEAT_FAILURE",
+                        owner="MACHINE", auto_recoverable=True,
+                    )
                     self.repo.alert(
                         alert_type="HEARTBEAT", severity="CRITICAL",
                         reason_code="HEARTBEAT_FAILURE",

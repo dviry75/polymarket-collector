@@ -471,6 +471,8 @@ class LiveRepository:
         return row["value"] if row else default
 
     def set_state(self, key: str, value: str, actor: str = "system") -> None:
+        if key == "kill_switch" and actor != "operator":
+            raise PermissionError("kill_switch is operator-owned")
         with self.connect() as conn:
             conn.execute(
                 """
@@ -492,6 +494,8 @@ class LiveRepository:
         """Write coalescible states using an existing transaction."""
         if not values:
             return
+        if "kill_switch" in values and actor != "operator":
+            raise PermissionError("kill_switch is operator-owned")
 
         ts = now_iso()
 
