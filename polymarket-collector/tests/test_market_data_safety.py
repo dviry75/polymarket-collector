@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import json
+from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -174,18 +175,20 @@ def test_best_update_may_arrive_before_delta_without_advancing_book_timestamp():
         "bids": [{"price": "0.35", "size": "5"}],
         "asks": [{"price": "0.36", "size": "5"}],
     }, now_ms=NOW_MS, max_age_ms=1_000)
-    prior_timestamp = books.books["yes"].last_exchange_timestamp_ms
+    prior_depth_timestamp = books.books["yes"].last_timestamp
 
     best_first = books.apply({
         "event_type": "best_bid_ask", "asset_id": "yes",
         "timestamp": NOW_MS - 100, "best_bid": "0.35", "best_ask": "0.37",
     }, now_ms=NOW_MS, max_age_ms=1_000)
     assert not best_first.updates[0]["book_ready"]
-    assert best_first.updates[0]["readiness_reason"] == "BEST_PRICE_MISMATCH"
-    assert books.books["yes"].last_exchange_timestamp_ms == prior_timestamp
+    assert best_first.updates[0]["readiness_reason"] == "BEST_PRICE_PENDING_DEPTH"
+    assert books.books["yes"].last_timestamp == prior_depth_timestamp
 
     repaired = books.apply({
-        "event_type": "price_change", "timestamp": NOW_MS - 100,
+        # Real captures show the matching depth may carry a 1 ms older
+        # exchange timestamp even though it follows on the wire.
+        "event_type": "price_change", "timestamp": NOW_MS - 101,
         "price_changes": [
             {"asset_id": "yes", "side": "SELL", "price": "0.36", "size": "0"},
             {"asset_id": "yes", "side": "SELL", "price": "0.37", "size": "5",
@@ -226,7 +229,7 @@ def test_stale_ordered_delta_preserves_structure_but_cannot_be_ready():
     assert fresh.updates[0]["book_ready"]
 
 
-def test_price_change_authoritative_best_prunes_displaced_levels():
+def test_price_change_best_never_prunes_levels_without_explicit_zero_delta():
     books = OrderBookSet(["yes"])
     books.apply({
         "event_type": "book", "asset_id": "yes", "timestamp": NOW_MS - 200,
@@ -246,11 +249,12 @@ def test_price_change_authoritative_best_prunes_displaced_levels():
             "best_bid": "0.04", "best_ask": "0.09",
         }],
     }, now_ms=NOW_MS, max_age_ms=1_000)
-    assert moved.updates[0]["book_ready"]
-    assert moved.updates[0]["best_bid"] == "0.04"
-    assert moved.updates[0]["best_ask"] == "0.09"
-    assert Decimal("0.06") not in books.books["yes"].bids
-    assert Decimal("0.07") not in books.books["yes"].asks
+    assert not moved.updates[0]["book_ready"]
+    assert moved.updates[0]["readiness_reason"] == "BEST_PRICE_MISMATCH"
+    assert moved.updates[0]["best_bid"] == "0.06"
+    assert moved.updates[0]["best_ask"] == "0.07"
+    assert Decimal("0.06") in books.books["yes"].bids
+    assert Decimal("0.07") in books.books["yes"].asks
 
 
 
@@ -293,12 +297,25 @@ def test_market_ws_transport_queue_is_bounded_but_burst_tolerant(monkeypatch):
         manager = MarketWebSocketManager(repo)
         assert manager.library_queue_high_water == 256
         assert manager.library_queue_low_water == 64
-
         monkeypatch.setenv("LIVE_MARKET_WS_LIBRARY_QUEUE_HIGH_WATER", "80")
         monkeypatch.setenv("LIVE_MARKET_WS_LIBRARY_QUEUE_LOW_WATER", "20")
         configured = MarketWebSocketManager(repo)
         assert configured.library_queue_high_water == 80
         assert configured.library_queue_low_water == 20
+    finally:
+        temp.cleanup()
+
+
+def test_diagnostic_ring_discards_tokens_removed_by_rollover():
+    temp, repo = make_repo()
+    try:
+        manager = MarketWebSocketManager(repo)
+        manager._book_event_history = {
+            "old-token": deque([{"wire_sequence": 1}], maxlen=64),
+            "new-token": deque([{"wire_sequence": 2}], maxlen=64),
+        }
+        manager._prune_book_event_history(["new-token"])
+        assert set(manager._book_event_history) == {"new-token"}
     finally:
         temp.cleanup()
 

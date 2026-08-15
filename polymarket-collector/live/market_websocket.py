@@ -167,6 +167,14 @@ class MarketWebSocketManager:
         self._connection_started_monotonic = 0.0
         self._last_subscription_change_monotonic = 0.0
         self._connection_frame_index = 0
+        self._wire_sequence = 0
+        self.best_price_pending_events = 0
+        self.best_price_alignment_recoveries = 0
+        self.best_price_mismatches = 0
+        self.duplicate_frames = 0
+        self.stale_generation_frames = 0
+        self._book_event_history: dict[str, deque[dict[str, Any]]] = {}
+        self._last_book_mismatch_diagnostic: dict[str, Any] = {}
         latency_csv_path = os.getenv("LIVE_MARKET_WS_LATENCY_CSV_PATH", "").strip()
         self._latency_csv = (
             MarketWsLatencyCsvDiagnostic(
@@ -321,7 +329,11 @@ class MarketWebSocketManager:
                         len(asset_ids),
                     )
                     self.order_books.ensure_assets(asset_ids)
-                    self.order_books.mark_not_ready("RECONNECT_AWAITING_FRESH_BOOKS")
+                    self._prune_book_event_history(asset_ids)
+                    self.order_books.mark_not_ready(
+                        "RECONNECT_AWAITING_FRESH_BOOKS",
+                        source_generation=self._connection_generation,
+                    )
                     await asyncio.to_thread(self._refresh_market_cache, asset_ids)
                     await ws.send(json.dumps(self.subscription_message(asset_ids)))
                     self.subscribed_asset_ids = asset_ids
@@ -460,6 +472,8 @@ class MarketWebSocketManager:
                     if not isinstance(message, dict):
                         continue
                     timing = dict(base_timing)
+                    self._wire_sequence += 1
+                    timing["wire_sequence"] = self._wire_sequence
                     timing["batch_index"] = index
                     timing["batch_size"] = len(messages)
                     timing["ingress_enqueued_monotonic"] = time.perf_counter()
@@ -531,32 +545,12 @@ class MarketWebSocketManager:
                 self.process_message(message, timing=timing)
                 if self._integrity_resync_reason and not resync.is_set():
                     resync_error = self._integrity_resync_reason
-                    latest = None
-                    if isinstance(message.get("price_changes"), list):
-                        latest = next((
-                            item for item in reversed(message["price_changes"])
-                            if isinstance(item, dict)
-                        ), None)
+                    diagnostic = self._book_mismatch_diagnostic(
+                        message, timing=timing, reason=resync_error
+                    )
                     self._logger.warning(
-                        "MARKET_WS_BOOK_INTEGRITY_FAILURE generation=%s reason=%s "
-                        "event_type=%s assets=%s timestamp=%s advertised_bid=%s "
-                        "advertised_ask=%s computed_top=%s changes=%s exchange_age_ms=%s",
-                        self._connection_generation, resync_error, event_type,
-                        self._message_asset_ids(message), message.get("timestamp"),
-                        (latest or message).get("best_bid"),
-                        (latest or message).get("best_ask"),
-                        timing.get("book_top"),
-                        [
-                            {
-                                key: change.get(key) for key in (
-                                    "asset_id", "side", "price", "size",
-                                    "best_bid", "best_ask",
-                                )
-                            }
-                            for change in (message.get("price_changes") or [])[-16:]
-                            if isinstance(change, dict)
-                        ],
-                        timing.get("exchange_to_socket_receive_ms"),
+                        "MARKET_WS_BOOK_INTEGRITY_FAILURE diagnostic=%s",
+                        json.dumps(diagnostic, separators=(",", ":"), default=str),
                     )
                     self._begin_ingress_resync(resync_error, resync)
                     await ws.close()
@@ -571,7 +565,9 @@ class MarketWebSocketManager:
             self.ingress_resync_reasons.get(reason, 0) + 1
         )
         resync.set()
-        self.order_books.mark_not_ready(reason)
+        self.order_books.mark_not_ready(
+            reason, source_generation=self._connection_generation
+        )
         self._queue_states({
             "strategy_readiness": "NOT_READY",
             "strategy_block_reason": reason,
@@ -680,6 +676,7 @@ class MarketWebSocketManager:
             if add or remove:
                 self.subscribed_asset_ids = list(wanted)
                 self.order_books.ensure_assets(wanted)
+                self._prune_book_event_history(wanted)
                 await asyncio.to_thread(self._refresh_market_cache, wanted)
                 self._logger.info(
                     "MARKET_WS_ROTATION_COMPLETE generation_before=%s generation_after=%s subscribed=%s removed=%s",
@@ -812,12 +809,21 @@ class MarketWebSocketManager:
             self.order_books.ensure_assets(
                 assets
             )
+            pending_before = {
+                asset: bool(book.alignment_pending)
+                for asset, book in self.order_books.books.items()
+            }
             frame = self.order_books.apply(
                 message,
                 now_ms=now_ms,
                 max_age_ms=self.stale_after_seconds * 1000,
                 future_tolerance_ms=self.future_tolerance_ms,
                 include_depth=self.include_depth_in_callback,
+                source_generation=(
+                    timing.get("connection_generation")
+                    if self._connection_generation > 0 else None
+                ),
+                wire_sequence=timing.get("wire_sequence"),
             )
             timing["message_hash"] = frame.message_hash
             timing["book_update_monotonic"] = time.perf_counter()
@@ -837,6 +843,28 @@ class MarketWebSocketManager:
             ]
             self.last_exchange_age_ms = frame.exchange_age_ms
             self.last_receive_latency_ms = frame.receive_latency_ms
+            if frame.duplicate:
+                self.duplicate_frames += 1
+            if frame.rejected_reason == "STALE_CONNECTION_GENERATION":
+                self.stale_generation_frames += 1
+            current_reasons = {
+                str(view.get("readiness_reason") or "")
+                for view in frame.updates
+            }
+            if "BEST_PRICE_PENDING_DEPTH" in current_reasons:
+                self.best_price_pending_events += 1
+            if "BEST_PRICE_MISMATCH" in current_reasons:
+                self.best_price_mismatches += 1
+            self.best_price_alignment_recoveries += sum(
+                1 for asset, was_pending in pending_before.items()
+                if was_pending
+                and (book := self.order_books.books.get(asset)) is not None
+                and book.ready
+                and not book.alignment_pending
+            )
+            self._record_book_event_history(
+                message, timing=timing, frame=frame, received_at=received_at
+            )
             if frame.out_of_order:
                 self.out_of_order_frames += 1
                 self.rejected_frames += 1
@@ -991,8 +1019,6 @@ class MarketWebSocketManager:
                 "BEST_PRICE_MISMATCH", "MALFORMED_DELTA",
             ):
                 if reason in integrity_reasons:
-                    if reason == "BEST_PRICE_MISMATCH" and event_type == "best_bid_ask":
-                        continue
                     self._integrity_resync_reason = reason
                     break
 
@@ -1083,6 +1109,155 @@ class MarketWebSocketManager:
             stored_critical if event_type == "market_resolved"
             else bool(callback_updates) and not frame.rejected_reason
         )
+
+    def _record_book_event_history(
+        self, message: dict[str, Any], *, timing: dict[str, Any],
+        frame: Any, received_at: str,
+    ) -> None:
+        """Keep a small per-token forensic ring; never persist raw WS traffic."""
+        event_type = str(
+            message.get("event_type") or message.get("type") or ""
+        ).lower()
+        updates = {
+            str(view.get("asset_id") or ""): view
+            for view in (getattr(frame, "updates", ()) or ())
+        }
+        changes = [
+            {
+                key: change.get(key)
+                for key in (
+                    "asset_id", "side", "price", "size", "best_bid", "best_ask"
+                )
+            }
+            for change in (message.get("price_changes") or [])[-16:]
+            if isinstance(change, dict)
+        ]
+        for asset in self._message_asset_ids(message):
+            book = self.order_books.books.get(asset)
+            view = updates.get(asset, {})
+            if book is None:
+                continue
+            ring = self._book_event_history.setdefault(asset, deque(maxlen=64))
+            ring.append({
+                "received_at_utc": received_at,
+                "exchange_timestamp_ms": timing.get("exchange_timestamp_ms"),
+                "receive_timestamp_ms": timing.get("socket_receive_wall_ms"),
+                "message_type": event_type,
+                "connection_generation": timing.get("connection_generation"),
+                "wire_sequence": timing.get("wire_sequence"),
+                "message_hash": getattr(frame, "message_hash", ""),
+                "advertised_best_bid": view.get("advertised_best_bid"),
+                "advertised_best_ask": view.get("advertised_best_ask"),
+                "local_best_bid": (
+                    canonical_decimal(book.best_bid)
+                    if book.best_bid is not None else None
+                ),
+                "local_best_ask": (
+                    canonical_decimal(book.best_ask)
+                    if book.best_ask is not None else None
+                ),
+                "readiness": book.reason,
+                "correlation_id": book.alignment_correlation_id,
+                "changes": [
+                    change for change in changes
+                    if str(change.get("asset_id") or "") == asset
+                ],
+            })
+
+    def _prune_book_event_history(self, asset_ids: list[str]) -> None:
+        wanted = {str(asset) for asset in asset_ids if asset}
+        for asset in list(self._book_event_history):
+            if asset not in wanted:
+                del self._book_event_history[asset]
+
+    def _book_mismatch_diagnostic(
+        self, message: dict[str, Any], *, timing: dict[str, Any], reason: str,
+    ) -> dict[str, Any]:
+        records: list[dict[str, Any]] = []
+        now_ms = self._clock_ms()
+        for asset in self._message_asset_ids(message):
+            book = self.order_books.books.get(asset)
+            if book is None:
+                continue
+            market = self._markets_by_asset.get(asset) or {}
+            outcome = (
+                "YES" if str(market.get("yes_token_id") or "") == asset
+                else "NO" if str(market.get("no_token_id") or "") == asset
+                else None
+            )
+            records.append({
+                "event_id": market.get("event_id"),
+                "condition_id": market.get("condition_id"),
+                "asset_id": asset,
+                "side": outcome,
+                "advertised_best_bid": (
+                    canonical_decimal(book.advertised_best_bid)
+                    if book.advertised_best_bid is not None else None
+                ),
+                "advertised_best_ask": (
+                    canonical_decimal(book.advertised_best_ask)
+                    if book.advertised_best_ask is not None else None
+                ),
+                "local_best_bid": (
+                    canonical_decimal(book.best_bid)
+                    if book.best_bid is not None else None
+                ),
+                "local_best_ask": (
+                    canonical_decimal(book.best_ask)
+                    if book.best_ask is not None else None
+                ),
+                "local_top_5_bids": book.levels("bids")[:5],
+                "local_top_5_asks": book.levels("asks")[:5],
+                "generation": book.generation,
+                "source_generation": book.source_generation,
+                "update_number": book.update_number,
+                "readiness": book.reason,
+                "subscription_status": (
+                    "SUBSCRIBED" if asset in self.subscribed_asset_ids
+                    else "NOT_SUBSCRIBED"
+                ),
+                "stale": self.status.stale,
+                "exchange_age_ms": (
+                    now_ms - book.last_exchange_timestamp_ms
+                    if book.last_exchange_timestamp_ms is not None else None
+                ),
+                "receive_latency_ms": book.receive_latency_ms,
+                "advertised_message_type": book.advertised_source,
+                "last_book_mutation_type": book.last_mutation_type,
+                "last_snapshot_timestamp_ms": book.last_snapshot_timestamp_ms,
+                "last_delta_timestamp_ms": book.last_delta_timestamp_ms,
+                "advertised_timestamp_ms": book.advertised_timestamp_ms,
+                "advertised_wire_sequence": book.advertised_wire_sequence,
+                "last_wire_sequence": book.last_wire_sequence,
+                "correlation_id": book.alignment_correlation_id,
+                "recent_events": list(self._book_event_history.get(asset, ())),
+            })
+        diagnostic = {
+            "timestamp_utc": now_iso(),
+            "exchange_timestamp_ms": timing.get("exchange_timestamp_ms"),
+            "receive_timestamp_ms": timing.get("socket_receive_wall_ms"),
+            "reason": reason,
+            "message_type": str(
+                message.get("event_type") or message.get("type") or ""
+            ).lower(),
+            "message_hash": timing.get("message_hash"),
+            "reconnect_generation": timing.get("connection_generation"),
+            "wire_sequence": timing.get("wire_sequence"),
+            "resync_count": self.ingress_resyncs,
+            "out_of_order_frames": self.out_of_order_frames,
+            "rejected_frames": self.rejected_frames,
+            "rejection_reasons": dict(self.rejection_reasons),
+            "ingress_queue_depth": timing.get("ingress_queue_depth", 0),
+            "ws_internal_queue_depth": timing.get("ws_internal_queue_depth"),
+            "persistence_queue_depth": len(self._pending_snapshots),
+            "ingress_queue_saturations": self.ingress_queue_saturations,
+            "ingress_frames_discarded": self.ingress_market_frames_discarded,
+            "snapshots_dropped": self.snapshots_dropped,
+            "snapshots_coalesced": self.snapshots_coalesced,
+            "records": records,
+        }
+        self._last_book_mismatch_diagnostic = diagnostic
+        return diagnostic
 
     @staticmethod
     def _message_asset_ids(message: dict[str, Any]) -> list[str]:
@@ -2075,7 +2250,9 @@ class MarketWebSocketManager:
         self.status.reconnect_attempts += 1
         self.status.stale = True
         self.status.error = error or None
-        self.order_books.mark_not_ready("WS_DISCONNECTED")
+        self.order_books.mark_not_ready(
+            "WS_DISCONNECTED", source_generation=self._connection_generation
+        )
         # Serialize disconnect state through the same coalescing writer so an
         # in-flight READY update can never commit after DISCONNECTED.
         self._queue_states({
@@ -2105,7 +2282,9 @@ class MarketWebSocketManager:
                     "ready": book.ready,
                     "reason": book.reason,
                     "generation": book.generation,
+                    "source_generation": book.source_generation,
                     "update_number": book.update_number,
+                    "wire_sequence": book.last_wire_sequence,
                     "exchange_timestamp_ms": book.last_exchange_timestamp_ms,
                     "exchange_age_ms": (
                         self._clock_ms() - book.last_exchange_timestamp_ms
@@ -2114,6 +2293,19 @@ class MarketWebSocketManager:
                     "receive_latency_ms": book.receive_latency_ms,
                     "best_bid": canonical_decimal(book.best_bid) if book.best_bid is not None else None,
                     "best_ask": canonical_decimal(book.best_ask) if book.best_ask is not None else None,
+                    "advertised_best_bid": (
+                        canonical_decimal(book.advertised_best_bid)
+                        if book.advertised_best_bid is not None else None
+                    ),
+                    "advertised_best_ask": (
+                        canonical_decimal(book.advertised_best_ask)
+                        if book.advertised_best_ask is not None else None
+                    ),
+                    "alignment_pending": book.alignment_pending,
+                    "correlation_id": book.alignment_correlation_id,
+                    "last_snapshot_timestamp_ms": book.last_snapshot_timestamp_ms,
+                    "last_delta_timestamp_ms": book.last_delta_timestamp_ms,
+                    "last_mutation_type": book.last_mutation_type,
                 }
                 for asset, book in self.order_books.books.items()
             },
@@ -2189,6 +2381,19 @@ class MarketWebSocketManager:
             "rejected_frames": self.rejected_frames,
             "out_of_order_frames": self.out_of_order_frames,
             "rejection_reasons": dict(self.rejection_reasons),
+            "best_price_pending_events": self.best_price_pending_events,
+            "best_price_alignment_recoveries": (
+                self.best_price_alignment_recoveries
+            ),
+            "best_price_mismatches": self.best_price_mismatches,
+            "duplicate_frames": self.duplicate_frames,
+            "stale_generation_frames": self.stale_generation_frames,
+            "book_diagnostic_ring_size": sum(
+                len(events) for events in self._book_event_history.values()
+            ),
+            "last_book_mismatch_diagnostic": (
+                self._last_book_mismatch_diagnostic
+            ),
             "idle_ready_checks_over_threshold": self.idle_ready_checks_over_threshold,
         }
 

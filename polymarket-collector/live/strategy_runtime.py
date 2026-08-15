@@ -100,6 +100,12 @@ class LiveStrategyRuntime:
         self._critical_price_state: dict[
             tuple[str, str], dict[str, Any]
         ] = {}
+        # NOT_READY observations are deduplicated independently. They must be
+        # visible and fail-closed, but must not consume the next actionable
+        # READY edge after deterministic book alignment/resync.
+        self._critical_observed_price_state: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
 
         self._stop = asyncio.Event()
         self.frames_processed = 0
@@ -444,6 +450,9 @@ class LiveStrategyRuntime:
         )
 
     def schedule_frame(self, context: dict[str, Any]) -> None:
+        if not hasattr(self, "_critical_observed_price_state"):
+            # Compatibility for focused unit fixtures constructed via __new__.
+            self._critical_observed_price_state = {}
         final_updates = [
             item
             for item in context.get("updates") or []
@@ -595,8 +604,14 @@ class LiveStrategyRuntime:
                     asset_id,
                 )
 
+                readiness_ready = bool(readiness.get("ready"))
+                state_store = (
+                    self._critical_price_state
+                    if readiness_ready
+                    else self._critical_observed_price_state
+                )
                 previous = (
-                    self._critical_price_state.get(
+                    state_store.get(
                         state_key,
                         {
                             "best_ask": None,
@@ -644,14 +659,16 @@ class LiveStrategyRuntime:
                     and previous_bid <= self.policy.emergency_price
                 )
 
-                # Always advance through every ordered intermediate
-                # observation and finally the atomic final state.
-                self._critical_price_state[
-                    state_key
-                ] = {
+                # Always deduplicate observed transitions. Only a READY state
+                # advances the actionable edge state; NOT_READY 0.74/0.66/0.60
+                # therefore remains blocked without disappearing after resync.
+                next_state = {
                     "best_ask": ask,
                     "best_bid": bid,
                 }
+                self._critical_observed_price_state[state_key] = next_state
+                if readiness_ready:
+                    self._critical_price_state[state_key] = next_state
 
                 latched = False
 
@@ -695,14 +712,17 @@ class LiveStrategyRuntime:
                     item[
                         "_critical_trigger_latched"
                     ] = True
-                    item["_critical_trigger_id"] = stable_id(
-                        "critical-trigger",
-                        ":".join((
-                            condition_id, asset_id,
-                            str(item.get("exchange_timestamp_ms") or ""),
-                            str(item.get("_raw_change_index") or ""),
-                            ",".join(sorted(critical_types)),
-                        )),
+                    item["_critical_trigger_id"] = (
+                        str(item.get("correlation_id") or "")
+                        or stable_id(
+                            "critical-trigger",
+                            ":".join((
+                                condition_id, asset_id,
+                                str(item.get("exchange_timestamp_ms") or ""),
+                                str(item.get("_raw_change_index") or ""),
+                                ",".join(sorted(critical_types)),
+                            )),
+                        )
                     )
                     self._trace_critical(
                         "TRIGGER_DETECTED", update=item, context=context
