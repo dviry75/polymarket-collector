@@ -94,6 +94,36 @@ def test_advertised_best_can_precede_older_timestamp_depth_without_false_mismatc
     assert not books.books["token"].alignment_pending
 
 
+def test_price_change_advertised_top_waits_for_same_timestamp_companion_delta():
+    books = OrderBookSet(["token"])
+    apply_fresh(books, {
+        "event_type": "book", "asset_id": "token", "timestamp": NOW_MS - 300,
+        "bids": [
+            {"price": "0.32", "size": "23"},
+            {"price": "0.31", "size": "23"},
+        ],
+        "asks": [{"price": "0.33", "size": "20"}],
+    })
+    first = apply_fresh(books, {
+        "event_type": "price_change", "timestamp": NOW_MS - 200,
+        "price_changes": [{
+            "asset_id": "token", "side": "SELL", "price": "0.33", "size": "20",
+            "best_bid": "0.31", "best_ask": "0.33",
+        }],
+    })
+    companion = apply_fresh(books, {
+        "event_type": "price_change", "timestamp": NOW_MS - 200,
+        "price_changes": [{
+            "asset_id": "token", "side": "BUY", "price": "0.32", "size": "0",
+            "best_bid": "0.31", "best_ask": "0.33",
+        }],
+    })
+    assert first.updates[0]["readiness_reason"] == "BEST_PRICE_PENDING_DEPTH"
+    assert not first.updates[0]["book_ready"]
+    assert companion.updates[0]["readiness_reason"] == "READY"
+    assert companion.updates[0]["best_bid"] == "0.31"
+
+
 def test_missing_depth_update_mismatch_no_order_then_resync_ready():
     books = OrderBookSet(["token"])
     apply_fresh(books, snapshot("token", NOW_MS - 400, "0.35", "0.36"))

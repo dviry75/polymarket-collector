@@ -454,10 +454,13 @@ class OrderBookSet:
                 message_hash=message_hash,
             )
             if book.alignment_pending:
-                # Without an earlier best_bid_ask target this delta is the
-                # synchronization barrier itself; disagreement is real.
+                # price_change carries the advertised top for the transaction,
+                # but Polymarket may split the depth mutations that realize it
+                # across consecutive same-timestamp messages. Keep the book
+                # fail-closed until those companion deltas arrive. A later
+                # timestamp or authoritative snapshot is the barrier above.
                 book.ready = False
-                book.reason = "BEST_PRICE_MISMATCH"
+                book.reason = "BEST_PRICE_PENDING_DEPTH"
                 return book.reason
 
         book.ready = True

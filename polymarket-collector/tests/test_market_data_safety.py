@@ -250,7 +250,7 @@ def test_price_change_best_never_prunes_levels_without_explicit_zero_delta():
         }],
     }, now_ms=NOW_MS, max_age_ms=1_000)
     assert not moved.updates[0]["book_ready"]
-    assert moved.updates[0]["readiness_reason"] == "BEST_PRICE_MISMATCH"
+    assert moved.updates[0]["readiness_reason"] == "BEST_PRICE_PENDING_DEPTH"
     assert moved.updates[0]["best_bid"] == "0.06"
     assert moved.updates[0]["best_ask"] == "0.07"
     assert Decimal("0.06") in books.books["yes"].bids
@@ -258,7 +258,7 @@ def test_price_change_best_never_prunes_levels_without_explicit_zero_delta():
 
 
 
-def test_exact_transition_survives_final_best_price_mismatch_fail_closed():
+def test_exact_transition_survives_final_best_price_pending_fail_closed():
     books = OrderBookSet(["yes"])
     books.apply({
         "event_type": "book", "asset_id": "yes", "timestamp": NOW_MS - 200,
@@ -284,7 +284,7 @@ def test_exact_transition_survives_final_best_price_mismatch_fail_closed():
         ],
     }, now_ms=NOW_MS, max_age_ms=1_000)
 
-    assert frame.updates[0]["readiness_reason"] == "BEST_PRICE_MISMATCH"
+    assert frame.updates[0]["readiness_reason"] == "BEST_PRICE_PENDING_DEPTH"
     assert not frame.updates[0]["book_ready"]
     assert [item["best_ask"] for item in frame.top_transitions] == ["0.74", "0.75"]
 
