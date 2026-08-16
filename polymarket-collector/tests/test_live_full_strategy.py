@@ -405,7 +405,7 @@ def test_stop_success_never_recreates_take_profit():
             final_state="PARTIAL_FINAL", min_sellable=Decimal("5"),
             purpose="STOP_066", book_hash="stop",
         )
-        assert stopped["state"] == "OPEN"
+        assert stopped["state"] == "EXITING"
         assert stopped["stop_stage"] == 1
         adapter = RecordingAdapter()
         runtime = LiveStrategyRuntime(
@@ -812,92 +812,6 @@ def test_recursive_masking_covers_payloads_and_error_strings():
     assert masked["token_id"] == "public-token-id"
 
 
-def test_paper_stop_gtc_partial_then_cancel_and_emergency_fak_closes_position():
-    temp, base, strategy = build_repo()
-    try:
-        base.upsert_market({
-            "event_id": "event-stop",
-            "condition_id": "condition-event-stop",
-            "yes_token_id": "token-event-stop",
-            "no_token_id": "token-no",
-            "token_mapping_status": "verified",
-            "accepting_orders": True,
-            "min_order_size": 1,
-            "min_tick_size": 0.01,
-            "taker_base_fee": 0,
-        })
-        position = reserve_and_open(
-            strategy, event="event-stop", shares=Decimal("5"), minimum=Decimal("1")
-        )
-        tp = strategy.reserve_position_intent(
-            position,
-            action="TP",
-            purpose="TAKE_PROFIT",
-            order_type="GTC",
-            shares=Decimal("5"),
-            price_limit=Decimal("0.96"),
-            book_hash="entry",
-        )
-        strategy.update_intent(tp["intent_id"], state="LIVE")
-        position = strategy.position_for_token("token-event-stop")
-        runtime = LiveStrategyRuntime(
-            LiveConfig(
-                live_module_enabled=True,
-                execution_mode="PAPER_TRADING",
-                paper_trading_enabled=True,
-            ),
-            base,
-            strategy,
-            MockTradingAdapter(),
-        )
-        asyncio.run(runtime._place_stop_loss(
-            position,
-            {
-                "asset_id": "token-event-stop",
-                "best_bid": "0.66",
-                "bids": [{"price": "0.66", "size": "2"}],
-            },
-            frame_hash="stop-book",
-        ))
-        partial = strategy.position_for_token("token-event-stop")
-        assert partial["remaining_shares_text"] == "3"
-        assert partial["active_exit_intent_id"]
-        stop_intent = strategy.intent(partial["active_exit_intent_id"])
-        assert stop_intent["order_type"] == "GTC"
-        assert stop_intent["price_limit_text"] == "0.55"
-        assert stop_intent["state"] == "PARTIAL"
-
-        restarted_strategy = StrategyRepository(LiveRepository(base.db_path))
-        restarted_strategy.migrate()
-        runtime = LiveStrategyRuntime(
-            LiveConfig(
-                live_module_enabled=True,
-                execution_mode="PAPER_TRADING",
-                paper_trading_enabled=True,
-            ),
-            base,
-            restarted_strategy,
-            MockTradingAdapter(),
-        )
-        partial = restarted_strategy.position_for_token("token-event-stop")
-        asyncio.run(runtime._emergency_exit(
-            partial,
-            {
-                "asset_id": "token-event-stop",
-                "best_bid": "0.60",
-                "bids": [{"price": "0.60", "size": "3"}],
-            },
-            purpose="EMERGENCY_060",
-            min_price=Decimal("0.55"),
-            frame_hash="emergency-book",
-        ))
-        closed = strategy.position_for_token("token-event-stop")
-        assert closed["state"] == "CLOSED"
-        assert closed["remaining_shares_text"] == "0"
-        assert strategy.intent(stop_intent["intent_id"])["state"] == "CANCELED"
-    finally:
-        temp.cleanup()
-
 
 def test_emergency_cancel_failure_never_submits_parallel_sell():
     class CancelFailureAdapter(MockTradingAdapter):
@@ -937,15 +851,15 @@ def test_emergency_cancel_failure_never_submits_parallel_sell():
             strategy,
             adapter,
         )
-        asyncio.run(runtime._emergency_exit(
+        asyncio.run(runtime._market_exit_fak(
             position,
             {
                 "asset_id": "token-cancel-failure",
                 "best_bid": "0.60",
                 "bids": [{"price": "0.60", "size": "5"}],
             },
-            purpose="EMERGENCY_060",
-            min_price=Decimal("0.55"),
+            purpose="EMERGENCY_OPERATOR",
+            min_price=Decimal("0.01"),
             frame_hash="emergency",
         ))
         assert adapter.create_calls == []
@@ -1375,7 +1289,7 @@ def test_latched_critical_trigger_is_not_rejected_as_frame_superseded():
 
 
 
-def test_stop_and_emergency_exact_prices_survive_conflation():
+def test_single_stop_edge_survives_conflation():
     async def scenario():
         runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
 
@@ -1453,7 +1367,7 @@ def test_stop_and_emergency_exact_prices_survive_conflation():
             if context.get("_critical_trigger")
         ]
 
-        assert len(critical) == 2
+        assert len(critical) == 1
 
         assert critical[0]["_critical_trigger_types"] == [
             "STOP_066"
@@ -1463,20 +1377,10 @@ def test_stop_and_emergency_exact_prices_survive_conflation():
             is True
         )
 
-        assert critical[1]["_critical_trigger_types"] == [
-            "EMERGENCY_060"
-        ]
-        assert (
-            critical[1]["updates"][0][
-                "_critical_emergency_latched"
-            ]
-            is True
-        )
-
         # Exact 0.66 appearing on two consecutive frames is one edge,
         # not two critical queue entries.
-        assert runtime.critical_triggers_queued == 2
-        assert runtime.critical_triggers_processed == 2
+        assert runtime.critical_triggers_queued == 1
+        assert runtime.critical_triggers_processed == 1
         assert runtime.critical_triggers_dropped == 0
 
         # Latest ordinary state still survives independently.
@@ -2168,7 +2072,7 @@ def test_order_book_preserves_stop_then_emergency_transition_order():
     ]
 
 
-def test_strategy_queues_intra_message_stop_and_emergency_fifo():
+def test_strategy_queues_only_first_stop_transition_in_message():
     import asyncio
     from collections import OrderedDict, deque
     from types import SimpleNamespace
@@ -2187,7 +2091,6 @@ def test_strategy_queues_intra_message_stop_and_emergency_fifo():
         runtime.policy = SimpleNamespace(
             entry_price=Decimal("0.74"),
             stop_price=Decimal("0.66"),
-            emergency_price=Decimal("0.60"),
         )
 
         runtime._critical_price_state = {}
@@ -2261,10 +2164,7 @@ def test_strategy_queues_intra_message_stop_and_emergency_fifo():
         assert [
             update["best_bid"]
             for update in latched
-        ] == [
-            "0.66",
-            "0.60",
-        ]
+        ] == ["0.66"]
 
         assert (
             latched[0][
@@ -2273,21 +2173,9 @@ def test_strategy_queues_intra_message_stop_and_emergency_fifo():
             is True
         )
 
-        assert (
-            latched[1][
-                "_critical_emergency_latched"
-            ]
-            is True
-        )
-
-        assert set(
-            critical[
-                "_critical_trigger_types"
-            ]
-        ) == {
-            "STOP_066",
-            "EMERGENCY_060",
-        }
+        assert critical["_critical_trigger_types"] == [
+            "STOP_066"
+        ]
 
     asyncio.run(scenario())
 
@@ -2491,311 +2379,7 @@ def test_zero_fill_in_event_a_does_not_block_entry_in_event_b():
         temp.cleanup()
 
 
-def test_manage_position_threshold_exit_priority():
-    cases = (
-        ("0.65", "STOP_066"),
-        ("0.61", "STOP_066"),
-        ("0.60", "EMERGENCY_060"),
-        ("0.58", "EMERGENCY_060"),
-        ("0.40", "EMERGENCY_060"),
-    )
 
-    for bid_text, expected in cases:
-        runtime = LiveStrategyRuntime.__new__(
-            LiveStrategyRuntime
-        )
-
-        runtime.policy = StrategyPolicy()
-        runtime.config = LiveConfig(
-            execution_mode="READ_ONLY",
-        )
-
-        runtime._hot_state = {
-            "reconciliation_readiness": "READY",
-            "positions_by_token": {
-                "token-threshold": [{
-                    "position_id": "position-threshold",
-                    "event_id": "event-threshold",
-                    "condition_id": "condition-threshold",
-                    "token_id": "token-threshold",
-                    "outcome": "YES",
-                    "state": "TP_OPEN",
-                    "remaining_shares_text": "5",
-                    "sellable_shares_text": "5",
-                    "stop_stage": 0,
-                    "tp_intent_id": "tp-threshold",
-                    "tp_intent_state": "LIVE",
-                    "active_exit_intent_id": None,
-                    "active_exit_intent_state": None,
-                }]
-            },
-        }
-
-        runtime.paper_mode = lambda: False
-
-        calls = []
-
-        async def fake_resume(
-            position,
-            update,
-            *,
-            bid,
-            frame_hash,
-            reconciliation_ready,
-        ):
-            return False
-
-        async def fake_stop(
-            position,
-            update,
-            *,
-            frame_hash,
-        ):
-            calls.append("STOP_066")
-
-        async def fake_emergency(
-            position,
-            update,
-            *,
-            purpose,
-            min_price,
-            frame_hash,
-        ):
-            calls.append(purpose)
-
-        async def fake_refresh():
-            return None
-
-        runtime._resume_waiting_sellable_intent = fake_resume
-        runtime._place_stop_loss = fake_stop
-        runtime._emergency_exit = fake_emergency
-        runtime._refresh_hot_state_once = fake_refresh
-
-        asyncio.run(
-            runtime._manage_position(
-                market={},
-                update={
-                    "asset_id": "token-threshold",
-                    "best_bid": bid_text,
-                },
-                event_ready=True,
-                frame_hash=f"threshold-{bid_text}",
-            )
-        )
-
-        assert calls == [expected], (
-            f"bid={bid_text}: expected {expected}, got {calls}"
-        )
-
-
-def test_waiting_sellable_exit_priority_and_resume():
-    async def run_case(
-        *,
-        bid_text,
-        active_purpose=None,
-        tp_waiting=False,
-        expected,
-    ):
-        runtime = LiveStrategyRuntime.__new__(
-            LiveStrategyRuntime
-        )
-
-        runtime.policy = StrategyPolicy()
-        runtime.config = LiveConfig(
-            execution_mode="READ_ONLY",
-        )
-        runtime.paper_mode = lambda: False
-
-        active_id = (
-            "exit-waiting"
-            if active_purpose
-            else None
-        )
-
-        tp_id = (
-            "tp-waiting"
-            if tp_waiting
-            else None
-        )
-
-        position = {
-            "position_id": "position-waiting",
-            "event_id": "event-waiting",
-            "condition_id": "condition-waiting",
-            "token_id": "token-waiting",
-            "outcome": "YES",
-            "state": (
-                "EXITING"
-                if active_id
-                else "TP_OPEN"
-                if tp_id
-                else "OPEN"
-            ),
-            "remaining_shares_text": "5",
-            # Emulate reconciliation having restored sellability.
-            "sellable_shares_text": "5",
-            "stop_stage": 0,
-            "tp_intent_id": tp_id,
-            "tp_intent_state": (
-                "WAITING_SELLABLE"
-                if tp_id
-                else None
-            ),
-            "active_exit_intent_id": active_id,
-            "active_exit_intent_state": (
-                "WAITING_SELLABLE"
-                if active_id
-                else None
-            ),
-        }
-
-        runtime._hot_state = {
-            "reconciliation_readiness": "READY",
-            "positions_by_token": {
-                "token-waiting": [position],
-            },
-        }
-
-        intents = {}
-
-        if active_id:
-            intents[active_id] = {
-                "intent_id": active_id,
-                "state": "WAITING_SELLABLE",
-                "remote_order_id": None,
-                "purpose": active_purpose,
-                "price_limit_text": "0.55",
-            }
-
-        if tp_id:
-            intents[tp_id] = {
-                "intent_id": tp_id,
-                "state": "WAITING_SELLABLE",
-                "remote_order_id": None,
-                "purpose": "TAKE_PROFIT",
-                "price_limit_text": "0.96",
-            }
-
-        class FakeRepo:
-            def intent(self, intent_id):
-                return intents.get(str(intent_id))
-
-        runtime.repo = FakeRepo()
-
-        calls = []
-
-        def fake_clear(intent_id, *, reason):
-            calls.append(
-                ("CLEAR", str(intent_id), reason)
-            )
-            return True
-
-        async def fake_refresh():
-            return None
-
-        async def fake_stop(
-            position,
-            update,
-            *,
-            frame_hash,
-        ):
-            calls.append(("STOP_066",))
-
-        async def fake_emergency(
-            position,
-            update,
-            *,
-            purpose,
-            min_price,
-            frame_hash,
-        ):
-            calls.append(
-                (
-                    purpose,
-                    str(min_price),
-                )
-            )
-
-        async def fake_tp(position):
-            calls.append(("TAKE_PROFIT",))
-
-        runtime._clear_local_waiting_intent = (
-            fake_clear
-        )
-        runtime._refresh_hot_state_once = (
-            fake_refresh
-        )
-        runtime._place_stop_loss = fake_stop
-        runtime._emergency_exit = fake_emergency
-        runtime._ensure_take_profit = fake_tp
-
-        await runtime._manage_position(
-            market={},
-            update={
-                "asset_id": "token-waiting",
-                "best_bid": bid_text,
-            },
-            event_ready=True,
-            frame_hash=f"waiting-{bid_text}",
-        )
-
-        action_calls = [
-            item[0]
-            for item in calls
-            if item[0] in {
-                "STOP_066",
-                "EMERGENCY_060",
-                "TAKE_PROFIT",
-            }
-        ]
-
-        assert action_calls == [expected], (
-            f"bid={bid_text}, "
-            f"active={active_purpose}, "
-            f"tp_waiting={tp_waiting}: "
-            f"expected {expected}, got {calls}"
-        )
-
-    # STOP was already triggered. Once sellability returns,
-    # retry it even though price is no longer exactly 0.66.
-    asyncio.run(
-        run_case(
-            bid_text="0.64",
-            active_purpose="STOP_066",
-            expected="STOP_066",
-        )
-    )
-
-    # A new Emergency threshold always supersedes
-    # an older waiting STOP.
-    asyncio.run(
-        run_case(
-            bid_text="0.58",
-            active_purpose="STOP_066",
-            expected="EMERGENCY_060",
-        )
-    )
-
-    # A pending TP must not be retried while STOP
-    # threshold is already breached.
-    asyncio.run(
-        run_case(
-            bid_text="0.65",
-            tp_waiting=True,
-            expected="STOP_066",
-        )
-    )
-
-    # Once Emergency was triggered, it remains pending.
-    # Sellability returning executes it even if price
-    # has moved back above the trigger threshold.
-    asyncio.run(
-        run_case(
-            bid_text="0.70",
-            active_purpose="EMERGENCY_060",
-            expected="EMERGENCY_060",
-        )
-    )
 
 def test_tp_waits_for_full_actual_fill_sellability_then_retries_once():
     class RecordingAdapter(MockTradingAdapter):
@@ -2867,61 +2451,6 @@ def test_tp_waits_for_full_actual_fill_sellability_then_retries_once():
     finally:
         temp.cleanup()
 
-def test_open_position_below_emergency_never_submits_tp_first():
-    runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
-    runtime.policy = StrategyPolicy()
-    runtime.config = LiveConfig(execution_mode="READ_ONLY")
-    runtime.paper_mode = lambda: False
-    runtime._hot_state = {
-        "reconciliation_readiness": "READY",
-        "positions_by_token": {
-            "priority-token": [{
-                "position_id": "priority-position",
-                "event_id": "priority-event",
-                "condition_id": "priority-condition",
-                "token_id": "priority-token",
-                "outcome": "YES",
-                "state": "OPEN",
-                "remaining_shares_text": "5",
-                "sellable_shares_text": "5",
-                "stop_stage": 0,
-                "tp_intent_id": None,
-                "active_exit_intent_id": None,
-            }],
-        },
-    }
-    calls = []
-
-    async def fake_resume(*_args, **_kwargs):
-        return False
-
-    async def fake_tp(_position):
-        calls.append("TAKE_PROFIT")
-
-    async def fake_stop(*_args, **_kwargs):
-        calls.append("STOP_066")
-
-    async def fake_emergency(*_args, **kwargs):
-        calls.append(kwargs["purpose"])
-
-    async def fake_refresh():
-        return None
-
-    runtime._resume_waiting_sellable_intent = fake_resume
-    runtime._ensure_take_profit = fake_tp
-    runtime._place_stop_loss = fake_stop
-    runtime._emergency_exit = fake_emergency
-    runtime._refresh_hot_state_once = fake_refresh
-
-    asyncio.run(runtime._manage_position(
-        market={},
-        update={"asset_id": "priority-token", "best_bid": "0.58"},
-        event_ready=True,
-        frame_hash="direct-emergency",
-    ))
-
-    assert calls == ["EMERGENCY_060"]
-
 
 def test_unknown_tp_without_remote_id_is_not_cancelled_or_parallel_sold():
     class RecordingAdapter(MockTradingAdapter):
@@ -2958,9 +2487,14 @@ def test_unknown_tp_without_remote_id_is_not_cancelled_or_parallel_sold():
             base, strategy, adapter,
         )
 
-        asyncio.run(runtime._place_stop_loss(
-            strategy.position_for_token("token-unknown-tp"),
+        latched = strategy.latch_stop_exit(
+            position["position_id"]
+        )
+        asyncio.run(runtime._market_exit_fak(
+            latched,
             {"asset_id": "token-unknown-tp", "best_bid": "0.65"},
+            purpose="STOP_066",
+            min_price=Decimal("0.01"),
             frame_hash="unknown-tp-stop",
         ))
 

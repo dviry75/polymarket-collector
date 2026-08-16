@@ -331,7 +331,7 @@ def test_stop_066_during_mismatch_remains_fail_closed_then_rearms_ready():
     asyncio.run(scenario())
 
 
-def test_emergency_060_during_mismatch_remains_fail_closed_then_rearms_ready():
+def test_below_stop_during_mismatch_remains_fail_closed_then_rearms_ready():
     async def scenario():
         runtime = runtime_fixture()
         runtime.schedule_frame(strategy_frame(
@@ -350,7 +350,7 @@ def test_emergency_060_during_mismatch_remains_fail_closed_then_rearms_ready():
         assert [item["event_readiness"]["condition"]["ready"] for item in critical] == [
             False, True,
         ]
-        assert all("EMERGENCY_060" in item["_critical_trigger_types"] for item in critical)
+        assert all("STOP_066" in item["_critical_trigger_types"] for item in critical)
     asyncio.run(scenario())
 
 

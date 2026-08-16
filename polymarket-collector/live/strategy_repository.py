@@ -1083,6 +1083,176 @@ class StrategyRepository:
                 total += cost * remaining / acquired
         return total
 
+    def latch_stop_exit(
+        self,
+        position_id: str,
+    ) -> dict[str, Any]:
+        """Durably latch the one-way 0.66 exit before any remote action."""
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (position_id,),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                raise KeyError(position_id)
+
+            remaining = (
+                decimal_value(current["remaining_shares_text"])
+                or Decimal("0")
+            )
+            prior_stage = int(current["stop_stage"] or 0)
+            newly_latched = prior_stage < 1 and remaining > 0
+
+            if remaining > 0:
+                conn.execute(
+                    """
+                    UPDATE live_strategy_positions
+                    SET stop_stage=MAX(stop_stage,1),
+                        state=CASE
+                            WHEN state='EXIT_RECONCILIATION_REQUIRED'
+                                THEN state
+                            ELSE 'EXITING'
+                        END,
+                        updated_at=?
+                    WHERE position_id=?
+                    """,
+                    (ts, position_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE live_event_states
+                    SET status='EXITING',updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (ts, current["event_id"]),
+                )
+
+            updated = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (position_id,),
+            ).fetchone()
+            conn.commit()
+
+        return {
+            **(row_to_dict(updated) or {}),
+            "_newly_latched": newly_latched,
+        }
+
+    def require_exit_reconciliation(
+        self,
+        position_id: str,
+    ) -> None:
+        """Fail closed until remote order/fill truth is known."""
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT event_id,remaining_shares_text
+                FROM live_strategy_positions
+                WHERE position_id=?
+                """,
+                (position_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise KeyError(position_id)
+            remaining = (
+                decimal_value(row["remaining_shares_text"])
+                or Decimal("0")
+            )
+            if remaining > 0:
+                conn.execute(
+                    """
+                    UPDATE live_strategy_positions
+                    SET state='EXIT_RECONCILIATION_REQUIRED',
+                        stop_stage=MAX(stop_stage,1),
+                        updated_at=?
+                    WHERE position_id=?
+                    """,
+                    (ts, position_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE live_event_states
+                    SET status='EXIT_RECONCILIATION_REQUIRED',updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (ts, row["event_id"]),
+                )
+            conn.commit()
+
+    def clear_exit_reconciliation(
+        self,
+        position_id: str,
+    ) -> None:
+        """Return a reconciled, still-open latched position to EXITING."""
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE live_strategy_positions
+                SET state='EXITING',updated_at=?
+                WHERE position_id=?
+                  AND state='EXIT_RECONCILIATION_REQUIRED'
+                  AND stop_stage>=1
+                  AND CAST(remaining_shares_text AS REAL)>0
+                """,
+                (ts, position_id),
+            )
+            conn.execute(
+                """
+                UPDATE live_event_states
+                SET status='EXITING',updated_at=?
+                WHERE event_id=(
+                    SELECT event_id FROM live_strategy_positions
+                    WHERE position_id=? AND state='EXITING'
+                )
+                """,
+                (ts, position_id),
+            )
+            conn.commit()
+
+    def note_exit_liquidity_wait(
+        self,
+        position_id: str,
+        book_hash: str,
+    ) -> bool:
+        """Persist one no-liquidity observation per distinct book state."""
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT last_exit_book_hash,stop_stage,remaining_shares_text
+                FROM live_strategy_positions
+                WHERE position_id=?
+                """,
+                (position_id,),
+            ).fetchone()
+            if (
+                row is None
+                or int(row["stop_stage"] or 0) < 1
+                or (decimal_value(row["remaining_shares_text"]) or Decimal("0")) <= 0
+                or str(row["last_exit_book_hash"] or "") == book_hash
+            ):
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                UPDATE live_strategy_positions
+                SET last_exit_book_hash=?,updated_at=?
+                WHERE position_id=?
+                """,
+                (book_hash, ts, position_id),
+            )
+            conn.commit()
+        return True
+
     def reserve_position_intent(
         self,
         position: dict[str, Any],
@@ -1260,7 +1430,7 @@ class StrategyRepository:
 
             row = conn.execute(
                 """
-                SELECT position_id,purpose,remote_order_id
+                SELECT position_id,purpose,remote_order_id,last_book_hash
                 FROM live_strategy_intents
                 WHERE intent_id=?
                 """,
@@ -1306,7 +1476,7 @@ class StrategyRepository:
 
                 position = conn.execute(
                     f"""
-                    SELECT {column},remaining_shares_text
+                    SELECT {column},remaining_shares_text,stop_stage
                     FROM live_strategy_positions
                     WHERE position_id=?
                     """,
@@ -1323,20 +1493,38 @@ class StrategyRepository:
                         )
                         or Decimal("0")
                     )
+                    latched_exit = (
+                        row["purpose"] == "STOP_066"
+                        and remaining > 0
+                    )
+                    next_state = (
+                        "EXITING"
+                        if latched_exit
+                        else "OPEN"
+                    )
+                    next_stage = max(
+                        int(position["stop_stage"] or 0),
+                        1 if latched_exit else 0,
+                    )
 
                     conn.execute(
                         f"""
                         UPDATE live_strategy_positions
                         SET {column}=NULL,
-                            state=CASE
-                                WHEN ? > 0 THEN 'OPEN'
-                                ELSE state
+                            state=CASE WHEN ? > 0 THEN ? ELSE state END,
+                            stop_stage=?,
+                            last_exit_book_hash=CASE
+                                WHEN ? THEN ? ELSE last_exit_book_hash
                             END,
                             updated_at=?
                         WHERE position_id=?
                         """,
                         (
                             1 if remaining > 0 else 0,
+                            next_state,
+                            next_stage,
+                            1 if latched_exit else 0,
+                            row["last_book_hash"],
                             ts,
                             row["position_id"],
                         ),
@@ -1518,6 +1706,8 @@ class StrategyRepository:
                 position_state = "EXIT_RECONCILIATION_REQUIRED"
             elif purpose == "TAKE_PROFIT":
                 position_state = "TP_OPEN"
+            elif purpose == "STOP_066":
+                position_state = "EXITING"
             elif keep_active:
                 position_state = "EXITING"
             else:
@@ -1804,7 +1994,12 @@ class StrategyRepository:
                         """
                         UPDATE live_strategy_positions SET
                             acquired_shares_text=?,remaining_shares_text=?,sellable_shares_text=?,
-                            dust_shares_text='0',average_entry_price_text=?,state='OPEN',updated_at=?
+                            dust_shares_text='0',average_entry_price_text=?,
+                            state=CASE
+                                WHEN stop_stage>=1 THEN 'EXITING'
+                                ELSE 'OPEN'
+                            END,
+                            updated_at=?
                         WHERE position_id=?
                         """,
                         (

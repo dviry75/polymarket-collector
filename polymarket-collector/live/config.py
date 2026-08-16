@@ -74,10 +74,10 @@ class LiveConfig:
     strategy_take_profit_price: Decimal = Decimal("0.96")
     strategy_stop_price: Decimal = Decimal("0.66")
     strategy_emergency_price: Decimal = Decimal("0.60")
-    strategy_stop_min_price: Decimal = Decimal("0.55")
-    strategy_emergency_min_price: Decimal = Decimal("0.55")
+    strategy_stop_min_price: Decimal = Decimal("0.01")
+    strategy_emergency_min_price: Decimal = Decimal("0.01")
     strategy_entry_window_seconds: int = 120
-    stop_loss_order_type: str = "GTC"
+    stop_loss_order_type: str = "FAK"
     stop_loss_initial_slippage: Decimal = Decimal("0.02")
     max_exit_slippage: Decimal = Decimal("0.05")
     max_stop_loss_attempts: int = 3
@@ -166,10 +166,10 @@ class LiveConfig:
             strategy_take_profit_price=_decimal_env("LIVE_STRATEGY_TAKE_PROFIT_PRICE", "0.96"),
             strategy_stop_price=_decimal_env("LIVE_STRATEGY_STOP_PRICE", "0.66"),
             strategy_emergency_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_PRICE", "0.60"),
-            strategy_stop_min_price=_decimal_env("LIVE_STRATEGY_STOP_MIN_PRICE", "0.55"),
-            strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.55"),
+            strategy_stop_min_price=_decimal_env("LIVE_STRATEGY_STOP_MIN_PRICE", "0.01"),
+            strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.01"),
             strategy_entry_window_seconds=int(_env("LIVE_STRATEGY_ENTRY_WINDOW_SECONDS", "120") or "120"),
-            stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "GTC").upper(),
+            stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "FAK").upper(),
             stop_loss_initial_slippage=_decimal_env("LIVE_STOP_LOSS_INITIAL_SLIPPAGE", "0.02"),
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
             max_stop_loss_attempts=int(_env("LIVE_MAX_STOP_LOSS_ATTEMPTS", "3") or "3"),
@@ -249,8 +249,8 @@ class LiveConfig:
             errors.append("LIVE_ENTRY_ORDER_TYPE must remain FAK")
         if not self.partial_fills_allowed:
             errors.append("LIVE_PARTIAL_FILLS_ALLOWED must remain true for FAK lifecycle")
-        if self.stop_loss_order_type != "GTC":
-            errors.append("LIVE_STOP_LOSS_ORDER_TYPE must remain GTC for the 0.66 stop")
+        if self.stop_loss_order_type != "FAK":
+            errors.append("LIVE_STOP_LOSS_ORDER_TYPE must remain FAK for the latched 0.66 exit")
         if self.redemption_mode not in {"manual", "approval", "automatic"}:
             errors.append("LIVE_REDEMPTION_MODE must be manual, approval, or automatic")
         if self.default_trade_amount_usd <= 0:
@@ -279,8 +279,8 @@ class LiveConfig:
             (self.strategy_take_profit_price, Decimal("0.96")),
             (self.strategy_stop_price, Decimal("0.66")),
             (self.strategy_emergency_price, Decimal("0.60")),
-            (self.strategy_stop_min_price, Decimal("0.55")),
-            (self.strategy_emergency_min_price, Decimal("0.55")),
+            (self.strategy_stop_min_price, Decimal("0.01")),
+            (self.strategy_emergency_min_price, Decimal("0.01")),
         )
         if any(actual != expected for actual, expected in expected_strategy):
             errors.append("strategy prices are immutable for this LIVE build")

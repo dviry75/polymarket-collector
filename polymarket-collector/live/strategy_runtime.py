@@ -650,17 +650,8 @@ class LiveStrategyRuntime:
                     and previous_bid <= self.policy.stop_price
                 )
 
-                emergency_now = (
-                    bid_value is not None
-                    and bid_value <= self.policy.emergency_price
-                )
-                emergency_before = (
-                    previous_bid is not None
-                    and previous_bid <= self.policy.emergency_price
-                )
-
                 # Always deduplicate observed transitions. Only a READY state
-                # advances the actionable edge state; NOT_READY 0.74/0.66/0.60
+                # advances the actionable edge state; NOT_READY 0.74/0.66
                 # therefore remains blocked without disappearing after resync.
                 next_state = {
                     "best_ask": ask,
@@ -696,18 +687,6 @@ class LiveStrategyRuntime:
                     )
                     latched = True
 
-                if (
-                    emergency_now
-                    and not emergency_before
-                ):
-                    item[
-                        "_critical_emergency_latched"
-                    ] = True
-                    critical_types.add(
-                        "EMERGENCY_060"
-                    )
-                    latched = True
-
                 if latched:
                     item[
                         "_critical_trigger_latched"
@@ -735,8 +714,8 @@ class LiveStrategyRuntime:
                     )
 
             if critical_types:
-                # Critical historical states must come first. Within each
-                # state, _manage_position gives Emergency priority over STOP.
+                # Critical historical states must come first. The only
+                # strategy loss-exit edge is the latched STOP_066.
                 # Append the latest atomic frame afterwards for other-side/
                 # event context.
                 def signature(
@@ -1694,9 +1673,8 @@ class LiveStrategyRuntime:
         """Resume a local-only SELL trigger once remote sellability is confirmed.
 
         Priority rules:
-        - pending Emergency always resumes as soon as shares are sellable;
-        - a fresh 0.60 Emergency supersedes a pending STOP;
-        - a fresh STOP/Emergency supersedes a pending TP;
+        - a latched STOP always resumes as soon as shares are sellable;
+        - a fresh STOP supersedes a pending TP;
         - UNKNOWN_AFTER_SUBMISSION is never touched here.
         """
         sellable = (
@@ -1726,11 +1704,6 @@ class LiveStrategyRuntime:
             purpose = str(intent.get("purpose") or "").upper()
 
             if purpose == "STOP_066":
-                # A fresh 0.60 trigger has higher priority than the old STOP.
-                # Let the normal emergency path below supersede this intent.
-                if bid <= self.policy.emergency_price:
-                    return False
-
                 if not self._clear_local_waiting_intent(
                     str(active_id),
                     reason="RETRY_SELLABLE_STOP_066",
@@ -1747,9 +1720,11 @@ class LiveStrategyRuntime:
                     or position
                 )
 
-                await self._place_stop_loss(
+                await self._market_exit_fak(
                     refreshed,
                     update,
+                    purpose="STOP_066",
+                    min_price=self.policy.stop_min_price,
                     frame_hash=frame_hash,
                 )
 
@@ -1782,7 +1757,7 @@ class LiveStrategyRuntime:
                     or position
                 )
 
-                await self._emergency_exit(
+                await self._market_exit_fak(
                     refreshed,
                     update,
                     purpose=purpose,
@@ -1802,7 +1777,7 @@ class LiveStrategyRuntime:
         ).upper()
 
         if tp_id and tp_state == "WAITING_SELLABLE":
-            # STOP/Emergency triggers take priority over retrying TP.
+            # A latched STOP takes priority over retrying TP.
             if bid <= self.policy.stop_price:
                 return False
 
@@ -1923,6 +1898,76 @@ class LiveStrategyRuntime:
             reason_code=response.get("failure_reason"),
         )
 
+    @staticmethod
+    def _exit_liquidity_hash(update: dict[str, Any]) -> str:
+        """Identify executable bid liquidity without conflating frame churn."""
+        levels: list[tuple[Decimal, Decimal]] = []
+        for level in update.get("bids") or []:
+            if not isinstance(level, dict):
+                continue
+            price = decimal_value(level.get("price"))
+            size = decimal_value(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or price < Decimal("0.01")
+                or size <= 0
+            ):
+                continue
+            levels.append((price, size))
+        levels.sort(key=lambda item: item[0], reverse=True)
+        payload = {
+            "asset_id": str(update.get("asset_id") or ""),
+            "generation": int(update.get("generation") or 0),
+            "bids": [
+                [canonical_decimal(price), canonical_decimal(size)]
+                for price, size in levels
+            ],
+        }
+        return stable_id(
+            "exit-liquidity",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _note_exit_no_liquidity(
+        self,
+        position: dict[str, Any],
+        update: dict[str, Any],
+        book_hash: str,
+    ) -> None:
+        if not self.repo.note_exit_liquidity_wait(
+            str(position["position_id"]),
+            book_hash,
+        ):
+            return
+        bid = decimal_value(update.get("best_bid"))
+        self.repo.timeline(
+            severity="WARNING",
+            category="EXIT",
+            component="strategy",
+            source="deterministic_book",
+            event_id=position["event_id"],
+            condition_id=position["condition_id"],
+            token_id=position["token_id"],
+            side="SELL",
+            deal_id=stable_id("deal", position["event_id"]),
+            requested_action="SELL_MARKET_FAK",
+            reason_code="EXIT_NO_LIQUIDITY_ABOVE_FLOOR",
+            result_status="EXIT_RETRY_PENDING",
+            remaining_shares_text=position["remaining_shares_text"],
+            parameters_json={
+                "best_bid": (
+                    canonical_decimal(bid)
+                    if bid is not None
+                    else None
+                ),
+                "min_price": canonical_decimal(
+                    self.policy.stop_min_price
+                ),
+                "liquidity_hash": book_hash,
+            },
+        )
+
     async def _manage_position(
         self,
         *,
@@ -1939,9 +1984,6 @@ class LiveStrategyRuntime:
 
         bid = decimal_value(update.get("best_bid"))
 
-        if bid is None:
-            return
-
         reconciliation_ready = (
             self.paper_mode()
             or str(
@@ -1952,7 +1994,112 @@ class LiveStrategyRuntime:
             ) == "READY"
         )
 
+        exit_book_hash = self._exit_liquidity_hash(update)
         for position in positions:
+            stop_latched = int(position.get("stop_stage") or 0) >= 1
+
+            if (
+                not stop_latched
+                and bid is not None
+                and bid <= self.policy.stop_price
+            ):
+                position = self.repo.latch_stop_exit(
+                    str(position["position_id"])
+                )
+                stop_latched = True
+                if position.pop("_newly_latched", False):
+                    self.repo.timeline(
+                        severity="WARNING",
+                        category="EXIT",
+                        component="strategy",
+                        source="deterministic_book",
+                        event_id=position["event_id"],
+                        condition_id=position["condition_id"],
+                        token_id=position["token_id"],
+                        side="SELL",
+                        deal_id=stable_id(
+                            "deal", position["event_id"]
+                        ),
+                        requested_action="LATCH_MARKET_EXIT",
+                        reason_code="STOP_066_TRIGGER_LATCHED",
+                        result_status="LATCHED",
+                        remaining_shares_text=position[
+                            "remaining_shares_text"
+                        ],
+                        parameters_json={
+                            "trigger_bid": canonical_decimal(bid),
+                            "min_price": canonical_decimal(
+                                self.policy.stop_min_price
+                            ),
+                            "liquidity_hash": exit_book_hash,
+                        },
+                    )
+                await self._refresh_hot_state_once()
+
+                position = (
+                    self._position_from_ram(
+                        token_id,
+                        str(position["position_id"]),
+                    )
+                    or position
+                )
+
+            if stop_latched:
+                if (
+                    str(position.get("state") or "").upper()
+                    == "EXIT_RECONCILIATION_REQUIRED"
+                ):
+                    reconciled = await self._reconcile(
+                        "latched_stop_reconciliation_required"
+                    )
+                    if reconciled.get("status") == "ok":
+                        self.repo.clear_exit_reconciliation(
+                            str(position["position_id"])
+                        )
+                    await self._refresh_hot_state_once()
+                    continue
+
+                if (
+                    bid is None
+                    or bid < self.policy.stop_min_price
+                ):
+                    self._note_exit_no_liquidity(
+                        position,
+                        update,
+                        exit_book_hash,
+                    )
+                    continue
+
+                resumed_waiting = (
+                    await self._resume_waiting_sellable_intent(
+                        position,
+                        update,
+                        bid=bid,
+                        frame_hash=exit_book_hash,
+                        reconciliation_ready=reconciliation_ready,
+                    )
+                )
+                if resumed_waiting:
+                    continue
+
+                # A non-terminal remote intent may exist. Its identity/fills
+                # must be reconciled before another SELL can be reserved.
+                if position.get("active_exit_intent_id"):
+                    continue
+
+                await self._market_exit_fak(
+                    position,
+                    update,
+                    purpose="STOP_066",
+                    min_price=self.policy.stop_min_price,
+                    frame_hash=exit_book_hash,
+                )
+                await self._refresh_hot_state_once()
+                continue
+
+            if bid is None:
+                continue
+
             resumed_waiting = await self._resume_waiting_sellable_intent(
                 position,
                 update,
@@ -1962,34 +2109,6 @@ class LiveStrategyRuntime:
             )
 
             if resumed_waiting:
-                continue
-
-            # Exit protection has priority over creating a new TP. In
-            # particular, an unprotected OPEN position first observed below
-            # 0.60 must go directly to Emergency; submitting a TP and then
-            # cancelling it introduces avoidable cancellation uncertainty.
-            if bid <= self.policy.emergency_price:
-                await self._emergency_exit(
-                    position,
-                    update,
-                    purpose="EMERGENCY_060",
-                    min_price=max(
-                        self.policy.emergency_min_price,
-                        self.policy.emergency_price
-                        - self.config.max_exit_slippage,
-                    ),
-                    frame_hash=frame_hash,
-                )
-                await self._refresh_hot_state_once()
-                continue
-
-            if bid <= self.policy.stop_price:
-                await self._place_stop_loss(
-                    position,
-                    update,
-                    frame_hash=frame_hash,
-                )
-                await self._refresh_hot_state_once()
                 continue
 
             if (
@@ -2083,230 +2202,8 @@ class LiveStrategyRuntime:
             pnl_text=updated["realized_pnl_text"],
         )
 
-    async def _place_stop_loss(
-        self,
-        position: dict[str, Any],
-        update: dict[str, Any],
-        *,
-        frame_hash: str,
-    ) -> None:
-        if position.get("active_exit_intent_id") or int(position.get("stop_stage") or 0) >= 1:
-            return
-        if position.get("tp_intent_id"):
-            tp_id = str(position["tp_intent_id"])
-            tp_current = self.repo.intent(tp_id)
 
-            if (
-                tp_current
-                and str(tp_current.get("state") or "").upper()
-                == "WAITING_SELLABLE"
-                and not tp_current.get("remote_order_id")
-            ):
-                # TP never reached Polymarket. There is nothing remote to
-                # cancel; STOP supersedes the local pending TP.
-                self._clear_local_waiting_intent(
-                    tp_id,
-                    reason="SUPERSEDED_BY_STOP_066",
-                )
-                refreshed = self.repo.active_positions(
-                    str(position["token_id"])
-                )
-                position = next(
-                    (
-                        item
-                        for item in refreshed
-                        if item["position_id"]
-                        == position["position_id"]
-                    ),
-                    position,
-                )
-            elif (
-                tp_current
-                and not tp_current.get("remote_order_id")
-                and not self.paper_mode()
-            ):
-                self.repo.alert(
-                    alert_type="EXIT", severity="CRITICAL",
-                    reason_code="TP_REMOTE_ORDER_ID_UNKNOWN",
-                    message="TP remote order identity is unresolved; STOP was not sent",
-                    entity_type="position", entity_id=position["position_id"],
-                )
-                return
-            else:
-                tp = self.repo.cancel_tp(
-                    position["position_id"],
-                    "STOP_066",
-                )
-                if tp:
-                    if self.paper_mode():
-                        self.repo.finalize_cancel(
-                            str(tp["intent_id"]),
-                            True,
-                            "PAPER_CANCEL_ACK",
-                        )
-                    else:
-                        response = await self.adapter.cancel_order_with_context(
-                            tp.get("remote_order_id"),
-                            {
-                                "event_id": position["event_id"],
-                                "condition_id": position["condition_id"],
-                                "token_id": position["token_id"],
-                                "intent_id": tp["intent_id"],
-                                "position_id": position["position_id"],
-                                "deal_id": stable_id("deal", position["event_id"]),
-                                "purpose": "STOP_066",
-                                "side": "SELL",
-                                "order_type": tp.get("order_type"),
-                            },
-                        )
-                        if not response.get("success"):
-                            self.repo.finalize_cancel(
-                                str(tp["intent_id"]), False, "CANCEL_UNCERTAIN"
-                            )
-                            return
-                        self.repo.finalize_cancel(str(tp["intent_id"]), True, "CANCEL_ACK")
-                        reconciled = await self._reconcile("tp_cancel_before_stop")
-                        if reconciled.get("status") != "ok":
-                            return
-            refreshed = self.repo.active_positions(str(position["token_id"]))
-            position = next(
-                (item for item in refreshed if item["position_id"] == position["position_id"]),
-                position,
-            )
-        shares = decimal_value(position.get("sellable_shares_text")) or Decimal("0")
-        if shares <= 0:
-            pending_shares = (
-                decimal_value(position.get("remaining_shares_text"))
-                or Decimal("0")
-            )
-
-            if pending_shares <= 0 or self.paper_mode():
-                return
-
-            intent = self.repo.reserve_position_intent(
-                position,
-                action="EXIT",
-                purpose="STOP_066",
-                order_type="GTC",
-                shares=pending_shares,
-                price_limit=self.policy.stop_min_price,
-                book_hash=frame_hash,
-            )
-
-            if intent.get("_duplicate"):
-                return
-
-            self.repo.mark_waiting_sellable(
-                str(intent["intent_id"]),
-                reason="STOP_066_WAITING_FOR_SELLABLE_BALANCE",
-            )
-
-            self.repo.timeline(
-                severity="WARNING",
-                category="EXIT",
-                component="strategy",
-                source="deterministic_book",
-                event_id=position["event_id"],
-                condition_id=position["condition_id"],
-                token_id=position["token_id"],
-                side="SELL",
-                deal_id=stable_id("deal", position["event_id"]),
-                intent_id=intent["intent_id"],
-                requested_action="SELL_LIMIT_GTC",
-                reason_code="STOP_066_WAITING_SELLABLE",
-                result_status="WAITING",
-                requested_shares_text=canonical_decimal(pending_shares),
-                parameters_json={
-                    "trigger_bid": canonical_decimal(
-                        decimal_value(update.get("best_bid"))
-                        or Decimal("0")
-                    ),
-                    "stop_price": canonical_decimal(
-                        self.policy.stop_min_price
-                    ),
-                },
-            )
-
-            return
-
-        intent = self.repo.reserve_position_intent(
-            position,
-            action="EXIT",
-            purpose="STOP_066",
-            order_type="GTC",
-            shares=shares,
-            price_limit=self.policy.stop_min_price,
-            book_hash=frame_hash,
-        )
-        if intent.get("_duplicate"):
-            return
-        if self.paper_mode():
-            fill = simulate_sell_fak(
-                update.get("bids") or [],
-                shares=shares,
-                min_price=self.policy.stop_min_price,
-                fee_rate=self._fee_rate(self._market(position["condition_id"]) or {}),
-            )
-            if fill.filled_shares <= 0:
-                self.repo.update_intent(str(intent["intent_id"]), state="LIVE")
-                return
-            self.repo.apply_exit_fill(
-                position_id=position["position_id"],
-                intent_id=intent["intent_id"],
-                sold_shares=fill.filled_shares,
-                average_price=fill.average_price,
-                fees=fill.fee,
-                final_state="FILLED" if fill.remaining_request == 0 else "PARTIAL",
-                min_sellable=self._min_order(position["condition_id"]),
-                purpose="STOP_066",
-                book_hash=frame_hash,
-            )
-            return
-        response = await self.adapter.create_order({
-            "idempotency_key": intent["intent_id"],
-            "durable_intent_reserved": True,
-            "event_id": position["event_id"],
-            "condition_id": position["condition_id"],
-            "token_id": position["token_id"],
-            "outcome": position["outcome"],
-            "side": "SELL",
-            "order_type": "GTC",
-            "purpose": "STOP_066",
-            "position_id": position["position_id"],
-            "deal_id": stable_id("deal", position["event_id"]),
-            "requested_price": canonical_decimal(self.policy.stop_min_price),
-            "requested_size": canonical_decimal(shares),
-        })
-        if self._is_waiting_sellable_response(response):
-            self.repo.mark_waiting_sellable(
-                str(intent["intent_id"]),
-                reason=str(
-                    response.get("failure_reason")
-                    or "INSUFFICIENT_BALANCE"
-                ),
-                normalized_error=response.get("message"),
-            )
-            return
-
-        if self._finalize_known_no_remote_submission(
-            intent,
-            response,
-        ):
-            return
-
-        self.repo.update_intent(
-            str(intent["intent_id"]),
-            state=str(
-                response.get("status") or "UNKNOWN"
-            ).upper(),
-            remote_order_id=response.get("polymarket_order_id"),
-            reason_code=response.get("failure_reason"),
-        )
-
-        await self._reconcile("stop_gtc_submission")
-
-
-    async def _emergency_exit(
+    async def _market_exit_fak(
         self,
         position: dict[str, Any],
         update: dict[str, Any],
@@ -2327,8 +2224,8 @@ class LiveStrategyRuntime:
                 == "WAITING_SELLABLE"
                 and not active_current.get("remote_order_id")
             ):
-                # This EXIT never reached Polymarket. Emergency supersedes it
-                # locally, so there is no remote cancellation to perform.
+                # This EXIT never reached Polymarket. The current market-exit
+                # request supersedes it locally; no remote cancel is needed.
                 self._clear_local_waiting_intent(
                     active_id,
                     reason=f"SUPERSEDED_BY_{purpose}",
@@ -2351,10 +2248,13 @@ class LiveStrategyRuntime:
                 and not active_current.get("remote_order_id")
                 and not self.paper_mode()
             ):
+                self.repo.require_exit_reconciliation(
+                    str(position["position_id"])
+                )
                 self.repo.alert(
                     alert_type="EXIT", severity="CRITICAL",
                     reason_code="ACTIVE_EXIT_REMOTE_ORDER_ID_UNKNOWN",
-                    message="Active EXIT remote order identity is unresolved; Emergency was not sent",
+                    message="Active EXIT remote order identity is unresolved; market SELL was not sent",
                     entity_type="position", entity_id=position["position_id"],
                 )
                 return
@@ -2391,7 +2291,7 @@ class LiveStrategyRuntime:
                                 alert_type="EXIT",
                                 severity="CRITICAL",
                                 reason_code="STOP_CANCEL_UNCERTAIN",
-                                message="STOP cancellation is uncertain; emergency SELL was not sent",
+                                message="EXIT cancellation is uncertain; market SELL was not sent",
                                 entity_type="position",
                                 entity_id=position["position_id"],
                             )
@@ -2399,8 +2299,11 @@ class LiveStrategyRuntime:
                         self.repo.finalize_cancel(
                             str(active["intent_id"]), True, "CANCEL_ACK"
                         )
-                        reconciled = await self._reconcile("stop_cancel_before_emergency")
+                        reconciled = await self._reconcile("exit_cancel_before_market_sell")
                         if reconciled.get("status") != "ok":
+                            self.repo.require_exit_reconciliation(
+                                str(position["position_id"])
+                            )
                             return
             refreshed = self.repo.active_positions(str(position["token_id"]))
             position = next(
@@ -2439,10 +2342,13 @@ class LiveStrategyRuntime:
                 and not tp_current.get("remote_order_id")
                 and not self.paper_mode()
             ):
+                self.repo.require_exit_reconciliation(
+                    str(position["position_id"])
+                )
                 self.repo.alert(
                     alert_type="EXIT", severity="CRITICAL",
                     reason_code="TP_REMOTE_ORDER_ID_UNKNOWN",
-                    message="TP remote order identity is unresolved; Emergency was not sent",
+                    message="TP remote order identity is unresolved; market SELL was not sent",
                     entity_type="position", entity_id=position["position_id"],
                 )
                 return
@@ -2481,7 +2387,14 @@ class LiveStrategyRuntime:
                             )
                             return
                         self.repo.finalize_cancel(str(tp["intent_id"]), True, "CANCEL_ACK")
-                        await self._reconcile("tp_cancel")
+                        reconciled = await self._reconcile(
+                            "tp_cancel_before_market_sell"
+                        )
+                        if reconciled.get("status") != "ok":
+                            self.repo.require_exit_reconciliation(
+                                str(position["position_id"])
+                            )
+                            return
             refreshed = self.repo.active_positions(str(position["token_id"]))
             position = next(
                 (item for item in refreshed if item["position_id"] == position["position_id"]),
@@ -2626,7 +2539,14 @@ class LiveStrategyRuntime:
             ),
         )
 
-        await self._reconcile("exit_submission")
+        self.repo.require_exit_reconciliation(
+            str(position["position_id"])
+        )
+        reconciled = await self._reconcile("exit_submission")
+        if reconciled.get("status") == "ok":
+            self.repo.clear_exit_reconciliation(
+                str(position["position_id"])
+            )
 
     async def _handle_resolution(self, market: dict[str, Any]) -> None:
         winner_asset = str(market.get("winning_asset_id") or "")
@@ -2680,7 +2600,7 @@ class LiveStrategyRuntime:
             update = book.view(
                 event_type="operator_emergency", timestamp=None, message_hash=frame_hash
             )
-            await self._emergency_exit(
+            await self._market_exit_fak(
                 position, update, purpose="EMERGENCY_OPERATOR",
                 min_price=self.policy.emergency_min_price, frame_hash=frame_hash,
             )
