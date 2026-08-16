@@ -1237,7 +1237,43 @@ class LiveStrategyRuntime:
             consume_canary=(not self.paper_mode() and not self.config.continuous_trading_enabled),
             require_empty_slot=(not self.paper_mode() and self.config.continuous_trading_enabled),
         )
-        if reservation.get("_duplicate") or reservation.get("_blocked"):
+        if reservation.get("_blocked"):
+            reservation_reason = str(
+                reservation.get("reason") or "ENTRY_RESERVATION_BLOCKED"
+            )
+            if trigger_update is not None:
+                self._trace_critical(
+                    "ENTRY_RESERVATION", update=trigger_update,
+                    reason=reservation_reason, result="BLOCKED",
+                )
+                self._trace_critical(
+                    "TERMINAL_RESULT", update=trigger_update,
+                    reason=reservation_reason, result="SKIPPED",
+                )
+            self.repo.timeline(
+                severity="WARNING", category="DECISION", component="strategy",
+                source="entry_slot_gate", event_id=event_id,
+                condition_id=condition_id, token_id=decision.token_id,
+                side=decision.side, requested_action="ENTRY",
+                reason_code=reservation_reason, result_status="SKIPPED",
+                parameters_json={
+                    key: reservation.get(key)
+                    for key in (
+                        "blocker_kind", "blocking_intent_id",
+                        "blocking_position_id", "blocking_event_id",
+                        "blocking_state", "blocking_closed_at",
+                        "blocking_remaining_shares_text",
+                        "blocking_sellable_shares_text",
+                    )
+                },
+            )
+            return
+        if reservation.get("_duplicate"):
+            if trigger_update is not None:
+                self._trace_critical(
+                    "ENTRY_RESERVATION", update=trigger_update,
+                    reason="EVENT_ENTRY_ALREADY_RESERVED", result="DUPLICATE",
+                )
             return
 
         self._mark_event_locked_ram(event_id)

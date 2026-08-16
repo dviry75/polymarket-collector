@@ -1160,6 +1160,76 @@ def test_continuous_entry_slot_is_atomic_for_intents_and_positions():
             reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
         )
         assert blocked_by_position["reason"] == "ACTIVE_ENTRY_SLOT_OCCUPIED"
+        assert blocked_by_position["blocker_kind"] == "POSITION"
+        assert blocked_by_position["blocking_state"] == "OPEN"
+    finally:
+        temporary.cleanup()
+
+
+def test_closed_dust_does_not_occupy_continuous_entry_slot():
+    temporary, base, strategy = build_repo()
+    try:
+        first = strategy.reserve_event_entry(
+            event_id="closed-dust-event", condition_id="closed-dust-condition",
+            token_id="closed-dust-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+        strategy.open_position(
+            event_id="closed-dust-event", condition_id="closed-dust-condition",
+            token_id="closed-dust-token", outcome="YES", shares=Decimal("0.006664"),
+            average_price=Decimal("0.74"), cost_all_in=Decimal("0.00493136"),
+            fees=Decimal("0"), sellable_shares=Decimal("0"),
+            min_sellable=Decimal("1"), entry_intent_id=first["entry_intent_id"],
+        )
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions SET closed_at=? WHERE event_id=?",
+                ("2026-08-11T21:09:32+00:00", "closed-dust-event"),
+            )
+            conn.commit()
+
+        second = strategy.reserve_event_entry(
+            event_id="event-after-closed-dust", condition_id="condition-after-closed-dust",
+            token_id="token-after-closed-dust", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+
+        assert not second.get("_blocked")
+        assert second["entry_intent_id"]
+    finally:
+        temporary.cleanup()
+
+
+def test_open_dust_still_occupies_continuous_entry_slot_fail_closed():
+    temporary, _base, strategy = build_repo()
+    try:
+        first = strategy.reserve_event_entry(
+            event_id="open-dust-event", condition_id="open-dust-condition",
+            token_id="open-dust-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+        position = strategy.open_position(
+            event_id="open-dust-event", condition_id="open-dust-condition",
+            token_id="open-dust-token", outcome="YES", shares=Decimal("0.006664"),
+            average_price=Decimal("0.74"), cost_all_in=Decimal("0.00493136"),
+            fees=Decimal("0"), sellable_shares=Decimal("0"),
+            min_sellable=Decimal("1"), entry_intent_id=first["entry_intent_id"],
+        )
+        assert position["state"] == "DUST"
+        assert position["closed_at"] is None
+
+        blocked = strategy.reserve_event_entry(
+            event_id="event-after-open-dust", condition_id="condition-after-open-dust",
+            token_id="token-after-open-dust", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+
+        assert blocked["reason"] == "ACTIVE_ENTRY_SLOT_OCCUPIED"
+        assert blocked["blocker_kind"] == "POSITION"
+        assert blocked["blocking_state"] == "DUST"
+        assert blocked["blocking_closed_at"] is None
+        assert blocked["blocking_remaining_shares_text"] == "0.006664"
+        assert blocked["blocking_sellable_shares_text"] == "0"
     finally:
         temporary.cleanup()
 

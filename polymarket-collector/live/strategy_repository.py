@@ -619,17 +619,49 @@ class StrategyRepository:
             correlation_id = stable_id("correlation", attempt_identity)
             if require_empty_slot:
                 unresolved = conn.execute(
-                    "SELECT 1 FROM live_strategy_intents "
+                    "SELECT intent_id,event_id,state FROM live_strategy_intents "
                     "WHERE state NOT IN ('FILLED', 'PARTIAL_FINAL', 'ZERO_FILL', 'CANCELED', "
                     "'REJECTED', 'FAILED', 'SETTLED', 'REDEEMED') LIMIT 1"
                 ).fetchone()
                 active_position = conn.execute(
-                    "SELECT 1 FROM live_strategy_positions "
-                    "WHERE state IN ('OPEN', 'TP_OPEN', 'EXITING', 'EXIT_RECONCILIATION_REQUIRED', 'DUST') LIMIT 1"
+                    "SELECT position_id,event_id,state,closed_at,remaining_shares_text,"
+                    "sellable_shares_text FROM live_strategy_positions "
+                    "WHERE state IN ('OPEN', 'TP_OPEN', 'EXITING', "
+                    "'EXIT_RECONCILIATION_REQUIRED') "
+                    "OR (state='DUST' AND closed_at IS NULL) LIMIT 1"
                 ).fetchone()
                 if unresolved is not None or active_position is not None:
                     conn.rollback()
-                    return {"_blocked": True, "reason": "ACTIVE_ENTRY_SLOT_OCCUPIED"}
+                    blocker = unresolved if unresolved is not None else active_position
+                    blocker_kind = "INTENT" if unresolved is not None else "POSITION"
+                    return {
+                        "_blocked": True,
+                        "reason": "ACTIVE_ENTRY_SLOT_OCCUPIED",
+                        "blocker_kind": blocker_kind,
+                        "blocking_intent_id": (
+                            str(blocker["intent_id"])
+                            if blocker_kind == "INTENT" else None
+                        ),
+                        "blocking_position_id": (
+                            str(blocker["position_id"])
+                            if blocker_kind == "POSITION" else None
+                        ),
+                        "blocking_event_id": str(blocker["event_id"]),
+                        "blocking_state": str(blocker["state"]),
+                        "blocking_closed_at": (
+                            str(blocker["closed_at"])
+                            if blocker_kind == "POSITION" and blocker["closed_at"]
+                            else None
+                        ),
+                        "blocking_remaining_shares_text": (
+                            str(blocker["remaining_shares_text"])
+                            if blocker_kind == "POSITION" else None
+                        ),
+                        "blocking_sellable_shares_text": (
+                            str(blocker["sellable_shares_text"])
+                            if blocker_kind == "POSITION" else None
+                        ),
+                    }
             if consume_canary:
                 state = {
                     row["key"]: row["value"]
