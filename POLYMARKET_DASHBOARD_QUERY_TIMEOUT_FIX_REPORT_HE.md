@@ -73,9 +73,9 @@ Endpoint: `GET /live/dashboard/v1/overview`
 
 - Dashboard health: `{"status":"ok"}`.
 - `polymarket-dashboard.service`: active לאחר restart מבוקר.
-- `polymarket-trader.service`: active לאורך כל העבודה; לא בוצע restart.
+- `polymarket-trader.service` היה active לאורך המיגרציה, ה-restart של Dashboard וכל בדיקות ה-polling; לא בוצע לו restart. לאחר האימות, ב-17:29:21 UTC, הופעלה מחוץ לשרשרת הפקודות המתועדת כאן פקודה מפורשת `sudo systemctl stop polymarket-trader.service` על-ידי `dvir`; השירות נסגר נקי ב-SIGTERM ולא קרס. הוא הושאר inactive ולא הופעל מחדש ללא אישור.
 - לאחר התיקון לא נמצאו בלוג Dashboard: `interrupted`, `busy`, `locked`, query-budget error או 500.
-- לא נמצאו שגיאות SQLite מקבילות ב-trader. stress polling יצר מספר `BrokenPipeError` ב-IPC `STATUS` בעת סגירת חיבור client; זו אינה שגיאת DB או trading path והשירות נשאר active.
+- לא נמצאו שגיאות SQLite מקבילות ב-trader בזמן שהיה פעיל. stress polling יצר מספר `BrokenPipeError` ב-IPC `STATUS` בעת סגירת חיבור client; זו אינה שגיאת DB או trading path והשירות נשאר active.
 - suite ממוקד: 21 passed.
 - suite מלא: 268 passed, 2 timing failures; שני הכשלים עברו מיד ב-rerun מבודד (2 passed in 2.19s), ולכן סווגו כ-resource-contention flaky ולא regression פונקציונלי.
 - clone regression כלל 112,130 account rows ו-1,011,525 audit rows, ולכן כיסה 100k+ rows.
