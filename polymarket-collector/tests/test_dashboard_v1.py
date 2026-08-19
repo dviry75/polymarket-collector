@@ -78,7 +78,7 @@ def test_migration_is_idempotent_and_does_not_invent_legacy_provenance():
             legacy = conn.execute("SELECT execution_mode,environment,verification_status FROM live_strategy_positions WHERE position_id='legacy'").fetchone()
             migrations = conn.execute("SELECT count(*) FROM live_schema_migrations").fetchone()[0]
         assert tuple(legacy) == ("UNKNOWN", "UNKNOWN", "UNKNOWN")
-        assert migrations == 5
+        assert migrations == 6
         with repo.connect() as conn:
             conn.execute("UPDATE live_strategy_positions SET updated_at=? WHERE position_id='legacy'", (NOW.isoformat(),))
             updated = conn.execute("SELECT execution_mode,environment,run_id FROM live_strategy_positions WHERE position_id='legacy'").fetchone()
@@ -242,6 +242,40 @@ def test_query_deadline_fails_closed_with_stable_exception():
             assert False, "expensive query should be interrupted"
         except DashboardQueryError as exc:
             assert "time budget" in str(exc)
+
+
+def test_account_equity_current_query_uses_partial_index_without_temp_sort():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        sql = """
+            SELECT * FROM live_account_snapshots
+            WHERE environment=? AND execution_mode=?
+              AND verification_status IN ('VERIFIED','RECONCILED')
+              AND ingested_at>=?
+            ORDER BY id DESC LIMIT 1
+        """
+        with repo.connect() as conn:
+            plan = "\n".join(str(row[3]) for row in conn.execute(
+                "EXPLAIN QUERY PLAN " + sql, ("LIVE", "REAL_TRADING", CUTOVER)
+            ))
+            selected = conn.execute(sql, ("LIVE", "REAL_TRADING", CUTOVER)).fetchone()
+        assert selected is not None
+        assert "idx_live_account_snapshots_dashboard_current" in plan
+        assert "TEMP B-TREE" not in plan
+
+
+def test_account_equity_does_not_fallback_to_sampled_at_after_cutover():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        with repo.connect() as conn:
+            conn.execute("UPDATE live_account_snapshots SET ingested_at=NULL "
+                         "WHERE environment='LIVE' AND execution_mode='REAL_TRADING'")
+            conn.commit()
+        equity = DashboardReadModel(LiveRepository(repo.db_path, query_only=True)).account_equity(now=NOW)
+        assert equity["cash"]["value"] is None
+        assert equity["cash"]["quality"] == "UNAVAILABLE"
 
 
 def test_response_cache_single_flight_coalesces_concurrent_tabs():

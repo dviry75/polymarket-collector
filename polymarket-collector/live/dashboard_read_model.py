@@ -221,7 +221,7 @@ class DashboardReadModel:
             SELECT * FROM live_account_snapshots
             WHERE environment=? AND execution_mode=?
               AND verification_status IN ('VERIFIED','RECONCILED')
-              AND COALESCE(ingested_at,sampled_at)>=?
+              AND ingested_at>=?
             ORDER BY id DESC LIMIT 1
             """,
             (self.environment, self.execution_mode, cutover_at),
@@ -519,8 +519,8 @@ class DashboardReadModel:
         rows = self._all(
             """SELECT occurred_at,severity,category,component,requested_action,reason_code,
                       result_status,verification_status,provenance_source
-               FROM live_audit_timeline
-               WHERE environment=? AND execution_mode=? AND COALESCE(ingested_at,occurred_at)>=?
+               FROM live_audit_timeline INDEXED BY idx_live_timeline_time
+               WHERE environment=? AND execution_mode=? AND ingested_at>=?
                ORDER BY id DESC LIMIT ?""",
             (self.environment, self.execution_mode, cutover_at, limit),
         )

@@ -8,7 +8,7 @@ from typing import Any
 
 from .repository import LiveRepository, now_iso
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 UNKNOWN = "UNKNOWN"
 
 
@@ -521,6 +521,22 @@ def migrate_dashboard_schema(
             """
             INSERT INTO live_schema_migrations(version,name,applied_at,checksum)
             VALUES(5,'dashboard_provenance_constraints_v5',?,'dashboard-provenance-constraints-v5')
+            ON CONFLICT(version) DO NOTHING
+            """,
+            (now_iso(),),
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_live_account_snapshots_dashboard_current
+            ON live_account_snapshots(environment,execution_mode,id DESC)
+            WHERE verification_status IN ('VERIFIED','RECONCILED')
+              AND ingested_at IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO live_schema_migrations(version,name,applied_at,checksum)
+            VALUES(6,'dashboard_account_current_index_v6',?,'dashboard-account-current-index-v6')
             ON CONFLICT(version) DO NOTHING
             """,
             (now_iso(),),
