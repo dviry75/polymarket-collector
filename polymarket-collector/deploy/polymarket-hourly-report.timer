@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Polymarket hourly reporting after bounded finalization grace
+
+[Timer]
+OnCalendar=*-*-* *:03:00
+Persistent=true
+RandomizedDelaySec=10
+Unit=polymarket-hourly-report.service
+
+[Install]
+WantedBy=timers.target

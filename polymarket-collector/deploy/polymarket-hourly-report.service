@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket hourly operational report (observability only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
+EnvironmentFile=/etc/polymarket-live/trader.env
+EnvironmentFile=/etc/polymarket-live/smtp.env
+ExecStart=/opt/polymarket-btc-live/.venv/bin/python -m scripts.run_reporting tick
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polymarket-btc-live
+
