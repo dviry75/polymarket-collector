@@ -73,7 +73,8 @@ Endpoint: `GET /live/dashboard/v1/overview`
 
 - Dashboard health: `{"status":"ok"}`.
 - `polymarket-dashboard.service`: active לאחר restart מבוקר.
-- `polymarket-trader.service` היה active לאורך המיגרציה, ה-restart של Dashboard וכל בדיקות ה-polling; לא בוצע לו restart. לאחר האימות, ב-17:29:21 UTC, הופעלה מחוץ לשרשרת הפקודות המתועדת כאן פקודה מפורשת `sudo systemctl stop polymarket-trader.service` על-ידי `dvir`; השירות נסגר נקי ב-SIGTERM ולא קרס. הוא הושאר inactive ולא הופעל מחדש ללא אישור.
+- `polymarket-trader.service` היה active לאורך המיגרציה, ה-restart של Dashboard ובדיקות ה-polling הראשונות. הוא נעצר נקי ב-17:29:21 UTC, הופעל שוב מחוץ לשרשרת התיקון ב-18:05:51 UTC, ונעצר שוב בצורה נקייה ב-2026-08-20 07:32:30 UTC. מצב המסירה הסופי הוא `inactive/dead`; לא הופעל מחדש במסגרת השלמת ה-Frontend.
+- probe סופי לאחר פריסת ה-Frontend: חמשת endpoints החזירו 200; סדרה נוספת של 10 קריאות overview החזירה 10/10 תגובות 200, עם 19.6–374.2ms.
 - לאחר התיקון לא נמצאו בלוג Dashboard: `interrupted`, `busy`, `locked`, query-budget error או 500.
 - לא נמצאו שגיאות SQLite מקבילות ב-trader בזמן שהיה פעיל. stress polling יצר מספר `BrokenPipeError` ב-IPC `STATUS` בעת סגירת חיבור client; זו אינה שגיאת DB או trading path והשירות נשאר active.
 - suite ממוקד: 21 passed.
@@ -82,15 +83,15 @@ Endpoint: `GET /live/dashboard/v1/overview`
 
 ## Frontend resilience
 
-ה-bundle הפעיל תחת `/var/www/live-status` אכן מכיל `Promise.all` לחמשת endpoints. refresh שנכשל שומר last-known snapshot, אך עדיין מסמן state גלובלי `error`; רק auth errors מקבלים state נפרד.
+מקור ה-Next.js אותר ב-`/home/dvir/polymarket-dashboard-preview` וב-repository `dviry75/polymarket-dashboard`. יושם state נפרד לכל endpoint (`data/loading/error/lastSuccessAt/lastAttemptAt`) באמצעות `Promise.allSettled`: כשל של endpoint יחיד שומר את ה-last-known-good שלו, מציג אזהרת STALE וגיל מקומי, ומאפשר לשאר המקטעים להתעדכן. כשל 401/403 נשאר חסימה גלובלית מכוונת.
 
-מקור ה-Next.js אינו קיים ב-repository, באף branch מקומי, או בסביבת ה-LIVE; קיים רק bundle ממוזער root-owned ללא sourcemap או build manifest שמאפשר build reproducible. לכן לא נערך bundle ידנית ולא ניתן היה להריץ build/test/fault-injection אמין. זהו פריט פתוח: יש למסור/לשחזר את source project, ואז ליישם state נפרד לכל endpoint (`data/loading/error/lastSuccessAt/lastAttemptAt`) ו-stale age מקומי. תיקון ה-backend אינו מסתיר מגבלה זו.
+נוספו בדיקות fault injection לכשל `overview` ולפקיעת session. התוצאה הסופית: 7/7 בדיקות Frontend עברו, lint עבר, build production עבר, וה-bundle החדש נפרס אטומית ב-2026-08-20 07:40 UTC תחת `/var/www/live-status`. הגרסה הקודמת נשמרה ב-`/var/www/live-status.rollback-20260820T074047Z`. Nginx config עבר אימות, ה-bundle המוגש מכיל את מנגנון הבידוד החדש, ולקוח לא מאומת מופנה ל-login כמצופה.
 
 ## Remaining risks
 
 - polling מקביל העלה latency עד כ-2.08s, אף שכל הבקשות הצליחו; cache single-flight מצמצם זאת ב-polling רגיל.
 - ה-IPC server רושם BrokenPipe בעת stress client disconnect; ראוי לטפל בנפרד, ללא קשר ל-SQLite.
-- frontend fault isolation עדיין דורש source reproducible.
+- תקלה מלאה בו-זמנית בכל endpoints שאינה auth תשאיר last-known-good עם אזהרות מקומיות; אם אין snapshot קודם יוצגו ערכים לא זמינים. זהו fail-visible מכוון.
 - index provenance הישן נשאר כי הוא משרת queries נוספים; לא הוסר דבר.
 
 ## Rollback
@@ -105,4 +106,6 @@ Endpoint: `GET /live/dashboard/v1/overview`
 
 - Branch: `feature/complete-live-dashboard-real-data-20260812`
 - Code commit: `efa2b7c`
-- Push status: יפורט במסירה הסופית.
+- Backend documentation commits: `74b5cc1`, `baa1aad`
+- Frontend commit: `0b3e149` (`dviry75/polymarket-dashboard`)
+- Push status: כל ארבעת ה-commits נדחפו ל-branch המרוחק המתאים.
