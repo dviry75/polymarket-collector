@@ -1,0 +1,441 @@
+diff --git a/polymarket-collector/live/market_websocket.py b/polymarket-collector/live/market_websocket.py
+index 30f8261..cd17655 100644
+--- a/polymarket-collector/live/market_websocket.py
++++ b/polymarket-collector/live/market_websocket.py
+@@ -222,6 +222,19 @@ class MarketWebSocketManager:
+         self._connection_generation = 0
+         self._connection_diagnostics: dict[str, Any] = {}
+         self._connection_started_monotonic = 0.0
++        self._generation_connected_at: str | None = None
++        self._generation_connected_monotonic = 0.0
++        self._subscription_sent_at: str | None = None
++        self._reconciliation_started_at: str | None = None
++        self._reconciliation_finished_at: str | None = None
++        self._generation_timing_generation = 0
++        self._generation_required_assets: tuple[str, ...] = ()
++        self._first_book_slots: dict[int, dict[str, Any]] = {}
++        self._first_book_required_assets: set[str] = set()
++        self._first_required_books_recorded = False
++        self._generation_to_first_book_slot_1_ms = _RollingMetric()
++        self._generation_to_first_book_slot_2_ms = _RollingMetric()
++        self._generation_to_first_required_books_ms = _RollingMetric()
+         self._last_subscription_change_monotonic = 0.0
+         self._connection_frame_index = 0
+         self._wire_sequence = 0
+@@ -251,7 +264,7 @@ class MarketWebSocketManager:
+         self.connection_generations_total = 0
+         self.disconnects_total = 0
+         self.connection_failures_total = 0
+-        self.heartbeat_timeout_disconnects = 0
++        self.websockets_keepalive_timeout_disconnects = 0
+         self._connection_lifetime_seconds = _RollingMetric()
+         self._has_attempted_connection = False
+         self._local_close_initiated = False
+@@ -434,6 +447,7 @@ class MarketWebSocketManager:
+                     self.successful_connections_total += 1
+                     self.connection_generations_total += 1
+                     self._connection_started_monotonic = time.monotonic()
++                    self._reset_generation_timing(asset_ids)
+                     self._local_close_initiated = False
+                     self._local_close_reason = ""
+                     self._local_close_timestamp = None
+@@ -455,12 +469,17 @@ class MarketWebSocketManager:
+                     )
+                     await asyncio.to_thread(self._refresh_market_cache, asset_ids)
+                     await ws.send(json.dumps(self.subscription_message(asset_ids)))
++                    self._subscription_sent_at = now_iso()
+                     self.subscribed_asset_ids = asset_ids
+                     self.status.status = "SUBSCRIBED"
+                     self.status.error = None
+                     attempt = 0
+                     if self.on_reconnect is not None:
+-                        await self.on_reconnect()
++                        self._reconciliation_started_at = now_iso()
++                        try:
++                            await self.on_reconnect()
++                        finally:
++                            self._reconciliation_finished_at = now_iso()
+                     heartbeat = asyncio.create_task(self._heartbeat(ws))
+                     subscriptions = asyncio.create_task(self._subscription_loop(ws))
+                     try:
+@@ -1004,6 +1023,8 @@ class MarketWebSocketManager:
+                 ),
+                 wire_sequence=timing.get("wire_sequence"),
+             )
++            if event_type == "book":
++                self._record_generation_first_book(message, timing, started)
+             timing["message_hash"] = frame.message_hash
+             timing["book_update_monotonic"] = time.perf_counter()
+             timing["handler_to_book_update_ms"] = (
+@@ -1678,6 +1699,58 @@ class MarketWebSocketManager:
+         close_code_sent = getattr(sent, "code", None)
+         return close_code_received, close_reason_received, close_code_sent
+ 
++    def _reset_generation_timing(self, asset_ids: list[str]) -> None:
++        """Reset observation-only warmup state for the newly connected generation."""
++        self._generation_timing_generation = self._connection_generation
++        self._generation_required_assets = tuple(str(asset) for asset in asset_ids)
++        self._generation_connected_monotonic = self._connection_started_monotonic
++        self._generation_connected_at = now_iso()
++        self._subscription_sent_at = None
++        self._reconciliation_started_at = None
++        self._reconciliation_finished_at = None
++        self._first_book_slots = {}
++        self._first_book_required_assets = set()
++        self._first_required_books_recorded = False
++
++    def _record_generation_first_book(
++        self, message: dict[str, Any], timing: dict[str, Any], observed: float,
++    ) -> None:
++        """Record first processed book facts without creating readiness semantics."""
++        if (
++            timing.get("connection_generation") != self._generation_timing_generation
++            or self._generation_timing_generation != self._connection_generation
++            or self._generation_connected_monotonic <= 0
++        ):
++            return
++        asset_id = str(message.get("asset_id") or "")
++        if not asset_id or asset_id not in self._generation_required_assets:
++            return
++        try:
++            slot = self._generation_required_assets.index(asset_id) + 1
++        except ValueError:
++            return
++        self._first_book_required_assets.add(asset_id)
++        duration_ms = max(
++            0.0, (observed - self._generation_connected_monotonic) * 1000
++        )
++        if slot not in self._first_book_slots:
++            self._first_book_slots[slot] = {
++                "first_book_at": now_iso(),
++                "generation_to_first_book_ms": round(duration_ms, 4),
++            }
++            if slot == 1:
++                self._generation_to_first_book_slot_1_ms.observe(duration_ms)
++            elif slot == 2:
++                self._generation_to_first_book_slot_2_ms.observe(duration_ms)
++        if (
++            not self._first_required_books_recorded
++            and self._generation_required_assets
++            and len(self._first_book_required_assets)
++            == len(set(self._generation_required_assets))
++        ):
++            self._first_required_books_recorded = True
++            self._generation_to_first_required_books_ms.observe(duration_ms)
++
+     @staticmethod
+     def _is_evidence_based_heartbeat_timeout(
+         exc: BaseException | None, text: str,
+@@ -1701,6 +1774,32 @@ class MarketWebSocketManager:
+         processing_age = self._exchange_age_at_processing_ms.snapshot()
+         loop_lag = self._event_loop_lag_metric.snapshot()
+         lifetime = self._connection_lifetime_seconds.snapshot()
++        generation_timing = {
++            "generation": self._generation_timing_generation,
++            "generation_connected_at": self._generation_connected_at,
++            "subscription_sent_at": self._subscription_sent_at,
++            "reconciliation_started_at": self._reconciliation_started_at,
++            "reconciliation_finished_at": self._reconciliation_finished_at,
++            "required_asset_count": len(self._generation_required_assets),
++            "first_book_observed_count": len(self._first_book_required_assets),
++            "first_book_slots": {
++                f"slot_{slot}": dict(value)
++                for slot, value in sorted(self._first_book_slots.items())
++                if slot <= 2
++            },
++            "generation_to_first_book_slot_1_ms": (
++                self._generation_to_first_book_slot_1_ms.snapshot()
++            ),
++            "generation_to_first_book_slot_2_ms": (
++                self._generation_to_first_book_slot_2_ms.snapshot()
++            ),
++            "generation_to_first_required_books_ms": (
++                self._generation_to_first_required_books_ms.snapshot()
++            ),
++            "generation_to_market_data_ready_ms": (
++                "NOT_MEASURABLE_WITH_CURRENT_SEMANTICS"
++            ),
++        }
+         return {
+             "ws_library_queue_depth_current": library["current"],
+             "ws_library_queue_depth_high_watermark": library["max"],
+@@ -1738,8 +1837,14 @@ class MarketWebSocketManager:
+             "connection_generations_total": self.connection_generations_total,
+             "connection_failures_total": self.connection_failures_total,
+             "connection_lifetime_seconds": lifetime,
+-            "heartbeat_timeout_disconnects": (
+-                self.heartbeat_timeout_disconnects
++            "generation_timing": generation_timing,
++            "websockets_keepalive_timeout_disconnects": (
++                self.websockets_keepalive_timeout_disconnects
++            ),
++            "automatic_websockets_keepalive_enabled": False,
++            "websockets_keepalive_metric_note": (
++                "ping_interval=None; expected zero and not evidence of "
++                "application heartbeat health"
+             ),
+             "local_close_reason_counts": dict(
+                 self._local_close_reason_counts
+@@ -2621,7 +2726,7 @@ class MarketWebSocketManager:
+             if self._is_evidence_based_heartbeat_timeout(
+                 exc, exception_text
+             ):
+-                self.heartbeat_timeout_disconnects += 1
++                self.websockets_keepalive_timeout_disconnects += 1
+             disconnect = {
+                 "generation": self._connection_generation,
+                 "disconnect_timestamp": now_iso(),
+diff --git a/polymarket-collector/live/reconciliation.py b/polymarket-collector/live/reconciliation.py
+index 71c129b..06663f3 100644
+--- a/polymarket-collector/live/reconciliation.py
++++ b/polymarket-collector/live/reconciliation.py
+@@ -1,9 +1,11 @@
+ from __future__ import annotations
+ 
+ import asyncio
++from collections import deque
+ from datetime import datetime, timezone
+ from decimal import Decimal
+ import random
++import statistics
+ import time
+ from typing import Any
+ 
+@@ -24,6 +26,48 @@ INTENT_SUBMISSION_GRACE_SECONDS = 15.0
+ AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES = Decimal("0.01")
+ RECONCILIATION_BACKOFF_BASE_SECONDS = 5.0
+ RECONCILIATION_BACKOFF_CAP_SECONDS = 60.0
++RECONCILIATION_TELEMETRY_CAPACITY = 1_024
++
++
++class _BoundedDurationMetric:
++    """Bounded in-memory durations; percentile sorting occurs on status reads."""
++
++    def __init__(self, capacity: int = RECONCILIATION_TELEMETRY_CAPACITY):
++        self.samples: deque[float] = deque(maxlen=capacity)
++        self.current: float | None = None
++        self.maximum: float | None = None
++
++    def observe(self, value: float) -> None:
++        observed = max(0.0, float(value))
++        self.samples.append(observed)
++        self.current = observed
++        self.maximum = observed if self.maximum is None else max(
++            self.maximum, observed
++        )
++
++    def snapshot(self) -> dict[str, float | int | None]:
++        if not self.samples:
++            return {
++                "count": 0, "current": None, "p50": None, "p95": None,
++                "p99": None, "max": self.maximum,
++            }
++        ordered = sorted(self.samples)
++
++        def percentile(fraction: float) -> float:
++            index = min(
++                len(ordered) - 1,
++                max(0, int(len(ordered) * fraction) - 1),
++            )
++            return round(ordered[index], 4)
++
++        return {
++            "count": len(ordered),
++            "current": round(float(self.current or 0.0), 4),
++            "p50": round(statistics.median(ordered), 4),
++            "p95": percentile(0.95),
++            "p99": percentile(0.99),
++            "max": round(float(self.maximum or 0.0), 4),
++        }
+ 
+ 
+ def _within_position_propagation_grace(
+@@ -114,6 +158,12 @@ class ReconciliationWorker:
+         self._consecutive_retries = 0
+         self._rate_limit_retry_after = 0.0
+         self._missing_position_suspects: dict[str, float] = {}
++        self.reconciliation_started_at: str | None = None
++        self.reconciliation_finished_at: str | None = None
++        self._reconciliation_duration_ms = {
++            "success": _BoundedDurationMetric(),
++            "failure": _BoundedDurationMetric(),
++        }
+ 
+     def _schedule_backoff(self, actor: str, error: str) -> float:
+         self._consecutive_retries += 1
+@@ -157,7 +207,32 @@ class ReconciliationWorker:
+                         self._rate_limit_retry_after - now, 3
+                     ),
+                 }
+-            return await self._run_once_serialized(actor)
++            started = time.perf_counter()
++            self.reconciliation_started_at = now_iso()
++            result: dict[str, Any] | None = None
++            try:
++                result = await self._run_once_serialized(actor)
++                return result
++            finally:
++                duration_ms = max(0.0, (time.perf_counter() - started) * 1000)
++                outcome = (
++                    "success"
++                    if result is not None and result.get("status") == "ok"
++                    else "failure"
++                )
++                self._reconciliation_duration_ms[outcome].observe(duration_ms)
++                self.reconciliation_finished_at = now_iso()
++
++    def health(self) -> dict[str, Any]:
++        return {
++            "reconciliation_started_at": self.reconciliation_started_at,
++            "reconciliation_finished_at": self.reconciliation_finished_at,
++            "reconciliation_duration_ms": {
++                outcome: metric.snapshot()
++                for outcome, metric in self._reconciliation_duration_ms.items()
++            },
++            "sample_capacity_per_outcome": RECONCILIATION_TELEMETRY_CAPACITY,
++        }
+ 
+     async def _run_once_serialized(self, actor: str) -> dict[str, Any]:
+         run_id = self.repo.start_reconciliation()
+diff --git a/polymarket-collector/live/trader_commands.py b/polymarket-collector/live/trader_commands.py
+index f4eccb7..05472e0 100644
+--- a/polymarket-collector/live/trader_commands.py
++++ b/polymarket-collector/live/trader_commands.py
+@@ -25,6 +25,7 @@ class TraderCommandHandler:
+         if command == "STATUS":
+             return sanitize({
+                 "adapter": {"name": adapter.name},
++                "reconciliation": reconciliation.health(),
+                 "market_ws": market_ws.health(),
+                 "user_ws": user_ws.health(),
+                 "strategy": runtime.health(),
+diff --git a/polymarket-collector/tests/test_market_ws_telemetry.py b/polymarket-collector/tests/test_market_ws_telemetry.py
+index 6691bef..ec3dc5b 100644
+--- a/polymarket-collector/tests/test_market_ws_telemetry.py
++++ b/polymarket-collector/tests/test_market_ws_telemetry.py
+@@ -5,6 +5,9 @@ import time
+ from pathlib import Path
+ 
+ from live.market_websocket import MarketWebSocketManager
++from live.reconciliation import (
++    RECONCILIATION_TELEMETRY_CAPACITY, ReconciliationWorker,
++)
+ from live.repository import LiveRepository
+ 
+ 
+@@ -223,3 +226,115 @@ def test_reader_reconciliation_order_and_market_semantics_are_unchanged():
+         }
+     finally:
+         temporary.cleanup()
++
++
++def test_reconciliation_duration_counts_success_failure_and_is_bounded():
++    temporary, repo = make_repo()
++    try:
++        worker = ReconciliationWorker(repo, object())
++        outcomes = iter(("ok", "gaps"))
++
++        async def fake_run(_actor):
++            return {"status": next(outcomes)}
++
++        worker._run_once_serialized = fake_run
++        assert asyncio.run(worker.run_once())["status"] == "ok"
++        assert asyncio.run(worker.run_once())["status"] == "gaps"
++        telemetry = worker.health()
++        success = telemetry["reconciliation_duration_ms"]["success"]
++        failure = telemetry["reconciliation_duration_ms"]["failure"]
++        assert success["count"] == 1
++        assert failure["count"] == 1
++        assert success["current"] >= 0
++        assert failure["current"] >= 0
++        assert telemetry["reconciliation_started_at"]
++        assert telemetry["reconciliation_finished_at"]
++
++        metric = worker._reconciliation_duration_ms["success"]
++        for value in range(RECONCILIATION_TELEMETRY_CAPACITY + 5):
++            metric.observe(value)
++        bounded = metric.snapshot()
++        assert bounded["count"] == RECONCILIATION_TELEMETRY_CAPACITY
++        assert bounded["current"] == RECONCILIATION_TELEMETRY_CAPACITY + 4
++        assert bounded["max"] == RECONCILIATION_TELEMETRY_CAPACITY + 4
++        assert bounded["p50"] == 516.5
++        assert bounded["p95"] == 976
++        assert bounded["p99"] == 1_017
++    finally:
++        temporary.cleanup()
++
++
++def test_reconciliation_unexpected_exception_is_timed_as_failure():
++    temporary, repo = make_repo()
++    try:
++        worker = ReconciliationWorker(repo, object())
++
++        async def fail(_actor):
++            raise RuntimeError("synthetic")
++
++        worker._run_once_serialized = fail
++        try:
++            asyncio.run(worker.run_once())
++        except RuntimeError as exc:
++            assert str(exc) == "synthetic"
++        else:
++            raise AssertionError("expected original exception")
++        assert worker.health()["reconciliation_duration_ms"]["failure"]["count"] == 1
++    finally:
++        temporary.cleanup()
++
++
++def test_generation_first_book_timing_resets_and_rejects_old_generation():
++    temporary, repo = make_repo()
++    try:
++        manager = MarketWebSocketManager(repo)
++        manager._connection_generation = 1
++        manager._connection_started_monotonic = 100.0
++        manager._reset_generation_timing(["yes", "no"])
++        manager._record_generation_first_book(
++            {"event_type": "book", "asset_id": "yes"},
++            {"connection_generation": 1}, 100.1,
++        )
++        first = manager.telemetry_snapshot()["generation_timing"]
++        assert first["first_book_observed_count"] == 1
++        assert first["generation_to_first_book_slot_1_ms"]["current"] == 100
++        assert first["generation_to_first_book_slot_2_ms"]["current"] is None
++        assert first["generation_to_first_required_books_ms"]["current"] is None
++
++        manager._record_generation_first_book(
++            {"event_type": "book", "asset_id": "no"},
++            {"connection_generation": 1}, 100.25,
++        )
++        first = manager.telemetry_snapshot()["generation_timing"]
++        assert first["generation_to_first_book_slot_2_ms"]["current"] == 250
++        assert first["generation_to_first_required_books_ms"]["current"] == 250
++
++        manager._connection_generation = 2
++        manager._connection_started_monotonic = 200.0
++        manager._reset_generation_timing(["yes", "no"])
++        manager._record_generation_first_book(
++            {"event_type": "book", "asset_id": "yes"},
++            {"connection_generation": 1}, 200.1,
++        )
++        reset = manager.telemetry_snapshot()["generation_timing"]
++        assert reset["generation"] == 2
++        assert reset["first_book_observed_count"] == 0
++        assert reset["first_book_slots"] == {}
++        assert reset["generation_to_first_required_books_ms"]["sample_count"] == 1
++        assert reset["generation_to_market_data_ready_ms"] == (
++            "NOT_MEASURABLE_WITH_CURRENT_SEMANTICS"
++        )
++    finally:
++        temporary.cleanup()
++
++
++def test_websockets_keepalive_metric_name_and_disabled_clarification():
++    temporary, repo = make_repo()
++    try:
++        telemetry = MarketWebSocketManager(repo).telemetry_snapshot()
++        assert "heartbeat_timeout_disconnects" not in telemetry
++        assert telemetry["websockets_keepalive_timeout_disconnects"] == 0
++        assert telemetry["automatic_websockets_keepalive_enabled"] is False
++        assert "ping_interval=None" in telemetry["websockets_keepalive_metric_note"]
++    finally:
++        temporary.cleanup()
