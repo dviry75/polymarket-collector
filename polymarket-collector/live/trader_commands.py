@@ -25,6 +25,7 @@ class TraderCommandHandler:
         if command == "STATUS":
             return sanitize({
                 "adapter": {"name": adapter.name},
+                "reconciliation": reconciliation.health(),
                 "market_ws": market_ws.health(),
                 "user_ws": user_ws.health(),
                 "strategy": runtime.health(),

@@ -5,6 +5,9 @@ import time
 from pathlib import Path
 
 from live.market_websocket import MarketWebSocketManager
+from live.reconciliation import (
+    RECONCILIATION_TELEMETRY_CAPACITY, ReconciliationWorker,
+)
 from live.repository import LiveRepository
 
 
@@ -221,5 +224,117 @@ def test_reader_reconciliation_order_and_market_semantics_are_unchanged():
         assert manager.rejection_reasons == {
             "STALE_EXCHANGE_TIMESTAMP": 1
         }
+    finally:
+        temporary.cleanup()
+
+
+def test_reconciliation_duration_counts_success_failure_and_is_bounded():
+    temporary, repo = make_repo()
+    try:
+        worker = ReconciliationWorker(repo, object())
+        outcomes = iter(("ok", "gaps"))
+
+        async def fake_run(_actor):
+            return {"status": next(outcomes)}
+
+        worker._run_once_serialized = fake_run
+        assert asyncio.run(worker.run_once())["status"] == "ok"
+        assert asyncio.run(worker.run_once())["status"] == "gaps"
+        telemetry = worker.health()
+        success = telemetry["reconciliation_duration_ms"]["success"]
+        failure = telemetry["reconciliation_duration_ms"]["failure"]
+        assert success["count"] == 1
+        assert failure["count"] == 1
+        assert success["current"] >= 0
+        assert failure["current"] >= 0
+        assert telemetry["reconciliation_started_at"]
+        assert telemetry["reconciliation_finished_at"]
+
+        metric = worker._reconciliation_duration_ms["success"]
+        for value in range(RECONCILIATION_TELEMETRY_CAPACITY + 5):
+            metric.observe(value)
+        bounded = metric.snapshot()
+        assert bounded["count"] == RECONCILIATION_TELEMETRY_CAPACITY
+        assert bounded["current"] == RECONCILIATION_TELEMETRY_CAPACITY + 4
+        assert bounded["max"] == RECONCILIATION_TELEMETRY_CAPACITY + 4
+        assert bounded["p50"] == 516.5
+        assert bounded["p95"] == 976
+        assert bounded["p99"] == 1_017
+    finally:
+        temporary.cleanup()
+
+
+def test_reconciliation_unexpected_exception_is_timed_as_failure():
+    temporary, repo = make_repo()
+    try:
+        worker = ReconciliationWorker(repo, object())
+
+        async def fail(_actor):
+            raise RuntimeError("synthetic")
+
+        worker._run_once_serialized = fail
+        try:
+            asyncio.run(worker.run_once())
+        except RuntimeError as exc:
+            assert str(exc) == "synthetic"
+        else:
+            raise AssertionError("expected original exception")
+        assert worker.health()["reconciliation_duration_ms"]["failure"]["count"] == 1
+    finally:
+        temporary.cleanup()
+
+
+def test_generation_first_book_timing_resets_and_rejects_old_generation():
+    temporary, repo = make_repo()
+    try:
+        manager = MarketWebSocketManager(repo)
+        manager._connection_generation = 1
+        manager._connection_started_monotonic = 100.0
+        manager._reset_generation_timing(["yes", "no"])
+        manager._record_generation_first_book(
+            {"event_type": "book", "asset_id": "yes"},
+            {"connection_generation": 1}, 100.1,
+        )
+        first = manager.telemetry_snapshot()["generation_timing"]
+        assert first["first_book_observed_count"] == 1
+        assert first["generation_to_first_book_slot_1_ms"]["current"] == 100
+        assert first["generation_to_first_book_slot_2_ms"]["current"] is None
+        assert first["generation_to_first_required_books_ms"]["current"] is None
+
+        manager._record_generation_first_book(
+            {"event_type": "book", "asset_id": "no"},
+            {"connection_generation": 1}, 100.25,
+        )
+        first = manager.telemetry_snapshot()["generation_timing"]
+        assert first["generation_to_first_book_slot_2_ms"]["current"] == 250
+        assert first["generation_to_first_required_books_ms"]["current"] == 250
+
+        manager._connection_generation = 2
+        manager._connection_started_monotonic = 200.0
+        manager._reset_generation_timing(["yes", "no"])
+        manager._record_generation_first_book(
+            {"event_type": "book", "asset_id": "yes"},
+            {"connection_generation": 1}, 200.1,
+        )
+        reset = manager.telemetry_snapshot()["generation_timing"]
+        assert reset["generation"] == 2
+        assert reset["first_book_observed_count"] == 0
+        assert reset["first_book_slots"] == {}
+        assert reset["generation_to_first_required_books_ms"]["sample_count"] == 1
+        assert reset["generation_to_market_data_ready_ms"] == (
+            "NOT_MEASURABLE_WITH_CURRENT_SEMANTICS"
+        )
+    finally:
+        temporary.cleanup()
+
+
+def test_websockets_keepalive_metric_name_and_disabled_clarification():
+    temporary, repo = make_repo()
+    try:
+        telemetry = MarketWebSocketManager(repo).telemetry_snapshot()
+        assert "heartbeat_timeout_disconnects" not in telemetry
+        assert telemetry["websockets_keepalive_timeout_disconnects"] == 0
+        assert telemetry["automatic_websockets_keepalive_enabled"] is False
+        assert "ping_interval=None" in telemetry["websockets_keepalive_metric_note"]
     finally:
         temporary.cleanup()

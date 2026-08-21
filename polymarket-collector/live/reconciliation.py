@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 import random
+import statistics
 import time
 from typing import Any
 
@@ -24,6 +26,48 @@ INTENT_SUBMISSION_GRACE_SECONDS = 15.0
 AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES = Decimal("0.01")
 RECONCILIATION_BACKOFF_BASE_SECONDS = 5.0
 RECONCILIATION_BACKOFF_CAP_SECONDS = 60.0
+RECONCILIATION_TELEMETRY_CAPACITY = 1_024
+
+
+class _BoundedDurationMetric:
+    """Bounded in-memory durations; percentile sorting occurs on status reads."""
+
+    def __init__(self, capacity: int = RECONCILIATION_TELEMETRY_CAPACITY):
+        self.samples: deque[float] = deque(maxlen=capacity)
+        self.current: float | None = None
+        self.maximum: float | None = None
+
+    def observe(self, value: float) -> None:
+        observed = max(0.0, float(value))
+        self.samples.append(observed)
+        self.current = observed
+        self.maximum = observed if self.maximum is None else max(
+            self.maximum, observed
+        )
+
+    def snapshot(self) -> dict[str, float | int | None]:
+        if not self.samples:
+            return {
+                "count": 0, "current": None, "p50": None, "p95": None,
+                "p99": None, "max": self.maximum,
+            }
+        ordered = sorted(self.samples)
+
+        def percentile(fraction: float) -> float:
+            index = min(
+                len(ordered) - 1,
+                max(0, int(len(ordered) * fraction) - 1),
+            )
+            return round(ordered[index], 4)
+
+        return {
+            "count": len(ordered),
+            "current": round(float(self.current or 0.0), 4),
+            "p50": round(statistics.median(ordered), 4),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "max": round(float(self.maximum or 0.0), 4),
+        }
 
 
 def _within_position_propagation_grace(
@@ -114,6 +158,12 @@ class ReconciliationWorker:
         self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
         self._missing_position_suspects: dict[str, float] = {}
+        self.reconciliation_started_at: str | None = None
+        self.reconciliation_finished_at: str | None = None
+        self._reconciliation_duration_ms = {
+            "success": _BoundedDurationMetric(),
+            "failure": _BoundedDurationMetric(),
+        }
 
     def _schedule_backoff(self, actor: str, error: str) -> float:
         self._consecutive_retries += 1
@@ -157,7 +207,32 @@ class ReconciliationWorker:
                         self._rate_limit_retry_after - now, 3
                     ),
                 }
-            return await self._run_once_serialized(actor)
+            started = time.perf_counter()
+            self.reconciliation_started_at = now_iso()
+            result: dict[str, Any] | None = None
+            try:
+                result = await self._run_once_serialized(actor)
+                return result
+            finally:
+                duration_ms = max(0.0, (time.perf_counter() - started) * 1000)
+                outcome = (
+                    "success"
+                    if result is not None and result.get("status") == "ok"
+                    else "failure"
+                )
+                self._reconciliation_duration_ms[outcome].observe(duration_ms)
+                self.reconciliation_finished_at = now_iso()
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "reconciliation_started_at": self.reconciliation_started_at,
+            "reconciliation_finished_at": self.reconciliation_finished_at,
+            "reconciliation_duration_ms": {
+                outcome: metric.snapshot()
+                for outcome, metric in self._reconciliation_duration_ms.items()
+            },
+            "sample_capacity_per_outcome": RECONCILIATION_TELEMETRY_CAPACITY,
+        }
 
     async def _run_once_serialized(self, actor: str) -> dict[str, Any]:
         run_id = self.repo.start_reconciliation()

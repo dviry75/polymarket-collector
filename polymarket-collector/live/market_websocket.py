@@ -222,6 +222,19 @@ class MarketWebSocketManager:
         self._connection_generation = 0
         self._connection_diagnostics: dict[str, Any] = {}
         self._connection_started_monotonic = 0.0
+        self._generation_connected_at: str | None = None
+        self._generation_connected_monotonic = 0.0
+        self._subscription_sent_at: str | None = None
+        self._reconciliation_started_at: str | None = None
+        self._reconciliation_finished_at: str | None = None
+        self._generation_timing_generation = 0
+        self._generation_required_assets: tuple[str, ...] = ()
+        self._first_book_slots: dict[int, dict[str, Any]] = {}
+        self._first_book_required_assets: set[str] = set()
+        self._first_required_books_recorded = False
+        self._generation_to_first_book_slot_1_ms = _RollingMetric()
+        self._generation_to_first_book_slot_2_ms = _RollingMetric()
+        self._generation_to_first_required_books_ms = _RollingMetric()
         self._last_subscription_change_monotonic = 0.0
         self._connection_frame_index = 0
         self._wire_sequence = 0
@@ -251,7 +264,7 @@ class MarketWebSocketManager:
         self.connection_generations_total = 0
         self.disconnects_total = 0
         self.connection_failures_total = 0
-        self.heartbeat_timeout_disconnects = 0
+        self.websockets_keepalive_timeout_disconnects = 0
         self._connection_lifetime_seconds = _RollingMetric()
         self._has_attempted_connection = False
         self._local_close_initiated = False
@@ -434,6 +447,7 @@ class MarketWebSocketManager:
                     self.successful_connections_total += 1
                     self.connection_generations_total += 1
                     self._connection_started_monotonic = time.monotonic()
+                    self._reset_generation_timing(asset_ids)
                     self._local_close_initiated = False
                     self._local_close_reason = ""
                     self._local_close_timestamp = None
@@ -455,12 +469,17 @@ class MarketWebSocketManager:
                     )
                     await asyncio.to_thread(self._refresh_market_cache, asset_ids)
                     await ws.send(json.dumps(self.subscription_message(asset_ids)))
+                    self._subscription_sent_at = now_iso()
                     self.subscribed_asset_ids = asset_ids
                     self.status.status = "SUBSCRIBED"
                     self.status.error = None
                     attempt = 0
                     if self.on_reconnect is not None:
-                        await self.on_reconnect()
+                        self._reconciliation_started_at = now_iso()
+                        try:
+                            await self.on_reconnect()
+                        finally:
+                            self._reconciliation_finished_at = now_iso()
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     subscriptions = asyncio.create_task(self._subscription_loop(ws))
                     try:
@@ -1004,6 +1023,8 @@ class MarketWebSocketManager:
                 ),
                 wire_sequence=timing.get("wire_sequence"),
             )
+            if event_type == "book":
+                self._record_generation_first_book(message, timing, started)
             timing["message_hash"] = frame.message_hash
             timing["book_update_monotonic"] = time.perf_counter()
             timing["handler_to_book_update_ms"] = (
@@ -1678,6 +1699,58 @@ class MarketWebSocketManager:
         close_code_sent = getattr(sent, "code", None)
         return close_code_received, close_reason_received, close_code_sent
 
+    def _reset_generation_timing(self, asset_ids: list[str]) -> None:
+        """Reset observation-only warmup state for the newly connected generation."""
+        self._generation_timing_generation = self._connection_generation
+        self._generation_required_assets = tuple(str(asset) for asset in asset_ids)
+        self._generation_connected_monotonic = self._connection_started_monotonic
+        self._generation_connected_at = now_iso()
+        self._subscription_sent_at = None
+        self._reconciliation_started_at = None
+        self._reconciliation_finished_at = None
+        self._first_book_slots = {}
+        self._first_book_required_assets = set()
+        self._first_required_books_recorded = False
+
+    def _record_generation_first_book(
+        self, message: dict[str, Any], timing: dict[str, Any], observed: float,
+    ) -> None:
+        """Record first processed book facts without creating readiness semantics."""
+        if (
+            timing.get("connection_generation") != self._generation_timing_generation
+            or self._generation_timing_generation != self._connection_generation
+            or self._generation_connected_monotonic <= 0
+        ):
+            return
+        asset_id = str(message.get("asset_id") or "")
+        if not asset_id or asset_id not in self._generation_required_assets:
+            return
+        try:
+            slot = self._generation_required_assets.index(asset_id) + 1
+        except ValueError:
+            return
+        self._first_book_required_assets.add(asset_id)
+        duration_ms = max(
+            0.0, (observed - self._generation_connected_monotonic) * 1000
+        )
+        if slot not in self._first_book_slots:
+            self._first_book_slots[slot] = {
+                "first_book_at": now_iso(),
+                "generation_to_first_book_ms": round(duration_ms, 4),
+            }
+            if slot == 1:
+                self._generation_to_first_book_slot_1_ms.observe(duration_ms)
+            elif slot == 2:
+                self._generation_to_first_book_slot_2_ms.observe(duration_ms)
+        if (
+            not self._first_required_books_recorded
+            and self._generation_required_assets
+            and len(self._first_book_required_assets)
+            == len(set(self._generation_required_assets))
+        ):
+            self._first_required_books_recorded = True
+            self._generation_to_first_required_books_ms.observe(duration_ms)
+
     @staticmethod
     def _is_evidence_based_heartbeat_timeout(
         exc: BaseException | None, text: str,
@@ -1701,6 +1774,32 @@ class MarketWebSocketManager:
         processing_age = self._exchange_age_at_processing_ms.snapshot()
         loop_lag = self._event_loop_lag_metric.snapshot()
         lifetime = self._connection_lifetime_seconds.snapshot()
+        generation_timing = {
+            "generation": self._generation_timing_generation,
+            "generation_connected_at": self._generation_connected_at,
+            "subscription_sent_at": self._subscription_sent_at,
+            "reconciliation_started_at": self._reconciliation_started_at,
+            "reconciliation_finished_at": self._reconciliation_finished_at,
+            "required_asset_count": len(self._generation_required_assets),
+            "first_book_observed_count": len(self._first_book_required_assets),
+            "first_book_slots": {
+                f"slot_{slot}": dict(value)
+                for slot, value in sorted(self._first_book_slots.items())
+                if slot <= 2
+            },
+            "generation_to_first_book_slot_1_ms": (
+                self._generation_to_first_book_slot_1_ms.snapshot()
+            ),
+            "generation_to_first_book_slot_2_ms": (
+                self._generation_to_first_book_slot_2_ms.snapshot()
+            ),
+            "generation_to_first_required_books_ms": (
+                self._generation_to_first_required_books_ms.snapshot()
+            ),
+            "generation_to_market_data_ready_ms": (
+                "NOT_MEASURABLE_WITH_CURRENT_SEMANTICS"
+            ),
+        }
         return {
             "ws_library_queue_depth_current": library["current"],
             "ws_library_queue_depth_high_watermark": library["max"],
@@ -1738,8 +1837,14 @@ class MarketWebSocketManager:
             "connection_generations_total": self.connection_generations_total,
             "connection_failures_total": self.connection_failures_total,
             "connection_lifetime_seconds": lifetime,
-            "heartbeat_timeout_disconnects": (
-                self.heartbeat_timeout_disconnects
+            "generation_timing": generation_timing,
+            "websockets_keepalive_timeout_disconnects": (
+                self.websockets_keepalive_timeout_disconnects
+            ),
+            "automatic_websockets_keepalive_enabled": False,
+            "websockets_keepalive_metric_note": (
+                "ping_interval=None; expected zero and not evidence of "
+                "application heartbeat health"
             ),
             "local_close_reason_counts": dict(
                 self._local_close_reason_counts
@@ -2621,7 +2726,7 @@ class MarketWebSocketManager:
             if self._is_evidence_based_heartbeat_timeout(
                 exc, exception_text
             ):
-                self.heartbeat_timeout_disconnects += 1
+                self.websockets_keepalive_timeout_disconnects += 1
             disconnect = {
                 "generation": self._connection_generation,
                 "disconnect_timestamp": now_iso(),
