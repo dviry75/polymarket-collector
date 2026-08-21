@@ -5,6 +5,7 @@ from typing import Any
 from .account_identity import MockPublicAccountIdentityClient, PublicAccountIdentityClient
 from .backup import LiveBackupManager
 from .public_client import MockPublicClobClient, PublicClobClient
+from .pause_recovery import PauseRecoveryCoordinator, request_manual_resume
 from .repository import now_iso
 from .secrets import EnvSecretProvider, GoogleSecretManagerProvider, secret_readiness
 from .strategy_repository import sanitize
@@ -27,6 +28,9 @@ class TraderCommandHandler:
                 "market_ws": market_ws.health(),
                 "user_ws": user_ws.health(),
                 "strategy": runtime.health(),
+                "recovery": PauseRecoveryCoordinator(
+                    repo, strategy_repo, market_ws, user_ws, config=config
+                ).status(),
                 "paper": paper_service().health(),
             })
         if command == "AUDIT":
@@ -44,32 +48,18 @@ class TraderCommandHandler:
             strategy_repo.set_pause_entries(True, "operator", "OPERATOR_PAUSE")
             return {"ok": True, "pause_entries": True}
         if command == "RESUME_ENTRIES":
-            status = runtime.health()
-            blockers: list[str] = []
-            if status.get("market_data_readiness") != "READY":
-                blockers.append("MARKET_DATA_NOT_READY")
-            if status.get("reconciliation_readiness") != "READY":
-                blockers.append("RECONCILIATION_NOT_READY")
-            if config.execution_mode == "REAL_TRADING":
-                if (
-                    not config.continuous_trading_enabled
-                    and repo.get_state("canary_armed", "false").lower() != "true"
-                ):
-                    blockers.append("CANARY_NOT_ARMED")
-                if user_ws.health().get("status") != "CONNECTED":
-                    blockers.append("USER_WS_NOT_CONNECTED")
-                if repo.get_state("order_heartbeat_status", "DISABLED") != "OK":
-                    blockers.append("HEARTBEAT_NOT_READY")
-            if blockers:
+            result = request_manual_resume(
+                config, repo, strategy_repo, market_ws, user_ws
+            )
+            if not result.get("ok"):
                 strategy_repo.timeline(
                     severity="WARNING", category="OPERATOR", component="ipc",
                     source="operator", requested_action="RESUME_ENTRIES",
-                    reason_code="READINESS_FAILED", result_status="BLOCKED",
-                    parameters_json={"blockers": blockers},
+                    reason_code=str(result.get("reason") or "READINESS_FAILED"),
+                    result_status="BLOCKED",
+                    parameters_json={"blockers": result.get("blockers", [])},
                 )
-                return {"ok": False, "reason": "READINESS_FAILED", "blockers": blockers}
-            strategy_repo.set_pause_entries(False, "operator", "READINESS_VERIFIED")
-            return {"ok": True, "pause_entries": False}
+            return result
         if command == "EMERGENCY_CLOSE_PREVIEW":
             positions = strategy_repo.active_positions()
             ids = {position.get("position_id") for position in positions}

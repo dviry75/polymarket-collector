@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -544,7 +545,11 @@ class DashboardReadModel:
             "SELECT key,value,updated_at FROM live_system_state WHERE key IN ("
             "'kill_switch','pause_entries','strategy_readiness','strategy_block_reason',"
             "'reconciliation_readiness','reconciliation_block_reason','order_heartbeat_status',"
-            "'market_ws_status','user_ws_status','last_successful_reconciliation_at')"
+            "'market_ws_status','user_ws_status','last_successful_reconciliation_at',"
+            "'pause_state','pause_owner','pause_cause','release_policy','pause_generation',"
+            "'pause_acquired_at','recovery_status','recovery_engine_status',"
+            "'recovery_blockers_json','pause_eligible_since','recovery_last_action',"
+            "'recovery_last_result','last_auto_recovery_at')"
         )
         states = {str(row["key"]): {"value": row["value"], "updated_at": row["updated_at"]} for row in state_rows}
         trader_available = bool(trader_status)
@@ -561,6 +566,26 @@ class DashboardReadModel:
             "market_websocket": states.get("market_ws_status", {}).get("value", "UNKNOWN") if trader_available else "STOPPED",
             "user_websocket": states.get("user_ws_status", {}).get("value", "UNKNOWN") if trader_available else "STOPPED",
             "last_reconciliation": states.get("last_successful_reconciliation_at", {}).get("value"),
+            "auto_recovery": (
+                (trader_status or {}).get("recovery")
+                or {
+                    "auto_recovery_status": states.get("recovery_status", {}).get("value", "UNKNOWN"),
+                    "engine_status": states.get("recovery_engine_status", {}).get("value", "UNKNOWN"),
+                    "pause_state": states.get("pause_state", {}).get("value", "UNKNOWN"),
+                    "owner": states.get("pause_owner", {}).get("value", "NONE"),
+                    "cause": states.get("pause_cause", {}).get("value", ""),
+                    "release_policy": states.get("release_policy", {}).get("value", "MANUAL_ONLY"),
+                    "generation": int(states.get("pause_generation", {}).get("value", "0") or 0),
+                    "acquired_at": states.get("pause_acquired_at", {}).get("value", ""),
+                    "eligible_since": states.get("pause_eligible_since", {}).get("value", ""),
+                    "current_blockers": json.loads(
+                        states.get("recovery_blockers_json", {}).get("value", "[]")
+                    ),
+                    "last_recovery_action": states.get("recovery_last_action", {}).get("value", ""),
+                    "last_recovery_result": states.get("recovery_last_result", {}).get("value", ""),
+                    "last_auto_recovery_at": states.get("last_auto_recovery_at", {}).get("value", ""),
+                }
+            ),
             "quality": "REAL", "as_of": self.metadata()["as_of"],
         }
 

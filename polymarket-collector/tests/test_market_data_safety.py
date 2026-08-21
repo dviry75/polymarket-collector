@@ -808,6 +808,32 @@ def test_latency_csv_is_bounded_and_stratified():
         assert sum(row["exact_block_reason"] == "READY" for row in rows) == 3
 
 
+def test_market_ws_heavy_diagnostics_are_opt_in(monkeypatch):
+    temp, repo = make_repo()
+    try:
+        monkeypatch.delenv("LIVE_MARKET_WS_DIAGNOSTICS_ENABLED", raising=False)
+        manager = MarketWebSocketManager(
+            repo, stale_after_seconds=1, clock_ms=lambda: NOW_MS
+        )
+        assert manager._diagnostics_enabled is False
+        manager.process_message(book("yes", NOW_MS - 100), timing={})
+        assert len(manager._latency_records) == 0
+        assert manager.health()["diagnostics_enabled"] is False
+
+        monkeypatch.setenv("LIVE_MARKET_WS_DIAGNOSTICS_ENABLED", "true")
+        diagnostic_manager = MarketWebSocketManager(
+            repo, stale_after_seconds=1, clock_ms=lambda: NOW_MS
+        )
+        assert diagnostic_manager._diagnostics_enabled is True
+        diagnostic_manager.process_message(
+            book("yes", NOW_MS - 90), timing={}
+        )
+        assert len(diagnostic_manager._latency_records) == 1
+        assert diagnostic_manager.health()["diagnostics_enabled"] is True
+    finally:
+        temp.cleanup()
+
+
 def test_market_ws_records_receive_and_processing_boundaries(monkeypatch):
     temp, repo = make_repo()
     csv_path = Path(temp.name) / "market-ws-latency.csv"

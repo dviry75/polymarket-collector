@@ -108,6 +108,9 @@ class LiveConfig:
     reconciliation_interval_seconds: int = 15
     reconciliation_active_interval_seconds: int = 3
     order_heartbeat_interval_seconds: int = 5
+    recovery_stability_seconds: float = 4.0
+    recovery_detection_debounce_seconds: float = 2.0
+    geographic_preflight_ttl_seconds: int = 3600
     profile_address: str = ""
     account_login_type: str = "email"
     signer_address: str = ""
@@ -200,6 +203,11 @@ class LiveConfig:
             reconciliation_interval_seconds=int(_env("LIVE_RECONCILIATION_INTERVAL_SECONDS", "15") or "15"),
             reconciliation_active_interval_seconds=int(_env("LIVE_RECONCILIATION_ACTIVE_INTERVAL_SECONDS", "3") or "3"),
             order_heartbeat_interval_seconds=int(_env("LIVE_ORDER_HEARTBEAT_INTERVAL_SECONDS", "5") or "5"),
+            recovery_stability_seconds=float(_env("LIVE_RECOVERY_STABILITY_SECONDS", "4") or "4"),
+            recovery_detection_debounce_seconds=float(
+                _env("LIVE_RECOVERY_DETECTION_DEBOUNCE_SECONDS", "2") or "2"
+            ),
+            geographic_preflight_ttl_seconds=int(_env("LIVE_GEOGRAPHIC_PREFLIGHT_TTL_SECONDS", "3600") or "3600"),
             profile_address=_env("POLYMARKET_PROFILE_ADDRESS", ""),
             account_login_type=_env("POLYMARKET_ACCOUNT_LOGIN_TYPE", "email").lower(),
             signer_address=_env("POLYMARKET_SIGNER_ADDRESS", _env("POLY_ADDRESS", "")),
@@ -288,6 +296,14 @@ class LiveConfig:
             errors.append("entry window must remain exactly 120 seconds")
         if self.order_heartbeat_interval_seconds != 5:
             errors.append("order heartbeat interval must remain exactly 5 seconds")
+        if not 0 < self.recovery_stability_seconds <= 5:
+            errors.append("LIVE_RECOVERY_STABILITY_SECONDS must be > 0 and <= 5")
+        if not 0 <= self.recovery_detection_debounce_seconds <= 5:
+            errors.append(
+                "LIVE_RECOVERY_DETECTION_DEBOUNCE_SECONDS must be >= 0 and <= 5"
+            )
+        if self.geographic_preflight_ttl_seconds < 60:
+            errors.append("LIVE_GEOGRAPHIC_PREFLIGHT_TTL_SECONDS must be >= 60")
         if self.canary_event_limit != 1:
             errors.append("LIVE_CANARY_EVENT_LIMIT must remain exactly 1")
         if self.max_exit_slippage > Decimal("0.05"):

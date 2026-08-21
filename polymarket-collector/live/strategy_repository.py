@@ -10,6 +10,7 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from .order_book import canonical_decimal, decimal_value
+from .recovery_policy import PauseState, ReleasePolicy, recovery_policy
 from .repository import LiveRepository, now_iso, row_to_dict
 
 
@@ -55,6 +56,7 @@ def stable_id(kind: str, identity: str) -> str:
 class StrategyRepository:
     def __init__(self, base: LiveRepository):
         self.base = base
+        self._inflight_submission_intents: set[str] = set()
 
     def migrate(self, *, pause_entries_default: bool = True) -> None:
         with self.base.connect() as conn:
@@ -342,7 +344,219 @@ class StrategyRepository:
                     """,
                     (key, value, now_iso()),
                 )
+            pause_rows = conn.execute(
+                "SELECT key,value,updated_at FROM live_system_state "
+                "WHERE key IN ('pause_entries','pause_owner','pause_reason')"
+            ).fetchall()
+            pause_legacy = {
+                str(row["key"]): {
+                    "value": str(row["value"]),
+                    "updated_at": str(row["updated_at"]),
+                }
+                for row in pause_rows
+            }
+            is_paused = (
+                pause_legacy.get("pause_entries", {}).get("value", "true").lower()
+                == "true"
+            )
+            legacy_reason = pause_legacy.get("pause_reason", {}).get("value", "")
+            legacy_policy = recovery_policy(legacy_reason)
+            legacy_acquired_at = pause_legacy.get(
+                "pause_entries", {}
+            ).get("updated_at", now_iso())
+            recovery_defaults = {
+                "pause_state": (
+                    PauseState.PAUSED_MANUAL_ONLY
+                    if is_paused
+                    and legacy_policy.release_policy == ReleasePolicy.MANUAL_ONLY
+                    else PauseState.PAUSED_RECOVERING
+                    if is_paused
+                    else PauseState.TRADING
+                ),
+                "pause_cause": legacy_reason,
+                "release_policy": legacy_policy.release_policy,
+                "pause_generation": "1" if is_paused else "0",
+                "pause_acquired_at": legacy_acquired_at if is_paused else "",
+                "pause_updated_at": legacy_acquired_at if is_paused else "",
+                "pause_eligible_since": "",
+                "pause_last_recovery_attempt_at": "",
+                "pause_last_release_at": "",
+                "recovery_attempt_count": "0",
+                "recovery_status": "PAUSED" if is_paused else "HEALTHY",
+                "recovery_engine_status": "STARTING",
+                "recovery_blockers_json": "[]",
+                "recovery_stability_elapsed_ms": "0",
+                "recovery_last_action": "",
+                "recovery_last_result": "",
+                "recovery_financial_verified_generation": "",
+                "last_successful_heartbeat_at": "",
+                "last_auto_recovery_at": "",
+            }
+            for key, value in recovery_defaults.items():
+                conn.execute(
+                    "INSERT INTO live_system_state(key,value,updated_at) "
+                    "VALUES(?,?,?) ON CONFLICT(key) DO NOTHING",
+                    (key, str(value), now_iso()),
+                )
+            bug_rows = conn.execute(
+                "SELECT key,value FROM live_system_state WHERE key IN "
+                "('pause_entries','pause_cause','release_policy',"
+                "'pause_generation','recovery_attempt_count')"
+            ).fetchall()
+            bug_state = {
+                str(row["key"]): str(row["value"]) for row in bug_rows
+            }
+            if (
+                bug_state.get("pause_entries", "false").lower() == "true"
+                and bug_state.get("pause_cause") == "STRATEGY_NOT_READY"
+                and bug_state.get("release_policy")
+                == ReleasePolicy.MANUAL_ONLY
+            ):
+                repaired_at = now_iso()
+                generation = int(
+                    bug_state.get("pause_generation", "0") or 0
+                ) + 1
+                attempts = int(
+                    bug_state.get("recovery_attempt_count", "0") or 0
+                ) + 1
+                self.base.set_states_on_connection(
+                    conn,
+                    {
+                        "pause_cause": "MARKET_DATA_NOT_READY",
+                        "pause_reason": "MARKET_DATA_NOT_READY",
+                        "release_policy": ReleasePolicy.AUTO_WHEN_CLEAN,
+                        "pause_state": PauseState.PAUSED_RECOVERING,
+                        "pause_generation": str(generation),
+                        "pause_acquired_at": repaired_at,
+                        "pause_updated_at": repaired_at,
+                        "pause_eligible_since": "",
+                        "pause_auto_recoverable": "true",
+                        "recovery_attempt_count": str(attempts),
+                        "recovery_status": "RECOVERING",
+                        "recovery_blockers_json": "[]",
+                        "recovery_last_action": (
+                            "MIGRATE_STRATEGY_READINESS_CLASSIFICATION"
+                        ),
+                        "recovery_last_result": "RECLASSIFIED_TRANSIENT",
+                    },
+                    "migration",
+                )
+                conn.execute(
+                    "INSERT INTO live_audit_log "
+                    "(occurred_at,actor,action,status,reason,details_json) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        repaired_at, "migration",
+                        "pause_policy_reclassified", "ok",
+                        "STRATEGY_NOT_READY",
+                        json.dumps(
+                            {
+                                "new_reason": "MARKET_DATA_NOT_READY",
+                                "generation": generation,
+                                "release_policy": (
+                                    ReleasePolicy.AUTO_WHEN_CLEAN
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
             conn.commit()
+
+    def repair_terminal_dust_slots(
+        self, *, actor: str = "startup_reconciliation"
+    ) -> list[dict[str, Any]]:
+        """Close legacy post-exit dust without hiding unresolved exposure.
+
+        A DUST position is eligible only when the matching deal already has a
+        durable terminal timestamp, no shares are sellable, and every intent
+        attached to the position is final. Entry-created dust deliberately has
+        no terminal deal timestamp and therefore remains fail-closed.
+        """
+        repaired: list[dict[str, Any]] = []
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT
+                    p.position_id,
+                    p.event_id,
+                    p.condition_id,
+                    p.token_id,
+                    p.outcome,
+                    p.remaining_shares_text,
+                    p.sellable_shares_text,
+                    d.closed_at AS terminal_closed_at
+                FROM live_strategy_positions AS p
+                JOIN live_strategy_deals AS d
+                  ON d.event_id = p.event_id
+                WHERE p.state = 'DUST'
+                  AND p.closed_at IS NULL
+                  AND CAST(COALESCE(p.sellable_shares_text, '0') AS REAL) <= 0
+                  AND d.state = 'DUST'
+                  AND d.closed_at IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM live_strategy_intents AS i
+                      WHERE i.position_id = p.position_id
+                        AND i.state NOT IN (
+                            'FILLED','PARTIAL_FINAL','ZERO_FILL','CANCELED',
+                            'REJECTED','FAILED','SETTLED','REDEEMED'
+                        )
+                  )
+                ORDER BY p.created_at
+                """
+            ).fetchall()
+            for row in rows:
+                closed_at = str(row["terminal_closed_at"])
+                cursor = conn.execute(
+                    """
+                    UPDATE live_strategy_positions
+                    SET closed_at = ?, updated_at = ?
+                    WHERE position_id = ?
+                      AND state = 'DUST'
+                      AND closed_at IS NULL
+                      AND CAST(COALESCE(sellable_shares_text, '0') AS REAL) <= 0
+                    """,
+                    (closed_at, now_iso(), str(row["position_id"])),
+                )
+                if cursor.rowcount:
+                    repaired.append(row_to_dict(row) or {})
+            conn.commit()
+
+        for row in repaired:
+            self.timeline(
+                severity="WARNING",
+                category="RECONCILIATION",
+                component="strategy_state_repair",
+                source=actor,
+                event_id=str(row.get("event_id") or ""),
+                condition_id=str(row.get("condition_id") or ""),
+                token_id=str(row.get("token_id") or ""),
+                side=str(row.get("outcome") or ""),
+                deal_id=stable_id("deal", str(row.get("event_id") or "")),
+                requested_action="CLOSE_TERMINAL_DUST_SLOT",
+                reason_code="TERMINAL_DUST_CLOSED_AT_REPAIRED",
+                previous_state="DUST_OPEN_SLOT",
+                new_state="DUST_CLOSED_SLOT",
+                result_status="REPAIRED",
+                remaining_shares_text=str(
+                    row.get("remaining_shares_text") or "0"
+                ),
+                parameters_json={
+                    "position_id": row.get("position_id"),
+                    "sellable_shares_text": row.get("sellable_shares_text"),
+                    "closed_at": row.get("terminal_closed_at"),
+                },
+            )
+        if repaired:
+            self.base.audit(
+                actor,
+                "repair_terminal_dust_slots",
+                "ok",
+                details={"repaired": len(repaired)},
+            )
+        return repaired
 
     def hot_state_snapshot(self) -> dict[str, Any]:
         """Load latency-sensitive strategy state using one SQLite connection.
@@ -474,64 +688,538 @@ class StrategyRepository:
             "loaded_at": now_iso(),
         }
 
+    PAUSE_STATE_KEYS = (
+        "pause_entries", "pause_state", "pause_owner", "pause_cause",
+        "pause_reason", "release_policy", "pause_generation",
+        "pause_acquired_at", "pause_updated_at", "pause_eligible_since",
+        "pause_last_recovery_attempt_at", "pause_last_release_at",
+        "pause_last_release_reason", "pause_source_reconciliation_run_id",
+        "pause_source_event_id", "pause_source_order_id",
+        "pause_source_position_id", "pause_auto_recoverable",
+        "recovery_financial_verified_generation", "recovery_blockers_json",
+        "recovery_attempt_count",
+    )
+
     def pause_entries(self) -> bool:
         return self.base.get_state("pause_entries", "true").lower() == "true"
+
+    @staticmethod
+    def _state_map_on_connection(
+        conn: sqlite3.Connection, keys: Iterable[str]
+    ) -> dict[str, str]:
+        key_list = tuple(keys)
+        placeholders = ",".join("?" for _ in key_list)
+        rows = conn.execute(
+            f"SELECT key,value FROM live_system_state WHERE key IN ({placeholders})",
+            key_list,
+        ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
+
+    def pause_record(self) -> dict[str, Any]:
+        with self.base.connect() as conn:
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+        return {
+            **state,
+            "pause_entries": state.get("pause_entries", "true").lower() == "true",
+            "pause_generation": int(state.get("pause_generation", "0") or 0),
+        }
+
+    def acquire_pause(
+        self,
+        *,
+        actor: str,
+        reason: str,
+        owner: str | None = None,
+        source_reconciliation_run_id: str | int | None = None,
+        source_event_id: str | None = None,
+        source_order_id: str | None = None,
+        source_position_id: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        reason = str(reason or "UNKNOWN").upper()
+        resolved_owner = (
+            owner or ("OPERATOR" if actor == "operator" else "MACHINE")
+        ).upper()
+        policy = recovery_policy(reason)
+        now = now_iso()
+
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            previous = current.get("pause_entries", "true").lower() == "true"
+            current_owner = current.get("pause_owner", "NONE").upper()
+            current_reason = current.get(
+                "pause_cause", current.get("pause_reason", "")
+            ).upper()
+            try:
+                current_policy = ReleasePolicy(
+                    current.get(
+                        "release_policy",
+                        recovery_policy(current_reason).release_policy,
+                    )
+                )
+            except ValueError:
+                current_policy = ReleasePolicy.MANUAL_ONLY
+            current_generation = int(
+                current.get("pause_generation", "0") or 0
+            )
+            recovery_attempts = int(
+                current.get("recovery_attempt_count", "0") or 0
+            )
+
+            if previous:
+                if (
+                    current_owner in {"OPERATOR", "STARTUP"}
+                    and resolved_owner not in {"OPERATOR", "STARTUP"}
+                ):
+                    conn.rollback()
+                    return self.pause_record(), False
+                if current_reason == reason and current_owner == resolved_owner:
+                    conn.rollback()
+                    return self.pause_record(), False
+
+                rank = {
+                    ReleasePolicy.AUTO_WHEN_CLEAN: 1,
+                    ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION: 2,
+                    ReleasePolicy.MANUAL_ONLY: 3,
+                }
+                if (
+                    resolved_owner not in {"OPERATOR", "STARTUP"}
+                    and rank[policy.release_policy] <= rank[current_policy]
+                ):
+                    conn.rollback()
+                    return self.pause_record(), False
+
+            generation = current_generation + 1
+            pause_state = (
+                PauseState.PAUSED_MANUAL_ONLY
+                if policy.release_policy == ReleasePolicy.MANUAL_ONLY
+                else PauseState.PAUSED_RECOVERING
+            )
+            values = {
+                "pause_entries": "true",
+                "pause_state": pause_state,
+                "pause_owner": resolved_owner,
+                "pause_cause": reason,
+                "pause_reason": reason,
+                "release_policy": policy.release_policy,
+                "pause_generation": str(generation),
+                "pause_acquired_at": now,
+                "pause_updated_at": now,
+                "pause_eligible_since": "",
+                "pause_last_recovery_attempt_at": now,
+                "recovery_attempt_count": str(recovery_attempts + 1),
+                "pause_auto_recoverable": (
+                    "true"
+                    if policy.release_policy == ReleasePolicy.AUTO_WHEN_CLEAN
+                    else "false"
+                ),
+                "recovery_financial_verified_generation": "",
+                "pause_source_reconciliation_run_id": str(
+                    source_reconciliation_run_id or ""
+                ),
+                "pause_source_event_id": str(source_event_id or ""),
+                "pause_source_order_id": str(source_order_id or ""),
+                "pause_source_position_id": str(source_position_id or ""),
+                "recovery_status": (
+                    "MANUAL_ONLY"
+                    if policy.release_policy == ReleasePolicy.MANUAL_ONLY
+                    else "RECOVERING"
+                ),
+                "recovery_stability_elapsed_ms": "0",
+                "recovery_last_action": policy.remediation,
+                "recovery_last_result": "PAUSE_ACQUIRED",
+            }
+            self.base.set_states_on_connection(conn, values, actor)
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    now, actor, "pause_acquired", "ok", reason,
+                    json.dumps(
+                        {
+                            "generation": generation,
+                            "owner": resolved_owner,
+                            "state": pause_state,
+                            "classification": policy.classification,
+                            "release_policy": policy.release_policy,
+                            "remediation": policy.remediation,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            conn.commit()
+
+        self.timeline(
+            severity="WARNING",
+            category=(
+                "OPERATOR"
+                if resolved_owner in {"OPERATOR", "STARTUP"}
+                else "SAFETY"
+            ),
+            component="recovery",
+            source=actor,
+            requested_action="PAUSE_ENTRIES",
+            reason_code=reason,
+            previous_state=str(previous).lower(),
+            new_state=pause_state,
+            result_status="ACQUIRED",
+            parameters_json={
+                "generation": generation,
+                "classification": policy.classification,
+                "release_policy": policy.release_policy,
+                "required_evidence": policy.required_evidence,
+                "remediation": policy.remediation,
+            },
+        )
+        return self.pause_record(), True
+
+    def promote_repairable_pause(
+        self,
+        *,
+        actor: str,
+        reconciliation_run_id: str | int,
+        clean_finished_at: str,
+    ) -> bool:
+        unresolved = bool(self.unresolved_intents())
+        uncertain_exposure = any(
+            str(position.get("state") or "").upper()
+            == "EXIT_RECONCILIATION_REQUIRED"
+            for position in self.active_positions()
+        )
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            generation = int(state.get("pause_generation", "0") or 0)
+            acquired_at = state.get("pause_acquired_at", "")
+            eligible = (
+                state.get("pause_entries", "true").lower() == "true"
+                and state.get("pause_owner", "").upper()
+                in {"RECONCILIATION", "MACHINE"}
+                and state.get("release_policy")
+                == ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION
+                and bool(clean_finished_at)
+                and bool(acquired_at)
+                and clean_finished_at > acquired_at
+                and not unresolved
+                and not uncertain_exposure
+            )
+            if not eligible:
+                conn.rollback()
+                return False
+            self.base.set_states_on_connection(
+                conn,
+                {
+                    "pause_auto_recoverable": "true",
+                    "recovery_financial_verified_generation": str(generation),
+                    "pause_source_reconciliation_run_id": str(
+                        reconciliation_run_id
+                    ),
+                    "pause_updated_at": now_iso(),
+                    "recovery_last_action": "RECONCILIATION_VERIFIED",
+                    "recovery_last_result": "CLEAN",
+                },
+                actor,
+            )
+            conn.commit()
+        self.timeline(
+            severity="INFO",
+            category="RECONCILIATION",
+            component="recovery",
+            source=actor,
+            requested_action="PROMOTE_RECOVERY_ELIGIBILITY",
+            reason_code="CLEAN_EVIDENCE_AFTER_PAUSE",
+            result_status="ALLOWED",
+            parameters_json={
+                "generation": generation,
+                "run_id": reconciliation_run_id,
+                "finished_at": clean_finished_at,
+            },
+        )
+        return True
+
+    def set_waiting_stability(
+        self, *, expected_generation: int, eligible_since: str
+    ) -> bool:
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            if (
+                state.get("pause_entries", "true").lower() != "true"
+                or int(state.get("pause_generation", "0") or 0)
+                != expected_generation
+            ):
+                conn.rollback()
+                return False
+            already_waiting = (
+                state.get("pause_state")
+                == PauseState.PAUSED_WAITING_STABILITY
+                and bool(state.get("pause_eligible_since"))
+            )
+            if already_waiting:
+                conn.rollback()
+                return True
+            self.base.set_states_on_connection(
+                conn,
+                {
+                    "pause_state": PauseState.PAUSED_WAITING_STABILITY,
+                    "pause_eligible_since": eligible_since,
+                    "pause_updated_at": now_iso(),
+                    "recovery_status": "WAITING_STABILITY",
+                    "recovery_stability_elapsed_ms": "0",
+                },
+                "pause_recovery",
+            )
+            conn.commit()
+        self.timeline(
+            severity="INFO",
+            category="SAFETY",
+            component="recovery",
+            source="pause_recovery",
+            requested_action="STABILITY_WINDOW_START",
+            reason_code="ALL_RELEASE_GATES_CLEAN",
+            result_status="STARTED",
+            parameters_json={"generation": expected_generation},
+        )
+        return True
+
+    def reset_stability(
+        self, *, expected_generation: int, blockers: list[dict[str, Any]]
+    ) -> bool:
+        blockers_json = json.dumps(sanitize(blockers), sort_keys=True)
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            if (
+                state.get("pause_entries", "true").lower() != "true"
+                or int(state.get("pause_generation", "0") or 0)
+                != expected_generation
+            ):
+                conn.rollback()
+                return False
+            was_waiting = (
+                state.get("pause_state")
+                == PauseState.PAUSED_WAITING_STABILITY
+            )
+            previous_blockers = state.get("recovery_blockers_json", "[]")
+            target_state = (
+                PauseState.PAUSED_MANUAL_ONLY
+                if state.get("release_policy") == ReleasePolicy.MANUAL_ONLY
+                else PauseState.PAUSED_RECOVERING
+            )
+            if (
+                not was_waiting
+                and previous_blockers == blockers_json
+                and state.get("pause_state") == target_state
+                and not state.get("pause_eligible_since")
+            ):
+                conn.rollback()
+                return True
+            values = {
+                "pause_state": target_state,
+                "pause_eligible_since": "",
+                "pause_updated_at": now_iso(),
+                "recovery_status": (
+                    "MANUAL_ONLY"
+                    if state.get("release_policy") == ReleasePolicy.MANUAL_ONLY
+                    else "RECOVERING"
+                ),
+                "recovery_blockers_json": blockers_json,
+                "recovery_stability_elapsed_ms": "0",
+            }
+            self.base.set_states_on_connection(
+                conn, values, "pause_recovery"
+            )
+            conn.commit()
+        if was_waiting or previous_blockers != blockers_json:
+            self.timeline(
+                severity="INFO",
+                category="SAFETY",
+                component="recovery",
+                source="pause_recovery",
+                requested_action=(
+                    "STABILITY_WINDOW_RESET"
+                    if was_waiting
+                    else "RECOVERY_BLOCKERS_CHANGED"
+                ),
+                reason_code=(
+                    str(blockers[0].get("code"))
+                    if blockers
+                    else "NO_BLOCKERS"
+                ),
+                result_status="BLOCKED" if blockers else "RESET",
+                parameters_json={
+                    "generation": expected_generation,
+                    "blockers": blockers,
+                },
+            )
+        return True
+
+    def release_pause_cas(
+        self,
+        *,
+        expected_generation: int,
+        expected_owner: str,
+        actor: str,
+        reason: str,
+    ) -> bool:
+        if actor not in {"operator", "pause_recovery"}:
+            return False
+        released_at = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            if (
+                state.get("pause_entries", "true").lower() != "true"
+                or int(state.get("pause_generation", "0") or 0)
+                != expected_generation
+                or state.get("pause_owner", "NONE").upper()
+                != expected_owner.upper()
+                or (
+                    actor == "pause_recovery"
+                    and state.get("release_policy")
+                    == ReleasePolicy.MANUAL_ONLY
+                )
+            ):
+                conn.rollback()
+                return False
+            self.base.set_states_on_connection(
+                conn,
+                {
+                    "pause_entries": "false",
+                    "pause_state": PauseState.TRADING,
+                    "pause_owner": "NONE",
+                    "pause_reason": "",
+                    "pause_auto_recoverable": "false",
+                    "pause_eligible_since": "",
+                    "pause_updated_at": released_at,
+                    "pause_last_release_at": released_at,
+                    "pause_last_release_reason": reason,
+                    "recovery_status": "HEALTHY",
+                    "recovery_stability_elapsed_ms": "0",
+                    "recovery_last_action": (
+                        "AUTO_RESUME"
+                        if actor == "pause_recovery"
+                        else "MANUAL_RESUME"
+                    ),
+                    "recovery_last_result": "RELEASED",
+                    "last_auto_recovery_at": (
+                        released_at if actor == "pause_recovery" else ""
+                    ),
+                },
+                actor,
+            )
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    released_at, actor, "pause_released", "ok", reason,
+                    json.dumps(
+                        {
+                            "generation": expected_generation,
+                            "owner": expected_owner,
+                            "mode": (
+                                "AUTO"
+                                if actor == "pause_recovery"
+                                else "MANUAL"
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            conn.commit()
+        self.timeline(
+            severity="INFO",
+            category="SAFETY" if actor == "pause_recovery" else "OPERATOR",
+            component="recovery",
+            source=actor,
+            requested_action="RESUME_ENTRIES",
+            reason_code=reason,
+            previous_state="true",
+            new_state="false",
+            result_status="RELEASED",
+            parameters_json={"generation": expected_generation},
+        )
+        return True
 
     def set_pause_entries(
         self, paused: bool, actor: str, reason: str, *,
         owner: str | None = None, auto_recoverable: bool = False,
-    ) -> None:
-        resolved_owner = (owner or ("OPERATOR" if actor == "operator" else "MACHINE")).upper()
-        with self.base.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                "SELECT key,value FROM live_system_state "
-                "WHERE key IN ('pause_entries','pause_owner','pause_auto_recoverable')"
-            ).fetchall()
-            current = {str(row["key"]): str(row["value"]) for row in rows}
-            previous = current.get("pause_entries", "true").lower() == "true"
-            current_owner = current.get("pause_owner", "NONE").upper()
-            current_auto = current.get("pause_auto_recoverable", "false").lower() == "true"
-            if paused:
-                if current_owner in {"OPERATOR", "STARTUP"} and resolved_owner in {"MACHINE", "RECONCILIATION"}:
-                    conn.rollback()
-                    return
-                if previous and not current_auto and resolved_owner in {"MACHINE", "RECONCILIATION"}:
-                    conn.rollback()
-                    return
-                values = {
-                    "pause_entries": "true", "pause_owner": resolved_owner,
-                    "pause_reason": reason,
-                    "pause_auto_recoverable": "true" if auto_recoverable else "false",
-                }
-            else:
-                if actor not in {"operator", "pause_recovery"}:
-                    conn.rollback()
-                    return
-                if current_owner in {"OPERATOR", "STARTUP"} and actor != "operator":
-                    conn.rollback()
-                    return
-                if actor == "pause_recovery" and (not owner or owner.upper() != current_owner):
-                    conn.rollback()
-                    return
-                values = {
-                    "pause_entries": "false", "pause_owner": "NONE",
-                    "pause_reason": "", "pause_auto_recoverable": "false",
-                    "pause_last_release_reason": reason,
-                }
-            self.base.set_states_on_connection(conn, values, actor)
-            conn.commit()
-        self.timeline(
-            severity="WARNING" if paused else "INFO",
-            category="OPERATOR" if resolved_owner in {"OPERATOR", "STARTUP"} else "SAFETY",
-            component="strategy",
-            source=actor,
-            requested_action="PAUSE_ENTRIES" if paused else "RESUME_ENTRIES",
-            reason_code=reason,
-            previous_state=str(previous).lower(),
-            new_state=str(paused).lower(),
-            result_status="ACK",
+    ) -> bool:
+        # Compatibility facade. Recovery policy, not the caller-provided
+        # boolean, is the source of truth for automatic release.
+        if paused:
+            _record, changed = self.acquire_pause(
+                actor=actor, reason=reason, owner=owner
+            )
+            return changed
+        record = self.pause_record()
+        return self.release_pause_cas(
+            expected_generation=int(record["pause_generation"]),
+            expected_owner=str(record.get("pause_owner") or "NONE"),
+            actor=actor,
+            reason=reason,
         )
+
+    def entry_slot_status(self) -> dict[str, Any]:
+        """Return the durable single-entry-slot blocker without mutating it."""
+        with self.base.connect() as conn:
+            unresolved = conn.execute(
+                """
+                SELECT intent_id,event_id,state
+                FROM live_strategy_intents
+                WHERE state NOT IN (
+                    'FILLED','PARTIAL_FINAL','ZERO_FILL','CANCELED',
+                    'REJECTED','FAILED','SETTLED','REDEEMED'
+                )
+                ORDER BY created_at
+                LIMIT 1
+                """
+            ).fetchone()
+            active_position = conn.execute(
+                """
+                SELECT position_id,event_id,state,closed_at,
+                       remaining_shares_text,sellable_shares_text
+                FROM live_strategy_positions
+                WHERE state IN (
+                    'OPEN','TP_OPEN','EXITING','EXIT_RECONCILIATION_REQUIRED'
+                )
+                   OR (state='DUST' AND closed_at IS NULL)
+                ORDER BY created_at
+                LIMIT 1
+                """
+            ).fetchone()
+        blocker = unresolved if unresolved is not None else active_position
+        if blocker is None:
+            return {"available": True, "blocker_kind": None}
+        blocker_kind = "INTENT" if unresolved is not None else "POSITION"
+        return {
+            "available": False,
+            "blocker_kind": blocker_kind,
+            "event_id": str(blocker["event_id"]),
+            "state": str(blocker["state"]),
+            "intent_id": (
+                str(blocker["intent_id"]) if blocker_kind == "INTENT" else None
+            ),
+            "position_id": (
+                str(blocker["position_id"]) if blocker_kind == "POSITION" else None
+            ),
+            "closed_at": (
+                str(blocker["closed_at"])
+                if blocker_kind == "POSITION" and blocker["closed_at"] else None
+            ),
+            "remaining_shares_text": (
+                str(blocker["remaining_shares_text"])
+                if blocker_kind == "POSITION" else None
+            ),
+            "sellable_shares_text": (
+                str(blocker["sellable_shares_text"])
+                if blocker_kind == "POSITION" else None
+            ),
+        }
 
     def reserve_event_entry(
         self,
@@ -754,6 +1442,8 @@ class StrategyRepository:
                 "SELECT * FROM live_event_states WHERE event_id = ?", (event_id,)
             ).fetchone()
             conn.commit()
+        if not simultaneous:
+            self._inflight_submission_intents.add(intent_id)
         return row_to_dict(row) or {}
 
     def consume_canary(self, actor: str = "strategy") -> None:
@@ -834,7 +1524,14 @@ class StrategyRepository:
             conn.commit()
         if row is None:
             raise KeyError(intent_id)
-        return row_to_dict(row) or {}
+        result = row_to_dict(row) or {}
+        state = str(result.get("state") or "").upper()
+        if result.get("remote_order_id") or state not in {"RESERVED", "SUBMITTING"}:
+            self._inflight_submission_intents.discard(intent_id)
+        return result
+
+    def intent_submission_inflight(self, intent_id: str) -> bool:
+        return intent_id in self._inflight_submission_intents
 
     def intent(self, intent_id: str) -> dict[str, Any] | None:
         with self.base.connect() as conn:
@@ -1328,6 +2025,7 @@ class StrategyRepository:
                 "SELECT * FROM live_strategy_intents WHERE intent_id=?", (intent_id,)
             ).fetchone()
             conn.commit()
+        self._inflight_submission_intents.add(intent_id)
         return row_to_dict(row) or {}
 
     def mark_waiting_sellable(
@@ -1675,10 +2373,37 @@ class StrategyRepository:
                 target_filled = prior_intent_filled + delta_shares
                 target_notional = prior_intent_notional + delta_notional
                 target_fees = prior_intent_fees + delta_fees
-            actual_sold = min(delta_shares, remaining_before)
-            remaining = remaining_before - actual_sold
             exit_value_before = decimal_value(row["exit_value_text"]) or Decimal("0")
             exit_fees_before = decimal_value(row["exit_fees_text"]) or Decimal("0")
+            acquired = decimal_value(row["acquired_shares_text"]) or Decimal("0")
+            if (
+                cumulative_filled_shares is not None
+                and prior_intent_filled == 0
+                and exit_value_before == 0
+                and remaining_before < acquired
+            ):
+                # A lagging positions response may have reduced local shares
+                # before maker fills were attributed. With no accounted exit
+                # proceeds and no other filled exit intent, rebuild the
+                # pre-exit baseline atomically before applying execution truth.
+                other_rows = conn.execute(
+                    "SELECT filled_shares_text FROM live_strategy_intents "
+                    "WHERE position_id=? AND intent_id<>? "
+                    "AND action IN ('EXIT','TP')",
+                    (position_id, intent_id),
+                ).fetchall()
+                other_exit_filled = sum(
+                    (
+                        decimal_value(item["filled_shares_text"])
+                        or Decimal("0")
+                        for item in other_rows
+                    ),
+                    Decimal("0"),
+                )
+                if other_exit_filled == 0:
+                    remaining_before = acquired
+            actual_sold = min(delta_shares, remaining_before)
+            remaining = remaining_before - actual_sold
             applied_notional = (
                 delta_notional * actual_sold / delta_shares
                 if delta_shares > 0 else Decimal("0")
@@ -1690,7 +2415,6 @@ class StrategyRepository:
             exit_value = exit_value_before + applied_notional
             exit_fees = exit_fees_before + applied_fees
             cost = decimal_value(row["cost_all_in_text"]) or Decimal("0")
-            acquired = decimal_value(row["acquired_shares_text"]) or Decimal("0")
             allocated_cost = cost * (acquired - remaining) / acquired if acquired > 0 else Decimal("0")
             pnl = exit_value - exit_fees - allocated_cost
             dust = remaining if Decimal("0") < remaining < min_sellable else Decimal("0")
@@ -1730,7 +2454,8 @@ class StrategyRepository:
                         WHEN ?='TAKE_PROFIT' AND ?=1 THEN tp_intent_id
                         WHEN ?='TAKE_PROFIT' THEN NULL ELSE tp_intent_id END,
                     last_exit_book_hash=?,
-                    updated_at=?,closed_at=CASE WHEN ?='CLOSED' THEN ? ELSE closed_at END
+                    updated_at=?,closed_at=CASE
+                        WHEN ? IN ('CLOSED','DUST') THEN ? ELSE closed_at END
                 WHERE position_id=?
                 """,
                 (
@@ -2040,25 +2765,46 @@ class StrategyRepository:
             )
         return row_to_dict(row) or {}, changed
 
-    def set_reconciliation_state(self, *, ready: bool, reason: str, actor: str) -> None:
-        self.base.set_state(
-            "reconciliation_readiness", "READY" if ready else "NOT_READY", actor
-        )
-        self.base.set_state(
-            "reconciliation_block_reason", "" if ready else reason, actor
-        )
-        self.base.set_state(
-            "live_blocked_by_reconciliation", "false" if ready else "true", actor
-        )
+    def set_reconciliation_state(
+        self,
+        *,
+        ready: bool,
+        reason: str,
+        actor: str,
+        auto_recoverable: bool = False,
+        run_id: str | int | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        completed_at = finished_at or now_iso()
+        if not ready:
+            self.acquire_pause(
+                actor=actor,
+                reason=reason,
+                owner="RECONCILIATION",
+                source_reconciliation_run_id=run_id,
+            )
+
+        values = {
+            "reconciliation_readiness": "READY" if ready else "NOT_READY",
+            "reconciliation_block_reason": "" if ready else reason,
+            "live_blocked_by_reconciliation": "false" if ready else "true",
+            "last_reconciliation_run_id": str(run_id or ""),
+            "last_reconciliation_finished_at": completed_at,
+        }
         if ready:
-            self.base.set_state("last_successful_reconciliation_at", now_iso(), actor)
-        else:
-            self.set_pause_entries(
-                True, actor, reason, owner="RECONCILIATION",
-                auto_recoverable=reason in {
-                    "RECONCILIATION_RATE_LIMITED",
-                    "RECONCILIATION_TEMPORARY_ERROR",
-                },
+            values["last_successful_reconciliation_at"] = completed_at
+
+        # Recovery sees all reconciliation flags and evidence as one snapshot.
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self.base.set_states_on_connection(conn, values, actor)
+            conn.commit()
+
+        if ready and run_id is not None:
+            self.promote_repairable_pause(
+                actor=actor,
+                reconciliation_run_id=run_id,
+                clean_finished_at=completed_at,
             )
 
     def unresolved_intents(self) -> list[dict[str, Any]]:

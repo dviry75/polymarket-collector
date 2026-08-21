@@ -717,9 +717,55 @@ class LiveRepository:
             conn.execute(
                 """
                 UPDATE live_markets SET
-                    market_resolved = 1, winning_asset_id = ?, winning_outcome = ?,
+                    market_resolved = 1, accepting_orders = 0,
+                    winning_asset_id = ?, winning_outcome = ?,
                     source = 'POLYMARKET_MARKET_WS', last_update_at = ?, updated_at = ?
                 WHERE condition_id = ?
+                """,
+                (winning_asset_id, winning_outcome, ts, ts, str(condition_id)),
+            )
+            conn.commit()
+
+    def markets_pending_resolution(
+        self, *, ended_before_epoch: int, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return ended BTC 5m markets without touching the trading hot path."""
+        safe_limit = max(1, min(int(limit), 100))
+        with self.connect() as conn:
+            query = """
+                SELECT event_id, condition_id, yes_token_id, no_token_id
+                FROM live_markets
+                WHERE market_resolved = 0
+                  AND event_id LIKE 'btc-updown-5m-%'
+                  AND CAST(SUBSTR(event_id, LENGTH('btc-updown-5m-') + 1) AS INTEGER)
+                      + 300 <= ?
+                ORDER BY CAST(SUBSTR(event_id, LENGTH('btc-updown-5m-') + 1) AS INTEGER) {}
+                LIMIT ?
+                """
+            recent_limit = (safe_limit + 1) // 2
+            backlog_limit = safe_limit - recent_limit
+            recent = conn.execute(
+                query.format("DESC"), (int(ended_before_epoch), recent_limit)
+            ).fetchall()
+            backlog = conn.execute(
+                query.format("ASC"), (int(ended_before_epoch), backlog_limit)
+            ).fetchall() if backlog_limit else []
+        unique = {str(row["condition_id"]): row for row in [*recent, *backlog]}
+        return [row_to_dict(row) or {} for row in unique.values()]
+
+    def mark_market_resolved_from_rest(
+        self, condition_id: str, winning_asset_id: str, winning_outcome: str
+    ) -> None:
+        ts = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE live_markets SET
+                    market_resolved = 1, accepting_orders = 0,
+                    winning_asset_id = ?, winning_outcome = ?,
+                    source = 'POLYMARKET_PUBLIC_REST',
+                    last_update_at = ?, updated_at = ?
+                WHERE condition_id = ? AND market_resolved = 0
                 """,
                 (winning_asset_id, winning_outcome, ts, ts, str(condition_id)),
             )

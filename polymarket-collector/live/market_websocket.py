@@ -29,6 +29,63 @@ from .market_ws_latency_csv import (
 )
 
 
+TELEMETRY_SAMPLE_CAPACITY = 4_096
+IMMEDIATE_RECV_THRESHOLD_MS = 1.0
+RECONNECT_AGE_BUCKETS = (
+    "0_1s", "1_5s", "5_15s", "15_30s", "30_60s", "gt_60s",
+)
+EVENT_LOOP_LAG_BUCKETS_MS = (100, 500, 1_000, 5_000, 20_000)
+LOCAL_CLOSE_REASONS = {
+    "LOCAL_CLOSE_BEST_PRICE_MISMATCH",
+    "LOCAL_CLOSE_INGRESS_SATURATION",
+    "LOCAL_CLOSE_SHUTDOWN",
+    "LOCAL_CLOSE_RECONNECT_POLICY",
+    "LOCAL_CLOSE_OTHER",
+}
+
+
+class _RollingMetric:
+    """A bounded, allocation-light observation ring; sorting occurs on read."""
+
+    def __init__(self, capacity: int = TELEMETRY_SAMPLE_CAPACITY):
+        self.samples: deque[float] = deque(maxlen=capacity)
+        self.current: float | None = None
+        self.maximum: float | None = None
+
+    def observe(self, value: float | int | None) -> float | None:
+        if value is None:
+            return None
+        observed = max(0.0, float(value))
+        self.samples.append(observed)
+        self.current = observed
+        self.maximum = observed if self.maximum is None else max(self.maximum, observed)
+        return observed
+
+    def snapshot(self) -> dict[str, float | int | None]:
+        if not self.samples:
+            return {
+                "current": self.current, "p50": None, "p95": None,
+                "p99": None, "max": self.maximum, "sample_count": 0,
+            }
+        ordered = sorted(self.samples)
+
+        def percentile(fraction: float) -> float:
+            index = min(
+                len(ordered) - 1,
+                max(0, int(len(ordered) * fraction) - 1),
+            )
+            return round(ordered[index], 4)
+
+        return {
+            "current": round(float(self.current or 0.0), 4),
+            "p50": round(statistics.median(ordered), 4),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+            "max": round(float(self.maximum or 0.0), 4),
+            "sample_count": len(ordered),
+        }
+
+
 @dataclass
 class WebSocketStatus:
     channel: str
@@ -168,6 +225,43 @@ class MarketWebSocketManager:
         self._last_subscription_change_monotonic = 0.0
         self._connection_frame_index = 0
         self._wire_sequence = 0
+        self._ws_library_queue_depth = _RollingMetric()
+        self._ws_library_queue_depth_unavailable = 0
+        self._recv_to_recv_gap_ms = _RollingMetric()
+        self._last_recv_return_monotonic: float | None = None
+        self._consecutive_recv_drain_count = 0
+        self._max_consecutive_immediate_recv = 0
+        self._exchange_age_at_reader_ms = _RollingMetric()
+        self._ingress_queue_wait_ms = _RollingMetric()
+        self._market_processing_ms = _RollingMetric()
+        self._exchange_age_at_processing_ms = _RollingMetric()
+        self._event_loop_lag_metric = _RollingMetric()
+        self._event_loop_lag_buckets = {
+            f"gt_{threshold}ms": 0 for threshold in EVENT_LOOP_LAG_BUCKETS_MS
+        }
+        self._messages_by_reconnect_age_bucket = {
+            bucket: 0 for bucket in RECONNECT_AGE_BUCKETS
+        }
+        self._stale_by_reconnect_age_bucket = {
+            bucket: 0 for bucket in RECONNECT_AGE_BUCKETS
+        }
+        self.connection_attempts_total = 0
+        self.reconnect_attempts_total = 0
+        self.successful_connections_total = 0
+        self.connection_generations_total = 0
+        self.disconnects_total = 0
+        self.connection_failures_total = 0
+        self.heartbeat_timeout_disconnects = 0
+        self._connection_lifetime_seconds = _RollingMetric()
+        self._has_attempted_connection = False
+        self._local_close_initiated = False
+        self._local_close_reason = ""
+        self._local_close_timestamp: str | None = None
+        self._local_close_reason_counts = {
+            reason: 0 for reason in sorted(LOCAL_CLOSE_REASONS)
+        }
+        self._last_disconnect: dict[str, Any] = {}
+        self._disconnect_history: deque[dict[str, Any]] = deque(maxlen=100)
         self.best_price_pending_events = 0
         self.best_price_alignment_recoveries = 0
         self.best_price_mismatches = 0
@@ -183,6 +277,9 @@ class MarketWebSocketManager:
             )
             if latency_csv_path else None
         )
+        self._diagnostics_enabled = os.getenv(
+            "LIVE_MARKET_WS_DIAGNOSTICS_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         diagnostics_default = (
             Path(getattr(self.repo, "db_path", "/opt/polymarket-btc-live/poly_live.sqlite3")).parent
             / "output" / "market_ws_latency_diagnostics.json"
@@ -214,17 +311,21 @@ class MarketWebSocketManager:
             self._stop.clear()
             self._ensure_persistence_writer()
             self._event_loop_watchdog_task = asyncio.create_task(
-                self._event_loop_watchdog(), name="market-ws-event-loop-watchdog"
+                self._event_loop_watchdog(
+                    capture_stacks=self._diagnostics_enabled
+                ),
+                name="market-ws-event-loop-watchdog",
             )
-            self._diagnostics_task = asyncio.create_task(
-                self._diagnostics_loop(), name="market-ws-latency-diagnostics"
-            )
+            if self._diagnostics_enabled:
+                self._diagnostics_task = asyncio.create_task(
+                    self._diagnostics_loop(), name="market-ws-latency-diagnostics"
+                )
             self._task = asyncio.create_task(self.run(url), name="polymarket-market-ws")
 
     async def stop(self) -> None:
         self._stop.set()
         if self._ws is not None:
-            await self._ws.close()
+            await self._close_websocket(self._ws, "LOCAL_CLOSE_SHUTDOWN")
         if self._task:
             try:
                 await asyncio.wait_for(self._task, 5)
@@ -286,7 +387,10 @@ class MarketWebSocketManager:
             try:
                 import websockets
             except Exception:
-                self.mark_disconnect("websockets package unavailable")
+                self.mark_disconnect(
+                    "websockets package unavailable",
+                    count_disconnect=False,
+                )
                 return
             connector = websockets.connect
         else:
@@ -302,6 +406,12 @@ class MarketWebSocketManager:
                     pass
                 continue
             self.status.status = "CONNECTING" if attempt == 0 else "RECONNECTING"
+            self.connection_attempts_total += 1
+            if self._has_attempted_connection:
+                self.reconnect_attempts_total += 1
+            self._has_attempted_connection = True
+            connected_this_attempt = False
+            active_ws = None
             try:
                 async with connector(
                     url,
@@ -317,9 +427,18 @@ class MarketWebSocketManager:
                     max_size=2 * 1024 * 1024,
                     compression=None,
                 ) as ws:
+                    active_ws = ws
+                    connected_this_attempt = True
                     self._ws = ws
                     self._connection_generation += 1
+                    self.successful_connections_total += 1
+                    self.connection_generations_total += 1
                     self._connection_started_monotonic = time.monotonic()
+                    self._local_close_initiated = False
+                    self._local_close_reason = ""
+                    self._local_close_timestamp = None
+                    self._last_recv_return_monotonic = None
+                    self._consecutive_recv_drain_count = 0
                     self._last_subscription_change_monotonic = self._connection_started_monotonic
                     self._connection_frame_index = 0
                     self._connection_diagnostics = self._connection_metadata(ws, url)
@@ -354,7 +473,14 @@ class MarketWebSocketManager:
             except Exception as exc:
                 self._ws = None
                 attempt += 1
-                self.mark_disconnect(f"{type(exc).__name__}: {exc}"[:500])
+                if not connected_this_attempt:
+                    self.connection_failures_total += 1
+                self.mark_disconnect(
+                    f"{type(exc).__name__}: {exc}"[:500],
+                    exc=exc,
+                    ws=active_ws,
+                    count_disconnect=connected_this_attempt,
+                )
                 try:
                     await asyncio.wait_for(
                         self._stop.wait(), min(30.0, 2 ** min(attempt, 5)) + random.random()
@@ -384,7 +510,9 @@ class MarketWebSocketManager:
             )
             if processor in done and not reader.done():
                 processor_error = processor.exception()
-                await ws.close()
+                await self._close_websocket(
+                    ws, "LOCAL_CLOSE_RECONNECT_POLICY"
+                )
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
                 if processor_error is not None:
@@ -427,6 +555,24 @@ class MarketWebSocketManager:
                     else len(str(raw).encode("utf-8"))
                 )
                 library_queue_depth = self._ws_internal_queue_depth(ws)
+                if library_queue_depth is None:
+                    self._ws_library_queue_depth_unavailable += 1
+                else:
+                    self._ws_library_queue_depth.observe(library_queue_depth)
+                if self._last_recv_return_monotonic is not None:
+                    self._recv_to_recv_gap_ms.observe(
+                        (recv_return - self._last_recv_return_monotonic) * 1000
+                    )
+                self._last_recv_return_monotonic = recv_return
+                recv_wait_ms = max(0.0, (recv_return - before_recv) * 1000)
+                if recv_wait_ms <= IMMEDIATE_RECV_THRESHOLD_MS:
+                    self._consecutive_recv_drain_count += 1
+                    self._max_consecutive_immediate_recv = max(
+                        self._max_consecutive_immediate_recv,
+                        self._consecutive_recv_drain_count,
+                    )
+                else:
+                    self._consecutive_recv_drain_count = 0
                 tcp_recv_q_bytes = self._tcp_recv_q_bytes(ws)
                 if raw == "PONG" or raw == b"PONG":
                     self.last_pong_at = now_iso()
@@ -439,6 +585,7 @@ class MarketWebSocketManager:
                 messages = payload if isinstance(payload, list) else [payload]
                 base_timing = {
                     "connection_generation": self._connection_generation,
+                    "generation_started_monotonic": self._connection_started_monotonic,
                     "before_recv_monotonic": before_recv,
                     "recv_return_monotonic": recv_return,
                     "socket_receive_wall_ms": socket_receive_wall_ms,
@@ -457,7 +604,7 @@ class MarketWebSocketManager:
                         receive_monotonic - self._last_subscription_change_monotonic
                         <= 5.0
                     ),
-                    "recv_wait_ms": (recv_return - before_recv) * 1000,
+                    "recv_wait_ms": recv_wait_ms,
                     "between_recv_gap_ms": between_recv_gap_ms,
                     "parse_start_monotonic": parse_start,
                     "parse_end_monotonic": parse_end,
@@ -482,7 +629,9 @@ class MarketWebSocketManager:
                         queue.put_nowait(item)
                     except asyncio.QueueFull:
                         self._handle_ingress_saturation(queue, item, resync)
-                        await ws.close()
+                        await self._close_websocket(
+                            ws, "LOCAL_CLOSE_INGRESS_SATURATION"
+                        )
                         raise ConnectionError("MARKET_WS_INGRESS_QUEUE_SATURATED")
                     self.ingress_frames_enqueued += 1
                     self.max_ingress_queue_depth = max(
@@ -537,9 +686,15 @@ class MarketWebSocketManager:
                         continue
                 timing["ingress_dequeued_monotonic"] = time.perf_counter()
                 timing["ingress_queue_wait_ms"] = (
-                    timing["ingress_dequeued_monotonic"]
-                    - timing["ingress_enqueued_monotonic"]
-                ) * 1000
+                    max(
+                        0.0,
+                        timing["ingress_dequeued_monotonic"]
+                        - timing["ingress_enqueued_monotonic"],
+                    ) * 1000
+                )
+                self._ingress_queue_wait_ms.observe(
+                    timing["ingress_queue_wait_ms"]
+                )
                 timing["ingress_queue_depth"] = queue.qsize()
                 self.ingress_frames_dequeued += 1
                 self.process_message(message, timing=timing)
@@ -553,7 +708,12 @@ class MarketWebSocketManager:
                         json.dumps(diagnostic, separators=(",", ":"), default=str),
                     )
                     self._begin_ingress_resync(resync_error, resync)
-                    await ws.close()
+                    close_reason = (
+                        "LOCAL_CLOSE_BEST_PRICE_MISMATCH"
+                        if resync_error == "BEST_PRICE_MISMATCH"
+                        else "LOCAL_CLOSE_RECONNECT_POLICY"
+                    )
+                    await self._close_websocket(ws, close_reason)
             finally:
                 queue.task_done()
         if resync_error:
@@ -662,7 +822,9 @@ class MarketWebSocketManager:
                         (time.perf_counter() - rotation_started) * 1000,
                     )
                     self.dynamic_subscription_fallbacks += 1
-                    await ws.close()
+                    await self._close_websocket(
+                        ws, "LOCAL_CLOSE_RECONNECT_POLICY"
+                    )
                     return
             if add:
                 self._logger.info(
@@ -693,9 +855,11 @@ class MarketWebSocketManager:
             return {"connected": False, "messages": 0, "error": "websockets package is not available"}
 
         received = 0
+        connected = False
         self.status.status = "CONNECTING"
         try:
             async with websockets.connect(url, ping_interval=None, close_timeout=2) as ws:
+                connected = True
                 self.status.status = "CONNECTED"
                 await ws.send(json.dumps(self.subscription_message(asset_ids)))
 
@@ -728,7 +892,11 @@ class MarketWebSocketManager:
                     heartbeat_task.cancel()
             return {"connected": True, "messages": received, "error": ""}
         except Exception as exc:
-            self.mark_disconnect(f"{type(exc).__name__}: {exc}")
+            self.mark_disconnect(
+                f"{type(exc).__name__}: {exc}",
+                exc=exc,
+                count_disconnect=connected,
+            )
             return {"connected": False, "messages": received, "error": f"{type(exc).__name__}: {exc}"}
 
     def reconnect_delay_seconds(self) -> float:
@@ -739,7 +907,9 @@ class MarketWebSocketManager:
         self, message: dict[str, Any], timing: dict[str, Any] | None = None
     ) -> bool:
         started = time.perf_counter()
-        diagnostic_timing = timing is not None
+        diagnostic_timing = timing is not None and (
+            self._diagnostics_enabled or self._latency_csv is not None
+        )
         timing = timing if timing is not None else {}
         timing["handler_entry_monotonic"] = started
         event_type = str(message.get("event_type") or message.get("type") or "").lower()
@@ -750,9 +920,13 @@ class MarketWebSocketManager:
         )
         timing["exchange_timestamp_ms"] = exchange_ms
         if exchange_ms is not None and timing.get("socket_receive_wall_ms") is not None:
-            timing["exchange_to_socket_receive_ms"] = (
-                timing["socket_receive_wall_ms"] - exchange_ms
+            reader_age_ms = max(
+                0, int(timing["socket_receive_wall_ms"]) - exchange_ms
             )
+            timing["exchange_to_socket_receive_ms"] = reader_age_ms
+            timing["exchange_age_at_reader_ms"] = reader_age_ms
+            self._exchange_age_at_reader_ms.observe(reader_age_ms)
+        timing["reader_recv_timestamp_ns"] = timing.get("receive_wall_ns")
         if timing.get("recv_return_monotonic") is not None:
             timing["socket_receive_to_handler_ms"] = (
                 started - timing["recv_return_monotonic"]
@@ -762,7 +936,12 @@ class MarketWebSocketManager:
         processing_monotonic_ns = time.monotonic_ns()
         timing["processing_wall_ns"] = processing_wall_ns
         timing["processing_monotonic_ns"] = processing_monotonic_ns
+        timing["processor_start_timestamp_ns"] = processing_wall_ns
         now_ms = self._clock_ms()
+        if exchange_ms is not None:
+            processing_age_ms = max(0, now_ms - exchange_ms)
+            timing["exchange_age_at_processing_ms"] = processing_age_ms
+            self._exchange_age_at_processing_ms.observe(processing_age_ms)
         frame = None
         # Local receipt time is observability/persistence only. It is never used
         # for market-data freshness or entry authorization.
@@ -862,9 +1041,10 @@ class MarketWebSocketManager:
                 and book.ready
                 and not book.alignment_pending
             )
-            self._record_book_event_history(
-                message, timing=timing, frame=frame, received_at=received_at
-            )
+            if self._diagnostics_enabled:
+                self._record_book_event_history(
+                    message, timing=timing, frame=frame, received_at=received_at
+                )
             if frame.out_of_order:
                 self.out_of_order_frames += 1
                 self.rejected_frames += 1
@@ -1093,9 +1273,21 @@ class MarketWebSocketManager:
                     asyncio.run(result)
 
         ended = time.perf_counter()
-        elapsed_ms = (ended - started) * 1000
+        elapsed_ms = max(0.0, (ended - started) * 1000)
+        processor_finish_wall_ns = time.time_ns()
         timing["handler_end_monotonic"] = ended
+        timing["processor_finish_timestamp_ns"] = processor_finish_wall_ns
+        timing["market_processing_ms"] = elapsed_ms
         timing["total_processing_ms"] = elapsed_ms
+        self._market_processing_ms.observe(elapsed_ms)
+        self._record_reconnect_age(
+            stale=bool(
+                frame is not None
+                and frame.rejected_reason == "STALE_EXCHANGE_TIMESTAMP"
+            ),
+            timing=timing,
+            observed_monotonic=ended,
+        )
         timing["handler_to_strategy_ms"] = (
             (timing.get("strategy_scheduled_monotonic") or ended) - started
         ) * 1000
@@ -1411,6 +1603,168 @@ class MarketWebSocketManager:
             }, stale=stale)
 
     @staticmethod
+    def _reconnect_age_bucket(age_seconds: float) -> str:
+        age = max(0.0, float(age_seconds))
+        if age < 1:
+            return "0_1s"
+        if age < 5:
+            return "1_5s"
+        if age < 15:
+            return "5_15s"
+        if age < 30:
+            return "15_30s"
+        if age < 60:
+            return "30_60s"
+        return "gt_60s"
+
+    def _record_reconnect_age(
+        self, *, stale: bool, timing: dict[str, Any],
+        observed_monotonic: float,
+    ) -> None:
+        explicit_age = timing.get("generation_age_seconds")
+        generation_started = timing.get("generation_started_monotonic")
+        if explicit_age is not None:
+            age_seconds = max(0.0, float(explicit_age))
+        elif generation_started is not None and float(generation_started) > 0:
+            age_seconds = max(
+                0.0, observed_monotonic - float(generation_started)
+            )
+        else:
+            return
+        bucket = self._reconnect_age_bucket(age_seconds)
+        self._messages_by_reconnect_age_bucket[bucket] += 1
+        if stale:
+            self._stale_by_reconnect_age_bucket[bucket] += 1
+
+    def _record_event_loop_lag(self, lag_ms: float) -> None:
+        observed = self._event_loop_lag_metric.observe(lag_ms) or 0.0
+        self._event_loop_lag_ms = observed
+        self._event_loop_lag_max_ms = max(
+            self._event_loop_lag_max_ms, observed
+        )
+        self._event_loop_lag_samples.append(observed)
+        for threshold in EVENT_LOOP_LAG_BUCKETS_MS:
+            if observed > threshold:
+                self._event_loop_lag_buckets[f"gt_{threshold}ms"] += 1
+
+    async def _close_websocket(self, ws: Any, reason: str) -> None:
+        normalized = (
+            reason if reason in LOCAL_CLOSE_REASONS
+            else "LOCAL_CLOSE_OTHER"
+        )
+        if not self._local_close_initiated:
+            self._local_close_initiated = True
+            self._local_close_reason = normalized
+            self._local_close_timestamp = now_iso()
+            self._local_close_reason_counts[normalized] += 1
+        await ws.close()
+
+    @staticmethod
+    def _received_close_details(
+        ws: Any | None, exc: BaseException | None,
+    ) -> tuple[Any, Any, Any]:
+        received = getattr(exc, "rcvd", None) if exc is not None else None
+        sent = getattr(exc, "sent", None) if exc is not None else None
+        close_code_received = getattr(received, "code", None)
+        close_reason_received = getattr(received, "reason", None)
+        if close_code_received is None and exc is not None:
+            close_code_received = getattr(exc, "code", None)
+        if close_reason_received is None and exc is not None:
+            close_reason_received = getattr(exc, "reason", None)
+        if close_code_received is None and ws is not None:
+            close_code_received = getattr(ws, "close_code", None)
+        if close_reason_received is None and ws is not None:
+            close_reason_received = getattr(ws, "close_reason", None)
+        close_code_sent = getattr(sent, "code", None)
+        return close_code_received, close_reason_received, close_code_sent
+
+    @staticmethod
+    def _is_evidence_based_heartbeat_timeout(
+        exc: BaseException | None, text: str,
+    ) -> bool:
+        if exc is None or type(exc).__name__ not in {
+            "ConnectionClosed", "ConnectionClosedError",
+        }:
+            return False
+        normalized = text.lower()
+        return (
+            "keepalive ping timeout" in normalized
+            or "ping timeout" in normalized
+        )
+
+    def telemetry_snapshot(self) -> dict[str, Any]:
+        library = self._ws_library_queue_depth.snapshot()
+        recv_gap = self._recv_to_recv_gap_ms.snapshot()
+        reader_age = self._exchange_age_at_reader_ms.snapshot()
+        queue_wait = self._ingress_queue_wait_ms.snapshot()
+        processing = self._market_processing_ms.snapshot()
+        processing_age = self._exchange_age_at_processing_ms.snapshot()
+        loop_lag = self._event_loop_lag_metric.snapshot()
+        lifetime = self._connection_lifetime_seconds.snapshot()
+        return {
+            "ws_library_queue_depth_current": library["current"],
+            "ws_library_queue_depth_high_watermark": library["max"],
+            "ws_library_queue_depth_p50": library["p50"],
+            "ws_library_queue_depth_p95": library["p95"],
+            "ws_library_queue_depth_p99": library["p99"],
+            "ws_library_queue_depth_sample_count": library["sample_count"],
+            "ws_library_queue_depth_unavailable_samples": (
+                self._ws_library_queue_depth_unavailable
+            ),
+            "consecutive_recv_drain_count": (
+                self._consecutive_recv_drain_count
+            ),
+            "max_consecutive_immediate_recv": (
+                self._max_consecutive_immediate_recv
+            ),
+            "immediate_recv_threshold_ms": IMMEDIATE_RECV_THRESHOLD_MS,
+            "recv_to_recv_gap_ms": recv_gap,
+            "event_loop_lag_ms": loop_lag,
+            "event_loop_lag_buckets": dict(self._event_loop_lag_buckets),
+            "exchange_age_at_reader_ms": reader_age,
+            "ingress_queue_wait_ms": queue_wait,
+            "market_processing_ms": processing,
+            "exchange_age_at_processing_ms": processing_age,
+            "messages_total_by_reconnect_age_bucket": dict(
+                self._messages_by_reconnect_age_bucket
+            ),
+            "stale_total_by_reconnect_age_bucket": dict(
+                self._stale_by_reconnect_age_bucket
+            ),
+            "disconnects_total": self.disconnects_total,
+            "connection_attempts_total": self.connection_attempts_total,
+            "reconnect_attempts_total": self.reconnect_attempts_total,
+            "successful_connections_total": self.successful_connections_total,
+            "connection_generations_total": self.connection_generations_total,
+            "connection_failures_total": self.connection_failures_total,
+            "connection_lifetime_seconds": lifetime,
+            "heartbeat_timeout_disconnects": (
+                self.heartbeat_timeout_disconnects
+            ),
+            "local_close_reason_counts": dict(
+                self._local_close_reason_counts
+            ),
+            "last_disconnect": dict(self._last_disconnect),
+            "recent_disconnects": list(self._disconnect_history)[-20:],
+            "websocket_configuration": {
+                "ping_interval": self._connection_diagnostics.get(
+                    "ping_interval"
+                ),
+                "ping_timeout": self._connection_diagnostics.get(
+                    "ping_timeout"
+                ),
+                "close_timeout": self._connection_diagnostics.get(
+                    "close_timeout", 5
+                ),
+                "max_queue_high": self.library_queue_high_water,
+                "max_queue_low": self.library_queue_low_water,
+            },
+            "sample_capacity_per_rolling_metric": (
+                TELEMETRY_SAMPLE_CAPACITY
+            ),
+        }
+
+    @staticmethod
     def _ws_internal_queue_depth(ws: Any) -> int | None:
         try:
             return len(ws.recv_messages.frames)
@@ -1446,6 +1800,7 @@ class MarketWebSocketManager:
             "compression_extensions": extensions,
             "ping_interval": getattr(ws, "ping_interval", None),
             "ping_timeout": getattr(ws, "ping_timeout", None),
+            "close_timeout": getattr(ws, "close_timeout", None),
             "local_address": str(getattr(ws, "local_address", None)),
             "remote_address": str(getattr(ws, "remote_address", None)),
             "proxy_environment": bool(
@@ -1453,18 +1808,19 @@ class MarketWebSocketManager:
             ),
         }
 
-    async def _event_loop_watchdog(self) -> None:
-        interval = 0.01
+    async def _event_loop_watchdog(
+        self, *, capture_stacks: bool = True,
+    ) -> None:
+        interval = 0.01 if capture_stacks else 0.1
         expected = time.perf_counter() + interval
         while not self._stop.is_set():
             await asyncio.sleep(interval)
             current = time.perf_counter()
             lag_ms = max(0.0, (current - expected) * 1000)
-            self._event_loop_lag_ms = lag_ms
-            self._event_loop_lag_max_ms = max(self._event_loop_lag_max_ms, lag_ms)
-            self._event_loop_lag_samples.append(lag_ms)
+            self._record_event_loop_lag(lag_ms)
             if (
-                lag_ms >= 50.0
+                capture_stacks
+                and lag_ms >= 50.0
                 and current - self._last_stall_capture_monotonic >= 1.0
             ):
                 self._last_stall_capture_monotonic = current
@@ -2241,10 +2597,75 @@ class MarketWebSocketManager:
         except (TypeError, ValueError):
             return None
 
-    def mark_disconnect(self, error: str = "") -> None:
+    def mark_disconnect(
+        self, error: str = "", *, exc: BaseException | None = None,
+        ws: Any | None = None, count_disconnect: bool = True,
+    ) -> None:
+        exception_text = error or (
+            f"{type(exc).__name__}: {exc}" if exc is not None else ""
+        )
+        close_code_received, close_reason_received, close_code_sent = (
+            self._received_close_details(ws, exc)
+        )
+        if count_disconnect:
+            self.disconnects_total += 1
+            connection_lifetime_seconds = None
+            if self._connection_started_monotonic > 0:
+                connection_lifetime_seconds = max(
+                    0.0,
+                    time.monotonic() - self._connection_started_monotonic,
+                )
+                self._connection_lifetime_seconds.observe(
+                    connection_lifetime_seconds
+                )
+            if self._is_evidence_based_heartbeat_timeout(
+                exc, exception_text
+            ):
+                self.heartbeat_timeout_disconnects += 1
+            disconnect = {
+                "generation": self._connection_generation,
+                "disconnect_timestamp": now_iso(),
+                "exception_class": (
+                    type(exc).__name__ if exc is not None else ""
+                ),
+                "exception_text": exception_text[:500],
+                "local_close_initiated": self._local_close_initiated,
+                "local_close_reason": (
+                    self._local_close_reason
+                    if self._local_close_initiated else ""
+                ),
+                "local_close_timestamp": self._local_close_timestamp,
+                "close_code_received": close_code_received,
+                "close_reason_received": close_reason_received,
+                "close_code_sent": close_code_sent,
+                "last_ping_timestamp": self.last_ping_at,
+                "last_pong_timestamp": self.last_pong_at,
+                "connection_lifetime_seconds": (
+                    round(connection_lifetime_seconds, 4)
+                    if connection_lifetime_seconds is not None else None
+                ),
+                "event_loop_lag_ms": round(
+                    self._event_loop_lag_ms, 4
+                ),
+                "event_loop_lag_max_lifetime_ms": round(
+                    self._event_loop_lag_max_ms, 4
+                ),
+                "ws_library_queue_depth_last_observed": (
+                    self._ws_library_queue_depth.current
+                ),
+                "ingress_queue_depth": (
+                    self._ingress_queue.qsize()
+                    if self._ingress_queue is not None else 0
+                ),
+            }
+            self._last_disconnect = disconnect
+            self._disconnect_history.append(disconnect)
         self._logger.warning(
-            "MARKET_WS_DISCONNECTED generation=%s reason=%s",
-            self._connection_generation, error or "UNKNOWN",
+            "MARKET_WS_DISCONNECTED generation=%s reason=%s "
+            "local_close=%s local_close_reason=%s",
+            self._connection_generation, exception_text or "UNKNOWN",
+            self._local_close_initiated,
+            self._local_close_reason if self._local_close_initiated else "",
         )
         self.status.status = "DISCONNECTED"
         self.status.reconnect_attempts += 1
@@ -2310,6 +2731,8 @@ class MarketWebSocketManager:
                 for asset, book in self.order_books.books.items()
             },
             "raw_payload_persistence": self.persist_raw_payloads,
+            "diagnostics_enabled": self._diagnostics_enabled,
+            "latency_record_count": len(self._latency_records),
             "snapshot_min_interval_seconds": self.snapshot_min_interval_seconds,
             "freshness_threshold_ms": self.stale_after_seconds * 1000,
             "future_tolerance_ms": self.future_tolerance_ms,
@@ -2395,6 +2818,7 @@ class MarketWebSocketManager:
                 self._last_book_mismatch_diagnostic
             ),
             "idle_ready_checks_over_threshold": self.idle_ready_checks_over_threshold,
+            "hot_path_telemetry": self.telemetry_snapshot(),
         }
 
 
@@ -2721,6 +3145,7 @@ class UserWebSocketManager:
         values = {
             "user_ws_status": self.status.status,
             "user_ws_health": json.dumps(self.health(), sort_keys=True),
+            "user_ws_last_message_at": self.status.last_message_at or "",
         }
         try:
             asyncio.get_running_loop()

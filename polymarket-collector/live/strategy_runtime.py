@@ -25,7 +25,14 @@ from .strategy import (
 from .strategy_repository import StrategyRepository, stable_id
 
 
+CRITICAL_ALIGNMENT_GRACE_SECONDS = 0.25
+CRITICAL_ALIGNMENT_POLL_SECONDS = 0.005
+CRITICAL_ALIGNMENT_TRANSIENT_REASONS = {
+    "BEST_PRICE_PENDING_DEPTH", "BOOK_NOT_READY", "FRAME_SUPERSEDED",
+}
+
 def _is_confirmed_fak_zero_fill_response(response: dict[str, Any]) -> bool:
+
     if response.get("polymarket_order_id"):
         return False
     reason = " ".join(str(response.get("failure_reason") or "").lower().replace("_", " ").split())
@@ -93,6 +100,9 @@ class LiveStrategyRuntime:
         self.critical_triggers_processed = 0
         self.critical_triggers_dropped = 0
         self.max_critical_queue_depth = 0
+        self.critical_alignment_waits = 0
+        self.critical_alignment_recoveries = 0
+        self.critical_alignment_timeouts = 0
 
         # Last observed top-of-book prices per condition/token.
         # Critical signals are latched only when price ENTERS an exact
@@ -397,6 +407,56 @@ class LiveStrategyRuntime:
             ):
                 return {**result, "ready": False, "reason": "FRAME_SUPERSEDED"}
         return result
+
+    async def _freshness_with_alignment_grace(
+        self, condition_id: str, update: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Wait briefly for companion depth only for a latched exact entry.
+
+        The trigger itself remains age-bounded by _freshness. Every non-
+        transient integrity failure still fails closed immediately.
+        """
+        result = self._freshness(condition_id, update)
+        if result.get("ready"):
+            return result
+        if not update.get("_critical_entry_latched"):
+            return result
+        if str(result.get("reason") or "") not in (
+            CRITICAL_ALIGNMENT_TRANSIENT_REASONS
+        ):
+            return result
+
+        self.critical_alignment_waits += 1
+        started = time.monotonic()
+        deadline = started + min(
+            CRITICAL_ALIGNMENT_GRACE_SECONDS,
+            max(0.0, float(self.config.max_market_data_age_seconds)),
+        )
+        while time.monotonic() < deadline:
+            await asyncio.sleep(CRITICAL_ALIGNMENT_POLL_SECONDS)
+            result = self._freshness(condition_id, update)
+            if result.get("ready"):
+                self.critical_alignment_recoveries += 1
+                return {
+                    **result,
+                    "alignment_grace_recovered": True,
+                    "alignment_grace_wait_ms": round(
+                        (time.monotonic() - started) * 1000, 3
+                    ),
+                }
+            if str(result.get("reason") or "") not in (
+                CRITICAL_ALIGNMENT_TRANSIENT_REASONS
+            ):
+                return result
+
+        self.critical_alignment_timeouts += 1
+        return {
+            **result,
+            "alignment_grace_recovered": False,
+            "alignment_grace_wait_ms": round(
+                (time.monotonic() - started) * 1000, 3
+            ),
+        }
 
     def _record_freshness_block(
         self, *, market: dict[str, Any], reason: str, intent_id: str | None = None,
@@ -1169,7 +1229,9 @@ class LiveStrategyRuntime:
         selected_update = next(
             item for item in updates if str(item.get("asset_id")) == decision.token_id
         )
-        freshness = self._freshness(condition_id, selected_update)
+        freshness = await self._freshness_with_alignment_grace(
+            condition_id, selected_update
+        )
         if trigger_update is not None:
             self._trace_critical(
                 "PRE_INTENT_GATE", update=trigger_update,
@@ -1342,7 +1404,9 @@ class LiveStrategyRuntime:
         fee_rate: Decimal,
     ) -> None:
         event_id = str(market["event_id"])
-        freshness = self._freshness(str(market["condition_id"]), update)
+        freshness = await self._freshness_with_alignment_grace(
+            str(market["condition_id"]), update
+        )
         if not freshness.get("ready"):
             reason = str(freshness.get("reason") or "FRESHNESS_FAILED")
             self.repo.update_intent(
@@ -2664,20 +2728,41 @@ class LiveStrategyRuntime:
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
             if self.config.real_submission_armed():
-                response = await self.adapter.heartbeat()
-                success = bool(response.get("success"))
-                self.base.set_state(
-                    "order_heartbeat_status", "OK" if success else "FAILED", "heartbeat"
-                )
-                if not success:
-                    self.repo.set_pause_entries(
-                        True, "heartbeat", "HEARTBEAT_FAILURE",
-                        owner="MACHINE", auto_recoverable=True,
+                try:
+                    response = await self.adapter.heartbeat()
+                    success = bool(response.get("success"))
+                    values = {
+                        "order_heartbeat_status": "OK" if success else "FAILED",
+                    }
+                    if success:
+                        values["last_successful_heartbeat_at"] = now_iso()
+                    self.base.set_states(values, "heartbeat")
+                    if not success:
+                        _record, acquired = self.repo.acquire_pause(
+                            actor="heartbeat",
+                            reason="HEARTBEAT_FAILURE",
+                            owner="MACHINE",
+                        )
+                        if acquired:
+                            self.repo.alert(
+                                alert_type="HEARTBEAT", severity="CRITICAL",
+                                reason_code="HEARTBEAT_FAILURE",
+                                message="Order heartbeat failed; entries paused",
+                            )
+                except Exception as exc:
+                    self.base.set_states(
+                        {
+                            "order_heartbeat_status": "FAILED",
+                            "last_heartbeat_error": (
+                                f"{type(exc).__name__}: {exc}"
+                            )[:500],
+                        },
+                        "heartbeat",
                     )
-                    self.repo.alert(
-                        alert_type="HEARTBEAT", severity="CRITICAL",
-                        reason_code="HEARTBEAT_FAILURE",
-                        message="Order heartbeat failed; entries paused",
+                    self.repo.acquire_pause(
+                        actor="heartbeat",
+                        reason="HEARTBEAT_FAILURE",
+                        owner="MACHINE",
                     )
             try:
                 await asyncio.wait_for(
@@ -2699,6 +2784,15 @@ class LiveStrategyRuntime:
             "critical_triggers_processed": self.critical_triggers_processed,
             "critical_triggers_dropped": self.critical_triggers_dropped,
             "max_critical_queue_depth": self.max_critical_queue_depth,
+            "critical_alignment_waits": self.critical_alignment_waits,
+            "critical_alignment_recoveries": (
+                self.critical_alignment_recoveries
+            ),
+            "critical_alignment_timeouts": self.critical_alignment_timeouts,
+            "critical_alignment_grace_ms": int(
+                CRITICAL_ALIGNMENT_GRACE_SECONDS * 1000
+            ),
+            "entry_slot": self.repo.entry_slot_status(),
             "hot_state_age_ms": (
                 max(
                     0.0,

@@ -22,6 +22,7 @@ from .order_manager import OrderManager
 from .paper_trading import PaperTradingEngine
 from .public_client import MockPublicClobClient, PublicClobClient
 from .reconciliation import ReconciliationWorker
+from .pause_recovery import request_manual_resume
 from .repository import LiveRepository, now_iso
 from .risk_manager import RiskManager
 from .trading_engine import TradingEngine
@@ -1082,32 +1083,20 @@ def resume_entries(
             raise HTTPException(status_code=409, detail=result)
         return result
     config, repo, *_ = services()
-    strategy_repo, runtime = strategy_services()
-    status = runtime.health()
-    blockers: list[str] = []
-    if status.get("market_data_readiness") != "READY":
-        blockers.append("MARKET_DATA_NOT_READY")
-    if status.get("reconciliation_readiness") != "READY":
-        blockers.append("RECONCILIATION_NOT_READY")
-    if config.execution_mode == "REAL_TRADING":
-        if (
-            not config.continuous_trading_enabled
-            and repo.get_state("canary_armed", "false").lower() != "true"
-        ):
-            blockers.append("CANARY_NOT_ARMED")
-        if services()[7].health().get("status") != "CONNECTED":
-            blockers.append("USER_WS_NOT_CONNECTED")
-        if repo.get_state("order_heartbeat_status", "DISABLED") != "OK":
-            blockers.append("HEARTBEAT_NOT_READY")
-    if blockers:
+    strategy_repo, _runtime = strategy_services()
+    result = request_manual_resume(
+        config, repo, strategy_repo, services()[6], services()[7]
+    )
+    if not result.get("ok"):
         strategy_repo.timeline(
-            severity="WARNING", category="OPERATOR", component="ui", source="operator",
-            requested_action="RESUME_ENTRIES", reason_code="READINESS_FAILED",
-            result_status="BLOCKED", parameters_json={"blockers": blockers},
+            severity="WARNING", category="OPERATOR", component="ui",
+            source="operator", requested_action="RESUME_ENTRIES",
+            reason_code=str(result.get("reason") or "READINESS_FAILED"),
+            result_status="BLOCKED",
+            parameters_json={"blockers": result.get("blockers", [])},
         )
-        raise HTTPException(status_code=409, detail={"reason": "READINESS_FAILED", "blockers": blockers})
-    strategy_repo.set_pause_entries(False, "operator", "READINESS_VERIFIED")
-    return {"ok": True, "pause_entries": False}
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @router.post("/emergency-close/preview")

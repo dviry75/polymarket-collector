@@ -188,7 +188,8 @@ def test_trader_command_owner_changes_state_over_ipc_only():
 
 def test_continuous_resume_does_not_require_canary_but_keeps_other_gates():
     from live.config import LiveConfig
-    from live.router import configure, services, strategy_services
+    from live.router import configure, services
+    from live.repository import now_iso
     from live.trader_commands import TraderCommandHandler
 
     async def scenario():
@@ -202,17 +203,39 @@ def test_continuous_resume_does_not_require_canary_but_keeps_other_gates():
             repo = services()[1]
             repo.set_state("canary_armed", "false")
             repo.set_state("order_heartbeat_status", "OK")
-            with patch.object(
-                strategy_services()[1], "health",
-                return_value={
-                    "market_data_readiness": "READY",
-                    "reconciliation_readiness": "READY",
+            repo.set_state("kill_switch", "false", "operator")
+            repo.set_state("strategy_readiness", "READY")
+            repo.set_state("reconciliation_readiness", "READY")
+            repo.set_state("live_blocked_by_reconciliation", "false")
+            repo.set_state("geographic_availability", "ALLOWED")
+            repo.set_state("geographic_checked_at", now_iso())
+            repo.set_state("recovery_engine_status", "HEALTHY")
+            healthy_market = {
+                "status": "CONNECTED",
+                "stale": False,
+                "subscribed_asset_ids": ["yes"],
+                "books": {
+                    "yes": {
+                        "ready": True,
+                        "reason": "READY",
+                        "exchange_age_ms": 0,
+                    }
                 },
+            }
+            healthy_user = {
+                "status": "CONNECTED",
+                "stale": False,
+                "last_message_at": now_iso(),
+            }
+            with patch.object(
+                services()[6], "health", return_value=healthy_market,
             ), patch.object(
-                services()[7], "health", return_value={"status": "CONNECTED"}
+                services()[7], "health", return_value=healthy_user,
             ):
                 result = await TraderCommandHandler()("RESUME_ENTRIES", {})
-            assert result == {"ok": True, "pause_entries": False}
+            assert result["ok"] is True
+            assert result["pause_entries"] is False
+            assert result["blockers"] == []
             assert repo.get_state("pause_entries") == "false"
 
     asyncio.run(scenario())

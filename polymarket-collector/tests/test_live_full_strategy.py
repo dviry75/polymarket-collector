@@ -297,8 +297,25 @@ def test_reconciled_exit_fill_is_idempotent_and_preserves_true_dust():
         assert repeated["remaining_shares_text"] == "0.006664"
         assert repeated["exit_value_text"] == "4.048"
         assert repeated["state"] == "DUST"
+        assert repeated["closed_at"] is not None
         assert repeated["tp_intent_id"] is None
         assert repeated["active_exit_intent_id"] is None
+        with _base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions SET closed_at=NULL "
+                "WHERE position_id=?", (position["position_id"],),
+            )
+            conn.commit()
+        repaired = strategy.repair_terminal_dust_slots(actor="test")
+        assert len(repaired) == 1
+        repaired_position = strategy.position_for_token(position["token_id"])
+        assert repaired_position["closed_at"] is not None
+        next_entry = strategy.reserve_event_entry(
+            event_id="after-terminal-dust", condition_id="after-terminal-dust-c",
+            token_id="after-terminal-dust-token", side="NO", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT", require_empty_slot=True,
+        )
+        assert not next_entry.get("_blocked")
     finally:
         temp.cleanup()
 
@@ -632,6 +649,9 @@ def test_reconciliation_recovers_remote_position_then_requires_clean_pass():
         corrected = asyncio.run(worker.run_once("test"))
         assert corrected["status"] == "gaps"
         assert strategy.position_for_token("remote-token")["remaining_shares_text"] == "7"
+        backed_off = asyncio.run(worker.run_once("test"))
+        assert backed_off["status"] == "backoff"
+        worker._rate_limit_retry_after = 0
         clean = asyncio.run(worker.run_once("test"))
         assert clean["status"] == "ok"
         assert base.get_state("reconciliation_readiness") == "READY"
@@ -1132,6 +1152,7 @@ def test_open_dust_still_occupies_continuous_entry_slot_fail_closed():
         assert position["state"] == "DUST"
         assert position["closed_at"] is None
 
+        assert strategy.repair_terminal_dust_slots(actor="test") == []
         blocked = strategy.reserve_event_entry(
             event_id="event-after-open-dust", condition_id="condition-after-open-dust",
             token_id="token-after-open-dust", side="NO", simultaneous=False,
@@ -1287,6 +1308,67 @@ def test_latched_critical_trigger_is_not_rejected_as_frame_superseded():
     assert regular["ready"] is False
     assert regular["reason"] == "FRAME_SUPERSEDED"
 
+
+
+def test_latched_entry_waits_for_transient_depth_alignment_only():
+    runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+    runtime.config = type(
+        "CriticalTriggerConfig",
+        (),
+        {"max_market_data_age_seconds": 2},
+    )()
+    runtime.critical_alignment_waits = 0
+    runtime.critical_alignment_recoveries = 0
+    runtime.critical_alignment_timeouts = 0
+
+    states = [
+        {"ready": False, "reason": "BEST_PRICE_PENDING_DEPTH"},
+        {"ready": False, "reason": "BEST_PRICE_PENDING_DEPTH"},
+        {
+            "ready": True,
+            "reason": "READY",
+            "book_versions": {
+                "yes-token": {"generation": 1, "update_number": 3}
+            },
+        },
+    ]
+
+    def freshness(_condition_id):
+        if len(states) > 1:
+            return states.pop(0)
+        return states[0]
+
+    runtime._market_freshness = freshness
+    trigger = {
+        "asset_id": "yes-token",
+        "generation": 1,
+        "update_number": 2,
+        "exchange_timestamp_ms": int(
+            datetime.now(timezone.utc).timestamp() * 1000
+        ),
+        "_critical_trigger_latched": True,
+        "_critical_entry_latched": True,
+    }
+    recovered = asyncio.run(
+        runtime._freshness_with_alignment_grace("condition-1", trigger)
+    )
+
+    assert recovered["ready"] is True
+    assert recovered["alignment_grace_recovered"] is True
+    assert recovered["alignment_grace_wait_ms"] > 0
+    assert runtime.critical_alignment_waits == 1
+    assert runtime.critical_alignment_recoveries == 1
+    assert runtime.critical_alignment_timeouts == 0
+
+    runtime._market_freshness = lambda _condition_id: {
+        "ready": False,
+        "reason": "BEST_PRICE_MISMATCH",
+    }
+    blocked = asyncio.run(
+        runtime._freshness_with_alignment_grace("condition-1", trigger)
+    )
+    assert blocked["reason"] == "BEST_PRICE_MISMATCH"
+    assert runtime.critical_alignment_waits == 1
 
 
 def test_single_stop_edge_survives_conflation():
@@ -2219,6 +2301,78 @@ def test_zero_fill_without_remote_id_is_terminal_and_reconciliation_clean():
         intent = strategy.intent(attempt["entry_intent_id"])
         assert intent["state"] == "ZERO_FILL"
         assert intent["remote_order_id"] is None
+    finally:
+        temp.cleanup()
+
+
+def test_reconciliation_submission_handoff_expires_fail_closed():
+    temp, base, strategy = build_repo()
+    try:
+        strategy.set_pause_entries(False, "operator", "PRECONDITION")
+        attempt = strategy.reserve_event_entry(
+            event_id="handoff-event", condition_id="handoff-condition",
+            token_id="handoff-token", side="YES", simultaneous=False,
+            reason_code="ENTRY_PRICE_EXACT",
+        )
+        worker = ReconciliationWorker(base, MockTradingAdapter(), strategy)
+        fresh = asyncio.run(worker.run_once("test"))
+        assert fresh["status"] == "ok"
+        assert fresh["gaps"] == []
+        assert not strategy.pause_entries()
+
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_intents SET created_at=?,updated_at=? "
+                "WHERE intent_id=?",
+                ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00",
+                 attempt["entry_intent_id"]),
+            )
+            conn.commit()
+        expired = asyncio.run(worker.run_once("test"))
+        assert expired["status"] == "gaps"
+        assert expired["gaps"][0]["type"] == "durable_intent_without_remote_id"
+        assert strategy.pause_entries()
+        assert base.get_state("pause_auto_recoverable") == "false"
+    finally:
+        temp.cleanup()
+
+
+def test_bounded_entry_position_correction_is_auto_recoverable():
+    temp, base, strategy = build_repo()
+    try:
+        strategy.set_pause_entries(False, "operator", "PRECONDITION")
+        event = "bounded-correction"
+        condition = "condition-bounded-correction"
+        token = "token-bounded-correction"
+        base.upsert_market({
+            "event_id": event, "condition_id": condition,
+            "yes_token_id": token, "no_token_id": "other-token",
+            "token_mapping_status": "verified", "accepting_orders": True,
+            "min_order_size": "5",
+        })
+        reserve_and_open(
+            strategy, event=event, shares=Decimal("5.5"),
+            minimum=Decimal("5"), sellable=Decimal("0"),
+        )
+        adapter = MockTradingAdapter()
+        adapter.positions = [{
+            "condition_id": condition, "token_id": token, "outcome": "YES",
+            "size": "5.5042", "average_price": "0.74", "current_value": "4.07",
+        }]
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert result["status"] == "gaps"
+        assert result["gaps"][0]["type"] == "remote_position_corrected_local"
+        assert base.get_state("pause_owner") == "RECONCILIATION"
+        assert base.get_state("release_policy") == "AUTO_AFTER_REPAIR_AND_VERIFICATION"
+        assert base.get_state("pause_auto_recoverable") == "false"
+        clean = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        assert clean["status"] == "ok"
+        assert base.get_state("pause_auto_recoverable") == "true"
+        assert base.get_state("recovery_financial_verified_generation") == base.get_state(
+            "pause_generation"
+        )
     finally:
         temp.cleanup()
 

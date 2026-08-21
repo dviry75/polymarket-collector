@@ -12,12 +12,18 @@ from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso
 from .dashboard_schema import mark_reconciled_provenance
 from .strategy_repository import StrategyRepository, sanitize
+from .reconciliation_stability import (
+    authoritative_token_balance, classify_missing_position,
+    ingest_maker_exit_fills,
+)
 
 
 
 POSITION_PROPAGATION_GRACE_SECONDS = 15.0
-RATE_LIMIT_BACKOFF_BASE_SECONDS = 15.0
-RATE_LIMIT_BACKOFF_CAP_SECONDS = 120.0
+INTENT_SUBMISSION_GRACE_SECONDS = 15.0
+AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES = Decimal("0.01")
+RECONCILIATION_BACKOFF_BASE_SECONDS = 5.0
+RECONCILIATION_BACKOFF_CAP_SECONDS = 60.0
 
 
 def _within_position_propagation_grace(
@@ -46,6 +52,23 @@ def _within_position_propagation_grace(
             <= POSITION_PROPAGATION_GRACE_SECONDS
         )
 
+    except (TypeError, ValueError):
+        return False
+
+
+def _within_intent_submission_grace(
+    timestamp: str | None,
+) -> bool:
+    if not timestamp:
+        return False
+    try:
+        observed = datetime.fromisoformat(
+            str(timestamp).replace("Z", "+00:00")
+        )
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - observed).total_seconds()
+        return 0 <= age <= INTENT_SUBMISSION_GRACE_SECONDS
     except (TypeError, ValueError):
         return False
 
@@ -88,8 +111,38 @@ class ReconciliationWorker:
         self.adapter = adapter
         self.strategy_repo = strategy_repo
         self._run_lock = asyncio.Lock()
-        self._consecutive_rate_limits = 0
+        self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
+        self._missing_position_suspects: dict[str, float] = {}
+
+    def _schedule_backoff(self, actor: str, error: str) -> float:
+        self._consecutive_retries += 1
+        base = min(
+            RECONCILIATION_BACKOFF_CAP_SECONDS,
+            RECONCILIATION_BACKOFF_BASE_SECONDS
+            * (2 ** (self._consecutive_retries - 1)),
+        )
+        delay = min(
+            RECONCILIATION_BACKOFF_CAP_SECONDS,
+            base * random.uniform(0.85, 1.15),
+        )
+        self._rate_limit_retry_after = time.monotonic() + delay
+        self.repo.set_states({
+            "reconciliation_retry_count": str(self._consecutive_retries),
+            "reconciliation_backoff_seconds": f"{delay:.3f}",
+            "last_reconciliation_error": error[:500],
+        }, actor)
+        return delay
+
+    def _reset_backoff(self, actor: str) -> None:
+        self._consecutive_retries = 0
+        self._rate_limit_retry_after = 0.0
+        self.repo.set_states({
+            "reconciliation_retry_count": "0",
+            "reconciliation_backoff_seconds": "0",
+            "last_reconciliation_error": "",
+            "last_reconciliation_success": now_iso(),
+        }, actor)
 
     async def run_once(self, actor: str = "system") -> dict[str, Any]:
         async with self._run_lock:
@@ -99,7 +152,7 @@ class ReconciliationWorker:
                     "run_id": None,
                     "status": "backoff",
                     "gaps": [],
-                    "reason": "RECONCILIATION_RATE_LIMIT_BACKOFF",
+                    "reason": "RECONCILIATION_BACKOFF",
                     "retry_after_seconds": round(
                         self._rate_limit_retry_after - now, 3
                     ),
@@ -109,6 +162,8 @@ class ReconciliationWorker:
     async def _run_once_serialized(self, actor: str) -> dict[str, Any]:
         run_id = self.repo.start_reconciliation()
         gaps: list[dict[str, Any]] = []
+        repairs: list[dict[str, Any]] = []
+        auto_recoverable_gaps = 0
         try:
             identity = {"status": "MOCK"}
             if hasattr(self.adapter, "identity_preflight"):
@@ -211,16 +266,66 @@ class ReconciliationWorker:
                         )
 
             if self.strategy_repo:
+                repairs.extend(ingest_maker_exit_fills(
+                    self.repo, self.strategy_repo, remote_trades, remote_by_id
+                ))
+                for repair in repairs:
+                    repaired_position = self.strategy_repo.position_for_token(
+                        str(repair.get("token_id") or "")
+                    )
+                    repaired_remaining = decimal_value(
+                        (repaired_position or {}).get("remaining_shares_text")
+                    )
+                    authoritative = await authoritative_token_balance(
+                        self.adapter, str(repair.get("token_id") or "")
+                    )
+                    repair["authoritative_balance"] = (
+                        canonical_decimal(authoritative)
+                        if authoritative is not None else "unknown"
+                    )
+                    if authoritative is None or repaired_remaining != authoritative:
+                        gaps.append({
+                            "type": "repaired_position_balance_mismatch",
+                            "position_id": repair.get("position_id"),
+                            "token_id": repair.get("token_id"),
+                            "local_shares": (
+                                canonical_decimal(repaired_remaining)
+                                if repaired_remaining is not None else "unknown"
+                            ),
+                            "authoritative_balance": repair["authoritative_balance"],
+                        })
+                        auto_recoverable_gaps += 1
+
+            if self.strategy_repo:
                 for intent in self.strategy_repo.unresolved_intents():
                     remote_id = str(intent.get("remote_order_id") or "")
                     if not remote_id:
+                        intent_state = str(intent.get("state") or "").upper()
                         if (
-                            str(intent.get("state") or "").upper()
-                            == "WAITING_SELLABLE"
+                            intent_state == "WAITING_SELLABLE"
                         ):
                             # This state is only created after a confirmed
                             # pre-submission balance failure. No remote order
                             # exists, so absence of remote_order_id is expected.
+                            continue
+
+                        if (
+                            intent_state in {"RESERVED", "SUBMITTING"}
+                            and self.strategy_repo.intent_submission_inflight(
+                                str(intent["intent_id"]))
+                            and _within_intent_submission_grace(
+                                str(
+                                    intent.get("updated_at")
+                                    or intent.get("created_at")
+                                    or ""
+                                )
+                            )
+                        ):
+                            # The durable reservation is committed before the
+                            # network request. A concurrent reconciliation may
+                            # observe that expected hand-off window. If it gets
+                            # stuck, the same state becomes a real gap after the
+                            # bounded grace period.
                             continue
 
                         gaps.append({
@@ -385,12 +490,23 @@ class ReconciliationWorker:
                         average_price=decimal_value(remote.get("average_price")) or Decimal("0"),
                     )
                     if changed:
+                        correction_is_bounded_propagation = bool(
+                            existing_position is not None
+                            and confirmed_exit_value <= 0
+                            and _within_position_propagation_grace(
+                                existing_position.get("created_at")
+                            )
+                            and abs(shares - local_remaining)
+                            <= AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES
+                        )
                         gaps.append({
                             "type": "remote_position_corrected_local",
                             "condition_id": condition_id,
                             "token_id": token_id,
                             "remote_shares": canonical_decimal(shares),
                         })
+                        if correction_is_bounded_propagation:
+                            auto_recoverable_gaps += 1
                     if bool(remote.get("redeemable")):
                         current_value = decimal_value(remote.get("current_value")) or Decimal("0")
                         self.strategy_repo.mark_position_resolved(
@@ -429,24 +545,55 @@ class ReconciliationWorker:
                             # briefly. Exits remain blocked because sellable=0.
                             continue
 
+                        cross_check = await classify_missing_position(
+                            self.adapter, local, self._missing_position_suspects
+                        )
+                        if cross_check["status"] in {"confirmed_active", "suspect"}:
+                            continue
+                        authoritative = cross_check.get("balance")
                         gaps.append({
                             "type": "local_position_missing_remote",
                             "position_id": local["position_id"],
                             "token_id": local["token_id"],
                             "local_shares": canonical_decimal(remaining),
+                            "authoritative_balance": (
+                                canonical_decimal(authoritative)
+                                if authoritative is not None else "unknown"
+                            ),
+                            "cross_check_status": cross_check["status"],
                         })
 
             status = "ok" if not gaps else "gaps"
-            self._consecutive_rate_limits = 0
-            self._rate_limit_retry_after = 0.0
+            if gaps:
+                retry_after_seconds = self._schedule_backoff(
+                    actor, f"persistent gaps: {len(gaps)}"
+                )
+            else:
+                retry_after_seconds = 0.0
+                self._reset_backoff(actor)
+            completed_at = now_iso()
             self.repo.finish_reconciliation(run_id, status, sanitize(gaps))
             if not gaps:
                 mark_reconciled_provenance(self.repo)
             if self.strategy_repo:
+                repairable_gap_set = bool(
+                    gaps and auto_recoverable_gaps == len(gaps)
+                )
                 self.strategy_repo.set_reconciliation_state(
                     ready=not gaps,
-                    reason="RECONCILIATION_GAP" if gaps else "",
+                    reason=(
+                        "RECONCILIATION_GAP"
+                        if repairable_gap_set
+                        else "RECONCILIATION_CONTRADICTION"
+                        if gaps
+                        else ""
+                    ),
                     actor=actor,
+                    auto_recoverable=(
+                        repairable_gap_set
+                    ),
+                    run_id=run_id,
+                    finished_at=completed_at,
                 )
                 if gaps:
                     self.strategy_repo.alert(
@@ -464,6 +611,9 @@ class ReconciliationWorker:
                     parameters_json={
                         "run_id": run_id,
                         "gaps": len(gaps),
+                        "repairs": len(repairs),
+                        "retry_count": self._consecutive_retries,
+                        "backoff_seconds": round(retry_after_seconds, 3),
                         "open_orders": len(remote_open),
                         "trades": len(remote_trades),
                         "positions": len(remote_positions),
@@ -473,28 +623,27 @@ class ReconciliationWorker:
                 actor, "live_reconciliation", status,
                 details={"run_id": run_id, "gaps": len(gaps)},
             )
-            return {"run_id": run_id, "status": status, "gaps": sanitize(gaps)}
+            return {
+                "run_id": run_id, "status": status, "gaps": sanitize(gaps),
+                "repairs": sanitize(repairs),
+                "retry_count": self._consecutive_retries,
+                "retry_after_seconds": round(retry_after_seconds, 3),
+            }
         except Exception as exc:
             safe_error = f"{type(exc).__name__}: {exc}"[:500]
             rate_limited = _is_rate_limit_error(exc)
-            retry_after_seconds = 0.0
-            if rate_limited:
-                self._consecutive_rate_limits += 1
-                base_delay = min(
-                    RATE_LIMIT_BACKOFF_CAP_SECONDS,
-                    RATE_LIMIT_BACKOFF_BASE_SECONDS
-                    * (2 ** (self._consecutive_rate_limits - 1)),
-                )
-                retry_after_seconds = min(
-                    RATE_LIMIT_BACKOFF_CAP_SECONDS,
-                    base_delay * random.uniform(0.8, 1.2),
-                )
-                self._rate_limit_retry_after = time.monotonic() + retry_after_seconds
-            else:
-                self._consecutive_rate_limits = 0
-                self._rate_limit_retry_after = 0.0
+            previously_degraded = self._consecutive_retries > 0
+            retry_after_seconds = self._schedule_backoff(actor, safe_error)
+            completed_at = now_iso()
             self.repo.finish_reconciliation(run_id, "failed", sanitize(gaps), safe_error)
-            temporary_error = rate_limited or _is_temporary_network_error(exc)
+            unauthorized = any(
+                token in str(exc).lower()
+                for token in ("unauthorized", "invalid api key", "http 401", "status 401")
+            )
+            temporary_error = (
+                rate_limited or _is_temporary_network_error(exc)
+                or (unauthorized and previously_degraded)
+            )
             # Kill switch is operator-owned. Machine failures acquire only an
             # explicitly-owned entry pause.
             self.repo.set_state("canary_armed", "false", actor)
@@ -511,6 +660,8 @@ class ReconciliationWorker:
                         )
                     ),
                     actor=actor,
+                    run_id=run_id,
+                    finished_at=completed_at,
                 )
                 self.strategy_repo.alert(
                     alert_type="RECONCILIATION", severity="CRITICAL",
