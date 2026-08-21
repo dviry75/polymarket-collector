@@ -1,0 +1,12 @@
+*.pem
+*.key
+.env
+.env.*
+*.sqlite-wal
+*.sqlite-shm
+.live-backups/
+*.bak
+*.bak.*
+*.backup
+*.backup-*
+*.backup.*
