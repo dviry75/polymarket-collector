@@ -10,7 +10,7 @@ from live.adapters.polymarket import RealPolymarketTradingAdapter
 from live.config import LiveConfig
 from live.order_book import OrderBookSet
 from live.reconciliation import ReconciliationWorker
-from live.repository import LiveRepository
+from live.repository import LiveRepository, now_iso
 from live.strategy import AllInBudget, StrategyPolicy, choose_entry, exact_trigger, simulate_buy_fak
 from live.strategy_runtime import LiveStrategyRuntime
 from live.strategy_repository import StrategyRepository, sanitize
@@ -2333,6 +2333,271 @@ def test_reconciliation_submission_handoff_expires_fail_closed():
         assert expired["gaps"][0]["type"] == "durable_intent_without_remote_id"
         assert strategy.pause_entries()
         assert base.get_state("pause_auto_recoverable") == "false"
+    finally:
+        temp.cleanup()
+
+
+# --- REMOTE_MATCHED_ZERO_FILL propagation race -----------------------------
+#
+# Two confirmed production incidents (2026-08-23, 09:58 and 12:18): a FAK
+# ENTRY order comes back from Polymarket's order-status endpoint as
+# "matched" before get_trades()/get_positions() have propagated the fill.
+# The old code treated any terminal status with filled==0 as a confirmed
+# zero-fill, immediately calling mark_zero_fill(). Once terminal, the intent
+# left unresolved_intents() forever, so the fill that showed up 6.5-8s later
+# could never resolve it through the normal path -- only the unrelated
+# remote_positions loop caught it, as an "unexplained" new position, which
+# is always classified RECONCILIATION_CONTRADICTION / MANUAL_ONLY.
+
+def _reserve_matched_pending_entry(
+    strategy, base, adapter, *, event_id="race-event", order_status="matched",
+):
+    condition_id = f"condition-{event_id}"
+    token_id = f"token-{event_id}"
+    base.upsert_market({
+        "event_id": event_id, "condition_id": condition_id,
+        "yes_token_id": token_id, "no_token_id": f"other-{event_id}",
+        "token_mapping_status": "verified", "accepting_orders": True,
+        "min_order_size": "5",
+    })
+    strategy.set_pause_entries(False, "operator", "PRECONDITION")
+    attempt = strategy.reserve_event_entry(
+        event_id=event_id, condition_id=condition_id, token_id=token_id,
+        side="YES", simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
+    )
+    order_id = f"order-{event_id}"
+    strategy.update_intent(
+        attempt["entry_intent_id"], remote_order_id=order_id, submitted_at=now_iso(),
+    )
+    adapter.orders[order_id] = {"status": order_status, "fills": []}
+    return attempt, order_id, condition_id, token_id
+
+
+def test_matched_zero_trades_defers_instead_of_zero_fill():  # Test A (part 1)
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        attempt, order_id, _cond, _token = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-a"
+        )
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert result["status"] == "ok"
+        assert result["gaps"] == []
+        intent = strategy.intent(attempt["entry_intent_id"])
+        assert intent["state"] != "ZERO_FILL"
+        assert intent["remote_order_id"] == order_id
+    finally:
+        temp.cleanup()
+
+
+def test_matched_zero_trades_then_fill_resolves_no_contradiction():  # Test A (full)
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        attempt, order_id, _cond, token_id = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-a2"
+        )
+        worker = ReconciliationWorker(base, adapter, strategy)
+        asyncio.run(worker.run_once("test"))  # deferred, no ZERO_FILL
+
+        adapter.orders[order_id]["fills"] = [{
+            "polymarket_trade_id": "trade-a2", "polymarket_order_id": order_id,
+            "price": "0.7", "size": "5.4285", "fee": "0", "status": "matched",
+            "matched_at": now_iso(), "transaction_hash": "tx-a2", "raw_message": {},
+        }]
+        second = asyncio.run(worker.run_once("test"))
+        assert second["status"] == "ok"
+        assert second["gaps"] == []
+        intent = strategy.intent(attempt["entry_intent_id"])
+        assert intent["state"] == "FILLED"
+        assert intent["filled_shares_text"] == "5.4285"
+        position = strategy.position_for_token(token_id)
+        assert position is not None
+        assert position["position_id"] == intent["position_id"]
+        assert position["acquired_shares_text"] == "5.4285"
+        assert not strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_matched_zero_trades_then_position_only_resolves_no_contradiction():  # Test B
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        attempt, order_id, condition_id, token_id = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-b"
+        )
+        worker = ReconciliationWorker(base, adapter, strategy)
+        asyncio.run(worker.run_once("test"))  # deferred, no ZERO_FILL, no position yet
+
+        # get_trades() never surfaces the fill; get_positions() does.
+        adapter.positions.append({
+            "token_id": token_id, "condition_id": condition_id,
+            "size": "5.4285", "average_price": "0.7", "outcome": "YES",
+            "redeemable": False, "current_value": "0",
+        })
+        second = asyncio.run(worker.run_once("test"))
+        assert second["status"] == "ok"
+        assert second["gaps"] == []
+        intent = strategy.intent(attempt["entry_intent_id"])
+        assert intent["state"] == "FILLED"
+        position = strategy.position_for_token(token_id)
+        assert position is not None
+        assert position["position_id"] == intent["position_id"]
+        assert position["acquired_shares_text"] == "5.4285"
+        assert not strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_matched_zero_trades_no_evidence_after_grace_fails_closed():  # Test C
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        attempt, order_id, _cond, _token = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-c"
+        )
+        worker = ReconciliationWorker(base, adapter, strategy)
+        asyncio.run(worker.run_once("test"))  # deferred
+
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_intents SET submitted_at=?,created_at=? "
+                "WHERE intent_id=?",
+                (
+                    "2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00",
+                    attempt["entry_intent_id"],
+                ),
+            )
+            conn.commit()
+        expired = asyncio.run(worker.run_once("test"))
+        assert expired["status"] == "ok"
+        intent = strategy.intent(attempt["entry_intent_id"])
+        assert intent["state"] == "ZERO_FILL"
+        assert intent["reason_code"] == "REMOTE_MATCHED_ZERO_FILL"
+        assert not strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_truly_zero_filled_entry_unaffected_by_race_fix():  # Test D
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        attempt, order_id, _cond, _token = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-d", order_status="unmatched",
+        )
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert result["status"] == "ok"
+        intent = strategy.intent(attempt["entry_intent_id"])
+        assert intent["state"] == "ZERO_FILL"
+        assert intent["reason_code"] == "REMOTE_UNMATCHED_ZERO_FILL"
+        assert not strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_unrelated_new_remote_position_still_contradiction():  # Test E
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        strategy.set_pause_entries(False, "operator", "PRECONDITION")
+        event_id = "race-e"
+        condition_id = f"condition-{event_id}"
+        token_id = f"token-{event_id}"
+        base.upsert_market({
+            "event_id": event_id, "condition_id": condition_id,
+            "yes_token_id": token_id, "no_token_id": f"other-{event_id}",
+            "token_mapping_status": "verified", "accepting_orders": True,
+            "min_order_size": "5",
+        })
+        # No ENTRY intent was ever reserved for this token -- nothing pending.
+        adapter.positions.append({
+            "token_id": token_id, "condition_id": condition_id,
+            "size": "5.4285", "average_price": "0.7", "outcome": "YES",
+            "redeemable": False, "current_value": "0",
+        })
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert result["status"] == "gaps"
+        assert result["gaps"][0]["type"] == "remote_position_corrected_local"
+        assert strategy.pause_record()["pause_cause"] == "RECONCILIATION_CONTRADICTION"
+    finally:
+        temp.cleanup()
+
+
+def test_position_without_matched_status_stays_contradiction():  # Test F
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        # The order genuinely came back UNMATCHED (not matched/filled), so it
+        # is never added to pending_entry_tokens and is finalized ZERO_FILL
+        # immediately. A position later appearing for that same token is not
+        # linkable to it and must not auto-resolve.
+        attempt, order_id, condition_id, token_id = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-f", order_status="unmatched",
+        )
+        worker = ReconciliationWorker(base, adapter, strategy)
+        first = asyncio.run(worker.run_once("test"))
+        assert strategy.intent(attempt["entry_intent_id"])["state"] == "ZERO_FILL"
+
+        adapter.positions.append({
+            "token_id": token_id, "condition_id": condition_id,
+            "size": "5.4285", "average_price": "0.7", "outcome": "YES",
+            "redeemable": False, "current_value": "0",
+        })
+        second = asyncio.run(worker.run_once("test"))
+        assert second["status"] == "gaps"
+        assert second["gaps"][0]["type"] == "remote_position_corrected_local"
+        assert strategy.pause_record()["pause_cause"] == "RECONCILIATION_CONTRADICTION"
+    finally:
+        temp.cleanup()
+
+
+def test_restart_during_propagation_pending_preserves_state_no_duplicate():  # Test G
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        attempt, order_id, condition_id, token_id = _reserve_matched_pending_entry(
+            strategy, base, adapter, event_id="race-g"
+        )
+        asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        before = strategy.intent(attempt["entry_intent_id"])
+        assert before["state"] != "ZERO_FILL"
+
+        # Simulate process restart: fresh StrategyRepository over the same DB.
+        restarted = StrategyRepository(base)
+        restarted.migrate(pause_entries_default=False)
+        after_restart = restarted.intent(attempt["entry_intent_id"])
+        assert after_restart["state"] == before["state"]
+        assert after_restart["remote_order_id"] == order_id
+
+        # A duplicate entry attempt for the same event must still be rejected
+        # while this intent remains unresolved.
+        duplicate = restarted.reserve_event_entry(
+            event_id="race-g", condition_id=condition_id, token_id=token_id,
+            side="YES", simultaneous=False, reason_code="ENTRY_PRICE_EXACT",
+        )
+        assert duplicate.get("_duplicate") is True
+
+        adapter.orders[order_id]["fills"] = [{
+            "polymarket_trade_id": "trade-g", "polymarket_order_id": order_id,
+            "price": "0.7", "size": "5.4285", "fee": "0", "status": "matched",
+            "matched_at": now_iso(), "transaction_hash": "tx-g", "raw_message": {},
+        }]
+        resumed = asyncio.run(
+            ReconciliationWorker(base, adapter, restarted).run_once("test")
+        )
+        assert resumed["status"] == "ok"
+        assert resumed["gaps"] == []
+        resolved = restarted.intent(attempt["entry_intent_id"])
+        assert resolved["state"] == "FILLED"
+        positions = [
+            row for row in restarted.active_positions() + [
+                restarted.position_for_token(token_id)
+            ]
+            if row and row.get("token_id") == token_id
+        ]
+        assert len({row["position_id"] for row in positions}) == 1
     finally:
         temp.cleanup()
 

@@ -24,6 +24,12 @@ from .reconciliation_stability import (
 POSITION_PROPAGATION_GRACE_SECONDS = 15.0
 INTENT_SUBMISSION_GRACE_SECONDS = 15.0
 AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES = Decimal("0.01")
+# Order-status can report a terminal MATCHED/FILLED outcome before the
+# trades/positions feeds have propagated the corresponding fill. Treating
+# that as an immediate zero-fill is a false negative, not a safety measure:
+# reconciliation.py:_run_once_serialized reuses INTENT_SUBMISSION_GRACE_SECONDS
+# to defer the terminal decision instead of inventing a new timeout.
+MATCHED_AWAITING_FILL_STATUSES = frozenset({"matched", "filled"})
 RECONCILIATION_BACKOFF_BASE_SECONDS = 5.0
 RECONCILIATION_BACKOFF_CAP_SECONDS = 60.0
 RECONCILIATION_TELEMETRY_CAPACITY = 1_024
@@ -239,6 +245,13 @@ class ReconciliationWorker:
         gaps: list[dict[str, Any]] = []
         repairs: list[dict[str, Any]] = []
         auto_recoverable_gaps = 0
+        # ENTRY intents deferred this pass because their remote order status
+        # is MATCHED/FILLED but no local fill has propagated yet. Populated
+        # by the entries loop below; consulted by the remote-positions loop
+        # so a position discovered via get_positions() before get_trades()
+        # catches up resolves the same intent instead of reading as an
+        # unexplained new position.
+        pending_entry_tokens: dict[str, dict[str, Any]] = {}
         try:
             identity = {"status": "MOCK"}
             if hasattr(self.adapter, "identity_preflight"):
@@ -443,6 +456,28 @@ class ReconciliationWorker:
                         )
                         continue
                     if intent.get("action") == "ENTRY" and terminal:
+                        if (
+                            status in MATCHED_AWAITING_FILL_STATUSES
+                            and _within_intent_submission_grace(
+                                str(
+                                    intent.get("submitted_at")
+                                    or intent.get("created_at")
+                                    or ""
+                                )
+                            )
+                        ):
+                            # The exchange's order-status endpoint and its
+                            # trades/positions feeds are not atomically
+                            # consistent. A MATCHED/FILLED order with no
+                            # local fill yet is a hand-off still in flight,
+                            # not a confirmed zero-fill -- the same bounded
+                            # uncertainty already tolerated above for
+                            # RESERVED/SUBMITTING intents. Re-check next
+                            # cycle; if the remote-positions loop below
+                            # discovers the fill first, it resolves this same
+                            # intent directly via pending_entry_tokens.
+                            pending_entry_tokens[str(intent["token_id"])] = intent
+                            continue
                         self.strategy_repo.mark_zero_fill(
                             str(intent["event_id"]),
                             f"REMOTE_{status.upper()}_ZERO_FILL",
@@ -531,6 +566,35 @@ class ReconciliationWorker:
                         remote.get("outcome") or "UNKNOWN"
                     ).upper()
                     existing_position = self.strategy_repo.position_for_token(token_id)
+                    pending_entry = pending_entry_tokens.pop(token_id, None)
+                    if existing_position is None and pending_entry is not None:
+                        # Authoritative linkage: a still-open ENTRY intent
+                        # for this exact token whose remote order status was
+                        # already observed as matched/filled earlier in this
+                        # same pass (see MATCHED_AWAITING_FILL_STATUSES
+                        # above). The positions feed is simply the first
+                        # endpoint to confirm the fill here -- resolve the
+                        # intent through the normal fill path instead of
+                        # treating the position as unexplained.
+                        entry_market = self.repo.latest_market(condition_id) or {}
+                        average_price = decimal_value(remote.get("average_price")) or Decimal("0")
+                        self.strategy_repo.open_position(
+                            event_id=str(pending_entry.get("event_id") or condition_id),
+                            condition_id=condition_id,
+                            token_id=token_id,
+                            outcome=str(pending_entry.get("side") or outcome),
+                            shares=shares,
+                            average_price=average_price,
+                            cost_all_in=shares * average_price,
+                            fees=Decimal("0"),
+                            sellable_shares=Decimal("0"),
+                            min_sellable=(
+                                decimal_value(entry_market.get("min_order_size"))
+                                or Decimal("0")
+                            ),
+                            entry_intent_id=str(pending_entry["intent_id"]),
+                        )
+                        continue
                     if existing_position is not None:
                         local_remaining = (
                             decimal_value(existing_position.get("remaining_shares_text"))
