@@ -480,6 +480,133 @@ def test_policy_table_is_fail_closed_for_unknown_reason():
     policy = recovery_policy("SOMETHING_NEW_AND_UNCLASSIFIED")
     assert policy.release_policy == ReleasePolicy.MANUAL_ONLY
 
+
+# --- RECONNECT_RECONCILIATION_PENDING regression coverage -----------------
+#
+# market_websocket.py sets strategy_block_reason="RECONNECT_RECONCILIATION_PENDING"
+# while a reconnect-triggered reconciliation is in flight. Before this fix that
+# reason was absent from RECOVERY_POLICIES, so it fell through to UNKNOWN_POLICY
+# (MANUAL_ONLY) the moment pause_recovery acquired a pause for it, permanently
+# requiring an operator even after every real safety gate went clean.
+
+def test_reconnect_reconciliation_pending_policy_is_transient_not_manual(  # Test A
+) -> None:
+    policy = recovery_policy("RECONNECT_RECONCILIATION_PENDING")
+    assert policy.release_policy == ReleasePolicy.AUTO_WHEN_CLEAN
+    assert policy.release_policy != ReleasePolicy.MANUAL_ONLY
+
+
+def test_reconnect_reconciliation_pending_blocks_while_pending():  # Test B
+    temp, base, strategy, _market, _user, recovery = build_clean()
+    try:
+        # market_websocket.py sets exactly these two keys while the
+        # reconnect-triggered reconciliation run is still in flight; it does
+        # not touch reconciliation_readiness itself (that belongs to the
+        # reconciliation worker's own lifecycle).
+        base.set_states({
+            "strategy_readiness": "NOT_READY",
+            "strategy_block_reason": "RECONNECT_RECONCILIATION_PENDING",
+        }, "test")
+        recovery.tick()
+        record = strategy.pause_record()
+        assert record["pause_entries"]
+        assert record["pause_cause"] == "RECONNECT_RECONCILIATION_PENDING"
+        assert record["release_policy"] == ReleasePolicy.AUTO_WHEN_CLEAN
+        assert record["pause_state"] != PauseState.PAUSED_MANUAL_ONLY
+
+        result = recovery.attempt_auto_resume()
+        assert not result.resumed
+        assert strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_reconnect_reconciliation_pending_auto_releases_once_clean():  # Test C
+    temp, base, strategy, _market, _user, recovery = build_clean()
+    try:
+        base.set_states({
+            "strategy_readiness": "NOT_READY",
+            "strategy_block_reason": "RECONNECT_RECONCILIATION_PENDING",
+        }, "test")
+        recovery.tick()
+        assert strategy.pause_record()["pause_cause"] == "RECONNECT_RECONCILIATION_PENDING"
+
+        # Reconciliation finishes; every other gate is already clean via build_clean().
+        base.set_states({
+            "strategy_readiness": "READY",
+            "strategy_block_reason": "",
+        }, "test")
+        result = complete_stability(base, recovery)
+        assert result.resumed
+        assert not strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_reconnect_reconciliation_pending_stays_blocked_with_other_blocker():  # Test D
+    temp, base, strategy, _market, _user, recovery = build_clean()
+    try:
+        base.set_states({
+            "strategy_readiness": "NOT_READY",
+            "strategy_block_reason": "RECONNECT_RECONCILIATION_PENDING",
+        }, "test")
+        recovery.tick()
+        assert strategy.pause_record()["pause_cause"] == "RECONNECT_RECONCILIATION_PENDING"
+
+        # Reconnect reconciliation itself finishes clean, but an unrelated
+        # safety gate (kill switch) is independently active.
+        base.set_states({
+            "strategy_readiness": "READY",
+            "strategy_block_reason": "",
+        }, "test")
+        base.set_state("kill_switch", "true", "operator")
+        result = recovery.attempt_auto_resume()
+        assert not result.resumed
+        assert "KILL_SWITCH_ACTIVE" in result.blockers
+        assert strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_true_manual_only_reasons_unaffected_by_reconnect_fix():  # Test E
+    assert recovery_policy("OPERATOR_PAUSE").release_policy == ReleasePolicy.MANUAL_ONLY
+    assert recovery_policy("KILL_SWITCH_ACTIVE").release_policy == ReleasePolicy.MANUAL_ONLY
+    assert (
+        recovery_policy("RECONCILIATION_CONTRADICTION").release_policy
+        == ReleasePolicy.MANUAL_ONLY
+    )
+
+    temp, _base, strategy, _market, _user, recovery = build_clean()
+    try:
+        strategy.acquire_pause(
+            actor="operator", reason="OPERATOR_PAUSE", owner="OPERATOR"
+        )
+        result = recovery.attempt_auto_resume()
+        assert "MANUAL_ONLY_PAUSE" in result.blockers
+        assert strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_unrelated_unknown_reason_still_fail_closed_after_reconnect_fix():  # Test F
+    policy = recovery_policy("SOME_OTHER_UNMAPPED_REASON_XYZ")
+    assert policy.release_policy == ReleasePolicy.MANUAL_ONLY
+
+    temp, _base, strategy, _market, _user, recovery = build_clean()
+    try:
+        strategy.acquire_pause(
+            actor="risk_manager",
+            reason="SOME_OTHER_UNMAPPED_REASON_XYZ",
+            owner="MACHINE",
+        )
+        record = strategy.pause_record()
+        assert record["release_policy"] == ReleasePolicy.MANUAL_ONLY
+        assert record["pause_state"] == PauseState.PAUSED_MANUAL_ONLY
+        assert "MANUAL_ONLY_PAUSE" in recovery.attempt_auto_resume().blockers
+    finally:
+        temp.cleanup()
+
+
 def test_heartbeat_requires_success_newer_than_pause():
     config = LiveConfig(
         trading_mode="LIVE",
