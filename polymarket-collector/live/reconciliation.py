@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 import random
 import statistics
 import time
@@ -13,7 +14,9 @@ from .adapters.base import TradingAdapter
 from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso
 from .dashboard_schema import mark_reconciled_provenance
-from .strategy_repository import StrategyRepository, sanitize
+from .strategy_repository import (
+    FINAL_INTENT_STATES, StrategyRepository, sanitize,
+)
 from .reconciliation_stability import (
     authoritative_token_balance, classify_missing_position,
     ingest_maker_exit_fills,
@@ -164,6 +167,7 @@ class ReconciliationWorker:
         self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
         self._missing_position_suspects: dict[str, float] = {}
+        self._resolved_zero_observations: dict[str, int] = {}
         self.reconciliation_started_at: str | None = None
         self.reconciliation_finished_at: str | None = None
         self._reconciliation_duration_ms = {
@@ -173,10 +177,23 @@ class ReconciliationWorker:
 
     def _schedule_backoff(self, actor: str, error: str) -> float:
         self._consecutive_retries += 1
+        # Saturate before exponentiation. Evaluating an unbounded
+        # 2 ** retry_count eventually creates an integer that cannot be
+        # converted to float, masking the original failure and orphaning the
+        # active reconciliation row.
+        maximum_exponent = max(
+            0,
+            math.ceil(
+                math.log2(
+                    RECONCILIATION_BACKOFF_CAP_SECONDS
+                    / RECONCILIATION_BACKOFF_BASE_SECONDS
+                )
+            ),
+        )
+        exponent = min(self._consecutive_retries - 1, maximum_exponent)
         base = min(
             RECONCILIATION_BACKOFF_CAP_SECONDS,
-            RECONCILIATION_BACKOFF_BASE_SECONDS
-            * (2 ** (self._consecutive_retries - 1)),
+            RECONCILIATION_BACKOFF_BASE_SECONDS * (2 ** exponent),
         )
         delay = min(
             RECONCILIATION_BACKOFF_CAP_SECONDS,
@@ -199,6 +216,153 @@ class ReconciliationWorker:
             "last_reconciliation_error": "",
             "last_reconciliation_success": now_iso(),
         }, actor)
+
+    async def _reconcile_resolved_local_positions(
+        self,
+        *,
+        remote_positions: list[dict[str, Any]],
+        gaps: list[dict[str, Any]],
+        repairs: list[dict[str, Any]],
+        actor: str,
+    ) -> None:
+        """Resolve local active rows only from strong, resolution-aware evidence."""
+        if self.strategy_repo is None:
+            return
+        remote_by_token = {
+            str(item.get("token_id") or ""): item
+            for item in remote_positions
+            if (decimal_value(item.get("size")) or Decimal("0")) > 0
+        }
+        for local in self.strategy_repo.active_positions():
+            market = self.repo.latest_market(str(local.get("condition_id") or ""))
+            if not market or not bool(market.get("market_resolved")):
+                continue
+            winner_token = str(market.get("winning_asset_id") or "")
+            token_id = str(local.get("token_id") or "")
+            if not winner_token or not token_id:
+                gaps.append({
+                    "type": "resolved_market_missing_winner_identity",
+                    "position_id": local.get("position_id"),
+                    "condition_id": local.get("condition_id"),
+                })
+                continue
+
+            linked_intent_id = str(
+                local.get("active_exit_intent_id")
+                or local.get("tp_intent_id")
+                or ""
+            )
+            if linked_intent_id:
+                linked = self.strategy_repo.intent(linked_intent_id)
+                if (
+                    linked is not None
+                    and str(linked.get("state") or "").upper()
+                    not in FINAL_INTENT_STATES
+                ):
+                    # Never race a still-unresolved remote exit with resolution
+                    # cleanup. Its order/fill identity must settle first.
+                    continue
+
+            balance = await authoritative_token_balance(self.adapter, token_id)
+            evidence_source = "conditional_token_balance"
+            observed = balance
+            if observed is None and token_id in remote_by_token:
+                observed = (
+                    decimal_value(remote_by_token[token_id].get("size"))
+                    or Decimal("0")
+                )
+                evidence_source = "remote_position_presence"
+            if observed is None:
+                # Public position absence alone is weak eventual-consistency
+                # evidence and can never terminalize a local financial row.
+                self._resolved_zero_observations.pop(token_id, None)
+                continue
+
+            winner = token_id == winner_token
+            if observed > 0:
+                self._resolved_zero_observations.pop(token_id, None)
+                if not winner:
+                    gaps.append({
+                        "type": "resolved_loser_authoritative_balance_active",
+                        "position_id": local["position_id"],
+                        "token_id": token_id,
+                        "authoritative_balance": canonical_decimal(observed),
+                        "evidence_source": evidence_source,
+                    })
+                    continue
+                before_state = str(local.get("state") or "")
+                updated = self.strategy_repo.mark_position_resolved(
+                    str(local["position_id"]),
+                    winner=True,
+                    redeem_pending=True,
+                )
+                if str(updated.get("state") or "") != before_state:
+                    repair = {
+                        "type": "resolved_winner_marked_redeem_pending",
+                        "position_id": local["position_id"],
+                        "token_id": token_id,
+                        "before_state": before_state,
+                        "after_state": updated.get("state"),
+                        "authoritative_balance": canonical_decimal(observed),
+                        "evidence_source": evidence_source,
+                    }
+                    repairs.append(repair)
+                    self.repo.audit(
+                        actor,
+                        "resolved_position_repair",
+                        "ok",
+                        "RESOLVED_WINNER_AUTHORITATIVE_BALANCE",
+                        repair,
+                    )
+                continue
+
+            # A zero is actionable only from the authoritative token-balance
+            # endpoint, after creation propagation grace and a second complete
+            # reconciliation observation.
+            if (
+                evidence_source != "conditional_token_balance"
+                or _within_position_propagation_grace(local.get("created_at"))
+            ):
+                self._resolved_zero_observations.pop(token_id, None)
+                continue
+            observations = self._resolved_zero_observations.get(token_id, 0) + 1
+            self._resolved_zero_observations[token_id] = observations
+            if observations < 2:
+                continue
+            if winner:
+                gaps.append({
+                    "type": "resolved_winner_authoritative_zero",
+                    "position_id": local["position_id"],
+                    "token_id": token_id,
+                    "authoritative_balance": "0",
+                    "confirmations": observations,
+                })
+                continue
+            before_state = str(local.get("state") or "")
+            updated = self.strategy_repo.mark_position_resolved(
+                str(local["position_id"]),
+                winner=False,
+                redeem_pending=False,
+            )
+            self._resolved_zero_observations.pop(token_id, None)
+            repair = {
+                "type": "resolved_loser_authoritative_zero",
+                "position_id": local["position_id"],
+                "token_id": token_id,
+                "before_state": before_state,
+                "after_state": updated.get("state"),
+                "authoritative_balance": "0",
+                "confirmations": observations,
+                "evidence_source": evidence_source,
+            }
+            repairs.append(repair)
+            self.repo.audit(
+                actor,
+                "resolved_position_repair",
+                "ok",
+                "RESOLVED_LOSER_AUTHORITATIVE_ZERO",
+                repair,
+            )
 
     async def run_once(self, actor: str = "system") -> dict[str, Any]:
         async with self._run_lock:
@@ -252,6 +416,7 @@ class ReconciliationWorker:
         # catches up resolves the same intent instead of reading as an
         # unexplained new position.
         pending_entry_tokens: dict[str, dict[str, Any]] = {}
+        pending_exit_tokens: set[str] = set()
         try:
             identity = {"status": "MOCK"}
             if hasattr(self.adapter, "identity_preflight"):
@@ -383,6 +548,13 @@ class ReconciliationWorker:
                             "authoritative_balance": repair["authoritative_balance"],
                         })
                         auto_recoverable_gaps += 1
+
+            await self._reconcile_resolved_local_positions(
+                remote_positions=remote_positions,
+                gaps=gaps,
+                repairs=repairs,
+                actor=actor,
+            )
 
             if self.strategy_repo:
                 for intent in self.strategy_repo.unresolved_intents():
@@ -520,6 +692,41 @@ class ReconciliationWorker:
                             )
                         continue
                     if intent.get("action") in {"EXIT", "TP"} and terminal:
+                        if status in MATCHED_AWAITING_FILL_STATUSES:
+                            # MATCHED/FILLED order status can lead the trades
+                            # and balance feeds. Preserve the durable remote
+                            # identity and keep the exit unresolved: zero fill
+                            # evidence is not evidence of a zero-filled exit.
+                            self.strategy_repo.update_intent(
+                                str(intent["intent_id"]),
+                                state="RECONCILIATION_REQUIRED",
+                                reason_code=(
+                                    "REMOTE_MATCHED_FILL_PROPAGATION_PENDING"
+                                ),
+                            )
+                            pending_exit_tokens.add(str(intent["token_id"]))
+                            if not _within_intent_submission_grace(
+                                str(
+                                    intent.get("submitted_at")
+                                    or intent.get("created_at")
+                                    or ""
+                                )
+                            ):
+                                if intent.get("position_id"):
+                                    self.strategy_repo.require_exit_reconciliation(
+                                        str(intent["position_id"])
+                                    )
+                                gaps.append({
+                                    "type": (
+                                        "exit_matched_without_fill_evidence"
+                                    ),
+                                    "intent_id": intent["intent_id"],
+                                    "position_id": intent.get("position_id"),
+                                    "token_id": intent.get("token_id"),
+                                    "polymarket_order_id": remote_id,
+                                    "status": status,
+                                })
+                            continue
                         if status in {"cancelled", "canceled", "expired"}:
                             self.strategy_repo.finalize_cancel(
                                 str(intent["intent_id"]), True, f"REMOTE_{status.upper()}"
@@ -673,6 +880,13 @@ class ReconciliationWorker:
                         and str(local.get("token_id"))
                         not in remote_tokens
                     ):
+                        if str(local.get("token_id")) in pending_exit_tokens:
+                            # Remote absence while a known EXIT is MATCHED but
+                            # its fill feed is pending is the expected opposite
+                            # side of the same propagation race. The intent
+                            # remains durable and unresolved; do not create a
+                            # second position contradiction for that absence.
+                            continue
                         if (
                             sellable <= 0
                             and _within_position_propagation_grace(
@@ -768,6 +982,28 @@ class ReconciliationWorker:
                 "retry_count": self._consecutive_retries,
                 "retry_after_seconds": round(retry_after_seconds, 3),
             }
+        except asyncio.CancelledError:
+            # Cancellation is a BaseException on supported Python versions,
+            # so the generic handler below cannot terminalize the row.
+            task = asyncio.current_task()
+            task_name = task.get_name() if task is not None else ""
+            if actor == "market_ws_reconnect":
+                cancellation_reason = "CANCELLED_WS_SESSION"
+            elif task_name == "live-reconciliation":
+                cancellation_reason = "CANCELLED_SERVICE_SHUTDOWN"
+            else:
+                cancellation_reason = "CANCELLED_RECONCILIATION_TASK"
+            self.repo.finish_reconciliation(
+                run_id, "failed", sanitize(gaps), cancellation_reason
+            )
+            self.repo.audit(
+                actor,
+                "live_reconciliation",
+                "failed",
+                cancellation_reason,
+                {"run_id": run_id, "cancelled": True},
+            )
+            raise
         except Exception as exc:
             safe_error = f"{type(exc).__name__}: {exc}"[:500]
             rate_limited = _is_rate_limit_error(exc)

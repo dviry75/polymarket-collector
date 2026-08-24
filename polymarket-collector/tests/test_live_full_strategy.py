@@ -2925,3 +2925,444 @@ def test_unknown_tp_without_remote_id_is_not_cancelled_or_parallel_sold():
         ] is None
     finally:
         temp.cleanup()
+
+
+# --- EXIT MATCHED/fill propagation race ------------------------------------
+
+def _reserve_matched_pending_exit(
+    strategy, base, adapter, *, event_id="exit-race", status="matched",
+    shares=Decimal("5.0666"),
+):
+    base.upsert_market({
+        "event_id": event_id,
+        "condition_id": f"condition-{event_id}",
+        "yes_token_id": f"token-{event_id}",
+        "no_token_id": f"other-{event_id}",
+        "token_mapping_status": "verified",
+        "accepting_orders": True,
+        "min_order_size": "5",
+    })
+    position = reserve_and_open(
+        strategy,
+        event=event_id,
+        shares=shares,
+        minimum=Decimal("5"),
+        sellable=shares,
+    )
+    intent = strategy.reserve_position_intent(
+        position,
+        action="EXIT",
+        purpose="STOP_066",
+        order_type="FAK",
+        shares=shares,
+        price_limit=Decimal("0.55"),
+        book_hash="exit-race",
+    )
+    order_id = f"exit-order-{event_id}"
+    strategy.update_intent(
+        intent["intent_id"],
+        remote_order_id=order_id,
+        submitted_at=now_iso(),
+    )
+    adapter.orders[order_id] = {
+        "polymarket_order_id": order_id,
+        "status": status,
+        "fills": [],
+    }
+    return position, intent, order_id
+
+
+def _exit_fill(order_id, size):
+    return {
+        "polymarket_trade_id": f"trade-{order_id}-{size}",
+        "polymarket_order_id": order_id,
+        "price": "0.60",
+        "size": str(size),
+        "fee": "0",
+        "status": "matched",
+        "matched_at": now_iso(),
+        "transaction_hash": f"tx-{order_id}",
+        "raw_message": {},
+    }
+
+
+def test_exit_matched_zero_fill_then_delayed_fill_is_not_terminalized():
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        position, intent, order_id = _reserve_matched_pending_exit(
+            strategy, base, adapter, event_id="exit-delay"
+        )
+        worker = ReconciliationWorker(base, adapter, strategy)
+
+        first = asyncio.run(worker.run_once("test"))
+        pending = strategy.intent(intent["intent_id"])
+        assert first["status"] == "ok"
+        assert pending["state"] == "RECONCILIATION_REQUIRED"
+        assert pending["remote_order_id"] == order_id
+        assert pending["reason_code"] == (
+            "REMOTE_MATCHED_FILL_PROPAGATION_PENDING"
+        )
+        assert strategy.position_for_token(position["token_id"])[
+            "remaining_shares_text"
+        ] == "5.0666"
+
+        adapter.orders[order_id]["fills"] = [
+            _exit_fill(order_id, Decimal("5.0666"))
+        ]
+        second = asyncio.run(worker.run_once("test"))
+        assert second["status"] == "ok"
+        resolved = strategy.intent(intent["intent_id"])
+        assert resolved["state"] == "FILLED"
+        assert resolved["filled_shares_text"] == "5.0666"
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "CLOSED"
+    finally:
+        temp.cleanup()
+
+
+def test_exit_propagation_pending_prevents_duplicate_exit():
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        position, intent, _order_id = _reserve_matched_pending_exit(
+            strategy, base, adapter, event_id="exit-no-duplicate"
+        )
+        asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        current = strategy.position_for_token(position["token_id"])
+        duplicate = strategy.reserve_position_intent(
+            current,
+            action="EXIT",
+            purpose="STOP_066",
+            order_type="FAK",
+            shares=Decimal("5.0666"),
+            price_limit=Decimal("0.55"),
+            book_hash="duplicate",
+        )
+        assert duplicate["_duplicate"] is True
+        assert duplicate["intent_id"] == intent["intent_id"]
+    finally:
+        temp.cleanup()
+
+
+def test_exit_propagation_pending_survives_restart():
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        _position, intent, order_id = _reserve_matched_pending_exit(
+            strategy, base, adapter, event_id="exit-restart"
+        )
+        asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+
+        restarted = StrategyRepository(base)
+        restarted.migrate(pause_entries_default=False)
+        durable = restarted.intent(intent["intent_id"])
+        assert durable["state"] == "RECONCILIATION_REQUIRED"
+        assert durable["remote_order_id"] == order_id
+
+        adapter.orders[order_id]["fills"] = [
+            _exit_fill(order_id, Decimal("5.0666"))
+        ]
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, restarted).run_once(
+                "restart-test"
+            )
+        )
+        assert result["status"] == "ok"
+        assert restarted.intent(intent["intent_id"])["state"] == "FILLED"
+    finally:
+        temp.cleanup()
+
+
+def test_exit_matched_partial_fill_uses_observed_quantity_only():
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        position, intent, order_id = _reserve_matched_pending_exit(
+            strategy, base, adapter, event_id="exit-partial"
+        )
+        adapter.orders[order_id]["fills"] = [
+            _exit_fill(order_id, Decimal("2"))
+        ]
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        assert result["status"] == "ok"
+        resolved = strategy.intent(intent["intent_id"])
+        assert resolved["state"] == "PARTIAL_FINAL"
+        assert resolved["filled_shares_text"] == "2"
+        current = strategy.position_for_token(position["token_id"])
+        assert current["remaining_shares_text"] == "3.0666"
+    finally:
+        temp.cleanup()
+
+
+def test_exit_matched_unexplained_beyond_grace_fails_closed():
+    temp, base, strategy = build_repo()
+    try:
+        adapter = MockTradingAdapter()
+        position, intent, order_id = _reserve_matched_pending_exit(
+            strategy, base, adapter, event_id="exit-expired"
+        )
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_intents "
+                "SET submitted_at='2000-01-01T00:00:00+00:00' "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )
+            conn.commit()
+
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        assert result["status"] == "gaps"
+        assert result["gaps"] == [{
+            "type": "exit_matched_without_fill_evidence",
+            "intent_id": intent["intent_id"],
+            "position_id": position["position_id"],
+            "token_id": position["token_id"],
+            "polymarket_order_id": order_id,
+            "status": "matched",
+        }]
+        assert strategy.intent(intent["intent_id"])[
+            "state"
+        ] == "RECONCILIATION_REQUIRED"
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "EXIT_RECONCILIATION_REQUIRED"
+        assert strategy.pause_entries()
+    finally:
+        temp.cleanup()
+
+
+def test_exit_cancelled_and_rejected_remain_terminal():
+    for status, expected in (("cancelled", "CANCELED"), ("rejected", "REJECTED")):
+        temp, base, strategy = build_repo()
+        try:
+            adapter = MockTradingAdapter()
+            position, intent, _order_id = _reserve_matched_pending_exit(
+                strategy,
+                base,
+                adapter,
+                event_id=f"exit-{status}",
+                status=status,
+            )
+            adapter.positions.append({
+                "token_id": position["token_id"],
+                "condition_id": position["condition_id"],
+                "size": position["remaining_shares_text"],
+                "average_price": position["average_entry_price_text"],
+                "outcome": position["outcome"],
+                "redeemable": False,
+                "current_value": "3",
+            })
+            result = asyncio.run(
+                ReconciliationWorker(base, adapter, strategy).run_once("test")
+            )
+            assert result["status"] == "ok"
+            assert strategy.intent(intent["intent_id"])["state"] == expected
+        finally:
+            temp.cleanup()
+
+
+# --- resolved-market local ghost reconciliation (D6) ----------------------
+
+class _TokenBalanceAdapter(MockTradingAdapter):
+    def __init__(self, balances=None):
+        super().__init__()
+        self.balances = dict(balances or {})
+        self.balance_calls = {}
+
+    async def get_token_balance(self, token_id):
+        self.balance_calls[token_id] = self.balance_calls.get(token_id, 0) + 1
+        value = self.balances.get(token_id)
+        if value is None:
+            return {"status": "unavailable"}
+        return {"status": "mock", "balance_text": str(value)}
+
+
+def _resolved_position_case(
+    *, event_id, winner_is_local, balance, age_position=True,
+):
+    temp, base, strategy = build_repo()
+    token = f"token-{event_id}"
+    other = f"other-{event_id}"
+    condition = f"condition-{event_id}"
+    base.upsert_market({
+        "event_id": event_id,
+        "condition_id": condition,
+        "yes_token_id": token,
+        "no_token_id": other,
+        "token_mapping_status": "verified",
+        "accepting_orders": True,
+        "min_order_size": "5",
+    })
+    position = reserve_and_open(
+        strategy,
+        event=event_id,
+        shares=Decimal("5"),
+        minimum=Decimal("5"),
+        sellable=Decimal("5"),
+    )
+    base.mark_market_resolved(
+        condition,
+        token if winner_is_local else other,
+        "YES" if winner_is_local else "NO",
+    )
+    if age_position:
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions "
+                "SET created_at='2000-01-01T00:00:00+00:00' "
+                "WHERE position_id=?",
+                (position["position_id"],),
+            )
+            conn.commit()
+    adapter = _TokenBalanceAdapter({token: balance})
+    return temp, base, strategy, adapter, position
+
+
+def test_resolved_loser_requires_second_authoritative_zero():
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-loser-zero",
+        winner_is_local=False,
+        balance="0",
+    )
+    try:
+        worker = ReconciliationWorker(base, adapter, strategy)
+        first = asyncio.run(worker.run_once("test"))
+        assert first["status"] == "gaps"
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "OPEN"
+
+        worker._rate_limit_retry_after = 0
+        second = asyncio.run(worker.run_once("test"))
+        assert second["status"] == "ok", second
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "RESOLVED_LOSER"
+        assert second["repairs"][0]["type"] == (
+            "resolved_loser_authoritative_zero"
+        )
+        with base.connect() as conn:
+            audit = conn.execute(
+                "SELECT action,reason FROM live_audit_log "
+                "WHERE action='resolved_position_repair' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert tuple(audit) == (
+            "resolved_position_repair",
+            "RESOLVED_LOSER_AUTHORITATIVE_ZERO",
+        )
+    finally:
+        temp.cleanup()
+
+
+def test_resolved_winner_positive_balance_becomes_redeem_pending():
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-winner-positive",
+        winner_is_local=True,
+        balance="5",
+    )
+    try:
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        assert result["status"] == "ok"
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "REDEEM_PENDING"
+        assert result["repairs"][0]["type"] == (
+            "resolved_winner_marked_redeem_pending"
+        )
+    finally:
+        temp.cleanup()
+
+
+def test_recent_resolved_position_within_grace_is_not_closed():
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-recent",
+        winner_is_local=False,
+        balance="0",
+        age_position=False,
+    )
+    try:
+        asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "OPEN"
+    finally:
+        temp.cleanup()
+
+
+def test_resolved_remote_absence_without_balance_never_closes():
+    temp, base, strategy, _adapter, position = _resolved_position_case(
+        event_id="resolved-absence",
+        winner_is_local=False,
+        balance=None,
+    )
+    try:
+        adapter = MockTradingAdapter()
+        worker = ReconciliationWorker(base, adapter, strategy)
+        asyncio.run(worker.run_once("test"))
+        worker._rate_limit_retry_after = 0
+        asyncio.run(worker.run_once("test"))
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "OPEN"
+    finally:
+        temp.cleanup()
+
+
+def test_resolved_loser_positive_authoritative_balance_stays_active():
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-loser-active",
+        winner_is_local=False,
+        balance="5",
+    )
+    try:
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+        assert result["status"] == "gaps"
+        assert any(
+            gap["type"] == "resolved_loser_authoritative_balance_active"
+            for gap in result["gaps"]
+        )
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "OPEN"
+    finally:
+        temp.cleanup()
+
+
+def test_resolved_winner_authoritative_zero_remains_fail_closed():
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-winner-zero",
+        winner_is_local=True,
+        balance="0",
+    )
+    try:
+        worker = ReconciliationWorker(base, adapter, strategy)
+        asyncio.run(worker.run_once("test"))
+        worker._rate_limit_retry_after = 0
+        result = asyncio.run(worker.run_once("test"))
+        assert result["status"] == "gaps"
+        assert any(
+            gap["type"] == "resolved_winner_authoritative_zero"
+            for gap in result["gaps"]
+        )
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "OPEN"
+    finally:
+        temp.cleanup()

@@ -1311,16 +1311,23 @@ class LiveRepository:
             conn.commit()
         return run_id
 
-    def finish_reconciliation(self, run_id: int, status: str, gaps: list[dict[str, Any]], error: str = "") -> None:
+    def finish_reconciliation(
+        self, run_id: int, status: str, gaps: list[dict[str, Any]], error: str = ""
+    ) -> bool:
+        """Move a reconciliation run to a terminal state exactly once."""
         with self.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE live_reconciliation_runs
                 SET finished_at = ?, status = ?, gaps_count = ?, gaps_json = ?, error = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
                 """,
                 (now_iso(), status, len(gaps), json_dumps(gaps), error, run_id),
             )
+            finalized = cursor.rowcount == 1
+            if not finalized:
+                conn.commit()
+                return False
             conn.execute(
                 """
                 INSERT INTO live_system_state (key, value, updated_at)
@@ -1339,6 +1346,7 @@ class LiveRepository:
                     (now_iso(),),
                 )
             conn.commit()
+        return True
 
     def store_account_snapshot(self, snapshot: dict[str, Any]) -> None:
         with self.connect() as conn:
