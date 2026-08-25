@@ -75,21 +75,18 @@ def test_alert_dedup_resolve_recurrence_and_acknowledge():
         temporary.cleanup()
 
 
-def test_operator_watchdog_opens_email_outbox_after_five_minutes_and_resolves():
+def test_operator_watchdog_opens_email_outbox_immediately_and_resolves():
     temporary, base, strategy = build_repo()
     try:
         strategy.acquire_pause(
             actor="operator", reason="OPERATOR_PAUSE", owner="OPERATOR"
         )
-        acquired = datetime.now(timezone.utc) - timedelta(minutes=6)
-        base.set_state("pause_acquired_at", acquired.isoformat(), "test")
-
         alert = strategy.watchdog_operator_action(
             actor="test", now=datetime.now(timezone.utc)
         )
         assert alert["status"] == "OPEN"
         assert alert["severity"] == "CRITICAL"
-        assert alert["reason_code"] == "OPERATOR_ACTION_REQUIRED_OVER_5M"
+        assert alert["reason_code"] == "OPERATOR_ACTION_REQUIRED"
         assert alert["message"].startswith("[CRITICAL ACTION]")
         repeated = strategy.watchdog_operator_action(
             actor="test", now=datetime.now(timezone.utc)

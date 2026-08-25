@@ -4248,7 +4248,7 @@ class StrategyRepository:
         self,
         *,
         actor: str = "alert_watchdog",
-        threshold_seconds: float = 300.0,
+        threshold_seconds: float = 0.0,
         now: datetime | None = None,
     ) -> dict[str, Any] | None:
         observed_now = now or datetime.now(timezone.utc)
@@ -4273,7 +4273,7 @@ class StrategyRepository:
             == ReleasePolicy.MANUAL_ONLY
         )
         alert_type = "OPERATOR_ACTION_WATCHDOG"
-        reason_code = "OPERATOR_ACTION_REQUIRED_OVER_5M"
+        reason_code = "OPERATOR_ACTION_REQUIRED"
         if (
             bool(pause.get("pause_entries"))
             and action_required
@@ -4300,8 +4300,8 @@ class StrategyRepository:
                 severity="CRITICAL",
                 reason_code=reason_code,
                 message=(
-                    "[CRITICAL ACTION] Trading has remained blocked pending "
-                    f"operator action for {int(age_seconds)}s; reason={reason}"
+                    "[CRITICAL ACTION] Trading is blocked pending operator "
+                    f"action; age_seconds={int(age_seconds)}; reason={reason}"
                 ),
                 entity_type="GLOBAL",
                 entity_id="ENTRY_GATE",
