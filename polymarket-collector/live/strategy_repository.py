@@ -1182,6 +1182,91 @@ class StrategyRepository:
         )
         return True
 
+    def reclassify_transient_reconciliation_failure(
+        self,
+        *,
+        actor: str,
+        reconciliation_run_id: str | int,
+        clean_finished_at: str,
+    ) -> bool:
+        """Downgrade one proven response-shape false positive after clean truth."""
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            source_run_id = str(
+                state.get("pause_source_reconciliation_run_id") or ""
+            )
+            source = conn.execute(
+                "SELECT id,finished_at,status,error "
+                "FROM live_reconciliation_runs WHERE id=?",
+                (source_run_id,),
+            ).fetchone() if source_run_id else None
+            error = str(source["error"] or "") if source else ""
+            normalized_error = error.lower()
+            proven_transient_shape = (
+                "unexpectedresponseerror" in normalized_error
+                and "did not match expected shape" in normalized_error
+            )
+            eligible = (
+                state.get("pause_entries", "false").lower() == "true"
+                and state.get("pause_owner", "").upper()
+                in {"RECONCILIATION", "MACHINE"}
+                and state.get("pause_cause", "").upper()
+                == "RECONCILIATION_FAILED"
+                and source is not None
+                and str(source["status"]) == "failed"
+                and proven_transient_shape
+                and bool(clean_finished_at)
+                and bool(source["finished_at"])
+                and clean_finished_at > str(source["finished_at"])
+            )
+            if not eligible:
+                conn.rollback()
+                return False
+            generation = int(
+                state.get("pause_generation", "0") or 0
+            ) + 1
+            self.base.set_states_on_connection(conn, {
+                "pause_state": PauseState.PAUSED_RECOVERING,
+                "pause_cause": "RECONCILIATION_TEMPORARY_ERROR",
+                "pause_reason": "RECONCILIATION_TEMPORARY_ERROR",
+                "release_policy": ReleasePolicy.AUTO_WHEN_CLEAN,
+                "pause_generation": str(generation),
+                "pause_updated_at": ts,
+                "pause_eligible_since": "",
+                "pause_auto_recoverable": "true",
+                "pause_source_reconciliation_run_id": str(
+                    reconciliation_run_id
+                ),
+                "recovery_status": "RECOVERING",
+                "recovery_last_action": "RETRY_RECONCILIATION_WITH_BACKOFF",
+                "recovery_last_result": "CLEAN_AFTER_TRANSIENT_SHAPE_ERROR",
+                "operator_action_required": "false",
+                "operator_action_reason": "",
+                "global_entry_halt_required": "true",
+                "global_entry_halt_reason": "RECONCILIATION_TEMPORARY_ERROR",
+                "incident_scope": "GLOBAL",
+            }, actor)
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor,
+                    "reclassify_transient_reconciliation_failure", "ok",
+                    "RECONCILIATION_TEMPORARY_ERROR",
+                    json.dumps({
+                        "failed_run_id": int(source["id"]),
+                        "clean_run_id": str(reconciliation_run_id),
+                        "failed_error": error[:500],
+                        "generation": generation,
+                    }, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        return True
+
     def set_waiting_stability(
         self, *, expected_generation: int, eligible_since: str
     ) -> bool:
@@ -3684,6 +3769,11 @@ class StrategyRepository:
             conn.commit()
 
         if ready and run_id is not None:
+            self.reclassify_transient_reconciliation_failure(
+                actor=actor,
+                reconciliation_run_id=run_id,
+                clean_finished_at=completed_at,
+            )
             self.promote_repairable_pause(
                 actor=actor,
                 reconciliation_run_id=run_id,

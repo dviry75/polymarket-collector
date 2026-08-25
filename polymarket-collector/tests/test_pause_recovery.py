@@ -868,3 +868,60 @@ def test_short_market_freshness_blip_gates_without_durable_pause():
         assert record["release_policy"] == ReleasePolicy.AUTO_WHEN_CLEAN
     finally:
         temp.cleanup()
+
+
+def test_unexpected_open_order_shape_is_transient_and_legacy_pause_recovers():
+    class UnexpectedResponseError(Exception):
+        pass
+
+    class ShapeAdapter(MockTradingAdapter):
+        async def get_balance(self):
+            raise UnexpectedResponseError(
+                "OpenOrder response did not match expected shape"
+            )
+
+    temp, base, strategy, _market, _user, recovery = build_clean()
+    try:
+        failed = asyncio.run(
+            ReconciliationWorker(
+                base, ShapeAdapter(), strategy
+            ).run_once("reconciliation")
+        )
+        assert failed["status"] == "failed"
+        assert (
+            strategy.pause_record()["pause_cause"]
+            == "RECONCILIATION_TEMPORARY_ERROR"
+        )
+
+        strategy.release_pause_cas(
+            expected_generation=int(
+                strategy.pause_record()["pause_generation"]
+            ),
+            expected_owner="RECONCILIATION",
+            actor="test", reason="TEST_RESET",
+        )
+        legacy_run = base.start_reconciliation()
+        base.finish_reconciliation(
+            legacy_run, "failed", [],
+            "UnexpectedResponseError: OpenOrder response did not match expected shape",
+        )
+        strategy.acquire_pause(
+            actor="legacy", reason="RECONCILIATION_FAILED",
+            owner="RECONCILIATION",
+            source_reconciliation_run_id=legacy_run,
+        )
+        assert strategy.pause_record()["operator_action_required"]
+
+        clean = asyncio.run(
+            ReconciliationWorker(
+                base, MockTradingAdapter(), strategy
+            ).run_once("reconciliation")
+        )
+        assert clean["status"] == "ok"
+        record = strategy.pause_record()
+        assert record["pause_cause"] == "RECONCILIATION_TEMPORARY_ERROR"
+        assert record["operator_action_required"] == "false"
+        assert record["pause_auto_recoverable"] == "true"
+        assert complete_stability(base, recovery).resumed
+    finally:
+        temp.cleanup()

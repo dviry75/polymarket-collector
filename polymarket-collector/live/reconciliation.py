@@ -144,7 +144,11 @@ def _is_temporary_network_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
         token in name or token in message
-        for token in ("timeout", "temporar", "connection", "network", "http 502", "http 503", "http 504")
+        for token in (
+            "timeout", "temporar", "connection", "network",
+            "http 502", "http 503", "http 504",
+            "unexpectedresponse", "did not match expected shape",
+        )
     )
 
 
