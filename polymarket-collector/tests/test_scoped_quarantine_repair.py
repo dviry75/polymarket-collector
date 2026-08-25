@@ -234,6 +234,76 @@ def test_authoritative_matched_exit_repair_matches_live_gap_arithmetic():
         temporary.cleanup()
 
 
+def test_authoritative_repair_recovers_existing_fill_and_prior_double_count():
+    temporary, base, strategy, adapter, position, intent = build_matched_exit_case(
+        valid_proof=True
+    )
+    try:
+        for remote_trade_id, fee_source, status in (
+            ("confirmed-trade", "polymarket_fee_rate_bps", "CONFIRMED"),
+            (
+                "authoritative:0xmatched-order:0xmatched-tx",
+                "authoritative_matched_order_attempt",
+                "MATCHED",
+            ),
+        ):
+            strategy.add_fill(
+                intent_id=intent["intent_id"],
+                remote_trade_id=remote_trade_id,
+                shares=Decimal("5.06"),
+                price=Decimal("0.54"),
+                fee=Decimal("0"),
+                fee_verification_status="VERIFIED",
+                fee_source=fee_source,
+                status=status,
+                transaction_hash="0xmatched-tx",
+                matched_at=now_iso(),
+                raw={"fixture": "prior-double-count"},
+            )
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions SET state='CLOSED',"
+                "remaining_shares_text='0',sellable_shares_text='0',"
+                "dust_shares_text='0',exit_value_text='2.73599856',"
+                "active_exit_intent_id=NULL,closed_at=? WHERE position_id=?",
+                (now_iso(), position["position_id"]),
+            )
+            conn.execute(
+                "UPDATE live_strategy_intents SET state='PARTIAL_FINAL',"
+                "filled_shares_text='10.12',average_price_text='0.54',"
+                "remaining_shares_text='0' WHERE intent_id=?",
+                (intent["intent_id"],),
+            )
+            conn.commit()
+        strategy.quarantine_position(
+            position["position_id"],
+            reason_code="AUTO_REPAIR_POSTCONDITION_MISMATCH",
+            evidence={
+                "remote_order_id": "0xmatched-order",
+                "authoritative_balance": "0.006664",
+            },
+            actor="test",
+        )
+
+        _first, second = confirm(
+            ReconciliationWorker(base, adapter, strategy), position["token_id"]
+        )
+        assert second["status"] == "ok", second
+        current = strategy.position_for_token(position["token_id"])
+        repaired_intent = strategy.intent(intent["intent_id"])
+        assert current["state"] == "DUST"
+        assert current["remaining_shares_text"] == "0.006664"
+        assert current["exit_value_text"] == "2.7324"
+        assert repaired_intent["filled_shares_text"] == "5.06"
+        assert repaired_intent["remaining_shares_text"] == "0.006664"
+        assert strategy.quarantine_records() == []
+        summary = strategy.fill_summary(intent["intent_id"])
+        assert summary["shares"] == Decimal("5.06")
+        assert summary["notional"] == Decimal("2.7324")
+    finally:
+        temporary.cleanup()
+
+
 def test_unsafe_authoritative_exit_evidence_is_scoped_quarantined():
     temporary, base, strategy, adapter, position, _intent = build_matched_exit_case(
         valid_proof=False

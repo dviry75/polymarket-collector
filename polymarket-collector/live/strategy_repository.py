@@ -1818,13 +1818,37 @@ class StrategyRepository:
         """Return a deterministic aggregate of deduplicated durable fills."""
         with self.base.connect() as conn:
             rows = conn.execute(
-                "SELECT shares_text,price_text,fee_text FROM live_strategy_fills WHERE intent_id=?",
+                "SELECT remote_trade_id,shares_text,price_text,fee_text,"
+                "fee_source,transaction_hash FROM live_strategy_fills "
+                "WHERE intent_id=? ORDER BY created_at,fill_id",
                 (intent_id,),
             ).fetchall()
+        authoritative_duplicates = {
+            (
+                str(row["transaction_hash"] or ""),
+                str(row["shares_text"]),
+                str(row["price_text"]),
+            )
+            for row in rows
+            if str(row["fee_source"] or "")
+            != "authoritative_matched_order_attempt"
+        }
         shares = Decimal("0")
         notional = Decimal("0")
         fees = Decimal("0")
         for row in rows:
+            identity = (
+                str(row["transaction_hash"] or ""),
+                str(row["shares_text"]),
+                str(row["price_text"]),
+            )
+            if (
+                str(row["fee_source"] or "")
+                == "authoritative_matched_order_attempt"
+                and identity[0]
+                and identity in authoritative_duplicates
+            ):
+                continue
             fill_shares = decimal_value(row["shares_text"]) or Decimal("0")
             fill_price = decimal_value(row["price_text"]) or Decimal("0")
             shares += fill_shares
@@ -2247,6 +2271,24 @@ class StrategyRepository:
             condition_id=str(position["condition_id"]),
             operator_action_required=operator_action_required,
         )
+
+    def open_quarantine_for_position(
+        self, position_id: str
+    ) -> dict[str, Any] | None:
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM live_quarantines WHERE position_id=? "
+                "AND status='OPEN' ORDER BY last_seen_at DESC LIMIT 1",
+                (str(position_id),),
+            ).fetchone()
+        item = row_to_dict(row)
+        if not item:
+            return None
+        try:
+            item["evidence"] = json.loads(item.get("evidence_json") or "{}")
+        except (TypeError, ValueError):
+            item["evidence"] = {}
+        return item
 
     def resolve_position_quarantine(
         self,
@@ -3168,6 +3210,208 @@ class StrategyRepository:
                 (remote_order_id,),
             ).fetchone()
         return row_to_dict(row)
+
+    def apply_authoritative_exit_repair(
+        self,
+        *,
+        position_id: str,
+        intent_id: str,
+        matched_shares: Decimal,
+        matched_notional: Decimal,
+        authoritative_balance: Decimal,
+        verified_fill_shares: Decimal,
+        verified_fill_notional: Decimal,
+        verified_fill_fees: Decimal,
+        min_sellable: Decimal,
+        actor: str,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Rebuild one exit from linked execution and token-balance truth."""
+        if matched_shares <= 0 or matched_notional <= 0:
+            raise ValueError("authoritative exit amounts must be positive")
+        if (
+            verified_fill_shares != matched_shares
+            or verified_fill_notional != matched_notional
+        ):
+            raise ValueError("durable fill evidence does not match order attempt")
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            position = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (str(position_id),),
+            ).fetchone()
+            intent = conn.execute(
+                "SELECT * FROM live_strategy_intents WHERE intent_id=?",
+                (str(intent_id),),
+            ).fetchone()
+            if position is None or intent is None:
+                conn.rollback()
+                raise KeyError(position_id if position is None else intent_id)
+            if (
+                str(intent["position_id"] or "") != str(position_id)
+                or str(intent["action"] or "").upper() not in {"EXIT", "TP"}
+            ):
+                conn.rollback()
+                raise ValueError("intent is not linked to the repaired position")
+            acquired = (
+                decimal_value(position["acquired_shares_text"])
+                or Decimal("0")
+            )
+            if (
+                authoritative_balance < 0
+                or acquired - matched_shares != authoritative_balance
+            ):
+                conn.rollback()
+                raise ValueError("authoritative balance arithmetic mismatch")
+            other_rows = conn.execute(
+                "SELECT i.intent_id,f.shares_text FROM live_strategy_intents AS i "
+                "JOIN live_strategy_fills AS f ON f.intent_id=i.intent_id "
+                "WHERE i.position_id=? AND i.intent_id<>? "
+                "AND i.action IN ('EXIT','TP')",
+                (str(position_id), str(intent_id)),
+            ).fetchall()
+            other_filled = sum(
+                (
+                    decimal_value(row["shares_text"]) or Decimal("0")
+                    for row in other_rows
+                ),
+                Decimal("0"),
+            )
+            if other_filled != 0:
+                conn.rollback()
+                raise ValueError("other exit fills prevent isolated rebuild")
+
+            before = row_to_dict(position) or {}
+            purpose = str(intent["purpose"] or "RECONCILED_EXIT")
+            remaining = authoritative_balance
+            dust = (
+                remaining
+                if remaining > 0 and remaining < min_sellable
+                else Decimal("0")
+            )
+            if remaining == 0:
+                position_state = "CLOSED"
+            elif dust > 0:
+                position_state = "DUST"
+            else:
+                position_state = "OPEN"
+            average_price = matched_notional / matched_shares
+            exit_value = matched_notional
+            exit_fees = verified_fill_fees
+            cost = (
+                decimal_value(position["cost_all_in_text"])
+                or Decimal("0")
+            )
+            allocated_cost = (
+                cost * matched_shares / acquired
+                if acquired > 0 else Decimal("0")
+            )
+            pnl = exit_value - exit_fees - allocated_cost
+            final_intent_state = (
+                "FILLED" if remaining == 0 else "PARTIAL_FINAL"
+            )
+            conn.execute(
+                """
+                UPDATE live_strategy_positions SET
+                    remaining_shares_text=?,sellable_shares_text=?,
+                    dust_shares_text=?,exit_value_text=?,exit_fees_text=?,
+                    realized_pnl_text=?,state=?,active_exit_intent_id=NULL,
+                    tp_intent_id=NULL,last_exit_book_hash=?,
+                    updated_at=?,closed_at=CASE
+                        WHEN ? IN ('CLOSED','DUST') THEN ?
+                        ELSE NULL END
+                WHERE position_id=?
+                """,
+                (
+                    canonical_decimal(remaining),
+                    canonical_decimal(
+                        Decimal("0") if dust > 0 else remaining
+                    ),
+                    canonical_decimal(dust),
+                    canonical_decimal(exit_value),
+                    canonical_decimal(exit_fees),
+                    canonical_decimal(pnl),
+                    position_state,
+                    "authoritative-order-attempt-balance-repair",
+                    ts,
+                    position_state,
+                    ts,
+                    str(position_id),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE live_strategy_intents SET state=?,
+                    filled_shares_text=?,average_price_text=?,fee_text=?,
+                    remaining_shares_text=?,final_at=?,updated_at=?
+                WHERE intent_id=?
+                """,
+                (
+                    final_intent_state,
+                    canonical_decimal(matched_shares),
+                    canonical_decimal(average_price),
+                    canonical_decimal(verified_fill_fees),
+                    canonical_decimal(remaining),
+                    ts,
+                    ts,
+                    str(intent_id),
+                ),
+            )
+            if position_state in {"CLOSED", "DUST"}:
+                conn.execute(
+                    """
+                    UPDATE live_strategy_deals SET state=?,
+                        total_fees_text=?,realized_pnl_text=?,
+                        final_reason=?,closed_at=?,updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (
+                        position_state,
+                        canonical_decimal(
+                            (decimal_value(position["entry_fees_text"])
+                             or Decimal("0")) + exit_fees
+                        ),
+                        canonical_decimal(pnl),
+                        purpose,
+                        ts,
+                        ts,
+                        str(position["event_id"]),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE live_event_states SET status=?,updated_at=? "
+                    "WHERE event_id=?",
+                    (position_state, ts, str(position["event_id"])),
+                )
+            updated = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (str(position_id),),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts,
+                    actor,
+                    "authoritative_exit_state_rebuilt",
+                    "ok",
+                    "MATCHED_EXIT_BALANCE_CONFIRMED",
+                    json.dumps(
+                        sanitize({
+                            "position_id": position_id,
+                            "intent_id": intent_id,
+                            "before": before,
+                            "after": row_to_dict(updated) or {},
+                            "evidence": evidence,
+                        }),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            conn.commit()
+        return row_to_dict(updated) or {}
 
     def matched_exit_attempt_evidence(
         self, intent_id: str

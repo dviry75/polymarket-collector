@@ -268,12 +268,15 @@ class ReconciliationWorker:
         authoritative_balance: Decimal,
         market: dict[str, Any],
         actor: str,
+        linked_intent_id: str | None = None,
     ) -> dict[str, Any]:
         if self.strategy_repo is None:
             return {"status": "not_applicable"}
         position_id = str(local.get("position_id") or "")
         token_id = str(local.get("token_id") or "")
-        intent_id = str(local.get("active_exit_intent_id") or "")
+        intent_id = str(
+            linked_intent_id or local.get("active_exit_intent_id") or ""
+        )
         intent = self.strategy_repo.intent(intent_id) if intent_id else None
         attempt = (
             self.strategy_repo.matched_exit_attempt_evidence(intent_id)
@@ -400,25 +403,49 @@ class ReconciliationWorker:
             },
         )
         summary = self.strategy_repo.fill_summary(intent_id)
-        updated = self.strategy_repo.apply_exit_fill(
-            position_id=position_id,
-            intent_id=intent_id,
-            sold_shares=making,
-            average_price=average_price,
-            fees=Decimal("0"),
-            final_state=(
-                "FILLED" if authoritative_balance == 0 else "PARTIAL_FINAL"
-            ),
-            min_sellable=(
-                decimal_value(market.get("min_order_size"))
-                or Decimal("0.000001")
-            ),
-            purpose=str(intent.get("purpose") or "RECONCILED_EXIT"),
-            book_hash="authoritative-order-attempt-balance-repair",
-            cumulative_filled_shares=summary["shares"],
-            cumulative_notional=summary["notional"],
-            cumulative_fees=summary["fees"],
-        )
+        try:
+            updated = self.strategy_repo.apply_authoritative_exit_repair(
+                position_id=position_id,
+                intent_id=intent_id,
+                matched_shares=making,
+                matched_notional=taking,
+                authoritative_balance=authoritative_balance,
+                verified_fill_shares=summary["shares"],
+                verified_fill_notional=summary["notional"],
+                verified_fill_fees=summary["fees"],
+                min_sellable=(
+                    decimal_value(market.get("min_order_size"))
+                    or Decimal("0.000001")
+                ),
+                actor=actor,
+                evidence=evidence,
+            )
+        except (KeyError, ValueError) as exc:
+            evidence = {
+                **evidence,
+                "state_rebuild_error": f"{type(exc).__name__}: {exc}",
+                "verified_fill_shares": canonical_decimal(summary["shares"]),
+                "verified_fill_notional": canonical_decimal(summary["notional"]),
+            }
+            quarantine = self.strategy_repo.quarantine_position(
+                position_id,
+                reason_code="AUTO_REPAIR_EVIDENCE_CONTRADICTION",
+                evidence=evidence,
+                actor=actor,
+                operator_action_required=True,
+            )
+            self.strategy_repo.reclassify_pause_as_scoped(
+                actor=actor,
+                incident_scope="POSITION",
+                source_position_id=position_id,
+                operator_action_required=True,
+                reason="AUTO_REPAIR_EVIDENCE_CONTRADICTION",
+            )
+            return {
+                "status": "quarantined",
+                "evidence": evidence,
+                "quarantine": quarantine,
+            }
         repaired_remaining = (
             decimal_value(updated.get("remaining_shares_text"))
             or Decimal("0")
@@ -532,6 +559,28 @@ class ReconciliationWorker:
                 or local.get("tp_intent_id")
                 or ""
             )
+            if (
+                not linked_intent_id
+                and str(local.get("state") or "").upper() == "QUARANTINED"
+            ):
+                quarantine = self.strategy_repo.open_quarantine_for_position(
+                    str(local.get("position_id") or "")
+                )
+                quarantine_evidence = (
+                    dict(quarantine.get("evidence") or {})
+                    if quarantine else {}
+                )
+                recovered_remote_id = str(
+                    quarantine_evidence.get("remote_order_id") or ""
+                )
+                recovered_intent = (
+                    self.strategy_repo.intent_by_remote_order(
+                        recovered_remote_id
+                    )
+                    if recovered_remote_id else None
+                )
+                if recovered_intent is not None:
+                    linked_intent_id = str(recovered_intent["intent_id"])
             if linked_intent_id:
                 linked = self.strategy_repo.intent(linked_intent_id)
                 if (
@@ -567,6 +616,7 @@ class ReconciliationWorker:
                     authoritative_balance=observed,
                     market=market,
                     actor=actor,
+                    linked_intent_id=linked_intent_id,
                 )
                 repair_status = str(exit_repair.get("status") or "")
                 if repair_status == "repaired":
