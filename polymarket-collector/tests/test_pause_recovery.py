@@ -923,5 +923,10 @@ def test_unexpected_open_order_shape_is_transient_and_legacy_pause_recovers():
         assert record["operator_action_required"] == "false"
         assert record["pause_auto_recoverable"] == "true"
         assert complete_stability(base, recovery).resumed
+        released = strategy.pause_record()
+        assert released["pause_cause"] == ""
+        assert released["operator_action_required"] == "false"
+        assert released["global_entry_halt_required"] == "false"
+        assert released["incident_scope"] == "NONE"
     finally:
         temp.cleanup()
