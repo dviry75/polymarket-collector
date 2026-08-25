@@ -9,6 +9,7 @@ import asyncio
 import array
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -227,6 +228,7 @@ class MarketWebSocketManager:
         self._subscription_sent_at: str | None = None
         self._reconciliation_started_at: str | None = None
         self._reconciliation_finished_at: str | None = None
+        self._reconciliation_pending = False
         self._generation_timing_generation = 0
         self._generation_required_assets: tuple[str, ...] = ()
         self._first_book_slots: dict[int, dict[str, Any]] = {}
@@ -314,6 +316,10 @@ class MarketWebSocketManager:
         if operation == "subscribe":
             message["custom_feature_enabled"] = True
         return message
+
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
 
     async def start(self, url: str) -> None:
         async with self._lock:
@@ -474,19 +480,7 @@ class MarketWebSocketManager:
                     self.status.status = "SUBSCRIBED"
                     self.status.error = None
                     attempt = 0
-                    if self.on_reconnect is not None:
-                        self._reconciliation_started_at = now_iso()
-                        try:
-                            await self.on_reconnect()
-                        finally:
-                            self._reconciliation_finished_at = now_iso()
-                    heartbeat = asyncio.create_task(self._heartbeat(ws))
-                    subscriptions = asyncio.create_task(self._subscription_loop(ws))
-                    try:
-                        await self._run_ingress_pipeline(ws)
-                    finally:
-                        heartbeat.cancel()
-                        subscriptions.cancel()
+                    await self._run_connected_pipeline(ws)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -507,6 +501,53 @@ class MarketWebSocketManager:
                 except asyncio.TimeoutError:
                     pass
         self.status.status = "STOPPED"
+
+    async def _run_connected_pipeline(self, ws: Any) -> None:
+        """Drain frames while coordinator-owned reconciliation runs independently."""
+        self._reconciliation_pending = self.on_reconnect is not None
+        if self._reconciliation_pending:
+            self._queue_states({
+                "strategy_readiness": "NOT_READY",
+                "strategy_block_reason": "RECONNECT_RECONCILIATION_PENDING",
+            })
+        heartbeat = asyncio.create_task(self._heartbeat(ws))
+        subscriptions = asyncio.create_task(self._subscription_loop(ws))
+        pipeline = asyncio.create_task(
+            self._run_ingress_pipeline(ws), name="market-ws-ingress-pipeline"
+        )
+        reconciliation_waiter: asyncio.Task[Any] | None = None
+        try:
+            if self.on_reconnect is not None:
+                self._reconciliation_started_at = now_iso()
+                reconciliation_waiter = asyncio.create_task(
+                    self.on_reconnect(), name="market-ws-reconciliation-waiter"
+                )
+                done, _pending = await asyncio.wait(
+                    {pipeline, reconciliation_waiter},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if pipeline in done and not reconciliation_waiter.done():
+                    # The socket lifecycle may end, but cancelling this waiter
+                    # cannot cancel coordinator-owned reconciliation work.
+                    reconciliation_waiter.cancel()
+                    await asyncio.gather(
+                        reconciliation_waiter, return_exceptions=True
+                    )
+                    await pipeline
+                    return
+                await reconciliation_waiter
+                self._reconciliation_finished_at = now_iso()
+            self._reconciliation_pending = False
+            await pipeline
+        finally:
+            self._reconciliation_pending = False
+            tasks = [pipeline, heartbeat, subscriptions]
+            if reconciliation_waiter is not None:
+                tasks.append(reconciliation_waiter)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_ingress_pipeline(self, ws: Any) -> None:
         """Drain the websocket continuously while processing book events in order."""
@@ -1252,9 +1293,18 @@ class MarketWebSocketManager:
                     condition_id, now_ms=now_ms
                 )
         if event_readiness:
-            all_ready = all(item["ready"] for item in event_readiness.values())
-            reason = "" if all_ready else next(
-                item["reason"] for item in event_readiness.values() if not item["ready"]
+            all_ready = (
+                not self._reconciliation_pending
+                and all(item["ready"] for item in event_readiness.values())
+            )
+            reason = (
+                "RECONNECT_RECONCILIATION_PENDING"
+                if self._reconciliation_pending
+                else "" if all_ready else next(
+                    item["reason"]
+                    for item in event_readiness.values()
+                    if not item["ready"]
+                )
             )
             self._queue_states({
                 "strategy_readiness": "READY" if all_ready else "NOT_READY",
@@ -1267,6 +1317,7 @@ class MarketWebSocketManager:
         if (
             self.on_atomic_frame is not None
             and (callback_updates or top_transition_updates)
+            and not self._reconciliation_pending
             and not (event_type != "market_resolved" and frame.rejected_reason)
         ):
             context = {
@@ -2894,6 +2945,7 @@ class MarketWebSocketManager:
             "dynamic_subscriptions": self.dynamic_subscriptions,
             "dynamic_subscription_fallbacks": self.dynamic_subscription_fallbacks,
             "readiness_state": self._readiness_state,
+            "reconciliation_pending": self._reconciliation_pending,
             "not_ready_transitions": self.not_ready_transitions,
             "not_ready_total_seconds": self.not_ready_total_seconds + (
                 time.monotonic() - self._not_ready_started_monotonic
@@ -2932,7 +2984,7 @@ class UserWebSocketManager:
     AUTH_KEYS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
 
     def __init__(self, repo: LiveRepository, stale_after_seconds: int = 25,
-                 reconciliation: Callable[[], Awaitable[Any]] | None = None,
+                 reconciliation: Callable[..., Awaitable[Any]] | None = None,
                  condition_ids_provider: Callable[[], list[str]] | None = None,
                  market_provider: Callable[[str], dict[str, Any] | None] | None = None,
                  event_queue_capacity: int = 1024):
@@ -2946,6 +2998,13 @@ class UserWebSocketManager:
         self._ws = None
         self._lock = asyncio.Lock()
         self._reconciliation = reconciliation
+        try:
+            self._reconciliation_accepts_reason = bool(
+                reconciliation is not None
+                and inspect.signature(reconciliation).parameters
+            )
+        except (TypeError, ValueError):
+            self._reconciliation_accepts_reason = False
         self._condition_ids_provider = condition_ids_provider
         self._market_provider = market_provider
         self._event_queue_capacity = max(16, int(event_queue_capacity))
@@ -2989,6 +3048,13 @@ class UserWebSocketManager:
         if token == str(market.get("no_token_id") or ""):
             return "NO"
         return None
+
+    async def _request_reconciliation(self, reason: str) -> Any:
+        if self._reconciliation is None:
+            return None
+        if self._reconciliation_accepts_reason:
+            return await self._reconciliation(reason)
+        return await self._reconciliation()
 
     async def start(self, url):
         async with self._lock:
@@ -3049,7 +3115,7 @@ class UserWebSocketManager:
                     self._set_state("CONNECTED")
                     attempt = 0
                     if self._reconciliation:
-                        await self._reconciliation()
+                        await self._request_reconciliation("reconnect")
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     subscriptions = asyncio.create_task(self._subscription_loop(ws))
                     try:
@@ -3156,7 +3222,7 @@ class UserWebSocketManager:
                 stored = await asyncio.to_thread(self.process_message, value)
                 event_type = str(value.get("event_type") or value.get("type") or "").lower()
                 if stored and event_type in {"order", "trade"} and self._reconciliation:
-                    await self._reconciliation()
+                    await self._request_reconciliation(f"{event_type}_event")
             except Exception as exc:
                 self.event_persistence_failures += 1
                 self._logger.exception("User WS persistence failed: %s", exc)
@@ -3181,7 +3247,11 @@ class UserWebSocketManager:
             self.trade_events_received += 1
         if stored and normalized.get("event_type") in {"order", "trade"} and self._reconciliation:
             try:
-                asyncio.get_running_loop().create_task(self._reconciliation())
+                asyncio.get_running_loop().create_task(
+                    self._request_reconciliation(
+                        f"{normalized.get('event_type')}_event"
+                    )
+                )
             except RuntimeError:
                 pass
         self.status.status, self.status.last_message_at, self.status.stale = "CONNECTED", now_iso(), False

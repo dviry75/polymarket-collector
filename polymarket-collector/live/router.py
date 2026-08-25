@@ -22,6 +22,7 @@ from .order_manager import OrderManager
 from .paper_trading import PaperTradingEngine
 from .public_client import MockPublicClobClient, PublicClobClient
 from .reconciliation import ReconciliationWorker
+from .reconciliation_coordinator import ReconciliationCoordinator
 from .pause_recovery import request_manual_resume
 from .repository import LiveRepository, now_iso
 from .risk_manager import RiskManager
@@ -45,6 +46,7 @@ _adapter: TradingAdapter | None = None
 _risk: RiskManager | None = None
 _orders: OrderManager | None = None
 _reconciliation: ReconciliationWorker | None = None
+_reconciliation_coordinator: ReconciliationCoordinator | None = None
 _market_ws: MarketWebSocketManager | None = None
 _user_ws: UserWebSocketManager | None = None
 _engine: TradingEngine | None = None
@@ -60,7 +62,7 @@ _dashboard_mode = False
 
 
 def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
-    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime, _ipc_client, _status_cache, _dashboard_mode
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _reconciliation_coordinator, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime, _ipc_client, _status_cache, _dashboard_mode
     _ipc_client = None
     _status_cache = None
     _dashboard_mode = False
@@ -83,9 +85,17 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     _risk = RiskManager(_config, _repo)
     _orders = OrderManager(_repo, _risk, _adapter)
     _reconciliation = ReconciliationWorker(_repo, _adapter, _strategy_repo)
+    _reconciliation_coordinator = ReconciliationCoordinator(
+        _reconciliation,
+        current_generation=lambda: (
+            _market_ws.connection_generation if _market_ws is not None else 0
+        ),
+    )
     _strategy_runtime = LiveStrategyRuntime(
         _config, _repo, _strategy_repo, _adapter,
-        reconciliation=lambda reason: _reconciliation.run_once(actor=f"strategy:{reason}"),
+        reconciliation=lambda reason: _reconciliation_coordinator.request(
+            actor=f"strategy:{reason}", evidence_changed=True
+        ),
     )
     _paper = PaperTradingEngine(
         _repo,
@@ -102,13 +112,19 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         snapshot_min_interval_seconds=float(_config.snapshot_min_interval_seconds),
         ingress_queue_capacity=_config.market_ws_ingress_queue_capacity,
         include_depth_in_callback=(_config.execution_mode == "PAPER_TRADING"),
-        on_reconnect=lambda: _reconciliation.run_once(actor="market_ws_reconnect"),
+        on_reconnect=lambda: _reconciliation_coordinator.request(
+            actor="market_ws_reconnect",
+            generation=_market_ws.connection_generation,
+        ),
     )
     _strategy_runtime.set_market_freshness_provider(_market_ws.event_freshness)
     _strategy_runtime.set_market_provider(_market_ws.market_for_condition)
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
-        reconciliation=lambda: _reconciliation.run_once(actor="user_ws_reconnect"),
+        reconciliation=lambda reason="reconnect": _reconciliation_coordinator.request(
+            actor=f"user_ws:{reason}",
+            evidence_changed=reason in {"order_event", "trade_event"},
+        ),
         condition_ids_provider=_market_ws.cached_condition_ids,
         market_provider=_market_ws.market_for_condition,
     )
@@ -119,7 +135,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
 
 def configure_dashboard(db_path: Path | str, config: LiveConfig | None = None) -> None:
     """Configure a credential-free, query-only Dashboard process."""
-    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime, _ipc_client, _status_cache, _dashboard_mode
+    global _repo, _config, _adapter, _risk, _orders, _reconciliation, _reconciliation_coordinator, _market_ws, _user_ws, _engine, _auth, _dry_run, _paper, _strategy_repo, _strategy_runtime, _ipc_client, _status_cache, _dashboard_mode
     _config = config or LiveConfig.from_env()
     _repo = LiveRepository(db_path, query_only=True)
     _ipc_client = TraderIPCClient(_config.trader_socket_path)
@@ -128,6 +144,7 @@ def configure_dashboard(db_path: Path | str, config: LiveConfig | None = None) -
     _risk = RiskManager(_config, _repo)
     _orders = named_service("remote-orders")
     _reconciliation = RemoteReconciliation(_ipc_client)
+    _reconciliation_coordinator = None
     _market_ws = RemoteHealth(_status_cache, "market_ws")
     _user_ws = RemoteHealth(_status_cache, "user_ws")
     _engine = named_service("remote-engine")
@@ -174,6 +191,12 @@ def services() -> tuple[LiveConfig, LiveRepository, TradingAdapter, RiskManager,
     if _repo is None or _config is None or _adapter is None or _risk is None or _orders is None or _reconciliation is None or _market_ws is None or _user_ws is None or _engine is None or _auth is None or _dry_run is None:
         raise RuntimeError("LIVE services are not configured")
     return _config, _repo, _adapter, _risk, _orders, _reconciliation, _market_ws, _user_ws, _engine, _auth, _dry_run
+
+
+def reconciliation_coordinator() -> ReconciliationCoordinator:
+    if _reconciliation_coordinator is None:
+        raise RuntimeError("Reconciliation coordinator is not configured")
+    return _reconciliation_coordinator
 
 
 def strategy_services() -> tuple[StrategyRepository, LiveStrategyRuntime]:

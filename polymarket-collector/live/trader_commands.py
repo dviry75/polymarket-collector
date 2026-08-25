@@ -16,16 +16,23 @@ class TraderCommandHandler:
 
     async def __call__(self, command: str, payload: dict[str, Any]) -> Any:
         # Import lazily to avoid a router/configuration import cycle.
-        from .router import paper_service, services, strategy_services
+        from .router import (
+            paper_service, reconciliation_coordinator, services,
+            strategy_services,
+        )
 
         config, repo, adapter, _risk, _orders, reconciliation, market_ws, user_ws, engine, _auth, dry_run = services()
         strategy_repo, runtime = strategy_services()
         command = command.upper()
 
         if command == "STATUS":
+            reconciliation_health = reconciliation.health()
+            reconciliation_health["coordinator"] = (
+                reconciliation_coordinator().health()
+            )
             return sanitize({
                 "adapter": {"name": adapter.name},
-                "reconciliation": reconciliation.health(),
+                "reconciliation": reconciliation_health,
                 "market_ws": market_ws.health(),
                 "user_ws": user_ws.health(),
                 "strategy": runtime.health(),
@@ -86,7 +93,9 @@ class TraderCommandHandler:
             repo.set_state("kill_switch", "true" if active else "false", "operator")
             return {"ok": True, "kill_switch": active}
         if command == "RECONCILIATION_RUN":
-            return await reconciliation.run_once(actor=str(payload.get("actor") or "operator"))
+            return await reconciliation_coordinator().request(
+                actor=str(payload.get("actor") or "operator"), force=True
+            )
         if command == "CREATE_RULE":
             return repo.create_rule(dict(payload["rule"]))
         if command == "UPDATE_RULE_STATUS":
@@ -94,7 +103,9 @@ class TraderCommandHandler:
         if command == "MOCK_ORDER":
             if config.live_adapter != "mock":
                 raise PermissionError("This command is mock-only")
-            await reconciliation.run_once(actor="operator")
+            await reconciliation_coordinator().request(
+                actor="operator", evidence_changed=True, force=True
+            )
             order_payload = dict(payload.get("payload") or {})
             order_payload.setdefault("idempotency_key", f"manual-{now_iso()}")
             order_payload.setdefault("requested_amount_usd", config.default_trade_amount_usd)

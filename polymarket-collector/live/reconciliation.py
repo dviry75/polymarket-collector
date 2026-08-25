@@ -8,7 +8,7 @@ import math
 import random
 import statistics
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .adapters.base import TradingAdapter
 from .order_book import canonical_decimal, decimal_value
@@ -21,6 +21,7 @@ from .reconciliation_stability import (
     authoritative_token_balance, classify_missing_position,
     ingest_maker_exit_fills,
 )
+from .reconciliation_coordinator import GapBackoffTracker
 
 
 
@@ -166,6 +167,7 @@ class ReconciliationWorker:
         self._run_lock = asyncio.Lock()
         self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
+        self._gap_backoff = GapBackoffTracker()
         self._missing_position_suspects: dict[str, float] = {}
         self._resolved_zero_observations: dict[str, int] = {}
         self.reconciliation_started_at: str | None = None
@@ -210,12 +212,37 @@ class ReconciliationWorker:
     def _reset_backoff(self, actor: str) -> None:
         self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
+        self._gap_backoff.reset()
         self.repo.set_states({
             "reconciliation_retry_count": "0",
             "reconciliation_backoff_seconds": "0",
             "last_reconciliation_error": "",
             "last_reconciliation_success": now_iso(),
         }, actor)
+
+    def reset_retry_backoff(self, actor: str = "financial_event") -> None:
+        """Allow new financial evidence to trigger immediate verification."""
+        self._reset_backoff(actor)
+
+    def _schedule_gap_backoff(
+        self, actor: str, gaps: list[dict[str, Any]]
+    ) -> float:
+        delay = self._gap_backoff.observe(gaps)
+        self._consecutive_retries = self._gap_backoff.repeat_count
+        self._rate_limit_retry_after = time.monotonic() + delay
+        snapshot = self._gap_backoff.snapshot()
+        self.repo.set_states({
+            "reconciliation_retry_count": str(self._consecutive_retries),
+            "reconciliation_backoff_seconds": f"{delay:.3f}",
+            "reconciliation_gap_fingerprint": snapshot["fingerprint"],
+            "reconciliation_gap_evidence_fingerprint": (
+                snapshot["evidence_fingerprint"]
+            ),
+            "reconciliation_gap_repeat_count": str(snapshot["repeat_count"]),
+            "reconciliation_gap_last_changed_at": snapshot["last_changed_at"],
+            "last_reconciliation_error": f"persistent gaps: {len(gaps)}",
+        }, actor)
+        return delay
 
     async def _reconcile_resolved_local_positions(
         self,
@@ -364,10 +391,16 @@ class ReconciliationWorker:
                 repair,
             )
 
-    async def run_once(self, actor: str = "system") -> dict[str, Any]:
+    async def run_once(
+        self,
+        actor: str = "system",
+        *,
+        ready_publish_guard: Callable[[], bool] | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
         async with self._run_lock:
             now = time.monotonic()
-            if now < self._rate_limit_retry_after:
+            if not force and now < self._rate_limit_retry_after:
                 return {
                     "run_id": None,
                     "status": "backoff",
@@ -381,7 +414,12 @@ class ReconciliationWorker:
             self.reconciliation_started_at = now_iso()
             result: dict[str, Any] | None = None
             try:
-                result = await self._run_once_serialized(actor)
+                if ready_publish_guard is None:
+                    result = await self._run_once_serialized(actor)
+                else:
+                    result = await self._run_once_serialized(
+                        actor, ready_publish_guard=ready_publish_guard
+                    )
                 return result
             finally:
                 duration_ms = max(0.0, (time.perf_counter() - started) * 1000)
@@ -404,7 +442,12 @@ class ReconciliationWorker:
             "sample_capacity_per_outcome": RECONCILIATION_TELEMETRY_CAPACITY,
         }
 
-    async def _run_once_serialized(self, actor: str) -> dict[str, Any]:
+    async def _run_once_serialized(
+        self,
+        actor: str,
+        *,
+        ready_publish_guard: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         run_id = self.repo.start_reconciliation()
         gaps: list[dict[str, Any]] = []
         repairs: list[dict[str, Any]] = []
@@ -918,36 +961,48 @@ class ReconciliationWorker:
 
             status = "ok" if not gaps else "gaps"
             if gaps:
-                retry_after_seconds = self._schedule_backoff(
-                    actor, f"persistent gaps: {len(gaps)}"
-                )
+                retry_after_seconds = self._schedule_gap_backoff(actor, gaps)
             else:
                 retry_after_seconds = 0.0
                 self._reset_backoff(actor)
             completed_at = now_iso()
             self.repo.finish_reconciliation(run_id, status, sanitize(gaps))
+            readiness_publish_allowed = bool(
+                gaps
+                or ready_publish_guard is None
+                or ready_publish_guard()
+            )
             if not gaps:
                 mark_reconciled_provenance(self.repo)
             if self.strategy_repo:
                 repairable_gap_set = bool(
                     gaps and auto_recoverable_gaps == len(gaps)
                 )
-                self.strategy_repo.set_reconciliation_state(
-                    ready=not gaps,
-                    reason=(
-                        "RECONCILIATION_GAP"
-                        if repairable_gap_set
-                        else "RECONCILIATION_CONTRADICTION"
-                        if gaps
-                        else ""
-                    ),
-                    actor=actor,
-                    auto_recoverable=(
-                        repairable_gap_set
-                    ),
-                    run_id=run_id,
-                    finished_at=completed_at,
-                )
+                if readiness_publish_allowed:
+                    self.strategy_repo.set_reconciliation_state(
+                        ready=not gaps,
+                        reason=(
+                            "RECONCILIATION_GAP"
+                            if repairable_gap_set
+                            else "RECONCILIATION_CONTRADICTION"
+                            if gaps
+                            else ""
+                        ),
+                        actor=actor,
+                        auto_recoverable=(
+                            repairable_gap_set
+                        ),
+                        run_id=run_id,
+                        finished_at=completed_at,
+                    )
+                else:
+                    self.repo.audit(
+                        actor,
+                        "reconciliation_readiness_publish",
+                        "ignored",
+                        "STALE_WS_GENERATION",
+                        {"run_id": run_id},
+                    )
                 if gaps:
                     self.strategy_repo.alert(
                         alert_type="RECONCILIATION", severity="CRITICAL",
@@ -981,6 +1036,7 @@ class ReconciliationWorker:
                 "repairs": sanitize(repairs),
                 "retry_count": self._consecutive_retries,
                 "retry_after_seconds": round(retry_after_seconds, 3),
+                "published_readiness": readiness_publish_allowed,
             }
         except asyncio.CancelledError:
             # Cancellation is a BaseException on supported Python versions,

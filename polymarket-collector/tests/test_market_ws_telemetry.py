@@ -201,11 +201,66 @@ def test_message_timing_boundaries_and_negative_queue_wait_clamp():
         temporary.cleanup()
 
 
-def test_reader_reconciliation_order_and_market_semantics_are_unchanged():
+def test_reader_starts_before_reconciliation_finishes_and_entries_stay_gated():
     source = inspect.getsource(MarketWebSocketManager.run)
-    assert source.index("await self.on_reconnect()") < source.index(
-        "await self._run_ingress_pipeline(ws)"
-    )
+    assert "await self._run_connected_pipeline(ws)" in source
+
+    temporary, repo = make_repo()
+    try:
+        reader_started = asyncio.Event()
+        reconciliation_observed_reader = []
+
+        async def reconcile():
+            await asyncio.wait_for(reader_started.wait(), 1)
+            reconciliation_observed_reader.append(True)
+
+        manager = MarketWebSocketManager(repo, on_reconnect=reconcile)
+
+        async def pipeline(_ws):
+            reader_started.set()
+
+        async def idle(_ws):
+            await asyncio.Event().wait()
+
+        manager._run_ingress_pipeline = pipeline
+        manager._heartbeat = idle
+        manager._subscription_loop = idle
+        asyncio.run(manager._run_connected_pipeline(object()))
+        assert reconciliation_observed_reader == [True]
+        assert manager._reconciliation_pending is False
+    finally:
+        temporary.cleanup()
+
+
+def test_atomic_strategy_callback_is_suppressed_while_reconciliation_pending():
+    temporary, repo = make_repo()
+    try:
+        callbacks = []
+        manager = MarketWebSocketManager(
+            repo,
+            stale_after_seconds=1,
+            clock_ms=lambda: NOW_MS,
+            on_atomic_frame=callbacks.append,
+        )
+        manager.subscribed_asset_ids = ["yes"]
+        manager._refresh_market_cache(["yes"])
+        manager._reconciliation_pending = True
+        assert manager.process_message(book(NOW_MS - 100))
+        assert callbacks == []
+        assert manager.health()["readiness_state"] == "NOT_READY"
+
+        manager._reconciliation_pending = False
+        assert manager.process_message(book(NOW_MS - 50, ask="0.75"))
+        assert len(callbacks) == 1
+        assert (
+            manager._last_queued_state_values["strategy_block_reason"]
+            != "RECONNECT_RECONCILIATION_PENDING"
+        )
+    finally:
+        temporary.cleanup()
+
+
+def test_market_semantics_are_unchanged_after_reconnect_gate():
 
     temporary, repo = make_repo()
     try:

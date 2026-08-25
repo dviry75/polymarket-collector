@@ -17,8 +17,11 @@ from live.geographic import geographic_preflight
 from live.ipc import TraderIPCServer
 from live.market_discovery import refresh_btc_5m_markets
 from live.pause_recovery import PauseRecoveryCoordinator
+from live.reconciliation_coordinator import ReconciliationCadencePolicy
 from live.repository import now_iso
-from live.router import configure, services, strategy_services
+from live.router import (
+    configure, reconciliation_coordinator, services, strategy_services,
+)
 from live.trader_commands import TraderCommandHandler
 
 
@@ -44,15 +47,31 @@ async def market_discovery_loop(config: LiveConfig) -> None:
 
 
 async def reconciliation_loop(config: LiveConfig) -> None:
+    cadence = ReconciliationCadencePolicy(
+        config.reconciliation_active_interval_seconds,
+        config.reconciliation_interval_seconds,
+    )
     while True:
         strategy_repo, _runtime = strategy_services()
-        active = bool(strategy_repo.unresolved_intents() or strategy_repo.active_positions())
-        interval = (
-            config.reconciliation_active_interval_seconds
-            if active else config.reconciliation_interval_seconds
+        active_work = [
+            {
+                "kind": "intent",
+                "id": intent.get("intent_id"),
+                "state": intent.get("state"),
+                "updated_at": intent.get("updated_at"),
+            }
+            for intent in strategy_repo.unresolved_intents()
+        ]
+        active_work.extend({
+            "kind": "position",
+            "id": position.get("position_id"),
+            "state": position.get("state"),
+            "updated_at": position.get("updated_at"),
+        } for position in strategy_repo.active_positions())
+        await asyncio.sleep(cadence.interval(active_work))
+        await reconciliation_coordinator().request(
+            actor="periodic_reconciliation"
         )
-        await asyncio.sleep(max(1, interval))
-        await services()[5].run_once(actor="periodic_reconciliation")
 
 
 async def pause_recovery_loop(coordinator: PauseRecoveryCoordinator) -> None:
@@ -138,15 +157,20 @@ async def startup() -> None:
             reason_code="RESTART_WITH_OPEN_STATE",
             message="Trader restarted with unresolved order/position state; entries paused",
         )
-    startup_reconciliation = await services()[5].run_once(
-        actor="startup_reconciliation"
+    await reconciliation_coordinator().start()
+    startup_reconciliation = await reconciliation_coordinator().request(
+        actor="startup_reconciliation", force=True
     )
     if startup_reconciliation.get("status") == "ok":
         repaired_dust = strategy_repo.repair_terminal_dust_slots(
             actor="startup_reconciliation"
         )
         if repaired_dust:
-            await services()[5].run_once(actor="post_dust_repair_reconciliation")
+            await reconciliation_coordinator().request(
+                actor="post_dust_repair_reconciliation",
+                evidence_changed=True,
+                force=True,
+            )
 
     _discovery_task = asyncio.create_task(market_discovery_loop(config), name="live-market-discovery")
     _reconciliation_task = asyncio.create_task(reconciliation_loop(config), name="live-reconciliation")
@@ -195,6 +219,10 @@ async def shutdown() -> None:
             await asyncio.wait_for(stop(), 10)
         except (asyncio.TimeoutError, Exception):
             pass
+    try:
+        await reconciliation_coordinator().stop()
+    except RuntimeError:
+        pass
     if _ipc_server is not None:
         await _ipc_server.stop()
         _ipc_server = None
