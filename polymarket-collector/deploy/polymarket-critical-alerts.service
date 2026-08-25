@@ -1,0 +1,33 @@
+[Unit]
+Description=Polymarket [CRITICAL ACTION] operator notification sender (notify-only)
+After=network-online.target
+Wants=network-online.target
+# Deliberately independent of polymarket-trader.service: this unit must never
+# start, stop, restart, or otherwise affect the trading core.
+
+[Service]
+Type=oneshot
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
+EnvironmentFile=/etc/polymarket-live/trader.env
+EnvironmentFile=/etc/polymarket-live/smtp.env
+ExecStart=/opt/polymarket-btc-live/.venv/bin/python -m scripts.run_critical_alerts
+TimeoutStartSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+ReadWritePaths=/opt/polymarket-btc-live
+Nice=10
