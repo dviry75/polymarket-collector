@@ -13,8 +13,11 @@ from live.pause_recovery import (
 )
 from live.reconciliation import ReconciliationWorker
 from live.recovery_policy import (
+    IncidentScope,
     PauseState,
     ReleasePolicy,
+    SafetyTier,
+    UNKNOWN_OBSERVATION_WINDOW_SECONDS,
     recovery_policy,
 )
 from live.repository import LiveRepository, now_iso
@@ -231,7 +234,7 @@ def test_kill_switch_never_auto_releases():
         temp.cleanup()
 
 
-def test_unknown_reason_defaults_manual_only():
+def test_unknown_reason_is_globally_blocked_during_classification_then_escalates():
     temp, _base, strategy, _market, _user, recovery = build_clean()
     try:
         strategy.acquire_pause(
@@ -240,8 +243,22 @@ def test_unknown_reason_defaults_manual_only():
             owner="MACHINE",
         )
         record = strategy.pause_record()
-        assert record["release_policy"] == ReleasePolicy.MANUAL_ONLY
-        assert record["pause_state"] == PauseState.PAUSED_MANUAL_ONLY
+        assert record["release_policy"] == ReleasePolicy.AUTO_WHEN_CLEAN
+        assert record["pause_state"] == PauseState.PAUSED_RECOVERING
+        assert record["global_entry_halt_required"] == "true"
+        assert record["operator_action_required"] == "false"
+        acquired = datetime.fromisoformat(record["unknown_cause_first_seen_at"])
+        assert strategy.escalate_unknown_pause_if_expired(
+            actor="test",
+            now=acquired + timedelta(
+                seconds=UNKNOWN_OBSERVATION_WINDOW_SECONDS + 1
+            ),
+        )
+        escalated = strategy.pause_record()
+        assert escalated["release_policy"] == ReleasePolicy.MANUAL_ONLY
+        assert escalated["pause_state"] == PauseState.PAUSED_MANUAL_ONLY
+        assert escalated["operator_action_required"] == "true"
+        assert escalated["global_entry_halt_required"] == "true"
         assert "MANUAL_ONLY_PAUSE" in recovery.attempt_auto_resume().blockers
     finally:
         temp.cleanup()
@@ -476,9 +493,16 @@ def test_temporary_network_error_retries_then_clean_recovers():
         temp.cleanup()
 
 
-def test_policy_table_is_fail_closed_for_unknown_reason():
+def test_policy_table_blocks_unknown_during_bounded_classification_window():
     policy = recovery_policy("SOMETHING_NEW_AND_UNCLASSIFIED")
-    assert policy.release_policy == ReleasePolicy.MANUAL_ONLY
+    assert policy.release_policy == ReleasePolicy.AUTO_WHEN_CLEAN
+    assert policy.safety_tier == SafetyTier.TRANSIENT_GLOBAL_BLOCK
+    escalated = recovery_policy(
+        "SOMETHING_NEW_AND_UNCLASSIFIED",
+        unknown_age_seconds=UNKNOWN_OBSERVATION_WINDOW_SECONDS,
+    )
+    assert escalated.release_policy == ReleasePolicy.MANUAL_ONLY
+    assert escalated.safety_tier == SafetyTier.GLOBAL_MANUAL_HARD_STOP
 
 
 # --- RECONNECT_RECONCILIATION_PENDING regression coverage -----------------
@@ -588,21 +612,31 @@ def test_true_manual_only_reasons_unaffected_by_reconnect_fix():  # Test E
         temp.cleanup()
 
 
-def test_unrelated_unknown_reason_still_fail_closed_after_reconnect_fix():  # Test F
-    policy = recovery_policy("SOME_OTHER_UNMAPPED_REASON_XYZ")
-    assert policy.release_policy == ReleasePolicy.MANUAL_ONLY
+def test_unknown_proven_scoped_uses_quarantine_policy_not_global_hard_stop():  # Test F
+    policy = recovery_policy(
+        "SOME_OTHER_UNMAPPED_REASON_XYZ",
+        incident_scope=IncidentScope.POSITION,
+    )
+    assert policy.release_policy == ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION
+    assert policy.safety_tier == SafetyTier.SCOPED_QUARANTINE
 
-    temp, _base, strategy, _market, _user, recovery = build_clean()
+    temp, _base, strategy, _market, _user, _recovery = build_clean()
     try:
         strategy.acquire_pause(
             actor="risk_manager",
             reason="SOME_OTHER_UNMAPPED_REASON_XYZ",
             owner="MACHINE",
         )
+        assert strategy.reclassify_pause_as_scoped(
+            actor="test", incident_scope=IncidentScope.POSITION,
+            source_position_id="position-1", operator_action_required=True,
+            reason="SCOPED_UNKNOWN",
+        )
         record = strategy.pause_record()
-        assert record["release_policy"] == ReleasePolicy.MANUAL_ONLY
-        assert record["pause_state"] == PauseState.PAUSED_MANUAL_ONLY
-        assert "MANUAL_ONLY_PAUSE" in recovery.attempt_auto_resume().blockers
+        assert record["incident_scope"] == IncidentScope.POSITION
+        assert record["global_entry_halt_required"] == "false"
+        assert record["operator_action_required"] == "true"
+        assert record["release_policy"] == ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION
     finally:
         temp.cleanup()
 

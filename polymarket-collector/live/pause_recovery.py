@@ -239,7 +239,7 @@ class EntryReleaseEvaluator:
                     "heartbeat",
                 )
 
-        unresolved = self.strategy_repo.unresolved_intents()
+        unresolved = self.strategy_repo.entry_blocking_intents()
         if unresolved:
             self._add(
                 blockers, "UNRESOLVED_INTENT", "financial_state",
@@ -257,7 +257,7 @@ class EntryReleaseEvaluator:
         if any(
             str(position.get("state") or "").upper()
             in UNKNOWN_POSITION_STATES
-            for position in self.strategy_repo.active_positions()
+            for position in self.strategy_repo.entry_blocking_positions()
         ):
             self._add(
                 blockers,
@@ -594,6 +594,9 @@ class PauseRecoveryCoordinator:
     def tick(self) -> PauseRecoveryResult:
         self.repo.set_states(
             {"recovery_engine_status": "HEALTHY"}, "pause_recovery"
+        )
+        self.strategy_repo.escalate_unknown_pause_if_expired(
+            actor="pause_recovery"
         )
         return self.attempt_auto_resume()
 

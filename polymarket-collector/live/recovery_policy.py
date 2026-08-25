@@ -23,12 +23,31 @@ class PauseState(StrEnum):
     PAUSED_MANUAL_ONLY = "PAUSED_MANUAL_ONLY"
 
 
+class SafetyTier(StrEnum):
+    TRANSIENT_GLOBAL_BLOCK = "TRANSIENT_GLOBAL_BLOCK"
+    SCOPED_QUARANTINE = "SCOPED_QUARANTINE"
+    GLOBAL_MANUAL_HARD_STOP = "GLOBAL_MANUAL_HARD_STOP"
+
+
+class IncidentScope(StrEnum):
+    POSITION = "POSITION"
+    TOKEN = "TOKEN"
+    EVENT = "EVENT"
+    ACCOUNT = "ACCOUNT"
+    GLOBAL = "GLOBAL"
+    UNKNOWN = "UNKNOWN"
+
+
+UNKNOWN_OBSERVATION_WINDOW_SECONDS = 60.0
+
+
 @dataclass(frozen=True)
 class RecoveryPolicy:
     classification: RecoveryClassification
     release_policy: ReleasePolicy
     required_evidence: tuple[str, ...]
     remediation: str
+    safety_tier: SafetyTier
 
 
 def _transient(remediation: str, *evidence: str) -> RecoveryPolicy:
@@ -37,6 +56,7 @@ def _transient(remediation: str, *evidence: str) -> RecoveryPolicy:
         ReleasePolicy.AUTO_WHEN_CLEAN,
         tuple(evidence),
         remediation,
+        SafetyTier.TRANSIENT_GLOBAL_BLOCK,
     )
 
 
@@ -46,6 +66,7 @@ def _repairable(remediation: str, *evidence: str) -> RecoveryPolicy:
         ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION,
         tuple(evidence),
         remediation,
+        SafetyTier.TRANSIENT_GLOBAL_BLOCK,
     )
 
 
@@ -55,6 +76,7 @@ def _manual(remediation: str, *evidence: str) -> RecoveryPolicy:
         ReleasePolicy.MANUAL_ONLY,
         tuple(evidence),
         remediation,
+        SafetyTier.GLOBAL_MANUAL_HARD_STOP,
     )
 
 
@@ -183,8 +205,51 @@ RECOVERY_POLICIES: dict[str, RecoveryPolicy] = {
 }
 
 
-UNKNOWN_POLICY = _manual("OPERATOR_REVIEW_UNKNOWN_CAUSE", "CAUSE_CLASSIFICATION_REQUIRED")
+GLOBAL_HARD_STOP_REASONS = frozenset({
+    "OPERATOR_PAUSE",
+    "KILL_SWITCH_ACTIVE",
+    "CONFIG_INVALID",
+    "GEOGRAPHIC_AVAILABILITY_FAILED",
+    "DAILY_LOSS_LIMIT",
+    "EMERGENCY_CLOSE_REQUESTED",
+})
+
+UNKNOWN_POLICY = _transient(
+    "CLASSIFY_UNKNOWN_CAUSE", "CAUSE_CLASSIFICATION_REQUIRED"
+)
+UNKNOWN_ESCALATED_POLICY = _manual(
+    "OPERATOR_REVIEW_UNKNOWN_CAUSE", "CAUSE_CLASSIFICATION_REQUIRED"
+)
+SCOPED_UNKNOWN_POLICY = RecoveryPolicy(
+    RecoveryClassification.REPAIRABLE,
+    ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION,
+    ("SCOPED_QUARANTINE_RECORDED", "RECONCILIATION_CLEAN"),
+    "QUARANTINE_AND_VERIFY",
+    SafetyTier.SCOPED_QUARANTINE,
+)
 
 
-def recovery_policy(reason: str) -> RecoveryPolicy:
-    return RECOVERY_POLICIES.get(str(reason or "").upper(), UNKNOWN_POLICY)
+def is_known_reason(reason: str) -> bool:
+    return str(reason or "").upper() in RECOVERY_POLICIES
+
+
+def recovery_policy(
+    reason: str,
+    *,
+    unknown_age_seconds: float = 0.0,
+    incident_scope: str = IncidentScope.UNKNOWN,
+) -> RecoveryPolicy:
+    normalized = str(reason or "").upper()
+    known = RECOVERY_POLICIES.get(normalized)
+    if known is not None:
+        return known
+    scope = str(incident_scope or IncidentScope.UNKNOWN).upper()
+    if scope in {
+        IncidentScope.POSITION,
+        IncidentScope.TOKEN,
+        IncidentScope.EVENT,
+    }:
+        return SCOPED_UNKNOWN_POLICY
+    if float(unknown_age_seconds) >= UNKNOWN_OBSERVATION_WINDOW_SECONDS:
+        return UNKNOWN_ESCALATED_POLICY
+    return UNKNOWN_POLICY

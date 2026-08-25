@@ -170,6 +170,9 @@ class ReconciliationWorker:
         self._gap_backoff = GapBackoffTracker()
         self._missing_position_suspects: dict[str, float] = {}
         self._resolved_zero_observations: dict[str, int] = {}
+        self._exit_repair_observations: dict[
+            str, tuple[tuple[str, ...], int, float]
+        ] = {}
         self.reconciliation_started_at: str | None = None
         self.reconciliation_finished_at: str | None = None
         self._reconciliation_duration_ms = {
@@ -244,6 +247,255 @@ class ReconciliationWorker:
         }, actor)
         return delay
 
+    def _observe_exit_repair_evidence(
+        self, token_id: str, evidence_key: tuple[str, ...]
+    ) -> tuple[int, float]:
+        now = time.monotonic()
+        prior = self._exit_repair_observations.get(token_id)
+        if prior is None or prior[0] != evidence_key:
+            observations, first_seen = 1, now
+        else:
+            observations, first_seen = prior[1] + 1, prior[2]
+        self._exit_repair_observations[token_id] = (
+            evidence_key, observations, first_seen
+        )
+        return observations, max(0.0, now - first_seen)
+
+    def _try_authoritative_exit_repair(
+        self,
+        *,
+        local: dict[str, Any],
+        authoritative_balance: Decimal,
+        market: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        if self.strategy_repo is None:
+            return {"status": "not_applicable"}
+        position_id = str(local.get("position_id") or "")
+        token_id = str(local.get("token_id") or "")
+        intent_id = str(local.get("active_exit_intent_id") or "")
+        intent = self.strategy_repo.intent(intent_id) if intent_id else None
+        attempt = (
+            self.strategy_repo.matched_exit_attempt_evidence(intent_id)
+            if intent is not None else None
+        )
+        normalized = (attempt or {}).get("normalized") or {}
+        remote_order_id = str((intent or {}).get("remote_order_id") or "")
+        evidence_order_id = str(
+            normalized.get("polymarket_order_id")
+            or (attempt or {}).get("remote_order_id")
+            or ""
+        )
+        making = decimal_value(normalized.get("making_amount"))
+        taking = decimal_value(normalized.get("taking_amount"))
+        acquired = decimal_value(local.get("acquired_shares_text"))
+        reason_code = str((intent or {}).get("reason_code") or "").upper()
+        action = str((intent or {}).get("action") or "").upper()
+        remote_status = str(normalized.get("status") or "").lower()
+        proof_valid = bool(
+            intent is not None
+            and action in {"EXIT", "TP"}
+            and reason_code in {
+                "REMOTE_MATCHED",
+                "REMOTE_MATCHED_FILL_PROPAGATION_PENDING",
+            }
+            and remote_order_id
+            and evidence_order_id == remote_order_id
+            and remote_status in MATCHED_AWAITING_FILL_STATUSES
+            and making is not None and making > 0
+            and taking is not None and taking > 0
+            and acquired is not None and acquired >= making
+            and acquired - making == authoritative_balance
+        )
+        evidence_key = (
+            remote_order_id,
+            canonical_decimal(authoritative_balance),
+            canonical_decimal(making) if making is not None else "",
+            canonical_decimal(taking) if taking is not None else "",
+            str((attempt or {}).get("record_id") or ""),
+            "valid" if proof_valid else "unsafe",
+        )
+        observations, elapsed = self._observe_exit_repair_evidence(
+            token_id, evidence_key
+        )
+        evidence = {
+            "source": "conditional_token_balance+matched_order_attempt",
+            "authoritative_balance": canonical_decimal(authoritative_balance),
+            "remote_order_id": remote_order_id,
+            "attempt_record_id": (attempt or {}).get("record_id"),
+            "making_amount": (
+                canonical_decimal(making) if making is not None else None
+            ),
+            "taking_amount": (
+                canonical_decimal(taking) if taking is not None else None
+            ),
+            "remote_status": remote_status,
+            "observations": observations,
+            "observation_elapsed_seconds": round(elapsed, 3),
+            "proof_valid": proof_valid,
+        }
+        if observations < 2 or elapsed < POSITION_PROPAGATION_GRACE_SECONDS:
+            return {"status": "confirmation_pending", "evidence": evidence}
+        if not proof_valid:
+            if str(local.get("state") or "").upper() != "QUARANTINED":
+                quarantine = self.strategy_repo.quarantine_position(
+                    position_id,
+                    reason_code="AUTHORITATIVE_POSITION_MISMATCH_UNREPAIRABLE",
+                    evidence=evidence,
+                    actor=actor,
+                    operator_action_required=True,
+                )
+                self.strategy_repo.reclassify_pause_as_scoped(
+                    actor=actor,
+                    incident_scope="POSITION",
+                    source_position_id=position_id,
+                    operator_action_required=True,
+                    reason="AUTHORITATIVE_POSITION_MISMATCH_UNREPAIRABLE",
+                )
+            else:
+                quarantine = {"position_id": position_id, "status": "OPEN"}
+            return {
+                "status": "quarantined",
+                "evidence": evidence,
+                "quarantine": quarantine,
+            }
+
+        assert intent is not None and attempt is not None
+        assert making is not None and taking is not None
+        transaction_hashes = normalized.get("transaction_hashes") or []
+        transaction_hash = (
+            str(transaction_hashes[0]) if transaction_hashes else None
+        )
+        average_price = taking / making
+        remote_fill_id = (
+            f"authoritative:{remote_order_id}:{transaction_hash or 'matched'}"
+        )
+        before = {
+            key: local.get(key)
+            for key in (
+                "state", "acquired_shares_text", "remaining_shares_text",
+                "sellable_shares_text", "dust_shares_text", "exit_value_text",
+                "exit_fees_text", "realized_pnl_text",
+            )
+        }
+        self.strategy_repo.add_fill(
+            intent_id=intent_id,
+            remote_trade_id=remote_fill_id,
+            shares=making,
+            price=average_price,
+            fee=Decimal("0"),
+            fee_verification_status="UNKNOWN",
+            fee_source="authoritative_matched_order_attempt",
+            status="MATCHED",
+            transaction_hash=transaction_hash,
+            matched_at=str(attempt.get("occurred_at") or now_iso()),
+            raw={
+                "source": "authoritative_exit_repair",
+                "order_attempt_record_id": attempt.get("record_id"),
+                "remote_order_id": remote_order_id,
+                "normalized": normalized,
+                "authoritative_balance": canonical_decimal(
+                    authoritative_balance
+                ),
+            },
+        )
+        summary = self.strategy_repo.fill_summary(intent_id)
+        updated = self.strategy_repo.apply_exit_fill(
+            position_id=position_id,
+            intent_id=intent_id,
+            sold_shares=making,
+            average_price=average_price,
+            fees=Decimal("0"),
+            final_state=(
+                "FILLED" if authoritative_balance == 0 else "PARTIAL_FINAL"
+            ),
+            min_sellable=(
+                decimal_value(market.get("min_order_size"))
+                or Decimal("0.000001")
+            ),
+            purpose=str(intent.get("purpose") or "RECONCILED_EXIT"),
+            book_hash="authoritative-order-attempt-balance-repair",
+            cumulative_filled_shares=summary["shares"],
+            cumulative_notional=summary["notional"],
+            cumulative_fees=summary["fees"],
+        )
+        repaired_remaining = (
+            decimal_value(updated.get("remaining_shares_text"))
+            or Decimal("0")
+        )
+        if repaired_remaining != authoritative_balance:
+            quarantine = self.strategy_repo.quarantine_position(
+                position_id,
+                reason_code="AUTO_REPAIR_POSTCONDITION_MISMATCH",
+                evidence={
+                    **evidence,
+                    "repaired_remaining": canonical_decimal(repaired_remaining),
+                },
+                actor=actor,
+                operator_action_required=True,
+            )
+            self.strategy_repo.reclassify_pause_as_scoped(
+                actor=actor,
+                incident_scope="POSITION",
+                source_position_id=position_id,
+                operator_action_required=True,
+                reason="AUTO_REPAIR_POSTCONDITION_MISMATCH",
+            )
+            return {
+                "status": "quarantined",
+                "evidence": evidence,
+                "quarantine": quarantine,
+            }
+        self.strategy_repo.resolve_position_quarantine(
+            position_id, actor=actor, reason="AUTHORITATIVE_EXIT_REPAIRED"
+        )
+        after = {
+            key: updated.get(key)
+            for key in (
+                "state", "acquired_shares_text", "remaining_shares_text",
+                "sellable_shares_text", "dust_shares_text", "exit_value_text",
+                "exit_fees_text", "realized_pnl_text",
+            )
+        }
+        audit_id = self.strategy_repo.record_authoritative_auto_repair(
+            actor=actor,
+            position_id=position_id,
+            reason="MATCHED_EXIT_BALANCE_CONFIRMED",
+            before=before,
+            after=after,
+            evidence=evidence,
+        )
+        self.strategy_repo.reclassify_pause_as_scoped(
+            actor=actor,
+            incident_scope="POSITION",
+            source_position_id=position_id,
+            operator_action_required=False,
+            reason="AUTHORITATIVE_EXIT_REPAIRED",
+        )
+        self.strategy_repo.alert(
+            alert_type="AUTO_REPAIR",
+            severity="INFO",
+            reason_code="AUTHORITATIVE_EXIT_AUTO_REPAIR",
+            message=(
+                "[AUTO-REPAIR] matched EXIT aligned from order-attempt and "
+                "conditional-token balance"
+            ),
+            entity_type="position",
+            entity_id=position_id,
+        )
+        self._exit_repair_observations.pop(token_id, None)
+        return {
+            "status": "repaired",
+            "type": "authoritative_matched_exit_repair",
+            "position_id": position_id,
+            "intent_id": intent_id,
+            "token_id": token_id,
+            "audit_id": audit_id,
+            "before": before,
+            "after": after,
+            "evidence": evidence,
+        }
+
     async def _reconcile_resolved_local_positions(
         self,
         *,
@@ -251,16 +503,17 @@ class ReconciliationWorker:
         gaps: list[dict[str, Any]],
         repairs: list[dict[str, Any]],
         actor: str,
-    ) -> None:
-        """Resolve local active rows only from strong, resolution-aware evidence."""
+    ) -> set[str]:
+        """Resolve/repair local rows and return tokens handled by scoped logic."""
+        handled_tokens: set[str] = set()
         if self.strategy_repo is None:
-            return
+            return handled_tokens
         remote_by_token = {
             str(item.get("token_id") or ""): item
             for item in remote_positions
             if (decimal_value(item.get("size")) or Decimal("0")) > 0
         }
-        for local in self.strategy_repo.active_positions():
+        for local in self.strategy_repo.reconciliation_positions():
             market = self.repo.latest_market(str(local.get("condition_id") or ""))
             if not market or not bool(market.get("market_resolved")):
                 continue
@@ -306,6 +559,41 @@ class ReconciliationWorker:
                 continue
 
             winner = token_id == winner_token
+            if linked_intent_id and str(local.get("state") or "").upper() in {
+                "EXIT_RECONCILIATION_REQUIRED", "QUARANTINED"
+            }:
+                exit_repair = self._try_authoritative_exit_repair(
+                    local=local,
+                    authoritative_balance=observed,
+                    market=market,
+                    actor=actor,
+                )
+                repair_status = str(exit_repair.get("status") or "")
+                if repair_status == "repaired":
+                    repairs.append(exit_repair)
+                    handled_tokens.add(token_id)
+                    continue
+                if repair_status == "quarantined":
+                    repairs.append({
+                        "type": "position_quarantined",
+                        "position_id": local.get("position_id"),
+                        "token_id": token_id,
+                        "evidence": exit_repair.get("evidence"),
+                    })
+                    handled_tokens.add(token_id)
+                    continue
+                if repair_status == "confirmation_pending":
+                    gaps.append({
+                        "type": "authoritative_exit_repair_confirmation_pending",
+                        "position_id": local.get("position_id"),
+                        "token_id": token_id,
+                        **dict(exit_repair.get("evidence") or {}),
+                    })
+                    handled_tokens.add(token_id)
+                    continue
+            if str(local.get("state") or "").upper() == "QUARANTINED":
+                handled_tokens.add(token_id)
+                continue
             if observed > 0:
                 self._resolved_zero_observations.pop(token_id, None)
                 if not winner:
@@ -390,6 +678,7 @@ class ReconciliationWorker:
                 "RESOLVED_LOSER_AUTHORITATIVE_ZERO",
                 repair,
             )
+        return handled_tokens
 
     async def run_once(
         self,
@@ -592,7 +881,7 @@ class ReconciliationWorker:
                         })
                         auto_recoverable_gaps += 1
 
-            await self._reconcile_resolved_local_positions(
+            resolved_handled_tokens = await self._reconcile_resolved_local_positions(
                 remote_positions=remote_positions,
                 gaps=gaps,
                 repairs=repairs,
@@ -903,7 +1192,7 @@ class ReconciliationWorker:
                             winner=current_value > 0,
                             redeem_pending=current_value > 0,
                         )
-                for local in self.strategy_repo.active_positions():
+                for local in self.strategy_repo.reconciliation_positions():
                     remaining = (
                         decimal_value(
                             local.get("remaining_shares_text")
@@ -923,6 +1212,12 @@ class ReconciliationWorker:
                         and str(local.get("token_id"))
                         not in remote_tokens
                     ):
+                        if str(local.get("token_id")) in resolved_handled_tokens:
+                            continue
+                        if str(local.get("state") or "").upper() == "QUARANTINED":
+                            # Known scoped exposure remains observed by balance/
+                            # resolution paths without re-creating a global gap.
+                            continue
                         if str(local.get("token_id")) in pending_exit_tokens:
                             # Remote absence while a known EXIT is MATCHED but
                             # its fill feed is pending is the expected opposite

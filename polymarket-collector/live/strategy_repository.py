@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import re
@@ -10,7 +10,11 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from .order_book import canonical_decimal, decimal_value
-from .recovery_policy import PauseState, ReleasePolicy, recovery_policy
+from .recovery_policy import (
+    GLOBAL_HARD_STOP_REASONS, UNKNOWN_OBSERVATION_WINDOW_SECONDS,
+    IncidentScope, PauseState, ReleasePolicy, SafetyTier, is_known_reason,
+    recovery_policy,
+)
 from .repository import LiveRepository, now_iso, row_to_dict
 
 
@@ -213,6 +217,36 @@ class StrategyRepository:
                     closed_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS live_quarantines (
+                    quarantine_id TEXT PRIMARY KEY,
+                    incident_scope TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    position_id TEXT,
+                    token_id TEXT,
+                    event_id TEXT,
+                    condition_id TEXT,
+                    reason_code TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    operator_action_required INTEGER NOT NULL DEFAULT 0,
+                    global_entry_halt_required INTEGER NOT NULL DEFAULT 0,
+                    before_state TEXT,
+                    evidence_json TEXT NOT NULL DEFAULT '{}',
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolution_reason TEXT,
+                    occurrence_count INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_live_quarantine_open
+                ON live_quarantines(
+                    incident_scope,entity_type,entity_id,reason_code
+                ) WHERE status='OPEN';
+                CREATE INDEX IF NOT EXISTS idx_live_quarantine_position
+                ON live_quarantines(position_id,status,last_seen_at);
+                CREATE INDEX IF NOT EXISTS idx_live_quarantine_status
+                ON live_quarantines(status,last_seen_at);
+
                 CREATE TABLE IF NOT EXISTS live_strategy_deals (
                     deal_id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,
@@ -335,6 +369,17 @@ class StrategyRepository:
                 "order_heartbeat_status": "DISABLED",
                 "last_successful_reconciliation_at": "",
                 "last_archive_at": "",
+                "operator_action_required": "false",
+                "operator_action_reason": "",
+                "global_entry_halt_required": "false",
+                "global_entry_halt_reason": "",
+                "incident_scope": "UNKNOWN",
+                "quarantined_positions_count": "0",
+                "quarantine_last_at": "",
+                "auto_repair_last_at": "",
+                "auto_repair_count_24h": "0",
+                "unknown_cause_first_seen_at": "",
+                "unknown_cause_reason": "",
             }
             for key, value in defaults.items():
                 conn.execute(
@@ -697,7 +742,10 @@ class StrategyRepository:
         "pause_source_event_id", "pause_source_order_id",
         "pause_source_position_id", "pause_auto_recoverable",
         "recovery_financial_verified_generation", "recovery_blockers_json",
-        "recovery_attempt_count",
+        "recovery_attempt_count", "operator_action_required",
+        "operator_action_reason", "global_entry_halt_required",
+        "global_entry_halt_reason", "incident_scope",
+        "unknown_cause_first_seen_at", "unknown_cause_reason",
     )
 
     def pause_entries(self) -> bool:
@@ -723,6 +771,142 @@ class StrategyRepository:
             "pause_entries": state.get("pause_entries", "true").lower() == "true",
             "pause_generation": int(state.get("pause_generation", "0") or 0),
         }
+
+    def escalate_unknown_pause_if_expired(
+        self,
+        *,
+        actor: str,
+        timeout_seconds: float = UNKNOWN_OBSERVATION_WINDOW_SECONDS,
+        now: datetime | None = None,
+    ) -> bool:
+        observed_now = now or datetime.now(timezone.utc)
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            reason = str(state.get("pause_cause") or "").upper()
+            if (
+                state.get("pause_entries", "false").lower() != "true"
+                or not reason
+                or is_known_reason(reason)
+                or state.get("release_policy") == ReleasePolicy.MANUAL_ONLY
+            ):
+                conn.rollback()
+                return False
+            raw_first = (
+                state.get("unknown_cause_first_seen_at")
+                or state.get("pause_acquired_at")
+            )
+            try:
+                first = datetime.fromisoformat(
+                    str(raw_first).replace("Z", "+00:00")
+                )
+                if first.tzinfo is None:
+                    first = first.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                first = observed_now
+            if (observed_now - first).total_seconds() < float(timeout_seconds):
+                conn.rollback()
+                return False
+            ts = observed_now.astimezone(timezone.utc).isoformat()
+            generation = int(state.get("pause_generation", "0") or 0) + 1
+            self.base.set_states_on_connection(conn, {
+                "pause_state": PauseState.PAUSED_MANUAL_ONLY,
+                "release_policy": ReleasePolicy.MANUAL_ONLY,
+                "pause_generation": str(generation),
+                "pause_updated_at": ts,
+                "recovery_status": "MANUAL_ONLY",
+                "recovery_last_action": "OPERATOR_REVIEW_UNKNOWN_CAUSE",
+                "recovery_last_result": "UNKNOWN_CLASSIFICATION_TIMEOUT",
+                "operator_action_required": "true",
+                "operator_action_reason": reason,
+                "global_entry_halt_required": "true",
+                "global_entry_halt_reason": reason,
+                "incident_scope": IncidentScope.UNKNOWN,
+            }, actor)
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor, "unknown_cause_escalated", "blocked", reason,
+                    json.dumps({
+                        "generation": generation,
+                        "incident_scope": IncidentScope.UNKNOWN,
+                        "safety_tier": SafetyTier.GLOBAL_MANUAL_HARD_STOP,
+                        "timeout_seconds": float(timeout_seconds),
+                    }, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        return True
+
+    def reclassify_pause_as_scoped(
+        self,
+        *,
+        actor: str,
+        incident_scope: str,
+        source_position_id: str | None,
+        operator_action_required: bool,
+        reason: str,
+    ) -> bool:
+        scope = str(incident_scope).upper()
+        if scope not in {
+            IncidentScope.POSITION,
+            IncidentScope.TOKEN,
+            IncidentScope.EVENT,
+        }:
+            raise ValueError("scope is not safely isolatable")
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            if state.get("pause_entries", "false").lower() != "true":
+                conn.rollback()
+                return False
+            generation = int(state.get("pause_generation", "0") or 0) + 1
+            self.base.set_states_on_connection(conn, {
+                "pause_state": PauseState.PAUSED_RECOVERING,
+                "pause_cause": "RECONCILIATION_GAP",
+                "pause_reason": "RECONCILIATION_GAP",
+                "release_policy": ReleasePolicy.AUTO_AFTER_REPAIR_AND_VERIFICATION,
+                "pause_generation": str(generation),
+                "pause_updated_at": ts,
+                "pause_eligible_since": "",
+                "pause_auto_recoverable": "false",
+                "recovery_financial_verified_generation": "",
+                "pause_source_position_id": str(source_position_id or ""),
+                "recovery_status": "RECOVERING",
+                "recovery_last_action": "SCOPED_REPAIR_VERIFY",
+                "recovery_last_result": str(reason),
+                "operator_action_required": (
+                    "true" if operator_action_required else "false"
+                ),
+                "operator_action_reason": (
+                    str(reason) if operator_action_required else ""
+                ),
+                "global_entry_halt_required": "false",
+                "global_entry_halt_reason": "",
+                "incident_scope": scope,
+                "unknown_cause_first_seen_at": "",
+                "unknown_cause_reason": "",
+            }, actor)
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor, "pause_reclassified_scoped", "ok", reason,
+                    json.dumps({
+                        "generation": generation,
+                        "incident_scope": scope,
+                        "source_position_id": source_position_id,
+                        "operator_action_required": operator_action_required,
+                        "safety_tier": SafetyTier.SCOPED_QUARANTINE,
+                    }, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        return True
 
     def acquire_pause(
         self,
@@ -828,6 +1012,25 @@ class StrategyRepository:
                 "recovery_stability_elapsed_ms": "0",
                 "recovery_last_action": policy.remediation,
                 "recovery_last_result": "PAUSE_ACQUIRED",
+                "operator_action_required": (
+                    "true"
+                    if policy.safety_tier == SafetyTier.GLOBAL_MANUAL_HARD_STOP
+                    else "false"
+                ),
+                "operator_action_reason": (
+                    reason
+                    if policy.safety_tier == SafetyTier.GLOBAL_MANUAL_HARD_STOP
+                    else ""
+                ),
+                "global_entry_halt_required": "true",
+                "global_entry_halt_reason": reason,
+                "incident_scope": "UNKNOWN",
+                "unknown_cause_first_seen_at": (
+                    now if not is_known_reason(reason) else ""
+                ),
+                "unknown_cause_reason": (
+                    reason if not is_known_reason(reason) else ""
+                ),
             }
             self.base.set_states_on_connection(conn, values, actor)
             conn.execute(
@@ -844,6 +1047,8 @@ class StrategyRepository:
                             "classification": policy.classification,
                             "release_policy": policy.release_policy,
                             "remediation": policy.remediation,
+                            "safety_tier": policy.safety_tier,
+                            "incident_scope": "UNKNOWN",
                         },
                         sort_keys=True,
                     ),
@@ -871,6 +1076,8 @@ class StrategyRepository:
                 "release_policy": policy.release_policy,
                 "required_evidence": policy.required_evidence,
                 "remediation": policy.remediation,
+                "safety_tier": policy.safety_tier,
+                "incident_scope": "UNKNOWN",
             },
         )
         return self.pause_record(), True
@@ -882,11 +1089,13 @@ class StrategyRepository:
         reconciliation_run_id: str | int,
         clean_finished_at: str,
     ) -> bool:
-        unresolved = bool(self.unresolved_intents())
+        # A known scoped quarantine remains visible to accounting/risk, but it
+        # must not keep an otherwise repaired global pause latched forever.
+        unresolved = bool(self.entry_blocking_intents())
         uncertain_exposure = any(
             str(position.get("state") or "").upper()
             == "EXIT_RECONCILIATION_REQUIRED"
-            for position in self.active_positions()
+            for position in self.entry_blocking_positions()
         )
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1237,6 +1446,24 @@ class StrategyRepository:
         status = "SKIPPED_SIMULTANEOUS_TRIGGER" if simultaneous else "ENTRY_INTENT_RESERVED"
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            quarantine = conn.execute(
+                "SELECT quarantine_id,incident_scope,reason_code FROM "
+                "live_quarantines WHERE status='OPEN' AND "
+                "((event_id IS NOT NULL AND event_id=?) OR "
+                "(token_id IS NOT NULL AND token_id=?)) "
+                "ORDER BY last_seen_at DESC LIMIT 1",
+                (event_id, str(token_id or "")),
+            ).fetchone()
+            if quarantine is not None:
+                conn.rollback()
+                return {
+                    "_blocked": True,
+                    "reason": "SCOPED_QUARANTINE",
+                    "quarantine_id": str(quarantine["quarantine_id"]),
+                    "incident_scope": str(quarantine["incident_scope"]),
+                    "reason_code": str(quarantine["reason_code"]),
+                    "blocking_event_id": event_id,
+                }
             existing = conn.execute(
                 "SELECT * FROM live_event_states WHERE event_id = ?", (event_id,)
             ).fetchone()
@@ -1307,9 +1534,18 @@ class StrategyRepository:
             correlation_id = stable_id("correlation", attempt_identity)
             if require_empty_slot:
                 unresolved = conn.execute(
-                    "SELECT intent_id,event_id,state FROM live_strategy_intents "
-                    "WHERE state NOT IN ('FILLED', 'PARTIAL_FINAL', 'ZERO_FILL', 'CANCELED', "
-                    "'REJECTED', 'FAILED', 'SETTLED', 'REDEEMED') LIMIT 1"
+                    "SELECT i.intent_id,i.event_id,i.state "
+                    "FROM live_strategy_intents AS i "
+                    "LEFT JOIN live_strategy_positions AS p "
+                    "ON p.position_id=i.position_id "
+                    "WHERE i.state NOT IN ('FILLED', 'PARTIAL_FINAL', 'ZERO_FILL', 'CANCELED', "
+                    "'REJECTED', 'FAILED', 'SETTLED', 'REDEEMED') "
+                    "AND COALESCE(p.state,'') != 'QUARANTINED' "
+                    "AND NOT EXISTS (SELECT 1 FROM live_quarantines AS q "
+                    "WHERE q.status='OPEN' AND ("
+                    "(q.event_id IS NOT NULL AND q.event_id=i.event_id) OR "
+                    "(q.token_id IS NOT NULL AND q.token_id=i.token_id))) "
+                    "LIMIT 1"
                 ).fetchone()
                 active_position = conn.execute(
                     "SELECT position_id,event_id,state,closed_at,remaining_shares_text,"
@@ -1756,23 +1992,317 @@ class StrategyRepository:
             )
             conn.commit()
 
-    def active_positions(self, token_id: str | None = None) -> list[dict[str, Any]]:
+    def _positions_in_states(
+        self, states: Iterable[str], token_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        state_list = tuple(sorted({str(state).upper() for state in states}))
+        placeholders = ",".join("?" for _ in state_list)
         query = (
-            "SELECT * FROM live_strategy_positions WHERE state IN "
-            "('OPEN','TP_OPEN','EXITING','EXIT_RECONCILIATION_REQUIRED')"
+            "SELECT * FROM live_strategy_positions "
+            f"WHERE state IN ({placeholders})"
         )
-        params: tuple[Any, ...] = ()
+        params: tuple[Any, ...] = state_list
         if token_id is not None:
             query += " AND token_id=?"
-            params = (token_id,)
+            params = (*params, str(token_id))
         query += " ORDER BY created_at"
         with self.base.connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [row_to_dict(row) or {} for row in rows]
 
+    def risk_managed_positions(
+        self, token_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._positions_in_states(
+            {*OPEN_POSITION_STATES, "QUARANTINED"}, token_id
+        )
+
+    def reconciliation_positions(
+        self, token_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self.risk_managed_positions(token_id)
+
+    def entry_blocking_positions(
+        self, token_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._positions_in_states(OPEN_POSITION_STATES, token_id)
+
+    def fast_reconciliation_positions(self) -> list[dict[str, Any]]:
+        return self.entry_blocking_positions()
+
+    def quarantined_positions(self) -> list[dict[str, Any]]:
+        return self._positions_in_states({"QUARANTINED"})
+
+    def active_positions(self, token_id: str | None = None) -> list[dict[str, Any]]:
+        """Backward-compatible risk-managed view; quarantines stay visible."""
+        return self.risk_managed_positions(token_id)
+
+    def quarantine_records(
+        self, *, status: str = "OPEN", limit: int = 200
+    ) -> list[dict[str, Any]]:
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM live_quarantines WHERE status=? "
+                "ORDER BY last_seen_at DESC LIMIT ?",
+                (str(status).upper(), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = row_to_dict(row) or {}
+            try:
+                item["evidence"] = json.loads(item.get("evidence_json") or "{}")
+            except (TypeError, ValueError):
+                item["evidence"] = {}
+            result.append(item)
+        return result
+
+    def _refresh_incident_state_on_connection(
+        self, conn: sqlite3.Connection, actor: str
+    ) -> None:
+        open_rows = conn.execute(
+            "SELECT * FROM live_quarantines WHERE status='OPEN' "
+            "ORDER BY last_seen_at DESC"
+        ).fetchall()
+        operator_rows = [row for row in open_rows if row["operator_action_required"]]
+        global_rows = [row for row in open_rows if row["global_entry_halt_required"]]
+        state = self._state_map_on_connection(
+            conn, ("kill_switch", "pause_cause")
+        )
+        hard_stop_reason = ""
+        if state.get("kill_switch", "false").lower() == "true":
+            hard_stop_reason = "KILL_SWITCH_ACTIVE"
+        elif state.get("pause_cause", "").upper() in GLOBAL_HARD_STOP_REASONS:
+            hard_stop_reason = state.get("pause_cause", "").upper()
+        latest = open_rows[0] if open_rows else None
+        operator = operator_rows[0] if operator_rows else None
+        global_incident = global_rows[0] if global_rows else None
+        self.base.set_states_on_connection(conn, {
+            "operator_action_required": "true" if operator else "false",
+            "operator_action_reason": (
+                str(operator["reason_code"]) if operator else ""
+            ),
+            "global_entry_halt_required": (
+                "true" if hard_stop_reason or global_incident else "false"
+            ),
+            "global_entry_halt_reason": (
+                hard_stop_reason
+                or (str(global_incident["reason_code"]) if global_incident else "")
+            ),
+            "incident_scope": (
+                str(latest["incident_scope"]) if latest else "UNKNOWN"
+            ),
+            "quarantined_positions_count": str(len({
+                str(row["position_id"])
+                for row in open_rows if row["position_id"]
+            })),
+            "quarantine_last_at": (
+                str(latest["last_seen_at"]) if latest else ""
+            ),
+        }, actor)
+
+    def quarantine_incident(
+        self,
+        *,
+        incident_scope: str,
+        entity_type: str,
+        entity_id: str,
+        reason_code: str,
+        evidence: dict[str, Any],
+        actor: str,
+        position_id: str | None = None,
+        token_id: str | None = None,
+        event_id: str | None = None,
+        condition_id: str | None = None,
+        operator_action_required: bool = True,
+    ) -> dict[str, Any]:
+        scope = str(incident_scope or IncidentScope.UNKNOWN).upper()
+        if scope not in {item.value for item in IncidentScope}:
+            raise ValueError(f"invalid incident scope: {scope}")
+        scoped = scope in {
+            IncidentScope.POSITION,
+            IncidentScope.TOKEN,
+            IncidentScope.EVENT,
+        }
+        ts = now_iso()
+        safe_evidence = sanitize(evidence)
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            position = None
+            before_state = None
+            if position_id:
+                position = conn.execute(
+                    "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                    (str(position_id),),
+                ).fetchone()
+                if position is None:
+                    conn.rollback()
+                    raise KeyError(position_id)
+                before_state = str(position["state"])
+            existing = conn.execute(
+                "SELECT * FROM live_quarantines WHERE incident_scope=? "
+                "AND entity_type=? AND entity_id=? AND reason_code=? "
+                "AND status='OPEN'",
+                (scope, str(entity_type).upper(), str(entity_id), str(reason_code).upper()),
+            ).fetchone()
+            if existing is None:
+                quarantine_id = stable_id(
+                    "quarantine",
+                    f"{scope}:{entity_type}:{entity_id}:{reason_code}:{ts}",
+                )
+                conn.execute(
+                    "INSERT INTO live_quarantines "
+                    "(quarantine_id,incident_scope,entity_type,entity_id,"
+                    "position_id,token_id,event_id,condition_id,reason_code,status,"
+                    "operator_action_required,global_entry_halt_required,before_state,"
+                    "evidence_json,first_seen_at,last_seen_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,'OPEN',?,?,?,?,?,?)",
+                    (
+                        quarantine_id, scope, str(entity_type).upper(), str(entity_id),
+                        position_id, token_id, event_id, condition_id,
+                        str(reason_code).upper(),
+                        1 if operator_action_required else 0,
+                        0 if scoped else 1,
+                        before_state,
+                        json.dumps(safe_evidence, sort_keys=True, separators=(",", ":")),
+                        ts, ts,
+                    ),
+                )
+            else:
+                quarantine_id = str(existing["quarantine_id"])
+                before_state = str(existing["before_state"] or before_state or "")
+                conn.execute(
+                    "UPDATE live_quarantines SET evidence_json=?,last_seen_at=?,"
+                    "occurrence_count=occurrence_count+1,"
+                    "operator_action_required=MAX(operator_action_required,?) "
+                    "WHERE quarantine_id=?",
+                    (
+                        json.dumps(safe_evidence, sort_keys=True, separators=(",", ":")),
+                        ts, 1 if operator_action_required else 0, quarantine_id,
+                    ),
+                )
+            if position is not None:
+                conn.execute(
+                    "UPDATE live_strategy_positions SET state='QUARANTINED',"
+                    "updated_at=? WHERE position_id=?",
+                    (ts, str(position_id)),
+                )
+                conn.execute(
+                    "UPDATE live_event_states SET status='QUARANTINED',updated_at=? "
+                    "WHERE event_id=?",
+                    (ts, str(position["event_id"])),
+                )
+            self._refresh_incident_state_on_connection(conn, actor)
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor, "incident_quarantined", "ok",
+                    str(reason_code).upper(),
+                    json.dumps(sanitize({
+                        "quarantine_id": quarantine_id,
+                        "scope": scope,
+                        "entity_type": entity_type,
+                        "entity_id": entity_id,
+                        "position_id": position_id,
+                        "before_state": before_state,
+                        "global_entry_halt_required": not scoped,
+                        "evidence": safe_evidence,
+                    }), sort_keys=True),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM live_quarantines WHERE quarantine_id=?",
+                (quarantine_id,),
+            ).fetchone()
+            conn.commit()
+        return row_to_dict(row) or {}
+
+    def quarantine_position(
+        self,
+        position_id: str,
+        *,
+        reason_code: str,
+        evidence: dict[str, Any],
+        actor: str,
+        operator_action_required: bool = True,
+    ) -> dict[str, Any]:
+        with self.base.connect() as conn:
+            position = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (str(position_id),),
+            ).fetchone()
+        if position is None:
+            raise KeyError(position_id)
+        return self.quarantine_incident(
+            incident_scope=IncidentScope.POSITION,
+            entity_type="POSITION",
+            entity_id=str(position_id),
+            reason_code=reason_code,
+            evidence=evidence,
+            actor=actor,
+            position_id=str(position_id),
+            token_id=str(position["token_id"]),
+            event_id=str(position["event_id"]),
+            condition_id=str(position["condition_id"]),
+            operator_action_required=operator_action_required,
+        )
+
+    def resolve_position_quarantine(
+        self,
+        position_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> int:
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE live_quarantines SET status='RESOLVED',resolved_at=?,"
+                "resolution_reason=?,last_seen_at=? "
+                "WHERE position_id=? AND status='OPEN'",
+                (ts, str(reason), ts, str(position_id)),
+            )
+            resolved = int(cursor.rowcount)
+            self._refresh_incident_state_on_connection(conn, actor)
+            if resolved:
+                conn.execute(
+                    "INSERT INTO live_audit_log "
+                    "(occurred_at,actor,action,status,reason,details_json) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        ts, actor, "incident_quarantine_resolved", "ok", reason,
+                        json.dumps({"position_id": position_id, "resolved": resolved}),
+                    ),
+                )
+            conn.commit()
+        return resolved
+
+    def is_quarantined(
+        self, *, event_id: str | None = None, token_id: str | None = None
+    ) -> bool:
+        clauses = []
+        params: list[str] = []
+        if event_id:
+            clauses.append("event_id=?")
+            params.append(str(event_id))
+        if token_id:
+            clauses.append("token_id=?")
+            params.append(str(token_id))
+        if not clauses:
+            return False
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM live_quarantines WHERE status='OPEN' AND ("
+                + " OR ".join(clauses) + ") LIMIT 1",
+                tuple(params),
+            ).fetchone()
+        return row is not None
+
     def exposure(self) -> Decimal:
         total = Decimal("0")
-        for position in self.active_positions():
+        for position in self.risk_managed_positions():
             remaining = decimal_value(position["remaining_shares_text"]) or Decimal("0")
             acquired = decimal_value(position["acquired_shares_text"]) or Decimal("0")
             cost = decimal_value(position["cost_all_in_text"]) or Decimal("0")
@@ -2300,7 +2830,14 @@ class StrategyRepository:
                 conn.execute(
                     f"""
                     UPDATE live_strategy_positions SET {column}=NULL,
-                        state=CASE WHEN ? THEN 'OPEN' ELSE 'EXIT_RECONCILIATION_REQUIRED' END,
+                        state=CASE
+                            WHEN state NOT IN (
+                                'OPEN', 'TP_OPEN', 'EXITING',
+                                'EXIT_RECONCILIATION_REQUIRED'
+                            ) THEN state
+                            WHEN ? THEN 'OPEN'
+                            ELSE 'EXIT_RECONCILIATION_REQUIRED'
+                        END,
                         updated_at=? WHERE position_id=?
                     """,
                     (1 if success else 0, ts, row["position_id"]),
@@ -2632,6 +3169,73 @@ class StrategyRepository:
             ).fetchone()
         return row_to_dict(row)
 
+    def matched_exit_attempt_evidence(
+        self, intent_id: str
+    ) -> dict[str, Any] | None:
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM live_order_attempts WHERE intent_id=? "
+                "AND operation='CREATE_ORDER' AND phase='RESULT' "
+                "AND success=1 ORDER BY occurred_at DESC,record_id DESC LIMIT 1",
+                (str(intent_id),),
+            ).fetchone()
+        item = row_to_dict(row)
+        if not item:
+            return None
+        for key in ("normalized_json", "response_json", "request_json"):
+            try:
+                item[key.removesuffix("_json")] = json.loads(
+                    item.get(key) or "{}"
+                )
+            except (TypeError, ValueError):
+                item[key.removesuffix("_json")] = {}
+        return item
+
+    def record_authoritative_auto_repair(
+        self,
+        *,
+        actor: str,
+        position_id: str,
+        reason: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> int:
+        ts = now_iso()
+        details = sanitize({
+            "position_id": position_id,
+            "before": before,
+            "after": after,
+            "authoritative_evidence": evidence,
+        })
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor, "authoritative_exit_auto_repair", "ok", reason,
+                    json.dumps(details, sort_keys=True),
+                ),
+            )
+            count_24h = int(conn.execute(
+                "SELECT COUNT(*) FROM live_audit_log "
+                "WHERE action='authoritative_exit_auto_repair' "
+                "AND occurred_at>=?",
+                (
+                    (datetime.now(timezone.utc).replace(microsecond=0)
+                     - timedelta(days=1)).isoformat(),
+                ),
+            ).fetchone()[0])
+            self.base.set_states_on_connection(conn, {
+                "auto_repair_last_at": ts,
+                "auto_repair_count_24h": str(count_24h),
+            }, actor)
+            audit_id = int(cursor.lastrowid)
+            conn.commit()
+        return audit_id
+
     def position_for_token(self, token_id: str) -> dict[str, Any] | None:
         with self.base.connect() as conn:
             row = conn.execute(
@@ -2721,6 +3325,7 @@ class StrategyRepository:
                             acquired_shares_text=?,remaining_shares_text=?,sellable_shares_text=?,
                             dust_shares_text='0',average_entry_price_text=?,
                             state=CASE
+                                WHEN state='QUARANTINED' THEN 'QUARANTINED'
                                 WHEN stop_stage>=1 THEN 'EXITING'
                                 ELSE 'OPEN'
                             END,
@@ -2817,6 +3422,34 @@ class StrategyRepository:
                 """
             ).fetchall()
         return [row_to_dict(row) or {} for row in rows]
+
+    def entry_blocking_intents(self) -> list[dict[str, Any]]:
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT i.* FROM live_strategy_intents AS i
+                LEFT JOIN live_strategy_positions AS p
+                  ON p.position_id=i.position_id
+                WHERE i.state NOT IN (
+                    'FILLED','PARTIAL_FINAL','ZERO_FILL','CANCELED','REJECTED',
+                    'FAILED','SETTLED','REDEEMED'
+                )
+                  AND COALESCE(p.state,'') != 'QUARANTINED'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM live_quarantines AS q
+                    WHERE q.status='OPEN'
+                      AND (
+                        (q.event_id IS NOT NULL AND q.event_id=i.event_id)
+                        OR (q.token_id IS NOT NULL AND q.token_id=i.token_id)
+                      )
+                  )
+                ORDER BY i.created_at
+                """
+            ).fetchall()
+        return [row_to_dict(row) or {} for row in rows]
+
+    def fast_reconciliation_intents(self) -> list[dict[str, Any]]:
+        return self.entry_blocking_intents()
 
     def timeline(self, **event: Any) -> int:
         columns = [

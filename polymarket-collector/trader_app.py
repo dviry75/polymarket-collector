@@ -60,14 +60,14 @@ async def reconciliation_loop(config: LiveConfig) -> None:
                 "state": intent.get("state"),
                 "updated_at": intent.get("updated_at"),
             }
-            for intent in strategy_repo.unresolved_intents()
+            for intent in strategy_repo.fast_reconciliation_intents()
         ]
         active_work.extend({
             "kind": "position",
             "id": position.get("position_id"),
             "state": position.get("state"),
             "updated_at": position.get("updated_at"),
-        } for position in strategy_repo.active_positions())
+        } for position in strategy_repo.fast_reconciliation_positions())
         await asyncio.sleep(cadence.interval(active_work))
         await reconciliation_coordinator().request(
             actor="periodic_reconciliation"
