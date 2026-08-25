@@ -1355,6 +1355,29 @@ class ReconciliationWorker:
                         message=f"Reconciliation found {len(gaps)} mismatch(es); entries paused",
                         entity_type="account", entity_id="remote_truth",
                     )
+                else:
+                    for resolved_type, resolved_reason, entity_type, entity_id in (
+                        (
+                            "RECONCILIATION", "RECONCILIATION_MISMATCH",
+                            "account", "remote_truth",
+                        ),
+                        (
+                            "RECONCILIATION", "RECONCILIATION_FAILED",
+                            "account", "remote_truth",
+                        ),
+                        (
+                            "SERVICE_RESTART", "RESTART_WITH_OPEN_STATE",
+                            "", "",
+                        ),
+                    ):
+                        self.strategy_repo.resolve_alert(
+                            alert_type=resolved_type,
+                            reason_code=resolved_reason,
+                            entity_type=entity_type,
+                            entity_id=entity_id,
+                            actor=actor,
+                            resolution_reason="CLEAN_RECONCILIATION",
+                        )
                 self.strategy_repo.timeline(
                     severity="INFO" if not gaps else "CRITICAL",
                     category="RECONCILIATION", component="reconciliation",

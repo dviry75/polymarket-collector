@@ -345,6 +345,40 @@ class StrategyRepository:
                 );
                 """
             )
+            alert_columns = {
+                "status": "TEXT NOT NULL DEFAULT 'OPEN'",
+                "resolved_at": "TEXT",
+                "resolution_reason": "TEXT",
+                "recurrence_count": "INTEGER NOT NULL DEFAULT 0",
+                "reopened_at": "TEXT",
+                "notification_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+                "notification_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "notification_sent_at": "TEXT",
+                "notification_last_error": "TEXT",
+            }
+            existing_alert_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(live_alerts)"
+                ).fetchall()
+            }
+            for column, definition in alert_columns.items():
+                if column not in existing_alert_columns:
+                    conn.execute(
+                        f"ALTER TABLE live_alerts ADD COLUMN {column} {definition}"
+                    )
+            conn.execute(
+                "UPDATE live_alerts SET status=CASE "
+                "WHEN active=1 THEN 'OPEN' "
+                "WHEN acknowledged_at IS NOT NULL THEN 'ACKNOWLEDGED' "
+                "ELSE 'RESOLVED' END "
+                "WHERE status IS NULL OR status='' "
+                "OR (active=0 AND status='OPEN')"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_alert_lifecycle "
+                "ON live_alerts(status,severity,last_seen_at DESC)"
+            )
             conn.execute("DROP INDEX IF EXISTS idx_live_strategy_one_active_exit")
             conn.execute(
                 """
@@ -3768,6 +3802,18 @@ class StrategyRepository:
             ).fetchall()
         return [row_to_dict(row) or {} for row in rows]
 
+    @staticmethod
+    def _alert_fingerprint(
+        alert_type: str,
+        reason_code: str,
+        entity_type: str,
+        entity_id: str,
+    ) -> str:
+        return stable_id(
+            "alert",
+            f"{alert_type}:{reason_code}:{entity_type}:{entity_id}",
+        )
+
     def alert(
         self,
         *,
@@ -3778,71 +3824,334 @@ class StrategyRepository:
         entity_type: str = "",
         entity_id: str = "",
     ) -> int:
-        fingerprint = stable_id(
-            "alert", f"{alert_type}:{reason_code}:{entity_type}:{entity_id}"
+        fingerprint = self._alert_fingerprint(
+            alert_type, reason_code, entity_type, entity_id
         )
         ts = now_iso()
         with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT id,active FROM live_alerts WHERE fingerprint=? ORDER BY active DESC,id DESC LIMIT 1",
+                "SELECT * FROM live_alerts WHERE fingerprint=? "
+                "ORDER BY active DESC,id DESC LIMIT 1",
                 (fingerprint,),
             ).fetchone()
-            if existing:
+            if existing and int(existing["active"]):
+                conn.execute(
+                    "UPDATE live_alerts SET last_seen_at=?,"
+                    "occurrence_count=occurrence_count+1,severity=?,"
+                    "message=?,status='OPEN' WHERE id=?",
+                    (ts, severity, message, existing["id"]),
+                )
+                alert_id = int(existing["id"])
+            elif existing:
                 conn.execute(
                     """
-                    UPDATE live_alerts SET last_seen_at=?,occurrence_count=occurrence_count+1,
-                        severity=?,message=?,active=1,acknowledged_at=NULL,acknowledged_by=NULL
+                    UPDATE live_alerts SET active=1,status='OPEN',
+                        last_seen_at=?,occurrence_count=occurrence_count+1,
+                        recurrence_count=recurrence_count+1,reopened_at=?,
+                        resolved_at=NULL,resolution_reason=NULL,
+                        acknowledged_at=NULL,acknowledged_by=NULL,
+                        severity=?,message=?,notification_status='PENDING',
+                        notification_attempts=0,notification_sent_at=NULL,
+                        notification_last_error=NULL
                     WHERE id=?
                     """,
-                    (ts, severity, message, existing["id"]),
+                    (ts, ts, severity, message, existing["id"]),
                 )
                 alert_id = int(existing["id"])
             else:
                 cursor = conn.execute(
                     """
                     INSERT INTO live_alerts(
-                        fingerprint,severity,alert_type,reason_code,entity_type,entity_id,
-                        message,first_seen_at,last_seen_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                        fingerprint,severity,alert_type,reason_code,
+                        entity_type,entity_id,message,active,status,
+                        first_seen_at,last_seen_at
+                    ) VALUES(?,?,?,?,?,?,?,1,'OPEN',?,?)
                     """,
                     (
-                        fingerprint, severity, alert_type, reason_code, entity_type,
-                        entity_id, message, ts, ts,
+                        fingerprint, severity, alert_type, reason_code,
+                        entity_type, entity_id, message, ts, ts,
                     ),
                 )
                 alert_id = int(cursor.lastrowid)
             conn.commit()
         return alert_id
 
+    def resolve_alert(
+        self,
+        *,
+        alert_type: str,
+        reason_code: str,
+        entity_type: str = "",
+        entity_id: str = "",
+        actor: str,
+        resolution_reason: str,
+    ) -> dict[str, Any] | None:
+        fingerprint = self._alert_fingerprint(
+            alert_type, reason_code, entity_type, entity_id
+        )
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM live_alerts WHERE fingerprint=? AND active=1",
+                (fingerprint,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            conn.execute(
+                "UPDATE live_alerts SET active=0,status='RESOLVED',"
+                "resolved_at=?,resolution_reason=?,last_seen_at=? "
+                "WHERE id=? AND active=1",
+                (ts, resolution_reason, ts, row["id"]),
+            )
+            updated = conn.execute(
+                "SELECT * FROM live_alerts WHERE id=?", (row["id"],)
+            ).fetchone()
+            conn.commit()
+        self.timeline(
+            severity="INFO", category="ALERT",
+            component="alert_lifecycle", source=actor,
+            requested_action="RESOLVE_ALERT",
+            reason_code=str(row["reason_code"]),
+            new_state="RESOLVED", result_status="RESOLVED",
+            parameters_json={
+                "alert_id": int(row["id"]),
+                "resolution_reason": resolution_reason,
+            },
+        )
+        return row_to_dict(updated) or {}
+
     def acknowledge_alert(self, alert_id: int, actor: str) -> dict[str, Any]:
         ts = now_iso()
         with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                """
-                UPDATE live_alerts SET active=0,acknowledged_at=?,acknowledged_by=?
-                WHERE id=? AND active=1
-                """,
+                "UPDATE live_alerts SET active=0,status='ACKNOWLEDGED',"
+                "acknowledged_at=?,acknowledged_by=? "
+                "WHERE id=? AND active=1",
                 (ts, actor, alert_id),
             )
-            row = conn.execute("SELECT * FROM live_alerts WHERE id=?", (alert_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM live_alerts WHERE id=?", (alert_id,)
+            ).fetchone()
             conn.commit()
         if row is None:
             raise KeyError(alert_id)
         self.timeline(
             severity="INFO", category="ALERT", component="ui", source=actor,
-            requested_action="ACKNOWLEDGE_ALERT", reason_code=str(row["reason_code"]),
+            requested_action="ACKNOWLEDGE_ALERT",
+            reason_code=str(row["reason_code"]),
             new_state="ACKNOWLEDGED", result_status="ACK",
             parameters_json={"alert_id": alert_id},
         )
         return row_to_dict(row) or {}
 
+    def critical_email_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return unsent critical action email payloads without sending them."""
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM live_alerts WHERE active=1 AND status='OPEN' "
+                "AND severity='CRITICAL' AND notification_status IN "
+                "('PENDING','FAILED') AND notification_attempts<3 "
+                "ORDER BY first_seen_at LIMIT ?",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [
+            {
+                "alert_id": int(row["id"]),
+                "subject": (
+                    f"[CRITICAL ACTION] Polymarket — {row['reason_code']}"
+                ),
+                "text": (
+                    f"[CRITICAL ACTION]\n\n{row['message']}\n\n"
+                    f"Alert ID: {row['id']}\n"
+                    f"First seen: {row['first_seen_at']}\n"
+                    f"Occurrences: {row['occurrence_count']}\n"
+                ),
+                "message_id": (
+                    f"<critical-alert-{row['id']}-"
+                    f"{int(row['recurrence_count'] or 0)}@polymarket-live>"
+                ),
+                "notification_status": str(row["notification_status"]),
+                "notification_attempts": int(
+                    row["notification_attempts"] or 0
+                ),
+            }
+            for row in rows
+        ]
+
+    def record_alert_notification_result(
+        self,
+        alert_id: int,
+        *,
+        sent: bool,
+        error: str = "",
+        actor: str,
+    ) -> dict[str, Any]:
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE live_alerts SET notification_status=?,"
+                "notification_attempts=notification_attempts+1,"
+                "notification_sent_at=?,notification_last_error=? "
+                "WHERE id=? AND active=1 AND status='OPEN'",
+                (
+                    "SENT" if sent else "FAILED",
+                    ts if sent else None,
+                    None if sent else str(error)[:500],
+                    int(alert_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise KeyError(alert_id)
+            row = conn.execute(
+                "SELECT * FROM live_alerts WHERE id=?", (int(alert_id),)
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor, "critical_alert_notification",
+                    "ok" if sent else "error",
+                    str(row["reason_code"]),
+                    json.dumps({
+                        "alert_id": int(alert_id),
+                        "notification_status": (
+                            "SENT" if sent else "FAILED"
+                        ),
+                        "error": str(error)[:500],
+                    }, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        return row_to_dict(row) or {}
+
+    def watchdog_operator_action(
+        self,
+        *,
+        actor: str = "alert_watchdog",
+        threshold_seconds: float = 300.0,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        observed_now = now or datetime.now(timezone.utc)
+        pause = self.pause_record()
+        try:
+            acquired = datetime.fromisoformat(
+                str(pause.get("pause_acquired_at") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+            if acquired.tzinfo is None:
+                acquired = acquired.replace(tzinfo=timezone.utc)
+            age_seconds = max(
+                0.0, (observed_now - acquired).total_seconds()
+            )
+        except (TypeError, ValueError):
+            age_seconds = 0.0
+        action_required = (
+            str(pause.get("operator_action_required", "false")).lower()
+            == "true"
+            or str(pause.get("release_policy") or "")
+            == ReleasePolicy.MANUAL_ONLY
+        )
+        alert_type = "OPERATOR_ACTION_WATCHDOG"
+        reason_code = "OPERATOR_ACTION_REQUIRED_OVER_5M"
+        if (
+            bool(pause.get("pause_entries"))
+            and action_required
+            and age_seconds >= float(threshold_seconds)
+        ):
+            fingerprint = self._alert_fingerprint(
+                alert_type, reason_code, "GLOBAL", "ENTRY_GATE"
+            )
+            with self.base.connect() as conn:
+                existing = conn.execute(
+                    "SELECT * FROM live_alerts WHERE fingerprint=? "
+                    "AND active=1 AND status='OPEN'",
+                    (fingerprint,),
+                ).fetchone()
+            if existing is not None:
+                return row_to_dict(existing) or {}
+            reason = str(
+                pause.get("operator_action_reason")
+                or pause.get("pause_cause")
+                or "UNKNOWN"
+            )
+            alert_id = self.alert(
+                alert_type=alert_type,
+                severity="CRITICAL",
+                reason_code=reason_code,
+                message=(
+                    "[CRITICAL ACTION] Trading has remained blocked pending "
+                    f"operator action for {int(age_seconds)}s; reason={reason}"
+                ),
+                entity_type="GLOBAL",
+                entity_id="ENTRY_GATE",
+            )
+            return next(
+                (
+                    row for row in self.active_alerts()
+                    if int(row["id"]) == alert_id
+                ),
+                None,
+            )
+        return self.resolve_alert(
+            alert_type=alert_type,
+            reason_code=reason_code,
+            entity_type="GLOBAL",
+            entity_id="ENTRY_GATE",
+            actor=actor,
+            resolution_reason="OPERATOR_ACTION_NO_LONGER_REQUIRED",
+        )
+
     def active_alerts(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.base.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM live_alerts WHERE active=1 ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM live_alerts WHERE active=1 AND status='OPEN' "
+                "ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 "
+                "WHEN 'ERROR' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,"
+                "last_seen_at DESC LIMIT ?",
                 (max(1, min(limit, 500)),),
             ).fetchall()
         return [row_to_dict(row) or {} for row in rows]
+
+    def alert_history(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM live_alerts ORDER BY last_seen_at DESC LIMIT ?",
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [row_to_dict(row) or {} for row in rows]
+
+    def alert_lifecycle_summary(self) -> dict[str, Any]:
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT status,severity,COUNT(*) AS count "
+                "FROM live_alerts GROUP BY status,severity"
+            ).fetchall()
+            oldest = conn.execute(
+                "SELECT first_seen_at FROM live_alerts "
+                "WHERE active=1 AND status='OPEN' "
+                "ORDER BY first_seen_at LIMIT 1"
+            ).fetchone()
+        counts: dict[str, int] = {}
+        for row in rows:
+            key = (
+                f"{str(row['status']).lower()}_"
+                f"{str(row['severity']).lower()}"
+            )
+            counts[key] = int(row["count"])
+        return {
+            "counts": counts,
+            "oldest_open_at": (
+                str(oldest["first_seen_at"]) if oldest else None
+            ),
+        }
 
     def daily_pnl(self) -> Decimal:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -3871,6 +4180,8 @@ class StrategyRepository:
             archive = conn.execute(
                 "SELECT * FROM live_archive_runs ORDER BY id DESC LIMIT 1"
             ).fetchone()
+        alert_lifecycle = self.alert_lifecycle_summary()
+        critical_email_outbox = self.critical_email_outbox()
         return {
             "pause_entries": self.pause_entries(),
             "pause_owner": self.base.get_state("pause_owner", "NONE"),
@@ -3897,6 +4208,8 @@ class StrategyRepository:
             "exposure_text": canonical_decimal(self.exposure()),
             "daily_pnl_text": canonical_decimal(self.daily_pnl()),
             "active_alerts": int(alerts),
+            "alert_lifecycle": alert_lifecycle,
+            "critical_email_pending": len(critical_email_outbox),
             "heartbeat_status": self.base.get_state("order_heartbeat_status", "DISABLED"),
             "last_reconciliation": self.base.get_state("last_successful_reconciliation_at", ""),
             "last_archive": row_to_dict(archive),

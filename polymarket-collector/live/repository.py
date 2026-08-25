@@ -1,7 +1,7 @@
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
@@ -1300,6 +1300,63 @@ class LiveRepository:
         if str(market.get("yes_token_id"))==str(asset_id): return "YES"
         if str(market.get("no_token_id"))==str(asset_id): return "NO"
         return None
+
+    def finalize_orphaned_reconciliations(
+        self,
+        *,
+        actor: str,
+        cutoff_seconds: float = 300.0,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Terminalize runs that cannot belong to the current process."""
+        observed_now = now or datetime.now(timezone.utc)
+        cutoff = (
+            observed_now - timedelta(seconds=max(0.0, cutoff_seconds))
+        ).isoformat()
+        finished_at = observed_now.isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT id,started_at FROM live_reconciliation_runs "
+                "WHERE status='running' AND started_at<? ORDER BY id",
+                (cutoff,),
+            ).fetchall()
+            run_ids = [int(row["id"]) for row in rows]
+            if run_ids:
+                placeholders = ",".join("?" for _ in run_ids)
+                conn.execute(
+                    f"UPDATE live_reconciliation_runs SET finished_at=?,"
+                    f"status='failed',gaps_count=0,gaps_json='[]',"
+                    f"error='ORPHANED_PREVIOUS_PROCESS' "
+                    f"WHERE status='running' AND id IN ({placeholders})",
+                    (finished_at, *run_ids),
+                )
+            self.set_states_on_connection(conn, {
+                "orphaned_reconciliations_finalized_count": str(len(run_ids)),
+                "orphaned_reconciliations_finalized_at": (
+                    finished_at if run_ids else ""
+                ),
+            }, actor)
+            conn.commit()
+        result = {
+            "count": len(run_ids),
+            "oldest_started_at": (
+                str(rows[0]["started_at"]) if rows else None
+            ),
+            "newest_started_at": (
+                str(rows[-1]["started_at"]) if rows else None
+            ),
+            "cutoff": cutoff,
+        }
+        if run_ids:
+            self.audit(
+                actor,
+                "finalize_orphaned_reconciliations",
+                "ok",
+                "ORPHANED_PREVIOUS_PROCESS",
+                result,
+            )
+        return result
 
     def start_reconciliation(self) -> int:
         with self.connect() as conn:

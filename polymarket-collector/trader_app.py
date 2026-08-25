@@ -107,6 +107,24 @@ async def geographic_recovery_loop(config: LiveConfig) -> None:
                 "geographic_checked_at": now_iso(),
                 "geographic_last_error": "",
             }, "geographic_recovery")
+            strategy_repo = strategy_services()[0]
+            if geo["status"] == "ALLOWED":
+                strategy_repo.resolve_alert(
+                    alert_type="GEOGRAPHIC",
+                    reason_code="GEOGRAPHIC_AVAILABILITY_FAILED",
+                    actor="geographic_recovery",
+                    resolution_reason="GEOGRAPHIC_PREFLIGHT_ALLOWED",
+                )
+            else:
+                strategy_repo.alert(
+                    alert_type="GEOGRAPHIC",
+                    severity="CRITICAL",
+                    reason_code="GEOGRAPHIC_AVAILABILITY_FAILED",
+                    message=(
+                        "Official geographic preflight did not allow "
+                        "new orders"
+                    ),
+                )
         except Exception as exc:
             services()[1].set_state(
                 "geographic_last_error",
@@ -122,6 +140,7 @@ async def startup() -> None:
     configure(Path(config.live_db_path), config)
     repo = services()[1]
     strategy_repo, runtime = strategy_services()
+    repo.finalize_orphaned_reconciliations(actor="startup")
     strategy_repo.acquire_pause(
         actor="startup",
         reason="SAFETY_STARTUP_HOLD",

@@ -598,6 +598,9 @@ class PauseRecoveryCoordinator:
         self.strategy_repo.escalate_unknown_pause_if_expired(
             actor="pause_recovery"
         )
+        self.strategy_repo.watchdog_operator_action(
+            actor="pause_recovery"
+        )
         return self.attempt_auto_resume()
 
     def mark_degraded(self, exc: Exception) -> None:

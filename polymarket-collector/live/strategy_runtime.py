@@ -2737,6 +2737,13 @@ class LiveStrategyRuntime:
                     if success:
                         values["last_successful_heartbeat_at"] = now_iso()
                     self.base.set_states(values, "heartbeat")
+                    if success:
+                        self.repo.resolve_alert(
+                            alert_type="HEARTBEAT",
+                            reason_code="HEARTBEAT_FAILURE",
+                            actor="heartbeat",
+                            resolution_reason="HEARTBEAT_RECOVERED",
+                        )
                     if not success:
                         _record, acquired = self.repo.acquire_pause(
                             actor="heartbeat",

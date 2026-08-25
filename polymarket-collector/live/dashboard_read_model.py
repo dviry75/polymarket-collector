@@ -535,8 +535,15 @@ class DashboardReadModel:
 
     def alerts(self) -> dict[str, Any]:
         rows = self._all(
-            """SELECT id,severity,alert_type,reason_code,message,first_seen_at,last_seen_at,occurrence_count
-               FROM live_alerts WHERE active=1 ORDER BY id DESC LIMIT 100"""
+            """SELECT id,status,severity,alert_type,reason_code,message,
+                      entity_type,entity_id,first_seen_at,last_seen_at,
+                      occurrence_count,recurrence_count,reopened_at,
+                      notification_status,notification_attempts,
+                      notification_sent_at,notification_last_error
+               FROM live_alerts WHERE active=1 AND status='OPEN'
+               ORDER BY CASE severity WHEN 'CRITICAL' THEN 0
+                        WHEN 'ERROR' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,
+                        last_seen_at DESC LIMIT 100"""
         )
         return {"items": rows, "quality": "REAL"}
 

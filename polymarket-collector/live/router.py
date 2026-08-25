@@ -593,7 +593,7 @@ def dashboard_content(view: str = "overview") -> str:
         """,
         "logs": f"""
           <div class="actions"><a class="button" href="/live/logs/export?format=csv">Export filtered CSV</a><a class="button" href="/live/logs/export?format=json">Export JSON</a></div>
-          {panel("Persistent Alerts", compact_table(strategy_services()[0].active_alerts(), ["id", "severity", "alert_type", "reason_code", "entity_type", "entity_id", "message", "last_seen_at", "occurrence_count"], "No active alerts"))}
+          {panel("Persistent Alerts", compact_table(strategy_services()[0].active_alerts(), ["id", "status", "severity", "alert_type", "reason_code", "entity_type", "entity_id", "message", "last_seen_at", "occurrence_count", "recurrence_count", "notification_status"], "No active alerts"))}
           {panel("Linked Audit Timeline", compact_table(strategy_services()[0].list_timeline(limit=200), ["id", "occurred_at", "severity", "category", "component", "event_id", "side", "deal_id", "intent_id", "order_id", "requested_action", "reason_code", "previous_state", "new_state", "result_status", "filled_shares_text", "remaining_shares_text", "pnl_text", "error_code"]))}
           {panel("Filters API", '<p class="muted"><code>GET /live/logs</code> supports time cursor, severity, category, event, side, deal, order, status, reason and search. Entity timelines: <code>/live/timeline/{deal|order|event}/{id}</code>.</p>')}
         """,
