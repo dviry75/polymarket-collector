@@ -141,6 +141,7 @@ async def startup() -> None:
     repo = services()[1]
     strategy_repo, runtime = strategy_services()
     repo.finalize_orphaned_reconciliations(actor="startup")
+    strategy_repo.normalize_legacy_alert_lifecycle(actor="startup")
     strategy_repo.acquire_pause(
         actor="startup",
         reason="SAFETY_STARTUP_HOLD",

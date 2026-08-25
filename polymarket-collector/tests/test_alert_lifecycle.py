@@ -100,6 +100,9 @@ def test_operator_watchdog_opens_email_outbox_after_five_minutes_and_resolves():
         assert len(outbox) == 1
         assert outbox[0]["subject"].startswith("[CRITICAL ACTION]")
         assert outbox[0]["notification_status"] == "PENDING"
+        assert "Environment: LIVE" in outbox[0]["text"]
+        assert "Incident scope:" in outbox[0]["text"]
+        assert "Operator action:" in outbox[0]["text"]
 
         sent = strategy.record_alert_notification_result(
             int(alert["id"]), sent=True, actor="authorized_sender"
@@ -159,5 +162,52 @@ def test_orphaned_reconciliation_runs_are_terminalized_once_with_audit():
         assert base.finalize_orphaned_reconciliations(
             actor="startup", now=now
         )["count"] == 0
+    finally:
+        temporary.cleanup()
+
+
+def test_legacy_alerts_resolve_once_and_current_condition_can_reopen():
+    temporary, _base, strategy = build_repo()
+    try:
+        alert_id = strategy.alert(
+            alert_type="LEGACY", severity="CRITICAL",
+            reason_code="OLD_NOISE", message="historical",
+        )
+        assert strategy.normalize_legacy_alert_lifecycle(actor="test") == 1
+        assert strategy.active_alerts() == []
+        history = strategy.alert_history()
+        assert history[0]["id"] == alert_id
+        assert history[0]["status"] == "RESOLVED"
+        assert strategy.normalize_legacy_alert_lifecycle(actor="test") == 0
+        reopened_id = strategy.alert(
+            alert_type="LEGACY", severity="CRITICAL",
+            reason_code="OLD_NOISE", message="current",
+        )
+        assert reopened_id == alert_id
+        assert strategy.active_alerts()[0]["recurrence_count"] == 1
+    finally:
+        temporary.cleanup()
+
+
+def test_reconciliation_watchdog_deduplicates_and_resolves_when_fresh():
+    temporary, base, strategy = build_repo()
+    try:
+        observed = datetime.now(timezone.utc)
+        base.set_state(
+            "last_successful_reconciliation_at",
+            (observed - timedelta(minutes=6)).isoformat(), "test",
+        )
+        first = strategy.watchdog_reconciliation(now=observed)
+        second = strategy.watchdog_reconciliation(now=observed)
+        assert first["id"] == second["id"]
+        assert first["reason_code"] == "RECONCILIATION_STALE_OVER_5M"
+        assert first["occurrence_count"] == 1
+        assert strategy.critical_email_outbox() == []
+        base.set_state(
+            "last_successful_reconciliation_at", observed.isoformat(), "test",
+        )
+        resolved = strategy.watchdog_reconciliation(now=observed)
+        assert resolved["status"] == "RESOLVED"
+        assert strategy.active_alerts() == []
     finally:
         temporary.cleanup()

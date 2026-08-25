@@ -3949,10 +3949,12 @@ class StrategyRepository:
         return row_to_dict(row) or {}
 
     def critical_email_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Return unsent critical action email payloads without sending them."""
+        """Return unsent operator-action email payloads without sending them."""
+        pause = self.pause_record()
         with self.base.connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM live_alerts WHERE active=1 AND status='OPEN' "
+                "AND alert_type='OPERATOR_ACTION_WATCHDOG' "
                 "AND severity='CRITICAL' AND notification_status IN "
                 "('PENDING','FAILED') AND notification_attempts<3 "
                 "ORDER BY first_seen_at LIMIT ?",
@@ -3965,10 +3967,23 @@ class StrategyRepository:
                     f"[CRITICAL ACTION] Polymarket — {row['reason_code']}"
                 ),
                 "text": (
-                    f"[CRITICAL ACTION]\n\n{row['message']}\n\n"
-                    f"Alert ID: {row['id']}\n"
-                    f"First seen: {row['first_seen_at']}\n"
-                    f"Occurrences: {row['occurrence_count']}\n"
+                    "[CRITICAL ACTION]\n\n"
+                    f"Timestamp: {row['last_seen_at']}\n"
+                    "Environment: LIVE\n"
+                    f"Incident scope: {pause.get('incident_scope', 'GLOBAL')}\n"
+                    f"What happened: {row['message']}\n"
+                    f"Affected object: {row['entity_type']}:{row['entity_id']}\n"
+                    "Trading impact: new entries are blocked\n"
+                    f"Global trading halted: {pause.get('pause_entries', True)}\n"
+                    "Current authoritative state: "
+                    f"{pause.get('pause_state', 'UNKNOWN')}\n"
+                    "Operator action: "
+                    f"{pause.get('operator_action_reason') or 'review and decide safe recovery'}\n"
+                    f"Relevant IDs: alert_id={row['id']} "
+                    f"fingerprint={row['fingerprint']}\n"
+                    "Current safety state: "
+                    f"owner={pause.get('pause_owner', 'UNKNOWN')} "
+                    f"release_policy={pause.get('release_policy', 'UNKNOWN')}\n"
                 ),
                 "message_id": (
                     f"<critical-alert-{row['id']}-"
@@ -4030,6 +4045,105 @@ class StrategyRepository:
             )
             conn.commit()
         return row_to_dict(row) or {}
+
+    def normalize_legacy_alert_lifecycle(
+        self, *, actor: str, now: datetime | None = None
+    ) -> int:
+        """Resolve pre-lifecycle alerts once so current state can re-open them."""
+        observed_now = now or datetime.now(timezone.utc)
+        ts = observed_now.isoformat()
+        marker_key = "alert_lifecycle_legacy_normalized"
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            marker_row = conn.execute(
+                "SELECT value FROM live_system_state WHERE key=?",
+                (marker_key,),
+            ).fetchone()
+            if marker_row and str(marker_row["value"]).lower() == "true":
+                conn.rollback()
+                return 0
+            cursor = conn.execute(
+                "UPDATE live_alerts SET active=0,status='RESOLVED',"
+                "resolved_at=?,resolution_reason=? "
+                "WHERE active=1 AND status='OPEN'",
+                (ts, "LIFECYCLE_MIGRATION_REEVALUATE_CURRENT_STATE"),
+            )
+            count = int(cursor.rowcount)
+            self.base.set_states_on_connection(
+                conn, {marker_key: "true"}, actor
+            )
+            conn.commit()
+        self.base.audit(
+            actor, "normalize_legacy_alert_lifecycle", "ok",
+            "LIFECYCLE_MIGRATION_REEVALUATE_CURRENT_STATE",
+            {"resolved_count": count},
+        )
+        return count
+
+    def watchdog_reconciliation(
+        self,
+        *,
+        actor: str = "reconciliation_watchdog",
+        threshold_seconds: float = 300.0,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        observed_now = now or datetime.now(timezone.utc)
+        last_success = self.base.get_state(
+            "last_successful_reconciliation_at", ""
+        )
+        try:
+            completed = datetime.fromisoformat(
+                str(last_success).replace("Z", "+00:00")
+            )
+            if completed.tzinfo is None:
+                completed = completed.replace(tzinfo=timezone.utc)
+            age_seconds = max(
+                0.0, (observed_now - completed).total_seconds()
+            )
+        except (TypeError, ValueError):
+            age_seconds = float("inf")
+        alert_type = "RECONCILIATION_WATCHDOG"
+        reason_code = "RECONCILIATION_STALE_OVER_5M"
+        if age_seconds > float(threshold_seconds):
+            fingerprint = self._alert_fingerprint(
+                alert_type, reason_code, "GLOBAL", "RECONCILIATION"
+            )
+            with self.base.connect() as conn:
+                existing = conn.execute(
+                    "SELECT * FROM live_alerts WHERE fingerprint=? "
+                    "AND active=1 AND status='OPEN'",
+                    (fingerprint,),
+                ).fetchone()
+            if existing is not None:
+                return row_to_dict(existing) or {}
+            global_halt = self.base.get_state(
+                "global_entry_halt_required", "false"
+            ).lower() == "true"
+            alert_id = self.alert(
+                alert_type=alert_type,
+                severity="WARNING" if global_halt else "CRITICAL",
+                reason_code=reason_code,
+                message=(
+                    "Reconciliation health is stale; "
+                    f"last_success_age_seconds={age_seconds}; "
+                    f"global_hard_stop={global_halt}"
+                ),
+                entity_type="GLOBAL",
+                entity_id="RECONCILIATION",
+            )
+            return next(
+                (row for row in self.active_alerts()
+                 if int(row["id"]) == alert_id),
+                None,
+            )
+        return self.resolve_alert(
+            alert_type=alert_type,
+            reason_code=reason_code,
+            entity_type="GLOBAL",
+            entity_id="RECONCILIATION",
+            actor=actor,
+            resolution_reason="RECONCILIATION_FRESH",
+        )
 
     def watchdog_operator_action(
         self,
