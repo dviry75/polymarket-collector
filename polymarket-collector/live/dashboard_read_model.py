@@ -547,7 +547,13 @@ class DashboardReadModel:
         )
         return {"items": rows, "quality": "REAL"}
 
-    def health(self, trader_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    def health(
+        self,
+        trader_status: dict[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        observed_now = now or datetime.now(timezone.utc)
         state_rows = self._all(
             "SELECT key,value,updated_at FROM live_system_state WHERE key IN ("
             "'kill_switch','pause_entries','strategy_readiness','strategy_block_reason',"
@@ -556,44 +562,246 @@ class DashboardReadModel:
             "'pause_state','pause_owner','pause_cause','release_policy','pause_generation',"
             "'pause_acquired_at','recovery_status','recovery_engine_status',"
             "'recovery_blockers_json','pause_eligible_since','recovery_last_action',"
-            "'recovery_last_result','last_auto_recovery_at')"
+            "'recovery_last_result','last_auto_recovery_at',"
+            "'operator_action_required','operator_action_reason',"
+            "'global_entry_halt_required','global_entry_halt_reason',"
+            "'incident_scope','quarantined_positions_count','quarantine_last_at',"
+            "'auto_repair_last_at','auto_repair_count_24h')"
         )
-        states = {str(row["key"]): {"value": row["value"], "updated_at": row["updated_at"]} for row in state_rows}
+        states = {
+            str(row["key"]): {
+                "value": row["value"], "updated_at": row["updated_at"]
+            }
+            for row in state_rows
+        }
         trader_available = bool(trader_status)
+        pause_entries = (
+            states.get("pause_entries", {}).get("value") == "true"
+        )
+        release_policy = states.get("release_policy", {}).get(
+            "value", "MANUAL_ONLY"
+        )
+        trading_status = (
+            "TRADING" if not pause_entries
+            else "MANUAL_HALT"
+            if release_policy == "MANUAL_ONLY"
+            else "TRANSIENT_BLOCK"
+        )
+        quarantine_state_count = int(
+            states.get("quarantined_positions_count", {}).get(
+                "value", "0"
+            ) or 0
+        )
+        classification = (
+            "GLOBAL_MANUAL_HARD_STOP"
+            if pause_entries and release_policy == "MANUAL_ONLY"
+            else "TRANSIENT_GLOBAL_BLOCK"
+            if pause_entries
+            else "SCOPED_QUARANTINE"
+            if quarantine_state_count
+            else "NONE"
+        )
+        last_success = states.get(
+            "last_successful_reconciliation_at", {}
+        ).get("value")
+        _stale, reconciliation_age = quality_for_timestamp(
+            last_success, stale_after_seconds=300.0, now=observed_now
+        )
+        latest_run = self._one(
+            "SELECT id,started_at,finished_at,status,gaps_count,error "
+            "FROM live_reconciliation_runs ORDER BY id DESC LIMIT 1"
+        )
+        running = self._one(
+            "SELECT COUNT(*) AS running_count,"
+            "COALESCE(SUM(CASE WHEN julianday(started_at)<"
+            "julianday('now','-5 minutes') THEN 1 ELSE 0 END),0) "
+            "AS stuck_running_count FROM live_reconciliation_runs "
+            "WHERE status='running'"
+        ) or {"running_count": 0, "stuck_running_count": 0}
+        quarantine_rows = self._all(
+            "SELECT quarantine_id,incident_scope,position_id,token_id,"
+            "event_id,reason_code,operator_action_required,"
+            "global_entry_halt_required,first_seen_at,last_seen_at "
+            "FROM live_quarantines WHERE status='OPEN' "
+            "ORDER BY last_seen_at DESC LIMIT 100"
+        )
+        quarantines = []
+        for row in quarantine_rows:
+            _unused_stale, age = quality_for_timestamp(
+                row.get("first_seen_at"),
+                stale_after_seconds=float("inf"),
+                now=observed_now,
+            )
+            quarantines.append({**row, "age_seconds": age})
+        runtime_recovery = (trader_status or {}).get("recovery") or {}
         return {
-            "trader_service": "RUNNING" if trader_available else "STOPPED",
+            "trader_service": (
+                "RUNNING" if trader_available else "STOPPED"
+            ),
             "dashboard_service": "RUNNING",
-            "kill_switch": states.get("kill_switch", {}).get("value") == "true",
-            "pause_entries": states.get("pause_entries", {}).get("value") == "true",
-            "strategy_readiness": states.get("strategy_readiness", {}).get("value", "UNKNOWN") if trader_available else "STOPPED",
-            "strategy_block_reason": states.get("strategy_block_reason", {}).get("value", ""),
-            "reconciliation_readiness": states.get("reconciliation_readiness", {}).get("value", "UNKNOWN") if trader_available else "STALE",
-            "reconciliation_block_reason": states.get("reconciliation_block_reason", {}).get("value", ""),
-            "order_heartbeat": states.get("order_heartbeat_status", {}).get("value", "UNKNOWN") if trader_available else "STOPPED",
-            "market_websocket": states.get("market_ws_status", {}).get("value", "UNKNOWN") if trader_available else "STOPPED",
-            "user_websocket": states.get("user_ws_status", {}).get("value", "UNKNOWN") if trader_available else "STOPPED",
-            "last_reconciliation": states.get("last_successful_reconciliation_at", {}).get("value"),
-            "auto_recovery": (
-                (trader_status or {}).get("recovery")
-                or {
-                    "auto_recovery_status": states.get("recovery_status", {}).get("value", "UNKNOWN"),
-                    "engine_status": states.get("recovery_engine_status", {}).get("value", "UNKNOWN"),
-                    "pause_state": states.get("pause_state", {}).get("value", "UNKNOWN"),
-                    "owner": states.get("pause_owner", {}).get("value", "NONE"),
-                    "cause": states.get("pause_cause", {}).get("value", ""),
-                    "release_policy": states.get("release_policy", {}).get("value", "MANUAL_ONLY"),
-                    "generation": int(states.get("pause_generation", {}).get("value", "0") or 0),
-                    "acquired_at": states.get("pause_acquired_at", {}).get("value", ""),
-                    "eligible_since": states.get("pause_eligible_since", {}).get("value", ""),
-                    "current_blockers": json.loads(
-                        states.get("recovery_blockers_json", {}).get("value", "[]")
+            "kill_switch": (
+                states.get("kill_switch", {}).get("value") == "true"
+            ),
+            "trading_status": trading_status,
+            "pause_entries": pause_entries,
+            "strategy_readiness": (
+                states.get("strategy_readiness", {}).get(
+                    "value", "UNKNOWN"
+                )
+                if trader_available else "STOPPED"
+            ),
+            "strategy_block_reason": states.get(
+                "strategy_block_reason", {}
+            ).get("value", ""),
+            "reconciliation_readiness": (
+                states.get("reconciliation_readiness", {}).get(
+                    "value", "UNKNOWN"
+                )
+                if trader_available else "STALE"
+            ),
+            "reconciliation_block_reason": states.get(
+                "reconciliation_block_reason", {}
+            ).get("value", ""),
+            "order_heartbeat": (
+                states.get("order_heartbeat_status", {}).get(
+                    "value", "UNKNOWN"
+                )
+                if trader_available else "STOPPED"
+            ),
+            "market_websocket": (
+                states.get("market_ws_status", {}).get("value", "UNKNOWN")
+                if trader_available else "STOPPED"
+            ),
+            "user_websocket": (
+                states.get("user_ws_status", {}).get("value", "UNKNOWN")
+                if trader_available else "STOPPED"
+            ),
+            "operator": {
+                "action_required": (
+                    states.get("operator_action_required", {}).get("value")
+                    == "true"
+                ),
+                "reason": states.get(
+                    "operator_action_reason", {}
+                ).get("value", ""),
+            },
+            "global_halt": {
+                "required": (
+                    states.get(
+                        "global_entry_halt_required", {}
+                    ).get("value") == "true"
+                ),
+                "reason": states.get(
+                    "global_entry_halt_reason", {}
+                ).get("value", ""),
+            },
+            "incident_scope": states.get("incident_scope", {}).get(
+                "value", "NONE"
+            ),
+            "quarantine": {
+                "count": len(quarantines),
+                "state_count": quarantine_state_count,
+                "last_at": states.get("quarantine_last_at", {}).get(
+                    "value", ""
+                ),
+                "items": quarantines,
+            },
+            "reconciliation": {
+                "readiness": (
+                    states.get("reconciliation_readiness", {}).get(
+                        "value", "UNKNOWN"
+                    )
+                    if trader_available else "STALE"
+                ),
+                "last_successful_at": last_success,
+                "success_age_seconds": reconciliation_age,
+                "last_run": latest_run,
+                "running_count": int(running.get("running_count") or 0),
+                "stuck_running_count": int(
+                    running.get("stuck_running_count") or 0
+                ),
+            },
+            "auto_repair": {
+                "last_at": states.get("auto_repair_last_at", {}).get(
+                    "value", ""
+                ),
+                "count_24h": int(
+                    states.get("auto_repair_count_24h", {}).get(
+                        "value", "0"
+                    ) or 0
+                ),
+            },
+            "recovery": {
+                "cause": states.get("pause_cause", {}).get("value", ""),
+                "classification": classification,
+                "release_policy": release_policy,
+                "stability": {
+                    "eligible_since": states.get(
+                        "pause_eligible_since", {}
+                    ).get("value", ""),
+                    "runtime_elapsed_ms": runtime_recovery.get(
+                        "stability_elapsed_ms"
                     ),
-                    "last_recovery_action": states.get("recovery_last_action", {}).get("value", ""),
-                    "last_recovery_result": states.get("recovery_last_result", {}).get("value", ""),
-                    "last_auto_recovery_at": states.get("last_auto_recovery_at", {}).get("value", ""),
+                    "runtime_target_ms": runtime_recovery.get(
+                        "stability_target_ms"
+                    ),
+                },
+                "last_action": states.get(
+                    "recovery_last_action", {}
+                ).get("value", ""),
+                "last_result": states.get(
+                    "recovery_last_result", {}
+                ).get("value", ""),
+            },
+            "last_reconciliation": last_success,
+            "auto_recovery": (
+                runtime_recovery
+                or {
+                    "auto_recovery_status": states.get(
+                        "recovery_status", {}
+                    ).get("value", "UNKNOWN"),
+                    "engine_status": states.get(
+                        "recovery_engine_status", {}
+                    ).get("value", "UNKNOWN"),
+                    "pause_state": states.get("pause_state", {}).get(
+                        "value", "UNKNOWN"
+                    ),
+                    "owner": states.get("pause_owner", {}).get(
+                        "value", "NONE"
+                    ),
+                    "cause": states.get("pause_cause", {}).get(
+                        "value", ""
+                    ),
+                    "release_policy": release_policy,
+                    "generation": int(
+                        states.get("pause_generation", {}).get(
+                            "value", "0"
+                        ) or 0
+                    ),
+                    "acquired_at": states.get(
+                        "pause_acquired_at", {}
+                    ).get("value", ""),
+                    "eligible_since": states.get(
+                        "pause_eligible_since", {}
+                    ).get("value", ""),
+                    "current_blockers": json.loads(
+                        states.get("recovery_blockers_json", {}).get(
+                            "value", "[]"
+                        )
+                    ),
+                    "last_recovery_action": states.get(
+                        "recovery_last_action", {}
+                    ).get("value", ""),
+                    "last_recovery_result": states.get(
+                        "recovery_last_result", {}
+                    ).get("value", ""),
+                    "last_auto_recovery_at": states.get(
+                        "last_auto_recovery_at", {}
+                    ).get("value", ""),
                 }
             ),
-            "quality": "REAL", "as_of": self.metadata()["as_of"],
+            "quality": "REAL",
+            "as_of": observed_now.isoformat(),
         }
 
     def freshness(self, trader_status: dict[str, Any] | None = None) -> dict[str, Any]:

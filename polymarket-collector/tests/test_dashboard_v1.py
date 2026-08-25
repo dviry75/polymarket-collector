@@ -166,6 +166,80 @@ def test_dashboard_api_auth_get_only_pagination_and_no_raw_identifiers():
         assert client.get("/live/dashboard/v1/trades?page_size=101").status_code == 422
 
 
+def test_health_exposes_three_tier_recovery_and_operational_state():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        repo.set_states({
+            "pause_entries": "true",
+            "pause_state": "PAUSED_RECOVERING",
+            "pause_cause": "RECONCILIATION_TEMPORARY_ERROR",
+            "release_policy": "AUTO_WHEN_CLEAN",
+            "operator_action_required": "false",
+            "operator_action_reason": "",
+            "global_entry_halt_required": "true",
+            "global_entry_halt_reason": "RECONCILIATION_TEMPORARY_ERROR",
+            "incident_scope": "GLOBAL",
+            "reconciliation_readiness": "READY",
+            "last_successful_reconciliation_at": (
+                "2026-08-12T10:10:00+00:00"
+            ),
+            "auto_repair_last_at": "2026-08-12T10:09:00+00:00",
+            "auto_repair_count_24h": "2",
+        }, "test")
+        with repo.connect() as conn:
+            conn.execute(
+                "INSERT INTO live_reconciliation_runs"
+                "(started_at,status) VALUES(?,?)",
+                ("2026-08-12T10:00:00+00:00", "running"),
+            )
+            conn.execute(
+                "INSERT INTO live_quarantines("
+                "quarantine_id,incident_scope,entity_type,entity_id,"
+                "position_id,reason_code,status,first_seen_at,last_seen_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    "q1", "POSITION", "POSITION", "position",
+                    "position", "SCOPED_TEST", "OPEN",
+                    "2026-08-12T10:05:00+00:00",
+                    "2026-08-12T10:06:00+00:00",
+                ),
+            )
+            conn.commit()
+        model = DashboardReadModel(
+            LiveRepository(repo.db_path, query_only=True)
+        )
+        health = model.health(
+            {
+                "recovery": {
+                    "stability_elapsed_ms": 2000,
+                    "stability_target_ms": 4000,
+                }
+            },
+            now=NOW,
+        )
+        assert health["trading_status"] == "TRANSIENT_BLOCK"
+        assert (
+            health["recovery"]["classification"]
+            == "TRANSIENT_GLOBAL_BLOCK"
+        )
+        assert health["operator"] == {
+            "action_required": False, "reason": ""
+        }
+        assert health["global_halt"]["required"] is True
+        assert health["incident_scope"] == "GLOBAL"
+        assert health["quarantine"]["count"] == 1
+        assert health["quarantine"]["items"][0]["age_seconds"] == 301.0
+        assert health["reconciliation"]["success_age_seconds"] == 1.0
+        assert health["reconciliation"]["running_count"] == 1
+        assert health["reconciliation"]["stuck_running_count"] == 1
+        assert health["auto_repair"]["count_24h"] == 2
+        assert (
+            health["recovery"]["stability"]["runtime_target_ms"]
+            == 4000
+        )
+
+
 def test_missing_fee_is_partial_and_never_rendered_as_zero():
     with tempfile.TemporaryDirectory() as tmp:
         repo, _config = build_db(tmp); seed_verified_lifecycle(repo)
