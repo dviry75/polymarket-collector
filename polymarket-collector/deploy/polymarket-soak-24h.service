@@ -1,0 +1,31 @@
+[Unit]
+Description=Polymarket independent read-only 24h soak monitor
+After=polymarket-trader.service
+Requires=polymarket-trader.service
+
+[Service]
+Type=simple
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live
+ExecStart=/usr/bin/python3 /opt/polymarket-btc-live/soak/soak_monitor.py --run-dir /opt/polymarket-btc-live/soak/soak_24h_20260825T101738Z --duration-seconds 86400 --sample-interval 10 --resource-interval 60 --db-interval 45
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+ReadOnlyPaths=/opt/polymarket-btc-live/poly_live.sqlite3 /opt/polymarket-btc-live/repo /run/polymarket
+ReadWritePaths=/opt/polymarket-btc-live/soak
+
+[Install]
+WantedBy=multi-user.target
