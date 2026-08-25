@@ -70,7 +70,7 @@ Resume ידני מבוצע רק דרך ה־Dashboard או פקודת `RESUME_ENT
 
 ## פירוש alerts
 
-- `[CRITICAL ACTION]`: פעולה אנושית נדרשת; אין לאשר/לסגור לפני בדיקת הראיות.
+- `[CRITICAL ACTION]`: נפתח מיד כאשר `operator_action_required=true`; אין לאשר/לסגור לפני בדיקת הראיות.
 - `[QUARANTINE]`: בידוד ממוקד; אינו בהכרח עצירה גלובלית.
 - `[AUTO-REPAIR]`: תיקון סמכותי שבוצע ללא צורך בהחלטת מפעיל.
 - Alert פתוח חוזר מעדכן occurrence/last_seen ללא flood. לאחר resolution, הישנות חדשה נפתחת מחדש עם recurrence גלוי.
@@ -78,4 +78,6 @@ Resume ידני מבוצע רק דרך ה־Dashboard או פקודת `RESUME_ENT
 
 ## בדיקת תוצאות ה־soak
 
-שירות `polymarket-soak-24h.service` הוא read-only ורץ כ־24 שעות. בסיום בדוק שאין stuck reconciliation,‏ WS storm, backlog, pause שלא השתחרר אחרי gates נקיים, duplicate order, גידול WAL/זיכרון לא חסום או contradiction חוזר מאותו אירוע ממוקד.
+שירות `polymarket-soak-24h.service` הוא read-only ורץ כ־24 שעות. הריצה הנוכחית התחילה ב־`2026-08-25T10:56:39.768160Z`, צפויה להסתיים ב־`2026-08-26T10:56:39.768160Z`, ושומרת תוצאות תחת `/opt/polymarket-btc-live/soak/soak_24h_20260825T104014Z`.
+
+בסיום בדוק את `metadata.json` (`completed=true`),‏ `samples.jsonl`,‏ `events.jsonl`,‏ `resources.jsonl`,‏ `hourly_summary.csv`, תיקיית `incidents/` ו־`logs/monitor.log`. ודא שאין stuck reconciliation,‏ WS storm, backlog, pause שלא השתחרר אחרי gates נקיים, duplicate order, גידול WAL/זיכרון לא חסום או contradiction חוזר מאותו אירוע ממוקד. אין צורך להשאיר Codex פתוח; השירות ממשיך עצמאית תחת systemd.
