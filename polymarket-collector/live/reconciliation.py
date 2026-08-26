@@ -26,6 +26,15 @@ from .reconciliation_coordinator import GapBackoffTracker
 
 
 POSITION_PROPAGATION_GRACE_SECONDS = 15.0
+
+
+class TransientAccountModeError(RuntimeError):
+    """The closed-only-mode probe failed; the account state is unknown.
+
+    Raised so the reconciliation error path classifies it as a temporary
+    error (backoff + retry) instead of an authoritative contradiction.
+    """
+
 INTENT_SUBMISSION_GRACE_SECONDS = 15.0
 AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES = Decimal("0.01")
 # Order-status can report a terminal MATCHED/FILLED outcome before the
@@ -142,6 +151,10 @@ def _is_rate_limit_error(exc: Exception) -> bool:
 def _is_temporary_network_error(exc: Exception) -> bool:
     name = type(exc).__name__.lower()
     message = str(exc).lower()
+    # Matched explicitly rather than by name substring so the classification
+    # cannot silently regress if the class is ever renamed.
+    if isinstance(exc, TransientAccountModeError):
+        return True
     return isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
         token in name or token in message
         for token in (
@@ -812,10 +825,21 @@ class ReconciliationWorker:
 
             if identity.get("status") == "VERIFIED" and hasattr(self.adapter, "get_closed_only_mode"):
                 account_mode = await self.adapter.get_closed_only_mode()  # type: ignore[attr-defined]
-                if account_mode.get("status") != "FULL_TRADING":
+                account_status = str(account_mode.get("status") or "")
+                if account_status == "FAILED":
+                    # The *check* failed (timeout, rate limit, 5xx) -- that is
+                    # not evidence the account is restricted. Treating it as a
+                    # financial contradiction escalated a transient API blip
+                    # into a permanent MANUAL_ONLY pause. Raise it as a
+                    # temporary error so the normal backoff/retry path owns it.
+                    raise TransientAccountModeError(
+                        str(account_mode.get("error") or "closed-only check failed")
+                    )
+                if account_status != "FULL_TRADING":
                     gaps.append({
                         "type": "account_not_full_trading",
-                        "status": account_mode.get("status"),
+                        "status": account_status,
+                        "error": str(account_mode.get("error") or ""),
                     })
             balance = await self.adapter.get_balance()
             allowances = await self.adapter.get_allowances()
@@ -851,6 +875,31 @@ class ReconciliationWorker:
                 if item.get("polymarket_order_id") or item.get("id")
             }
             local_orders = self.repo.non_final_orders()
+            local_orders_by_remote_id = {
+                str(order.get("polymarket_order_id")): order
+                for order in local_orders if order.get("polymarket_order_id")
+            }
+            strategy_intents_by_remote_id: dict[str, dict[str, Any]] = {}
+            if self.strategy_repo:
+                strategy_remote_ids = set(remote_by_id)
+                for trade in remote_trades:
+                    trade_order_id = str(
+                        trade.get("polymarket_order_id") or ""
+                    )
+                    if trade_order_id:
+                        strategy_remote_ids.add(trade_order_id)
+                    raw = trade.get("raw_message") or {}
+                    for child in raw.get("maker_orders") or []:
+                        if not isinstance(child, dict):
+                            continue
+                        child_order_id = str(child.get("order_id") or "")
+                        if child_order_id:
+                            strategy_remote_ids.add(child_order_id)
+                strategy_intents_by_remote_id = (
+                    self.strategy_repo.intents_by_remote_orders(
+                        strategy_remote_ids
+                    )
+                )
             for order in local_orders:
                 remote_id = order.get("polymarket_order_id")
                 if remote_id and str(remote_id) not in remote_by_id and order.get("status") in {
@@ -861,15 +910,10 @@ class ReconciliationWorker:
                         "local_order_id": order["local_order_id"],
                         "polymarket_order_id": remote_id,
                     })
-            local_remote_ids = {
-                str(order.get("polymarket_order_id"))
-                for order in local_orders if order.get("polymarket_order_id")
-            }
+            local_remote_ids = set(local_orders_by_remote_id)
             for remote_id in remote_by_id:
                 legacy_known = remote_id in local_remote_ids
-                strategy_known = bool(
-                    self.strategy_repo and self.strategy_repo.intent_by_remote_order(remote_id)
-                )
+                strategy_known = remote_id in strategy_intents_by_remote_id
                 if not legacy_known and not strategy_known:
                     gaps.append({
                         "type": "remote_order_missing_local",
@@ -878,17 +922,11 @@ class ReconciliationWorker:
 
             for trade in remote_trades:
                 order_id = str(trade.get("polymarket_order_id") or "")
-                legacy = next(
-                    (
-                        item for item in local_orders
-                        if str(item.get("polymarket_order_id") or "") == order_id
-                    ),
-                    None,
-                )
+                legacy = local_orders_by_remote_id.get(order_id)
                 if legacy and trade.get("price") is not None and trade.get("size") is not None:
                     self.repo.add_fill(int(legacy["local_order_id"]), trade)
                 if self.strategy_repo and order_id:
-                    intent = self.strategy_repo.intent_by_remote_order(order_id)
+                    intent = strategy_intents_by_remote_id.get(order_id)
                     if intent and trade.get("price") is not None and trade.get("size") is not None:
                         self.strategy_repo.add_fill(
                             intent_id=str(intent["intent_id"]),
@@ -906,7 +944,8 @@ class ReconciliationWorker:
 
             if self.strategy_repo:
                 repairs.extend(ingest_maker_exit_fills(
-                    self.repo, self.strategy_repo, remote_trades, remote_by_id
+                    self.repo, self.strategy_repo, remote_trades, remote_by_id,
+                    strategy_intents_by_remote_id,
                 ))
                 for repair in repairs:
                     repaired_position = self.strategy_repo.position_for_token(

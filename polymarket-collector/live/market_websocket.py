@@ -3014,6 +3014,10 @@ class UserWebSocketManager:
         self.event_persistence_failures = 0
         self._authenticated_signal = False
         self._silent_failures = 0
+        self._auth_failures = 0
+        self.auth_failure_threshold = max(
+            2, int(os.getenv("LIVE_USER_WS_AUTH_FAILURE_THRESHOLD", "3"))
+        )
         self._logger = logging.getLogger("live.user_ws")
 
     def subscription_message(self, condition_ids, auth_payload=None):
@@ -3134,19 +3138,37 @@ class UserWebSocketManager:
             except Exception as exc:
                 self._ws = None
                 error = self._safe_error(exc)
-                if self._is_auth_error(error):
-                    self._set_state("AUTH_FAILED", "User WebSocket authentication failed")
-                    return
                 attempt += 1
-                if not self._authenticated_signal:
+                # An auth rejection is not proof of bad credentials: rate
+                # limiting and transient exchange-side refusals surface
+                # identically. Keep retrying with backoff and only surface a
+                # terminal AUTH_FAILED once the failures persist, so a blip
+                # can no longer kill the private feed until the next restart.
+                if self._is_auth_error(error):
+                    self._auth_failures += 1
+                    if self._auth_failures >= self.auth_failure_threshold:
+                        self._set_state(
+                            "AUTH_FAILED",
+                            "User WebSocket authentication failed "
+                            f"{self._auth_failures}x; still retrying",
+                        )
+                    else:
+                        self._set_state("RECONNECTING", error)
+                elif not self._authenticated_signal:
                     self._silent_failures += 1
-                    if self._silent_failures >= 2:
-                        self._set_state("AUTH_FAILED", "User WebSocket closed before authentication acknowledgement")
-                        return
+                    if self._silent_failures >= self.auth_failure_threshold:
+                        self._set_state(
+                            "AUTH_FAILED",
+                            "User WebSocket closed before authentication "
+                            f"acknowledgement {self._silent_failures}x; still retrying",
+                        )
+                    else:
+                        self._set_state("RECONNECTING", error)
                 else:
                     self._silent_failures = 0
                 self.status.reconnect_attempts += 1
-                self._set_state("RECONNECTING", error)
+                if self.status.status != "AUTH_FAILED":
+                    self._set_state("RECONNECTING", error)
                 try:
                     await asyncio.wait_for(self._stop.wait(), min(30.0, 2 ** min(attempt, 5)) + random.random())
                 except asyncio.TimeoutError:
@@ -3176,6 +3198,7 @@ class UserWebSocketManager:
         if raw == "PONG" or raw == b"PONG":
             self._authenticated_signal = True
             self._silent_failures = 0
+            self._auth_failures = 0
             self.last_pong_at = now_iso()
             self._persist_state()
             return

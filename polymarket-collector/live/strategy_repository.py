@@ -1384,6 +1384,70 @@ class StrategyRepository:
             )
         return True
 
+    def deescalate_pause_policy_cas(
+        self,
+        *,
+        expected_generation: int,
+        expected_cause: str,
+        actor: str,
+    ) -> bool:
+        """Clear a stale MANUAL_ONLY stamp whose cause is provably resolved.
+
+        The MANUAL_ONLY release policy is written once at acquire time and read
+        back on every cycle, so it used to outlive the condition that produced
+        it: a transient reconciliation error could hold entries down forever.
+
+        This does NOT weaken release_pause_cas -- that guard stays intact. It
+        de-escalates the stored policy back to AUTO_WHEN_CLEAN so the ordinary
+        stability gates own the decision again. The caller must prove the cause
+        is gone; only reconciliation-derived causes qualify.
+        """
+        if actor != "pause_recovery":
+            return False
+        cause = str(expected_cause or "").upper()
+        if not cause.startswith("RECONCILIATION_"):
+            return False
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._state_map_on_connection(conn, self.PAUSE_STATE_KEYS)
+            if (
+                state.get("pause_entries", "true").lower() != "true"
+                or int(state.get("pause_generation", "0") or 0)
+                != expected_generation
+                or state.get("release_policy") != ReleasePolicy.MANUAL_ONLY
+                or str(state.get("pause_cause") or "").upper() != cause
+            ):
+                conn.rollback()
+                return False
+            self.base.set_states_on_connection(
+                conn,
+                {
+                    "release_policy": ReleasePolicy.AUTO_WHEN_CLEAN,
+                    "pause_auto_recoverable": "true",
+                    "operator_action_required": "false",
+                    "operator_action_reason": "",
+                    "pause_updated_at": now_iso(),
+                },
+                actor,
+            )
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    now_iso(), actor, "pause_policy_deescalated", "ok",
+                    "AUTHORITATIVE_CONTRADICTION_RESOLVED",
+                    json.dumps({
+                        "pause_generation": expected_generation,
+                        "cause": cause,
+                        "from": str(ReleasePolicy.MANUAL_ONLY),
+                        "to": str(ReleasePolicy.AUTO_WHEN_CLEAN),
+                    }, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        return True
+
     def release_pause_cas(
         self,
         *,
@@ -3607,6 +3671,26 @@ class StrategyRepository:
             audit_id = int(cursor.lastrowid)
             conn.commit()
         return audit_id
+
+    def intents_by_remote_orders(
+        self, remote_order_ids: Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Load remote-order intent identities with one SQLite connection."""
+        order_ids = tuple(dict.fromkeys(
+            str(order_id) for order_id in remote_order_ids if str(order_id)
+        ))
+        if not order_ids:
+            return {}
+        placeholders = ",".join("?" for _ in order_ids)
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM live_strategy_intents WHERE remote_order_id IN ({placeholders})",
+                order_ids,
+            ).fetchall()
+        return {
+            str(row["remote_order_id"]): row_to_dict(row) or {}
+            for row in rows
+        }
 
     def position_for_token(self, token_id: str) -> dict[str, Any] | None:
         with self.base.connect() as conn:

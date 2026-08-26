@@ -103,6 +103,58 @@ class EntryReleaseEvaluator:
         if code not in {item.code for item in blockers}:
             blockers.append(RecoveryBlocker(code, source, details, age_ms))
 
+    # Causes that stay MANUAL_ONLY forever: an operator, risk, or compliance
+    # decision is not something the machine may reverse on its own.
+    NEVER_AUTO_DEESCALATE = frozenset({
+        "OPERATOR_PAUSE", "KILL_SWITCH_ACTIVE", "OPERATOR_MAINTENANCE_HOLD",
+        "EMERGENCY_CLOSE_REQUESTED", "DAILY_LOSS_LIMIT",
+        "CONSECUTIVE_FAILED_ORDERS", "CONSECUTIVE_LOSING_DEALS",
+        "GEOGRAPHIC_AVAILABILITY_FAILED", "CONFIG_INVALID",
+        "CANARY_NOT_ARMED",
+    })
+
+    # How long reconciliation must stay demonstrably clean before a
+    # reconciliation-derived MANUAL_ONLY pause is considered stale.
+    MANUAL_DEESCALATION_CLEAN_SECONDS = 300.0
+
+    def _manual_cause_resolved(
+        self, pause: dict[str, Any], state: dict[str, str], now: datetime
+    ) -> bool:
+        """True when a MANUAL_ONLY pause's own cause is provably gone.
+
+        A MANUAL_ONLY stamp is written once and read back every cycle, so it
+        used to outlive the condition that produced it -- a transient
+        reconciliation error could lock entries permanently. Only
+        reconciliation-derived causes de-escalate, and only on positive
+        evidence: readiness READY, no block reason, and a successful
+        reconciliation sustained past the clean window.
+        """
+        if not pause.get("pause_entries"):
+            return False
+        cause = str(pause.get("pause_cause") or "").upper()
+        if not cause.startswith("RECONCILIATION_"):
+            return False
+        if cause in self.NEVER_AUTO_DEESCALATE:
+            return False
+        if state.get("reconciliation_readiness") != "READY":
+            return False
+        if str(state.get("reconciliation_block_reason") or ""):
+            return False
+        if str(state.get("live_blocked_by_reconciliation", "true")).lower() == "true":
+            return False
+        clean_at = _parse_time(state.get("last_successful_reconciliation_at"))
+        if clean_at is None:
+            return False
+        acquired_at = _parse_time(pause.get("pause_acquired_at"))
+        # The clean evidence must be newer than the pause it would clear.
+        if acquired_at is not None and clean_at <= acquired_at:
+            return False
+        return (
+            now - clean_at
+        ).total_seconds() <= self.MANUAL_DEESCALATION_CLEAN_SECONDS and (
+            now - (acquired_at or clean_at)
+        ).total_seconds() >= self.MANUAL_DEESCALATION_CLEAN_SECONDS
+
     def evaluate_entry_release_gates(
         self, *, allow_manual_policy: bool = False
     ) -> ReleaseEvaluation:
@@ -111,6 +163,22 @@ class EntryReleaseEvaluator:
         pause = self.strategy_repo.pause_record()
         blockers: list[RecoveryBlocker] = []
         evidence: dict[str, Any] = {}
+        state = self.repo.get_states({
+            "strategy_readiness": "NOT_READY",
+            "strategy_block_reason": "",
+            "reconciliation_readiness": "NOT_READY",
+            "last_successful_reconciliation_at": "",
+            "reconciliation_block_reason": "",
+            "live_blocked_by_reconciliation": "true",
+            "kill_switch": "true",
+            "order_heartbeat_status": "DISABLED",
+            "last_successful_heartbeat_at": "",
+            "geographic_availability": "NOT_CHECKED",
+            "geographic_checked_at": "",
+            "canary_armed": "false",
+            "recovery_financial_verified_generation": "",
+            "recovery_engine_status": "STARTING",
+        })
 
         market = self.market_ws.health()
         evidence["market_ws"] = market
@@ -180,21 +248,15 @@ class EntryReleaseEvaluator:
                 "private state freshness not proven", user_age,
             )
 
-        strategy_readiness = self.repo.get_state(
-            "strategy_readiness", "NOT_READY"
-        )
+        strategy_readiness = state["strategy_readiness"]
         if strategy_readiness != "READY":
             self._add(
                 blockers, "MARKET_READINESS_NOT_READY", "strategy",
-                self.repo.get_state("strategy_block_reason", ""),
+                state["strategy_block_reason"],
             )
 
-        reconciliation_readiness = self.repo.get_state(
-            "reconciliation_readiness", "NOT_READY"
-        )
-        last_clean_reconciliation = self.repo.get_state(
-            "last_successful_reconciliation_at", ""
-        )
+        reconciliation_readiness = state["reconciliation_readiness"]
+        last_clean_reconciliation = state["last_successful_reconciliation_at"]
         evidence["reconciliation"] = {
             "readiness": reconciliation_readiness,
             "last_clean_at": last_clean_reconciliation,
@@ -202,25 +264,19 @@ class EntryReleaseEvaluator:
         if reconciliation_readiness != "READY":
             self._add(
                 blockers, "RECONCILIATION_NOT_READY", "reconciliation",
-                self.repo.get_state("reconciliation_block_reason", ""),
+                state["reconciliation_block_reason"],
             )
-        if self.repo.get_state(
-            "live_blocked_by_reconciliation", "true"
-        ).lower() == "true":
+        if state["live_blocked_by_reconciliation"].lower() == "true":
             self._add(
                 blockers, "RECONCILIATION_NOT_CLEAN", "reconciliation"
             )
 
-        if self.repo.kill_switch_active():
+        if state["kill_switch"].lower() == "true":
             self._add(blockers, "KILL_SWITCH_ACTIVE", "operator")
 
         if self.config.execution_mode == "REAL_TRADING":
-            heartbeat = self.repo.get_state(
-                "order_heartbeat_status", "DISABLED"
-            )
-            heartbeat_at = self.repo.get_state(
-                "last_successful_heartbeat_at", ""
-            )
+            heartbeat = state["order_heartbeat_status"]
+            heartbeat_at = state["last_successful_heartbeat_at"]
             evidence["heartbeat"] = {
                 "status": heartbeat,
                 "last_success_at": heartbeat_at,
@@ -265,12 +321,8 @@ class EntryReleaseEvaluator:
                 "financial_state",
             )
 
-        geographic = self.repo.get_state(
-            "geographic_availability", "NOT_CHECKED"
-        )
-        geographic_checked_at = self.repo.get_state(
-            "geographic_checked_at", ""
-        )
+        geographic = state["geographic_availability"]
+        geographic_checked_at = state["geographic_checked_at"]
         geographic_age = _age_ms(geographic_checked_at, now=now)
         geographic_ttl_ms = float(
             getattr(self.config, "geographic_preflight_ttl_seconds", 3600)
@@ -303,9 +355,7 @@ class EntryReleaseEvaluator:
         if (
             self.config.execution_mode == "REAL_TRADING"
             and not self.config.continuous_trading_enabled
-            and self.repo.get_state(
-                "canary_armed", "false"
-            ).lower() != "true"
+            and state["canary_armed"].lower() != "true"
         ):
             self._add(blockers, "CANARY_NOT_ARMED", "canary")
 
@@ -315,13 +365,14 @@ class EntryReleaseEvaluator:
             or recovery_policy(str(pause.get("pause_cause") or "")).release_policy
         )
         acquired_at = str(pause.get("pause_acquired_at") or "")
-        financial_verified = self.repo.get_state(
-            "recovery_financial_verified_generation", ""
-        )
+        financial_verified = state["recovery_financial_verified_generation"]
+        manual_stale = self._manual_cause_resolved(pause, state, now)
+        evidence["manual_only_cause_resolved"] = manual_stale
         if (
             pause.get("pause_entries")
             and release_policy == ReleasePolicy.MANUAL_ONLY
             and not allow_manual_policy
+            and not manual_stale
         ):
             self._add(
                 blockers, "MANUAL_ONLY_PAUSE", "pause_policy",
@@ -368,9 +419,7 @@ class EntryReleaseEvaluator:
                 "reconciliation",
             )
 
-        if self.repo.get_state(
-            "recovery_engine_status", "STARTING"
-        ) == "DEGRADED":
+        if state["recovery_engine_status"] == "DEGRADED":
             self._add(
                 blockers, "AUTO_RECOVERY_DEGRADED", "recovery_engine"
             )
@@ -575,6 +624,22 @@ class PauseRecoveryCoordinator:
                 False, ("STABILITY_WINDOW",), owner, reason,
                 generation, PauseState.PAUSED_WAITING_STABILITY,
             )
+
+        # The gates are clean and stable. If this pause still carries a
+        # MANUAL_ONLY stamp whose cause is provably resolved, clear the stamp
+        # first -- release_pause_cas refuses machine releases under
+        # MANUAL_ONLY, so without this the pause would sit here forever with
+        # nothing left blocking it.
+        if evaluation.evidence.get("manual_only_cause_resolved"):
+            if self.strategy_repo.deescalate_pause_policy_cas(
+                expected_generation=generation,
+                expected_cause=reason,
+                actor="pause_recovery",
+            ):
+                self.repo.set_state(
+                    "recovery_last_action", "PAUSE_POLICY_DEESCALATED",
+                    "pause_recovery",
+                )
 
         released = self.strategy_repo.release_pause_cas(
             expected_generation=generation,
