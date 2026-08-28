@@ -3042,6 +3042,72 @@ class StrategyRepository:
             conn.commit()
         return row_to_dict(row)
 
+    FINAL_EXIT_INTENT_STATES = frozenset({"FILLED", "PARTIAL_FINAL"})
+
+    def finalize_exit_intent_state(
+        self, intent_id: str, *, final_state: str, reason: str
+    ) -> bool:
+        """Close out an EXIT/TP intent whose remote order can no longer fill.
+
+        Exit intents used to reach a final state only as a side effect of
+        applying a *new* fill. When the last fill was already recorded the
+        delta is zero, so an order that finished with an unsellable remainder
+        (below min_order_size) stayed non-final forever and held entries down
+        as an UNRESOLVED_INTENT.
+
+        This only rewrites the intent's own lifecycle columns. Position
+        accounting is untouched -- by this point the fills are already applied
+        and the position has settled itself (typically to DUST).
+        """
+        if final_state not in self.FINAL_EXIT_INTENT_STATES:
+            return False
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT action,state,position_id,purpose FROM live_strategy_intents "
+                "WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["action"]) not in {"EXIT", "TP"}
+                or str(row["state"]) in FINAL_INTENT_STATES
+            ):
+                conn.rollback()
+                return False
+            conn.execute(
+                "UPDATE live_strategy_intents "
+                "SET state=?,reason_code=?,final_at=?,updated_at=? WHERE intent_id=?",
+                (final_state, reason, ts, ts, intent_id),
+            )
+            if row["position_id"]:
+                column = (
+                    "tp_intent_id"
+                    if row["purpose"] == "TAKE_PROFIT"
+                    else "active_exit_intent_id"
+                )
+                conn.execute(
+                    f"UPDATE live_strategy_positions SET {column}=NULL,updated_at=? "
+                    f"WHERE position_id=? AND {column}=?",
+                    (ts, row["position_id"], intent_id),
+                )
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    ts, "reconciliation", "exit_intent_finalized", "ok", reason,
+                    json.dumps({
+                        "intent_id": intent_id,
+                        "from_state": str(row["state"]),
+                        "to_state": final_state,
+                    }, sort_keys=True),
+                ),
+            )
+            conn.commit()
+        return True
+
     def finalize_cancel(self, intent_id: str, success: bool, reason: str) -> None:
         state = "CANCELED" if success else "CANCEL_UNCERTAIN"
         ts = now_iso()

@@ -256,3 +256,67 @@ def test_successful_auth_resets_the_failure_counter():
     assert source.count("self._auth_failures = 0") >= 2, (
         "counter must reset on successful authentication, not only at init"
     )
+
+
+# --------------------------------------------------------------------- D14
+# An EXIT/TP order that ends with a remainder below min_order_size could never
+# reach a final state: finalisation only ran as a side effect of applying a new
+# fill, so once the last fill was recorded (delta == 0) the intent stayed
+# non-final forever and blocked entries as UNRESOLVED_INTENT.
+
+def _exit_intent(repo, *, state="PARTIAL", action="TP", purpose="TAKE_PROFIT"):
+    from live.repository import now_iso
+    with repo.base.connect() as conn:
+        conn.execute(
+            "INSERT INTO live_strategy_intents "
+            "(intent_id,correlation_id,event_id,condition_id,action,purpose,"
+            " token_id,side,state,requested_shares_text,filled_shares_text,"
+            " remaining_shares_text,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("i-1", "c-1", "e-1", "0xcond", action, purpose, "tok", "YES",
+             state, "5.1351", "5.13", "0.005134", now_iso(), now_iso()),
+        )
+        conn.commit()
+    return "i-1"
+
+
+def test_stuck_partial_exit_intent_can_be_finalized(tmp_path):
+    repo = _repo(tmp_path)
+    iid = _exit_intent(repo)
+    assert repo.finalize_exit_intent_state(
+        iid, final_state="PARTIAL_FINAL",
+        reason="REMOTE_ORDER_CLOSED_NO_FURTHER_FILL",
+    ) is True
+    with repo.base.connect() as conn:
+        row = conn.execute(
+            "SELECT state,final_at,reason_code FROM live_strategy_intents "
+            "WHERE intent_id=?", (iid,)
+        ).fetchone()
+    assert row["state"] == "PARTIAL_FINAL"
+    assert row["final_at"], "final_at must be stamped so the intent is resolved"
+    assert row["reason_code"] == "REMOTE_ORDER_CLOSED_NO_FURTHER_FILL"
+
+
+def test_finalize_is_idempotent_and_refuses_already_final_intents(tmp_path):
+    repo = _repo(tmp_path)
+    iid = _exit_intent(repo, state="PARTIAL_FINAL")
+    assert repo.finalize_exit_intent_state(
+        iid, final_state="PARTIAL_FINAL", reason="x",
+    ) is False
+
+
+def test_finalize_refuses_entry_intents(tmp_path):
+    repo = _repo(tmp_path)
+    iid = _exit_intent(repo, action="ENTRY", purpose="ENTRY")
+    assert repo.finalize_exit_intent_state(
+        iid, final_state="PARTIAL_FINAL", reason="x",
+    ) is False
+
+
+def test_finalize_refuses_non_final_target_states(tmp_path):
+    repo = _repo(tmp_path)
+    iid = _exit_intent(repo)
+    for bad in ("PARTIAL", "OPEN", "CANCEL_UNCERTAIN", ""):
+        assert repo.finalize_exit_intent_state(
+            iid, final_state=bad, reason="x",
+        ) is False

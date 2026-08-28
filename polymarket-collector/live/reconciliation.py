@@ -1020,10 +1020,57 @@ class ReconciliationWorker:
                         })
                         continue
                     remote = remote_by_id.get(remote_id)
+                    remote_unreadable = ""
                     if remote is None:
-                        remote = await self.adapter.get_order(remote_id)
+                        try:
+                            remote = await self.adapter.get_order(remote_id)
+                        except Exception as exc:
+                            # One unparseable order must never abort the whole
+                            # run. It used to: the order that needed resolving
+                            # was itself the one whose response could not be
+                            # decoded, so every reconciliation died on it and
+                            # the intent could never be finalised -- the stuck
+                            # order prevented its own resolution.
+                            remote = None
+                            remote_unreadable = f"{type(exc).__name__}: {exc}"[:200]
                     summary = self.strategy_repo.fill_summary(str(intent["intent_id"]))
                     filled = summary["shares"]
+                    if remote_unreadable:
+                        market_row = self.repo.latest_market(
+                            str(intent["condition_id"])
+                        ) or {}
+                        closed = bool(
+                            market_row.get("market_resolved")
+                        ) or not bool(market_row.get("accepting_orders", True))
+                        if (
+                            closed
+                            and intent.get("action") in {"EXIT", "TP"}
+                            and filled > 0
+                        ):
+                            # The market is resolved and no longer accepting
+                            # orders, so this order cannot fill again whatever
+                            # its unreadable payload says. The fills already
+                            # recorded locally are the complete picture.
+                            requested = (
+                                decimal_value(intent.get("requested_shares_text"))
+                                or filled
+                            )
+                            self.strategy_repo.finalize_exit_intent_state(
+                                str(intent["intent_id"]),
+                                final_state=(
+                                    "FILLED" if filled >= requested
+                                    else "PARTIAL_FINAL"
+                                ),
+                                reason="REMOTE_ORDER_UNREADABLE_MARKET_CLOSED",
+                            )
+                            continue
+                        gaps.append({
+                            "type": "remote_order_unreadable",
+                            "intent_id": intent["intent_id"],
+                            "remote_order_id": remote_id,
+                            "error": remote_unreadable,
+                        })
+                        continue
                     status = str((remote or {}).get("status") or "unknown").lower()
                     if status.startswith("order_status_"):
                         status = status.removeprefix("order_status_")
@@ -1091,12 +1138,26 @@ class ReconciliationWorker:
                             continue
                         prior_shares = decimal_value(intent.get("filled_shares_text")) or Decimal("0")
                         delta = max(Decimal("0"), filled - prior_shares)
-                        if delta > 0:
-                            requested = decimal_value(intent.get("requested_shares_text")) or filled
-                            final_state = (
-                                "PARTIAL" if is_open else
-                                "FILLED" if filled >= requested else "PARTIAL_FINAL"
+                        requested = decimal_value(intent.get("requested_shares_text")) or filled
+                        final_state = (
+                            "PARTIAL" if is_open else
+                            "FILLED" if filled >= requested else "PARTIAL_FINAL"
+                        )
+                        if delta <= 0 and not is_open:
+                            # Every fill this order produced is already
+                            # recorded and it can no longer fill, so it is
+                            # finished. Finalising only happened as a side
+                            # effect of applying a *new* fill, which left an
+                            # order that ended with an unsellable remainder
+                            # (below min_order_size) stuck non-final forever,
+                            # blocking entries as an UNRESOLVED_INTENT.
+                            self.strategy_repo.finalize_exit_intent_state(
+                                str(intent["intent_id"]),
+                                final_state=final_state,
+                                reason="REMOTE_ORDER_CLOSED_NO_FURTHER_FILL",
                             )
+                            continue
+                        if delta > 0:
                             market = self.repo.latest_market(str(intent["condition_id"])) or {}
                             self.strategy_repo.apply_exit_fill(
                                 position_id=str(position["position_id"]),
