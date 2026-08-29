@@ -320,3 +320,49 @@ def test_finalize_refuses_non_final_target_states(tmp_path):
         assert repo.finalize_exit_intent_state(
             iid, final_state=bad, reason="x",
         ) is False
+
+
+# --------------------------------------------------------------------- D16
+# A WAITING_SELLABLE exit intent is local-only: no remote order, no fills. Only
+# the strategy hot path cancelled it, and that path stops receiving frames once
+# the market resolves -- so an intent left waiting when the market closed stayed
+# unresolved forever and held entries down.
+
+def _waiting_sellable(repo):
+    from live.repository import now_iso
+    with repo.base.connect() as conn:
+        conn.execute(
+            "INSERT INTO live_strategy_intents "
+            "(intent_id,correlation_id,event_id,condition_id,action,purpose,"
+            " token_id,side,state,requested_shares_text,filled_shares_text,"
+            " remaining_shares_text,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("ws-1", "c-1", "e-1", "0xcond", "EXIT", "STOP_066", "tok", "YES",
+             "WAITING_SELLABLE", "5.066664", "0", "0", now_iso(), now_iso()),
+        )
+        conn.commit()
+    return "ws-1"
+
+
+def test_waiting_sellable_on_closed_market_is_cancelled(tmp_path):
+    repo = _repo(tmp_path)
+    iid = _waiting_sellable(repo)
+    repo.finalize_cancel(iid, True, "WAITING_SELLABLE_MARKET_CLOSED")
+    with repo.base.connect() as conn:
+        row = conn.execute(
+            "SELECT state,final_at,reason_code FROM live_strategy_intents "
+            "WHERE intent_id=?", (iid,)
+        ).fetchone()
+    assert row["state"] == "CANCELED"
+    assert row["final_at"], "must be stamped final so it stops blocking entries"
+    assert row["reason_code"] == "WAITING_SELLABLE_MARKET_CLOSED"
+
+
+def test_waiting_sellable_cancel_never_touches_a_submitted_order(tmp_path):
+    """The guard that keeps this safe: it must be local-only."""
+    import inspect
+    from live.strategy_runtime import LiveStrategyRuntime
+
+    source = inspect.getsource(LiveStrategyRuntime._clear_local_waiting_intent)
+    assert 'if intent.get("remote_order_id"):' in source
+    assert "return False" in source

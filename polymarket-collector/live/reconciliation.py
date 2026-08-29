@@ -992,6 +992,27 @@ class ReconciliationWorker:
                             # This state is only created after a confirmed
                             # pre-submission balance failure. No remote order
                             # exists, so absence of remote_order_id is expected.
+                            market_row = self.repo.latest_market(
+                                str(intent["condition_id"])
+                            ) or {}
+                            if bool(market_row.get("market_resolved")) or not bool(
+                                market_row.get("accepting_orders", True)
+                            ):
+                                # The market closed while the intent was still
+                                # waiting for a sellable balance, so it can
+                                # never be submitted. Only the strategy hot
+                                # path cancelled these, and it stops receiving
+                                # frames once the market resolves -- leaving
+                                # the intent unresolved forever and holding
+                                # entries down. It never reached Polymarket
+                                # (no remote id, no fills), so cancelling is
+                                # local bookkeeping only; the position settles
+                                # through redemption.
+                                self.strategy_repo.finalize_cancel(
+                                    str(intent["intent_id"]),
+                                    True,
+                                    "WAITING_SELLABLE_MARKET_CLOSED",
+                                )
                             continue
 
                         if (
