@@ -42,11 +42,18 @@ def ingest_maker_exit_fills(
     strategy_repo: Any,
     remote_trades: list[dict[str, Any]],
     remote_by_id: dict[str, dict[str, Any]],
+    intents_by_remote_order: dict[str, dict[str, Any]] | None = None,
+    drifted_intents: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Persist and apply fills where our GTC exit is a maker child.
 
     Account trade records identify the taker order at the top level. The exact
     maker child's matched_amount is the only valid size for our local order.
+
+    ``drifted_intents`` carries exits whose already-persisted fills exceed their
+    applied shares. Reconciliation used to rediscover those by re-reading the
+    whole trade history every run; with a windowed read they are sourced from
+    the local fills instead, so a repair that was skipped once is still retried.
     """
     affected: dict[str, dict[str, Any]] = {}
     evidence_by_intent: dict[str, list[dict[str, Any]]] = {}
@@ -54,7 +61,12 @@ def ingest_maker_exit_fills(
         trade_id = str(trade.get("polymarket_trade_id") or "")
         for child in _maker_children(trade):
             order_id = str(child.get("order_id") or "")
-            intent = strategy_repo.intent_by_remote_order(order_id) if order_id else None
+            intent = (
+                (intents_by_remote_order or {}).get(order_id)
+                if order_id else None
+            )
+            if intent is None and order_id and intents_by_remote_order is None:
+                intent = strategy_repo.intent_by_remote_order(order_id)
             if not intent or str(intent.get("action") or "").upper() not in {"EXIT", "TP"}:
                 continue
             shares = decimal_value(child.get("matched_amount")) or Decimal("0")
@@ -96,6 +108,9 @@ def ingest_maker_exit_fills(
                 "inserted": inserted,
             })
 
+    for intent_id, drifted in (drifted_intents or {}).items():
+        affected.setdefault(intent_id, drifted)
+
     repairs: list[dict[str, Any]] = []
     for intent_id, original_intent in affected.items():
         intent = strategy_repo.intent(intent_id) or original_intent
@@ -136,7 +151,9 @@ def ingest_maker_exit_fills(
             "filled_shares": canonical_decimal(summary["shares"]),
             "remaining_shares": updated.get("remaining_shares_text"),
             "state": updated.get("state"),
-            "evidence": evidence_by_intent[intent_id],
+            "evidence": evidence_by_intent.get(intent_id) or [
+                {"source": "local_fill_drift", "intent_id": intent_id}
+            ],
         })
     return repairs
 

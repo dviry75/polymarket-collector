@@ -210,6 +210,8 @@ def test_continuous_resume_does_not_require_canary_but_keeps_other_gates():
             repo.set_state("geographic_availability", "ALLOWED")
             repo.set_state("geographic_checked_at", now_iso())
             repo.set_state("recovery_engine_status", "HEALTHY")
+            repo.set_state("provenance_gate_ok", "True")
+            repo.set_state("provenance_gate_reasons", "")
             healthy_market = {
                 "status": "CONNECTED",
                 "stale": False,

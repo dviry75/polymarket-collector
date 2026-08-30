@@ -549,29 +549,35 @@ def mark_reconciled_provenance(repo: LiveRepository) -> dict[str, int]:
     """Promote only post-cutover rows backed by remote identifiers/reconciliation."""
     if repo.query_only:
         raise RuntimeError("query-only repository cannot mark reconciliation provenance")
-    cutover = repo.get_state("dashboard_cutover_at", "")
-    if not cutover:
-        return {}
     counts: dict[str, int] = {}
     with repo.connect() as conn:
+        cutover_row = conn.execute(
+            "SELECT value FROM live_system_state WHERE key='dashboard_cutover_at'"
+        ).fetchone()
+        cutover = str(cutover_row[0]) if cutover_row else ""
+        if not cutover:
+            return {}
         updates = {
             "account_snapshots": (
                 """UPDATE live_account_snapshots SET reconciliation_status='RECONCILED',verification_status='VERIFIED'
                    WHERE environment='LIVE' AND execution_mode='REAL_TRADING'
                      AND COALESCE(ingested_at,sampled_at)>=? AND status='ok'
-                     AND account_identity_status='VERIFIED'""",
+                     AND account_identity_status='VERIFIED'
+                     AND (reconciliation_status!='RECONCILED' OR verification_status!='VERIFIED')""",
                 (cutover,),
             ),
             "intents": (
                 """UPDATE live_strategy_intents SET reconciliation_status='RECONCILED',verification_status='VERIFIED'
                    WHERE environment='LIVE' AND execution_mode='REAL_TRADING'
-                     AND COALESCE(ingested_at,created_at)>=? AND remote_order_id IS NOT NULL""",
+                     AND COALESCE(ingested_at,created_at)>=? AND remote_order_id IS NOT NULL
+                     AND (reconciliation_status!='RECONCILED' OR verification_status!='VERIFIED')""",
                 (cutover,),
             ),
             "fills": (
                 """UPDATE live_strategy_fills SET reconciliation_status='RECONCILED',verification_status='VERIFIED'
                    WHERE environment='LIVE' AND execution_mode='REAL_TRADING'
-                     AND COALESCE(ingested_at,created_at)>=? AND remote_trade_id IS NOT NULL""",
+                     AND COALESCE(ingested_at,created_at)>=? AND remote_trade_id IS NOT NULL
+                     AND (reconciliation_status!='RECONCILED' OR verification_status!='VERIFIED')""",
                 (cutover,),
             ),
             "positions": (
@@ -583,7 +589,8 @@ def mark_reconciled_provenance(repo: LiveRepository) -> dict[str, int]:
                          SELECT 1 FROM live_strategy_intents i
                          JOIN live_strategy_fills f ON f.intent_id=i.intent_id
                          WHERE i.event_id=p.event_id AND f.verification_status='VERIFIED'
-                     )""",
+                     )
+                     AND (reconciliation_status!='RECONCILED' OR verification_status!='DERIVED_VERIFIED')""",
                 (cutover,),
             ),
             "deals": (
@@ -612,6 +619,27 @@ def mark_reconciled_provenance(repo: LiveRepository) -> dict[str, int]:
                          SELECT 1 FROM live_strategy_intents i
                          JOIN live_strategy_fills f ON f.intent_id=i.intent_id
                          WHERE i.event_id=d.event_id AND f.verification_status='VERIFIED'
+                     )
+                     AND (
+                         reconciliation_status!='RECONCILED'
+                         OR verification_status!='DERIVED_VERIFIED'
+                         OR fee_verification_status IS NOT CASE
+                             WHEN EXISTS (
+                                 SELECT 1 FROM live_strategy_intents fi
+                                 JOIN live_strategy_fills ff ON ff.intent_id=fi.intent_id
+                                 WHERE fi.event_id=d.event_id
+                             ) AND NOT EXISTS (
+                                 SELECT 1 FROM live_strategy_intents fi
+                                 JOIN live_strategy_fills ff ON ff.intent_id=fi.intent_id
+                                 WHERE fi.event_id=d.event_id
+                                   AND ff.fee_verification_status!='VERIFIED'
+                             ) THEN 'VERIFIED' ELSE 'UNKNOWN' END
+                         OR fee_source IS NOT CASE
+                             WHEN EXISTS (
+                                 SELECT 1 FROM live_strategy_intents fi
+                                 JOIN live_strategy_fills ff ON ff.intent_id=fi.intent_id
+                                 WHERE fi.event_id=d.event_id AND ff.fee_verification_status='VERIFIED'
+                             ) THEN 'polymarket_fee_rate_bps_formula' ELSE NULL END
                      )""",
                 (cutover,),
             ),

@@ -875,3 +875,29 @@ def test_market_ws_records_receive_and_processing_boundaries(monkeypatch):
     finally:
         manager._latency_csv.close()
         temp.cleanup()
+
+def test_exit_book_requires_fresh_aligned_held_token_depth():
+    temp, repo = make_repo()
+    manager = MarketWebSocketManager(
+        repo,
+        stale_after_seconds=1,
+        clock_ms=lambda: NOW_MS,
+    )
+    manager.subscribed_asset_ids = ["yes", "no"]
+    manager.status.status = "CONNECTED"
+    manager._refresh_market_cache(["yes", "no"])
+
+    try:
+        manager.process_message(book("yes", NOW_MS))
+        fresh = manager.exit_book("yes", now_ms=NOW_MS)
+        assert fresh is not None
+        assert fresh["best_bid"] == "0.73"
+        assert fresh["bids"] == [{"price": "0.73", "size": "10"}]
+
+        assert manager.exit_book("yes", now_ms=NOW_MS + 1_001) is None
+
+        held_book = manager.order_books.books["yes"]
+        held_book.alignment_pending = True
+        assert manager.exit_book("yes", now_ms=NOW_MS) is None
+    finally:
+        temp.cleanup()

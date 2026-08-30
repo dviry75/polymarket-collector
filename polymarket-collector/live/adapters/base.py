@@ -35,6 +35,26 @@ class TradingAdapter(ABC):
     async def get_trades(self) -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    async def get_trades_page(
+        self,
+        *,
+        after: str | None = None,
+        before: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Read one page of account trades, optionally time-filtered.
+
+        ``after``/``before`` are unix-second strings, matching the CLOB
+        ``/data/trades`` contract. An adapter without a paginated remote answers
+        the whole set in one page; callers deduplicate by Trade ID, so an
+        adapter that ignores the filters stays correct -- just not cheaper.
+        """
+        return {
+            "trades": await self.get_trades(),
+            "has_more": False,
+            "next_cursor": None,
+        }
+
     @abstractmethod
     async def get_positions(self) -> list[dict[str, Any]]:
         raise NotImplementedError

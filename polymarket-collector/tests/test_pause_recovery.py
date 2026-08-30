@@ -52,6 +52,10 @@ def build_clean(config: LiveConfig | None = None):
         "order_heartbeat_status": "OK",
         "last_successful_heartbeat_at": now,
         "recovery_engine_status": "HEALTHY",
+        # A clean box is an attested box: startup records the deployment
+        # attestation, and without it the gate correctly refuses to release.
+        "provenance_gate_ok": "True",
+        "provenance_gate_reasons": "",
     }, "operator")
     market = FakeHealth({
         "status": "CONNECTED", "stale": False,
@@ -114,6 +118,26 @@ def test_healthy_system_stays_enabled():
         assert not result.resumed
         assert not strategy.pause_entries()
         assert result.state == PauseState.TRADING
+    finally:
+        temp.cleanup()
+
+
+def test_release_evaluator_batches_system_state_reads():
+    temp, base, _strategy, _market, _user, recovery = build_clean()
+    original = base.get_states
+    calls = []
+
+    def counted(defaults):
+        calls.append(tuple(defaults))
+        return original(defaults)
+
+    base.get_states = counted
+    try:
+        evaluation = recovery.evaluate_entry_release_gates()
+        assert evaluation.safe_to_resume
+        assert len(calls) == 1
+        assert "kill_switch" in calls[0]
+        assert "reconciliation_readiness" in calls[0]
     finally:
         temp.cleanup()
 

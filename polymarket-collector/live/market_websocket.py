@@ -602,9 +602,16 @@ class MarketWebSocketManager:
                     (before_recv - self._last_handler_end_monotonic) * 1000
                     if self._last_handler_end_monotonic is not None else None
                 )
-                raw = await asyncio.wait_for(
-                    ws.recv(), timeout=max(15, self.stale_after_seconds)
-                )
+                # ``asyncio.wait_for`` wraps the receive coroutine in a new
+                # Task. The market feed can deliver hundreds of frames per
+                # second, so doing that per frame creates enough scheduler and
+                # timer churn to make otherwise-current books stale. The
+                # timeout context preserves the same cancellation/timeout
+                # semantics without allocating a child Task for every frame.
+                async with asyncio.timeout(
+                    max(15, self.stale_after_seconds)
+                ):
+                    raw = await ws.recv()
                 # Earliest receipt boundary: before frame sizing or JSON parsing.
                 receive_wall_ns = time.time_ns()
                 receive_monotonic_ns = time.monotonic_ns()
@@ -707,10 +714,17 @@ class MarketWebSocketManager:
         resync: asyncio.Event,
     ) -> None:
         resync_error = ""
+        processed_without_yield = 0
         while not (reader_done.is_set() and queue.empty()):
             try:
-                message, timing = await asyncio.wait_for(queue.get(), 0.1)
-            except asyncio.TimeoutError:
+                if queue.empty():
+                    processed_without_yield = 0
+                    async with asyncio.timeout(0.1):
+                        message, timing = await queue.get()
+                else:
+                    message, timing = queue.get_nowait()
+                    processed_without_yield += 1
+            except (asyncio.TimeoutError, asyncio.QueueEmpty):
                 continue
             try:
                 event_type = str(
@@ -776,6 +790,14 @@ class MarketWebSocketManager:
                     await self._close_websocket(ws, close_reason)
             finally:
                 queue.task_done()
+            # ``get_nowait`` removes the per-frame timeout Task, but a bounded
+            # cooperative yield is still required when the queue stays hot so
+            # the reader, heartbeat and safety coordinators keep making
+            # progress. Sixteen frames keeps the uninterrupted CPU slice
+            # short while avoiding one scheduler round-trip per message.
+            if processed_without_yield >= 16:
+                processed_without_yield = 0
+                await asyncio.sleep(0)
         if resync_error:
             raise ConnectionError(f"MARKET_WS_BOOK_RESYNC:{resync_error}")
 
@@ -2837,6 +2859,36 @@ class MarketWebSocketManager:
             "strategy_readiness": "NOT_READY",
             "strategy_block_reason": "WS_DISCONNECTED",
         })
+
+    def exit_book(
+        self,
+        token_id: str,
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a fresh, internally aligned held-token book for exits."""
+        book = self.order_books.books.get(str(token_id))
+        observed_at_ms = self._clock_ms() if now_ms is None else int(now_ms)
+        if (
+            book is None
+            or not book.ready
+            or book.alignment_pending
+            or book.source_generation != self._connection_generation
+            or book.last_received_at_ms is None
+            or observed_at_ms - book.last_received_at_ms
+            > self.stale_after_seconds * 1000
+        ):
+            return None
+        message_hash = (
+            f"exit:{book.source_generation}:{book.generation}:"
+            f"{book.update_number}:{book.last_message_hash}"
+        )
+        return book.view(
+            event_type="exit_supervisor_ws",
+            timestamp=None,
+            message_hash=message_hash,
+            now_ms=observed_at_ms,
+        )
 
     def health(self) -> dict[str, Any]:
         stale = True

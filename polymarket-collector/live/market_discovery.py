@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,7 +30,7 @@ def _outcomes(market: dict[str, Any]) -> tuple[str | None, str | None, bool]:
     return yes_id, no_id, bool(yes_id and no_id and labels == {"up", "down"})
 
 
-async def refresh_btc_5m_markets(repo: LiveRepository) -> list[str]:
+async def refresh_btc_5m_markets(repo: LiveRepository, client: Any | None = None) -> list[str]:
     """Discover only the official BTC Up/Down 5m series through the unified SDK.
 
     The Gamma event supplies series/schedule metadata; both CLOB books independently
@@ -40,7 +41,9 @@ async def refresh_btc_5m_markets(repo: LiveRepository) -> list[str]:
     base = (int(datetime.now(timezone.utc).timestamp()) // 300) * 300
     slugs = [f"{EXPECTED_SLUG_PREFIX}{base}", f"{EXPECTED_SLUG_PREFIX}{base + 300}"]
     found: list[str] = []
-    client = AsyncPublicClient()
+    owns_client = client is None
+    if client is None:
+        client = await asyncio.to_thread(AsyncPublicClient)
     try:
         for slug in slugs:
             try:
@@ -82,7 +85,7 @@ async def refresh_btc_5m_markets(repo: LiveRepository) -> list[str]:
                 tick_size = next(iter(tick_sizes)) if len(tick_sizes) == 1 else trading.get("minimum_tick_size")
                 fee_rate = fee_schedule.get("rate")
                 accepting = state.get("accepting_orders") is True and state.get("closed") is not True
-                repo.upsert_market({
+                await asyncio.to_thread(repo.upsert_market, {
                     "event_id": slug,
                     "condition_id": condition_id,
                     "yes_token_id": yes_id,
@@ -133,9 +136,10 @@ async def refresh_btc_5m_markets(repo: LiveRepository) -> list[str]:
                 if scope_verified:
                     found.append(condition_id)
                 else:
-                    repo.audit("market_discovery", "market_scope_validation", "blocked", "METADATA_OR_CLOB_MISMATCH", {"event_id": slug, "condition_id": condition_id})
+                    await asyncio.to_thread(repo.audit, "market_discovery", "market_scope_validation", "blocked", "METADATA_OR_CLOB_MISMATCH", {"event_id": slug, "condition_id": condition_id})
             except Exception as exc:
-                repo.audit("market_discovery", "market_discovery_refresh", "error", f"{type(exc).__name__}: {exc}"[:500], {"event_id": slug})
+                await asyncio.to_thread(repo.audit, "market_discovery", "market_discovery_refresh", "error", f"{type(exc).__name__}: {exc}"[:500], {"event_id": slug})
     finally:
-        await client.close()
+        if owns_client:
+            await client.close()
     return found

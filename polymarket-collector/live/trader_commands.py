@@ -4,6 +4,7 @@ from typing import Any
 
 from .account_identity import MockPublicAccountIdentityClient, PublicAccountIdentityClient
 from .backup import LiveBackupManager
+from .reconciliation_stability import authoritative_token_balance
 from .public_client import MockPublicClobClient, PublicClobClient
 from .pause_recovery import PauseRecoveryCoordinator, request_manual_resume
 from .repository import now_iso
@@ -40,6 +41,7 @@ class TraderCommandHandler:
                     repo, strategy_repo, market_ws, user_ws, config=config
                 ).status(),
                 "paper": paper_service().health(),
+                "provenance": repo.states_with_prefix("provenance_"),
             })
         if command == "AUDIT":
             repo.audit(
@@ -96,6 +98,60 @@ class TraderCommandHandler:
             return await reconciliation_coordinator().request(
                 actor=str(payload.get("actor") or "operator"), force=True
             )
+        if command == "RESOLVE_UNKNOWN_CLOSED_FAK":
+            intent_id = str(payload.get("intent_id") or "")
+            intent = strategy_repo.intent(intent_id)
+            if not intent:
+                raise KeyError(intent_id)
+            token_id = str(intent.get("token_id") or "")
+            condition_id = str(intent.get("condition_id") or "")
+            if not token_id or not condition_id:
+                raise RuntimeError("intent lacks token/condition identity")
+
+            identity = (
+                await adapter.identity_preflight()
+                if hasattr(adapter, "identity_preflight")
+                else {"status": "MOCK"}
+            )
+            open_orders = await adapter.get_open_orders()
+            trades = await adapter.get_trades()
+            balance = await authoritative_token_balance(adapter, token_id)
+            if balance is None:
+                raise RuntimeError("authoritative conditional balance unavailable")
+
+            matching_open_orders = [
+                order for order in open_orders
+                if (
+                    str(order.get("token_id") or "") == token_id
+                    or str(order.get("condition_id") or "") == condition_id
+                )
+            ]
+            matching_sell_trades = [
+                trade for trade in trades
+                if (
+                    str(trade.get("token_id") or "") == token_id
+                    and str(trade.get("side") or "").lower() == "sell"
+                )
+            ]
+            recovery = strategy_repo.resolve_unknown_closed_fak_zero_fill(
+                intent_id,
+                authoritative_balance=balance,
+                identity_verified=str(identity.get("status") or "").upper()
+                in {"VERIFIED", "MOCK"},
+                matching_open_orders=len(matching_open_orders),
+                matching_sell_trades=len(matching_sell_trades),
+                actor=str(payload.get("actor") or "operator"),
+            )
+            reconciliation_result = await reconciliation_coordinator().request(
+                actor="operator:unknown_fak_recovery",
+                evidence_changed=True,
+                force=True,
+            )
+            return sanitize({
+                "ok": reconciliation_result.get("status") == "ok",
+                "recovery": recovery,
+                "reconciliation": reconciliation_result,
+            })
         if command == "CREATE_RULE":
             return repo.create_rule(dict(payload["rule"]))
         if command == "UPDATE_RULE_STATUS":

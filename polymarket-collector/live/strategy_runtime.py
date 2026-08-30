@@ -3,15 +3,17 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 import json
 import logging
+import re
 import time
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters.base import TradingAdapter
 from .config import LiveConfig
+from .exit_supervision import ExitSupervisionTracker
 from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso
 from .strategy import (
@@ -24,6 +26,8 @@ from .strategy import (
 )
 from .strategy_repository import StrategyRepository, stable_id
 
+
+EVENT_WINDOW_PATTERN = re.compile(r"-(\d+)m-(\d+)$")
 
 CRITICAL_ALIGNMENT_GRACE_SECONDS = 0.25
 CRITICAL_ALIGNMENT_POLL_SECONDS = 0.005
@@ -53,6 +57,12 @@ def _is_confirmed_fak_zero_fill_response(response: dict[str, Any]) -> bool:
 
 
 class LiveStrategyRuntime:
+    # Class-level defaults so a partially constructed runtime (tests, and any
+    # recovery path that builds the object without running __init__) degrades
+    # to the SQLite fallback instead of raising AttributeError on the hot path.
+    _market_provider: Callable[[str], dict[str, Any] | None] | None = None
+    _exit_book_provider: Callable[[str], dict[str, Any] | None] | None = None
+
     def __init__(
         self,
         config: LiveConfig,
@@ -84,6 +94,23 @@ class LiveStrategyRuntime:
         self._event_locks: dict[str, asyncio.Lock] = {}
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._frame_task: asyncio.Task[Any] | None = None
+        self._exit_task: asyncio.Task[Any] | None = None
+        self._exit_wakeup = asyncio.Event()
+        self._exit_book_provider: (
+            Callable[[str], dict[str, Any] | None] | None
+        ) = None
+        self._exit_rest_last_attempt: dict[str, float] = {}
+        self._exit_reconciliation_last_attempt: dict[str, float] = {}
+        self.exit_supervisor_runs = 0
+        self.exit_rest_fallbacks = 0
+        self.exit_rest_failures = 0
+        self._exit_tracker = ExitSupervisionTracker(
+            strategy_repo,
+            monitor_sla_seconds=config.exit_supervisor_sla_seconds,
+            waiting_sla_seconds=config.waiting_sellable_sla_seconds,
+        )
+        self._stop_exhausted_positions: set[str] = set()
+        self._stop_capitulation_logged: set[str] = set()
         self._frame_event = asyncio.Event()
         self._pending_frames: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
@@ -154,11 +181,11 @@ class LiveStrategyRuntime:
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
         instant = at or datetime.now(timezone.utc)
         local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
-        friday_exception = local.date().isoformat() == "2026-08-14"
+        unrestricted_date = local.date().isoformat() == "2026-08-21"
         inactive = (
             local.weekday() < 5
             and 14 <= local.hour < 23
-            and not friday_exception
+            and not unrestricted_date
         )
         return {
             "allowed": not inactive,
@@ -176,6 +203,11 @@ class LiveStrategyRuntime:
         self, provider: Callable[[str], dict[str, Any] | None]
     ) -> None:
         self._market_provider = provider
+
+    def set_exit_book_provider(
+        self, provider: Callable[[str], dict[str, Any] | None]
+    ) -> None:
+        self._exit_book_provider = provider
 
     def _market(self, condition_id: str) -> dict[str, Any] | None:
         """Use the in-memory market cache on the hot path.
@@ -281,6 +313,20 @@ class LiveStrategyRuntime:
         # Atomic reference replacement. Readers never see a half-built state.
         self._hot_state = snapshot
         self._hot_state_refreshed_monotonic = time.monotonic()
+        if any(
+            int(position.get("stop_stage") or 0) >= 1
+            and (
+                decimal_value(position.get("remaining_shares_text"))
+                or Decimal("0")
+            ) > 0
+            for positions in (
+                snapshot.get("positions_by_token") or {}
+            ).values()
+            for position in positions
+            if isinstance(position, dict)
+        ):
+            # Reconciliation can make shares sellable without a market frame.
+            self._exit_wakeup.set()
 
     async def _hot_state_loop(self) -> None:
         while not self._stop.is_set():
@@ -1784,11 +1830,17 @@ class LiveStrategyRuntime:
                     or position
                 )
 
+                min_price = decimal_value(
+                    intent.get("price_limit_text")
+                )
+                if min_price is None:
+                    return False
+
                 await self._market_exit_fak(
                     refreshed,
                     update,
                     purpose="STOP_066",
-                    min_price=self.policy.stop_min_price,
+                    min_price=min_price,
                     frame_hash=frame_hash,
                 )
 
@@ -1963,6 +2015,376 @@ class LiveStrategyRuntime:
         )
 
     @staticmethod
+    def _seconds_to_market_close(event_id: str) -> float | None:
+        """Seconds left in the event window, derived from its slug.
+
+        Slugs look like ``btc-updown-5m-<start_epoch>``. Returns None when the
+        slug cannot be parsed, which keeps every caller on the pre-existing
+        behaviour instead of guessing a deadline.
+        """
+        match = EVENT_WINDOW_PATTERN.search(str(event_id or ""))
+        if not match:
+            return None
+        minutes = int(match.group(1))
+        start_epoch = int(match.group(2))
+        if minutes <= 0 or start_epoch <= 0:
+            return None
+        closes_at = start_epoch + minutes * 60
+        return closes_at - datetime.now(timezone.utc).timestamp()
+
+    def _stop_capitulation_due(self, position: dict[str, Any]) -> bool:
+        """True once protected attempts are spent and the window is closing.
+
+        The protected ladder refuses to sell below its floor. That is correct
+        while there is still time for liquidity to return, but holding a losing
+        binary into resolution realises the full loss, so the floor is dropped
+        for the last seconds of the window.
+        """
+        if not self.config.stop_capitulation_enabled:
+            return False
+        remaining = self._seconds_to_market_close(
+            str(position.get("event_id") or "")
+        )
+        if remaining is None:
+            return False
+        return remaining <= float(
+            self.config.stop_capitulation_seconds_before_close
+        )
+
+    def _stop_optimistic_submit_allowed(self, purpose: str) -> bool:
+        """Risk exits may be submitted before local sellability is confirmed."""
+        if not self.config.stop_optimistic_submit_enabled:
+            return False
+        name = str(purpose or "").upper()
+        return name == "STOP_066" or name.startswith("EMERGENCY_")
+
+    def _stop_attempt_plan(
+        self,
+        position: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self.repo.stop_attempt_state(str(position["position_id"]))
+        attempt_count = int(state.get("attempt_count") or 0)
+        max_attempts = max(1, int(self.config.max_stop_loss_attempts))
+
+        exhausted = attempt_count >= max_attempts
+        # The market deadline outranks the retry counter. Once the configured
+        # emergency window begins, waiting to exhaust protected attempts can
+        # strand a losing binary through resolution.
+        capitulation = self._stop_capitulation_due(position)
+
+        if exhausted and not capitulation:
+            return {
+                "ready": False,
+                "exhausted": True,
+                "attempt_count": attempt_count,
+            }
+
+        last_attempt_at = str(state.get("last_attempt_at") or "")
+        if last_attempt_at and self.config.stop_loss_retry_delay_ms > 0:
+            try:
+                last_attempt = datetime.fromisoformat(
+                    last_attempt_at.replace("Z", "+00:00")
+                )
+                if last_attempt.tzinfo is None:
+                    last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+                elapsed_ms = (
+                    datetime.now(timezone.utc) - last_attempt
+                ).total_seconds() * 1000
+                if elapsed_ms < self.config.stop_loss_retry_delay_ms:
+                    return {
+                        "ready": False,
+                        "exhausted": False,
+                        "attempt_count": attempt_count,
+                    }
+            except ValueError:
+                return {
+                    "ready": False,
+                    "exhausted": False,
+                    "attempt_count": attempt_count,
+                }
+
+        if capitulation:
+            # Protected attempts are spent and the window is about to close:
+            # take the best available bid rather than ride the position to
+            # resolution.
+            return {
+                "ready": True,
+                "exhausted": False,
+                "capitulation": True,
+                "attempt_count": attempt_count,
+                "min_price": self.policy.stop_min_price,
+            }
+
+        initial = max(
+            Decimal("0"),
+            min(
+                self.config.stop_loss_initial_slippage,
+                self.config.max_exit_slippage,
+            ),
+        )
+        maximum = max(initial, self.config.max_exit_slippage)
+        if max_attempts == 1:
+            slippage = initial
+        else:
+            slippage = initial + (
+                (maximum - initial)
+                * Decimal(attempt_count)
+                / Decimal(max_attempts - 1)
+            )
+
+        market = self._market(str(position.get("condition_id") or "")) or {}
+        tick = decimal_value(market.get("min_tick_size")) or Decimal("0.01")
+        if tick <= 0:
+            tick = Decimal("0.01")
+        raw_floor = max(
+            self.policy.stop_min_price,
+            self.policy.stop_price - slippage,
+        )
+        floor = (
+            raw_floor / tick
+        ).to_integral_value(rounding=ROUND_DOWN) * tick
+        floor = max(self.policy.stop_min_price, floor)
+
+        return {
+            "ready": True,
+            "exhausted": False,
+            "attempt_count": attempt_count,
+            "min_price": floor,
+        }
+
+    def _note_stop_capitulation(
+        self,
+        position: dict[str, Any],
+        update: dict[str, Any],
+    ) -> None:
+        position_id = str(position["position_id"])
+        if position_id in self._stop_capitulation_logged:
+            return
+        self._stop_capitulation_logged.add(position_id)
+        bid = decimal_value(update.get("best_bid"))
+        remaining = self._seconds_to_market_close(
+            str(position.get("event_id") or "")
+        )
+        self.repo.timeline(
+            severity="CRITICAL",
+            category="EXIT",
+            component="strategy",
+            source="exit_supervisor",
+            event_id=position["event_id"],
+            condition_id=position["condition_id"],
+            token_id=position["token_id"],
+            side="SELL",
+            deal_id=stable_id("deal", position["event_id"]),
+            requested_action="SELL_MARKET_FAK",
+            reason_code="STOP_EXIT_CAPITULATION_BEFORE_CLOSE",
+            result_status="CAPITULATING",
+            remaining_shares_text=position["remaining_shares_text"],
+            parameters_json={
+                "best_bid": (
+                    canonical_decimal(bid) if bid is not None else None
+                ),
+                "min_price": canonical_decimal(self.policy.stop_min_price),
+                "seconds_to_close": (
+                    round(remaining, 3) if remaining is not None else None
+                ),
+            },
+        )
+
+    def _release_stop_protection_pause(self, position_id: str) -> None:
+        """Clear the exhaustion pause once its position is no longer open."""
+        self._stop_exhausted_positions.discard(position_id)
+        self._stop_capitulation_logged.discard(position_id)
+        reason = "STOP_EXIT_PRICE_PROTECTION_EXHAUSTED"
+        record = self.repo.pause_record()
+        if not record.get("pause_entries"):
+            return
+        current = str(
+            record.get("pause_cause") or record.get("pause_reason") or ""
+        ).upper()
+        if current != reason:
+            return
+        released = self.repo.release_pause_cas(
+            expected_generation=int(record.get("pause_generation") or 0),
+            expected_owner=str(record.get("pause_owner") or "MACHINE"),
+            actor="pause_recovery",
+            reason="LATCHED_POSITION_FLAT",
+        )
+        if not released:
+            return
+        self.repo.resolve_alert(
+            alert_type="EXIT",
+            reason_code=reason,
+            entity_type="position",
+            entity_id=position_id,
+            actor="strategy_exit_supervisor",
+            resolution_reason="LATCHED_POSITION_FLAT",
+        )
+
+    def _stop_protection_exhausted(
+        self,
+        position: dict[str, Any],
+    ) -> None:
+        position_id = str(position["position_id"])
+        if position_id in self._stop_exhausted_positions:
+            return
+        reason = "STOP_EXIT_PRICE_PROTECTION_EXHAUSTED"
+        self.repo.acquire_pause(
+            actor="strategy_exit_supervisor",
+            reason=reason,
+            owner="MACHINE",
+            source_event_id=str(position["event_id"]),
+            source_position_id=position_id,
+        )
+        self.repo.alert(
+            alert_type="EXIT",
+            severity="CRITICAL",
+            reason_code=reason,
+            message=(
+                "Protected STOP attempts were exhausted; entries are paused "
+                "and the position remains latched for operator review"
+            ),
+            entity_type="position",
+            entity_id=position_id,
+        )
+        self._stop_exhausted_positions.add(position_id)
+
+    async def _exit_book_for_position(
+        self,
+        position: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        token_id = str(position["token_id"])
+        if self._exit_book_provider is not None:
+            try:
+                update = self._exit_book_provider(token_id)
+            except Exception as exc:
+                self.last_error = (
+                    f"EXIT_BOOK_PROVIDER:{type(exc).__name__}:{exc}"
+                )[:500]
+            else:
+                if update:
+                    return dict(update)
+
+        now = time.monotonic()
+        last_attempt = self._exit_rest_last_attempt.get(token_id, 0.0)
+        if now - last_attempt < 0.5:
+            return None
+        self._exit_rest_last_attempt[token_id] = now
+        self.exit_rest_fallbacks += 1
+
+        try:
+            payload = await asyncio.wait_for(
+                self.adapter.get_order_book(token_id),
+                timeout=1.0,
+            )
+        except Exception as exc:
+            self.exit_rest_failures += 1
+            self.last_error = (
+                f"EXIT_REST_BOOK:{type(exc).__name__}:{exc}"
+            )[:500]
+            return None
+
+        bids: list[dict[str, str]] = []
+        for level in payload.get("bids") or []:
+            if not isinstance(level, dict):
+                continue
+            price = decimal_value(level.get("price"))
+            size = decimal_value(level.get("size"))
+            if price is None or size is None or size <= 0:
+                continue
+            bids.append({
+                "price": canonical_decimal(price),
+                "size": canonical_decimal(size),
+            })
+        bids.sort(
+            key=lambda level: decimal_value(level["price"]) or Decimal("0"),
+            reverse=True,
+        )
+        return {
+            **dict(payload),
+            "asset_id": token_id,
+            "best_bid": bids[0]["price"] if bids else None,
+            "bids": bids,
+            "generation": int(payload.get("generation") or 0),
+            "event_type": "exit_supervisor_rest",
+        }
+
+    async def _drive_latched_exits_once(self) -> None:
+        self.exit_supervisor_runs += 1
+        positions_by_token = self._hot_state.get("positions_by_token") or {}
+        positions = [
+            dict(position)
+            for token_positions in positions_by_token.values()
+            for position in token_positions
+            if isinstance(position, dict)
+            and (
+                decimal_value(position.get("remaining_shares_text"))
+                or Decimal("0")
+            ) > 0
+            and str(position.get("state") or "").upper()
+            != "CLOSED"
+        ]
+
+        if self._stop_exhausted_positions:
+            open_ids = {
+                str(position["position_id"]) for position in positions
+            }
+            for position_id in list(self._stop_exhausted_positions):
+                if position_id not in open_ids:
+                    self._release_stop_protection_pause(position_id)
+
+        active_ids = {str(position["position_id"]) for position in positions}
+        self._exit_tracker.prune(active_ids)
+        for position in positions:
+            self._exit_tracker.note(
+                position, update=None, decision="CHECKING_EXIT_OBLIGATION"
+            )
+            update = await self._exit_book_for_position(position)
+            if not update:
+                if self._exit_tracker.monitoring_sla_exceeded(
+                    str(position["position_id"])
+                ):
+                    self._exit_tracker.fault(
+                        position,
+                        reason="EXIT_SUPERVISOR_SLA_EXCEEDED",
+                        message=(
+                            "Exit supervisor has no usable WS or REST book "
+                            "within the configured SLA; new entries remain blocked"
+                        ),
+                    )
+                continue
+            self._exit_tracker.note(
+                position, update=update, decision="USABLE_BOOK_OBSERVED"
+            )
+            event_id = str(position["event_id"])
+            lock = self._event_locks.setdefault(event_id, asyncio.Lock())
+            async with lock:
+                await self._manage_position(
+                    market=self._market(
+                        str(position.get("condition_id") or "")
+                    ) or {},
+                    update=update,
+                    event_ready=True,
+                    frame_hash=self._exit_liquidity_hash(update),
+                )
+            self._exit_tracker.note(
+                position, update=update, decision="EXIT_POLICY_EVALUATED"
+            )
+
+    async def _exit_supervisor_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._exit_wakeup.wait(), 0.25)
+            except asyncio.TimeoutError:
+                pass
+            self._exit_wakeup.clear()
+            try:
+                await self._drive_latched_exits_once()
+            except Exception as exc:
+                self.last_error = (
+                    f"EXIT_SUPERVISOR:{type(exc).__name__}:{exc}"
+                )[:500]
+
+    @staticmethod
     def _exit_liquidity_hash(update: dict[str, Any]) -> str:
         """Identify executable bid liquidity without conflating frame churn."""
         levels: list[tuple[Decimal, Decimal]] = []
@@ -1998,6 +2420,7 @@ class LiveStrategyRuntime:
         position: dict[str, Any],
         update: dict[str, Any],
         book_hash: str,
+        min_price: Decimal,
     ) -> None:
         if not self.repo.note_exit_liquidity_wait(
             str(position["position_id"]),
@@ -2025,9 +2448,7 @@ class LiveStrategyRuntime:
                     if bid is not None
                     else None
                 ),
-                "min_price": canonical_decimal(
-                    self.policy.stop_min_price
-                ),
+                "min_price": canonical_decimal(min_price),
                 "liquidity_hash": book_hash,
             },
         )
@@ -2043,10 +2464,11 @@ class LiveStrategyRuntime:
         token_id = str(update.get("asset_id") or "")
         positions = self._positions_from_ram(token_id)
 
-        if not positions or not event_ready:
+        if not positions:
             return
 
         bid = decimal_value(update.get("best_bid"))
+        critical_stop = bool(update.get("_critical_stop_latched"))
 
         reconciliation_ready = (
             self.paper_mode()
@@ -2062,8 +2484,37 @@ class LiveStrategyRuntime:
         for position in positions:
             stop_latched = int(position.get("stop_stage") or 0) >= 1
 
+            minimum = self._min_order(
+                str(position.get("condition_id") or "")
+            )
+            if self._exit_tracker.unsellable_remainder(position, minimum):
+                self._exit_tracker.note(
+                    position,
+                    update=update,
+                    decision="MANAGED_UNSELLABLE_BELOW_MIN_ORDER",
+                )
+                self._exit_tracker.fault(
+                    position,
+                    reason="DUST_UNSELLABLE_REMAINDER",
+                    message=(
+                        "Positive exit remainder is below the exchange minimum; "
+                        "no invalid SELL was sent and new entries remain blocked"
+                    ),
+                )
+                continue
+            if self._exit_tracker.waiting_sellable_sla_exceeded(position):
+                self._exit_tracker.fault(
+                    position,
+                    reason="WAITING_SELLABLE_SLA_EXCEEDED",
+                    message=(
+                        "Exit intent remained WAITING_SELLABLE beyond SLA; "
+                        "the supervisor continues reconciliation while entries stay blocked"
+                    ),
+                )
+
             if (
                 not stop_latched
+                and (event_ready or critical_stop)
                 and bid is not None
                 and bid <= self.policy.stop_price
             ):
@@ -2072,6 +2523,9 @@ class LiveStrategyRuntime:
                 )
                 stop_latched = True
                 if position.pop("_newly_latched", False):
+                    initial_stop_floor = decimal_value(
+                        self._stop_attempt_plan(position).get("min_price")
+                    ) or self.policy.stop_min_price
                     self.repo.timeline(
                         severity="WARNING",
                         category="EXIT",
@@ -2092,9 +2546,7 @@ class LiveStrategyRuntime:
                         ],
                         parameters_json={
                             "trigger_bid": canonical_decimal(bid),
-                            "min_price": canonical_decimal(
-                                self.policy.stop_min_price
-                            ),
+                            "min_price": canonical_decimal(initial_stop_floor),
                             "liquidity_hash": exit_book_hash,
                         },
                     )
@@ -2108,11 +2560,25 @@ class LiveStrategyRuntime:
                     or position
                 )
 
+            if not event_ready:
+                if stop_latched:
+                    self._exit_wakeup.set()
+                continue
+
             if stop_latched:
+
                 if (
                     str(position.get("state") or "").upper()
                     == "EXIT_RECONCILIATION_REQUIRED"
                 ):
+                    position_id = str(position["position_id"])
+                    attempted_at = self._exit_reconciliation_last_attempt.get(
+                        position_id, 0.0
+                    )
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - attempted_at < 1.0:
+                        continue
+                    self._exit_reconciliation_last_attempt[position_id] = now_monotonic
                     reconciled = await self._reconcile(
                         "latched_stop_reconciliation_required"
                     )
@@ -2122,6 +2588,28 @@ class LiveStrategyRuntime:
                         )
                     await self._refresh_hot_state_once()
                     continue
+                stop_plan = self._stop_attempt_plan(position)
+                if not stop_plan.get("ready"):
+                    if (
+                        stop_plan.get("exhausted")
+                        and not position.get("active_exit_intent_id")
+                    ):
+                        self._stop_protection_exhausted(position)
+                    continue
+                protected_min_price = decimal_value(
+                    stop_plan.get("min_price")
+                )
+                if protected_min_price is None:
+                    continue
+                protected_book_hash = stable_id(
+                    "protected-stop-attempt",
+                    (
+                        f"{exit_book_hash}:"
+                        f"{canonical_decimal(protected_min_price)}"
+                    ),
+                )
+                if stop_plan.get("capitulation"):
+                    self._note_stop_capitulation(position, update)
 
                 if (
                     bid is None
@@ -2131,6 +2619,7 @@ class LiveStrategyRuntime:
                         position,
                         update,
                         exit_book_hash,
+                        protected_min_price,
                     )
                     continue
 
@@ -2139,7 +2628,7 @@ class LiveStrategyRuntime:
                         position,
                         update,
                         bid=bid,
-                        frame_hash=exit_book_hash,
+                        frame_hash=protected_book_hash,
                         reconciliation_ready=reconciliation_ready,
                     )
                 )
@@ -2155,8 +2644,8 @@ class LiveStrategyRuntime:
                     position,
                     update,
                     purpose="STOP_066",
-                    min_price=self.policy.stop_min_price,
-                    frame_hash=exit_book_hash,
+                    min_price=protected_min_price,
+                    frame_hash=protected_book_hash,
                 )
                 await self._refresh_hot_state_once()
                 continue
@@ -2276,6 +2765,21 @@ class LiveStrategyRuntime:
         min_price: Decimal,
         frame_hash: str,
     ) -> None:
+        remaining_obligation = (
+            decimal_value(position.get("remaining_shares_text"))
+            or Decimal("0")
+        )
+        minimum = self._min_order(str(position.get("condition_id") or ""))
+        if 0 < remaining_obligation < minimum:
+            self._exit_tracker.fault(
+                position,
+                reason="DUST_UNSELLABLE_REMAINDER",
+                message=(
+                    "SELL suppressed because the positive remainder is below "
+                    "the exchange minimum; entries remain blocked"
+                ),
+            )
+            return
         if position.get("last_exit_book_hash") == frame_hash:
             return
         if position.get("active_exit_intent_id"):
@@ -2474,49 +2978,80 @@ class LiveStrategyRuntime:
             if pending_shares <= 0 or self.paper_mode():
                 return
 
-            intent = self.repo.reserve_position_intent(
-                position,
-                action="EXIT",
-                purpose=purpose,
-                order_type="FAK",
-                shares=pending_shares,
-                price_limit=min_price,
-                book_hash=frame_hash,
-            )
+            if self._stop_optimistic_submit_allowed(purpose):
+                # Local sellability only turns positive once a reconciliation
+                # pass reads remote position truth, which trails on-chain
+                # settlement of the entry by 8-30 seconds. Pre-empting the
+                # submission here is what kept the STOP mute through exactly
+                # that window. The exchange is the authority: submit, and let
+                # an INSUFFICIENT_BALANCE rejection land in the same
+                # WAITING_SELLABLE state as the branch below, consuming no
+                # protected attempt.
+                self.repo.timeline(
+                    severity="WARNING",
+                    category="EXIT",
+                    component="strategy",
+                    source="deterministic_book",
+                    event_id=position["event_id"],
+                    condition_id=position["condition_id"],
+                    token_id=position["token_id"],
+                    side="SELL",
+                    deal_id=stable_id("deal", position["event_id"]),
+                    requested_action="SELL_MARKET_FAK",
+                    reason_code=f"{purpose}_OPTIMISTIC_SUBMIT",
+                    result_status="ATTEMPTING",
+                    requested_shares_text=canonical_decimal(pending_shares),
+                    remaining_shares_text=position["remaining_shares_text"],
+                    parameters_json={
+                        "min_price": canonical_decimal(min_price),
+                        "sellable_shares": canonical_decimal(shares),
+                    },
+                )
+                shares = pending_shares
+            else:
+                intent = self.repo.reserve_position_intent(
+                    position,
+                    action="EXIT",
+                    purpose=purpose,
+                    order_type="FAK",
+                    shares=pending_shares,
+                    price_limit=min_price,
+                    book_hash=frame_hash,
+                )
 
-            if intent.get("_duplicate"):
+                if intent.get("_duplicate"):
+                    return
+
+                self.repo.mark_waiting_sellable(
+                    str(intent["intent_id"]),
+                    reason=f"{purpose}_WAITING_FOR_SELLABLE_BALANCE",
+                )
+
+                self.repo.timeline(
+                    severity="CRITICAL",
+                    category="EXIT",
+                    component="strategy",
+                    source="deterministic_book",
+                    event_id=position["event_id"],
+                    condition_id=position["condition_id"],
+                    token_id=position["token_id"],
+                    side="SELL",
+                    deal_id=stable_id("deal", position["event_id"]),
+                    intent_id=intent["intent_id"],
+                    requested_action="SELL_MARKET_FAK",
+                    reason_code=f"{purpose}_WAITING_SELLABLE",
+                    result_status="WAITING",
+                    requested_shares_text=canonical_decimal(pending_shares),
+                    parameters_json={
+                        "trigger_bid": canonical_decimal(
+                            decimal_value(update.get("best_bid"))
+                            or Decimal("0")
+                        ),
+                        "min_price": canonical_decimal(min_price),
+                    },
+                )
+
                 return
-
-            self.repo.mark_waiting_sellable(
-                str(intent["intent_id"]),
-                reason=f"{purpose}_WAITING_FOR_SELLABLE_BALANCE",
-            )
-
-            self.repo.timeline(
-                severity="CRITICAL",
-                category="EXIT",
-                component="strategy",
-                source="deterministic_book",
-                event_id=position["event_id"],
-                condition_id=position["condition_id"],
-                token_id=position["token_id"],
-                side="SELL",
-                deal_id=stable_id("deal", position["event_id"]),
-                intent_id=intent["intent_id"],
-                requested_action="SELL_MARKET_FAK",
-                reason_code=f"{purpose}_WAITING_SELLABLE",
-                result_status="WAITING",
-                requested_shares_text=canonical_decimal(pending_shares),
-                parameters_json={
-                    "trigger_bid": canonical_decimal(
-                        decimal_value(update.get("best_bid"))
-                        or Decimal("0")
-                    ),
-                    "min_price": canonical_decimal(min_price),
-                },
-            )
-
-            return
 
         intent = self.repo.reserve_position_intent(
             position, action="EXIT", purpose=purpose, order_type="FAK",
@@ -2524,6 +3059,11 @@ class LiveStrategyRuntime:
         )
         if intent.get("_duplicate"):
             return
+        intent = self.repo.update_intent(
+            str(intent["intent_id"]),
+            state="SUBMITTING",
+            submitted_at=now_iso(),
+        )
         if self.paper_mode():
             fill = simulate_sell_fak(
                 update.get("bids") or [], shares=shares, min_price=min_price,
@@ -2584,6 +3124,10 @@ class LiveStrategyRuntime:
                 ),
                 normalized_error=response.get("message"),
             )
+            self.repo.update_intent(
+                str(intent["intent_id"]),
+                submitted_at=None,
+            )
             return
 
         if self._finalize_known_no_remote_submission(
@@ -2613,6 +3157,17 @@ class LiveStrategyRuntime:
             )
 
     async def _handle_resolution(self, market: dict[str, Any]) -> None:
+        if not self.paper_mode():
+            source = str(market.get("source") or "").upper()
+            if source != "POLYMARKET_PUBLIC_REST":
+                self.repo.timeline(
+                    severity="WARNING", category="RESOLUTION", component="strategy",
+                    source="market_ws", condition_id=str(market["condition_id"]),
+                    requested_action="RESOLUTION", reason_code="WEAK_RESOLUTION_DEFERRED",
+                    result_status="WAITING_AUTHORITATIVE_REST",
+                )
+            await self._reconcile("authoritative_market_resolution")
+            return
         winner_asset = str(market.get("winning_asset_id") or "")
         for position in self.repo.unresolved_positions(str(market["condition_id"])):
             winner = position["token_id"] == winner_asset
@@ -2695,12 +3250,26 @@ class LiveStrategyRuntime:
             self._frame_task = asyncio.create_task(
                 self._frame_worker(), name="strategy-frame-worker"
             )
+        if self._exit_task is None or self._exit_task.done():
+            self._exit_task = asyncio.create_task(
+                self._exit_supervisor_loop(),
+                name="strategy-exit-supervisor",
+            )
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="polymarket-order-heartbeat"
         )
 
     async def stop(self) -> None:
         self._stop.set()
+
+        if self._exit_task:
+            self._exit_wakeup.set()
+            self._exit_task.cancel()
+            try:
+                await self._exit_task
+            except asyncio.CancelledError:
+                pass
+            self._exit_task = None
 
         if self._hot_state_task:
             self._hot_state_task.cancel()
@@ -2783,6 +3352,13 @@ class LiveStrategyRuntime:
             "enabled": self.enabled(),
             "mode": self.config.execution_mode,
             "frames_processed": self.frames_processed,
+            "exit_supervisor_running": bool(
+                self._exit_task and not self._exit_task.done()
+            ),
+            "exit_supervisor_runs": self.exit_supervisor_runs,
+            "exit_rest_fallbacks": self.exit_rest_fallbacks,
+            "exit_rest_failures": self.exit_rest_failures,
+            "exit_supervision": self._exit_tracker.health(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
             "frames_dropped": self.frames_dropped,

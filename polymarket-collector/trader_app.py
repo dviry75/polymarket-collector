@@ -17,6 +17,7 @@ from live.geographic import geographic_preflight
 from live.ipc import TraderIPCServer
 from live.market_discovery import refresh_btc_5m_markets
 from live.pause_recovery import PauseRecoveryCoordinator
+from live.provenance import collect as collect_provenance
 from live.reconciliation_coordinator import ReconciliationCadencePolicy
 from live.repository import now_iso
 from live.router import (
@@ -35,15 +36,22 @@ _ipc_server: TraderIPCServer | None = None
 
 
 async def market_discovery_loop(config: LiveConfig) -> None:
-    while True:
-        try:
-            await refresh_btc_5m_markets(services()[1])
-        except Exception as exc:
-            services()[1].audit(
-                "market_discovery", "market_discovery_refresh", "error",
-                f"{type(exc).__name__}: {exc}"[:500],
-            )
-        await asyncio.sleep(max(1, config.market_discovery_interval_seconds))
+    from polymarket import AsyncPublicClient
+
+    client = await asyncio.to_thread(AsyncPublicClient)
+    try:
+        while True:
+            try:
+                await refresh_btc_5m_markets(services()[1], client=client)
+            except Exception as exc:
+                await asyncio.to_thread(
+                    services()[1].audit,
+                    "market_discovery", "market_discovery_refresh", "error",
+                    f"{type(exc).__name__}: {exc}"[:500],
+                )
+            await asyncio.sleep(max(1, config.market_discovery_interval_seconds))
+    finally:
+        await client.close()
 
 
 async def reconciliation_loop(config: LiveConfig) -> None:
@@ -154,6 +162,37 @@ async def startup() -> None:
             owner="MACHINE",
         )
 
+    # Deployment attestation, before anything can trade. This records which
+    # source is actually loaded in this interpreter so a later investigation
+    # never again has to guess, and refuses real money to a runtime that
+    # cannot be tied to an approved deployment.
+    provenance = collect_provenance(config)
+    repo.set_states(provenance.state_rows(), "startup")
+    print(provenance.summary_line(), flush=True)
+    repo.audit(
+        "startup",
+        "runtime_provenance",
+        "ok" if provenance.gate_ok else "blocked",
+        ",".join(provenance.gate_reasons) or "ATTESTED",
+        provenance.as_dict(),
+    )
+    if not provenance.gate_ok:
+        strategy_repo.acquire_pause(
+            actor="startup",
+            reason="PROVENANCE_UNVERIFIED",
+            owner="MACHINE",
+        )
+        strategy_repo.alert(
+            alert_type="PROVENANCE",
+            severity="CRITICAL",
+            reason_code="RUNTIME_PROVENANCE_UNVERIFIED",
+            message=(
+                "Runtime could not be attested to an approved deployment ("
+                + (", ".join(provenance.gate_reasons) or "UNKNOWN")
+                + "); entries are blocked until an operator approves it"
+            ),
+        )
+
     _ipc_server = TraderIPCServer(config.trader_socket_path, TraderCommandHandler())
     await _ipc_server.start()
 
@@ -181,16 +220,6 @@ async def startup() -> None:
     startup_reconciliation = await reconciliation_coordinator().request(
         actor="startup_reconciliation", force=True
     )
-    if startup_reconciliation.get("status") == "ok":
-        repaired_dust = strategy_repo.repair_terminal_dust_slots(
-            actor="startup_reconciliation"
-        )
-        if repaired_dust:
-            await reconciliation_coordinator().request(
-                actor="post_dust_repair_reconciliation",
-                evidence_changed=True,
-                force=True,
-            )
 
     _discovery_task = asyncio.create_task(market_discovery_loop(config), name="live-market-discovery")
     _reconciliation_task = asyncio.create_task(reconciliation_loop(config), name="live-reconciliation")

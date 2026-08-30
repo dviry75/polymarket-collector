@@ -87,6 +87,9 @@ def test_two_maker_tp_fills_become_verified_dust_and_are_idempotent():
             ready=False, reason="RECONCILIATION_GAP", actor="test"
         )
         worker = ReconciliationWorker(base, adapter, strategy)
+        strategy.intent_by_remote_order = lambda _order_id: (_ for _ in ()).throw(
+            AssertionError("reconciliation must use the batched intent map")
+        )
         result = asyncio.run(worker.run_once("test"))
         assert result["status"] == "ok"
         assert len(result["repairs"]) == 1

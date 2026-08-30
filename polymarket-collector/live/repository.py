@@ -470,6 +470,36 @@ class LiveRepository:
             row = conn.execute("SELECT value FROM live_system_state WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
+    def states_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Read a whole namespace of system state, keyed without the prefix."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT key,value FROM live_system_state WHERE key LIKE ? "
+                "ORDER BY key",
+                (f"{prefix}%",),
+            ).fetchall()
+        return {
+            str(row["key"])[len(prefix):]: str(row["value"] or "")
+            for row in rows
+        }
+
+    def get_states(self, defaults: dict[str, str]) -> dict[str, str]:
+        """Read a coherent group of system states with one connection."""
+        if not defaults:
+            return {}
+        keys = tuple(defaults)
+        placeholders = ",".join("?" for _ in keys)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT key,value FROM live_system_state WHERE key IN ({placeholders})",
+                keys,
+            ).fetchall()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return {
+            key: values.get(key, default)
+            for key, default in defaults.items()
+        }
+
     def set_state(self, key: str, value: str, actor: str = "system") -> None:
         if key == "kill_switch" and actor != "operator":
             raise PermissionError("kill_switch is operator-owned")
@@ -721,6 +751,7 @@ class LiveRepository:
                     winning_asset_id = ?, winning_outcome = ?,
                     source = 'POLYMARKET_MARKET_WS', last_update_at = ?, updated_at = ?
                 WHERE condition_id = ?
+                  AND COALESCE(source, '') != 'POLYMARKET_PUBLIC_REST'
                 """,
                 (winning_asset_id, winning_outcome, ts, ts, str(condition_id)),
             )
@@ -735,7 +766,10 @@ class LiveRepository:
             query = """
                 SELECT event_id, condition_id, yes_token_id, no_token_id
                 FROM live_markets
-                WHERE market_resolved = 0
+                WHERE (
+                    market_resolved = 0
+                    OR COALESCE(source, '') != 'POLYMARKET_PUBLIC_REST'
+                )
                   AND event_id LIKE 'btc-updown-5m-%'
                   AND CAST(SUBSTR(event_id, LENGTH('btc-updown-5m-') + 1) AS INTEGER)
                       + 300 <= ?
@@ -765,7 +799,7 @@ class LiveRepository:
                     winning_asset_id = ?, winning_outcome = ?,
                     source = 'POLYMARKET_PUBLIC_REST',
                     last_update_at = ?, updated_at = ?
-                WHERE condition_id = ? AND market_resolved = 0
+                WHERE condition_id = ?
                 """,
                 (winning_asset_id, winning_outcome, ts, ts, str(condition_id)),
             )

@@ -110,7 +110,7 @@ class EntryReleaseEvaluator:
         "EMERGENCY_CLOSE_REQUESTED", "DAILY_LOSS_LIMIT",
         "CONSECUTIVE_FAILED_ORDERS", "CONSECUTIVE_LOSING_DEALS",
         "GEOGRAPHIC_AVAILABILITY_FAILED", "CONFIG_INVALID",
-        "CANARY_NOT_ARMED",
+        "CANARY_NOT_ARMED", "PROVENANCE_UNVERIFIED",
     })
 
     # How long reconciliation must stay demonstrably clean before a
@@ -178,6 +178,8 @@ class EntryReleaseEvaluator:
             "canary_armed": "false",
             "recovery_financial_verified_generation": "",
             "recovery_engine_status": "STARTING",
+            "provenance_gate_ok": "False",
+            "provenance_gate_reasons": "PROVENANCE_NOT_ATTESTED",
         })
 
         market = self.market_ws.health()
@@ -352,6 +354,22 @@ class EntryReleaseEvaluator:
                 "; ".join(config_errors),
             )
 
+        # Deployment attestation. The startup gate writes this; re-reading it
+        # every cycle means an unattested runtime keeps blocking entries for
+        # the whole life of the process rather than only at the moment it
+        # started. Absent state reads as unattested, so the gate fails closed.
+        provenance_ok = str(state["provenance_gate_ok"]).strip().lower() == "true"
+        provenance_reasons = str(state["provenance_gate_reasons"] or "")
+        evidence["provenance"] = {
+            "gate_ok": provenance_ok,
+            "reasons": provenance_reasons,
+        }
+        if not provenance_ok:
+            self._add(
+                blockers, "PROVENANCE_UNVERIFIED", "provenance",
+                provenance_reasons or "PROVENANCE_NOT_ATTESTED",
+            )
+
         if (
             self.config.execution_mode == "REAL_TRADING"
             and not self.config.continuous_trading_enabled
@@ -438,6 +456,7 @@ class PauseRecoveryCoordinator:
 
     BLOCKER_TO_CAUSE = {
         "CONFIG_INVALID": "CONFIG_INVALID",
+        "PROVENANCE_UNVERIFIED": "PROVENANCE_UNVERIFIED",
         "KILL_SWITCH_ACTIVE": "KILL_SWITCH_ACTIVE",
         "CANARY_NOT_ARMED": "CANARY_NOT_ARMED",
         "GEOGRAPHIC_NOT_ALLOWED": "GEOGRAPHIC_AVAILABILITY_FAILED",

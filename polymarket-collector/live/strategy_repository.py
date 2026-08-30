@@ -21,7 +21,9 @@ from .repository import LiveRepository, now_iso, row_to_dict
 FINAL_INTENT_STATES = {
     "FILLED", "PARTIAL_FINAL", "ZERO_FILL", "CANCELED", "REJECTED", "FAILED", "SETTLED", "REDEEMED"
 }
-OPEN_POSITION_STATES = {"OPEN", "TP_OPEN", "EXITING", "EXIT_RECONCILIATION_REQUIRED"}
+OPEN_POSITION_STATES = {
+    "OPEN", "TP_OPEN", "EXITING", "EXIT_RECONCILIATION_REQUIRED", "DUST",
+}
 SENSITIVE_KEYS = {
     "private_key", "apikey", "api_key", "api_secret", "secret", "passphrase",
     "signature", "authorization", "cookie", "operator_token", "session_secret",
@@ -379,6 +381,18 @@ class StrategyRepository:
                 "CREATE INDEX IF NOT EXISTS idx_live_alert_lifecycle "
                 "ON live_alerts(status,severity,last_seen_at DESC)"
             )
+            # Additive indexes for incremental trade reconciliation: the trade
+            # watermark bootstrap reads the newest persisted match_time, and the
+            # maker-fill drift sweep reads only recently created fills. Without
+            # them both degrade into full scans as the fill table grows.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_fills_matched_at "
+                "ON live_strategy_fills(matched_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_fills_created_at "
+                "ON live_strategy_fills(created_at DESC)"
+            )
             conn.execute("DROP INDEX IF EXISTS idx_live_strategy_one_active_exit")
             conn.execute(
                 """
@@ -681,7 +695,10 @@ class StrategyRepository:
                 SELECT
                     p.*,
                     tp.state AS tp_intent_state,
-                    active_i.state AS active_exit_intent_state
+                    active_i.state AS active_exit_intent_state,
+                    active_i.created_at AS active_exit_intent_created_at,
+                    active_i.updated_at AS active_exit_intent_updated_at,
+                    active_i.reason_code AS active_exit_intent_reason_code
                 FROM live_strategy_positions AS p
                 LEFT JOIN live_strategy_intents AS tp
                     ON tp.intent_id = p.tp_intent_id
@@ -691,7 +708,8 @@ class StrategyRepository:
                     'OPEN',
                     'TP_OPEN',
                     'EXITING',
-                    'EXIT_RECONCILIATION_REQUIRED'
+                    'EXIT_RECONCILIATION_REQUIRED',
+                    'DUST'
                 )
                 ORDER BY p.created_at
                 """
@@ -2994,6 +3012,303 @@ class StrategyRepository:
 
             conn.commit()
 
+    def resolve_unknown_closed_fak_zero_fill(
+        self,
+        intent_id: str,
+        *,
+        authoritative_balance: Decimal,
+        identity_verified: bool,
+        matching_open_orders: int,
+        matching_sell_trades: int,
+        actor: str = "operator",
+    ) -> dict[str, Any]:
+        """Resolve a proven zero-fill FAK whose POST response was lost.
+
+        This accepts only an UNKNOWN-after-submission STOP on a resolved
+        winning market when authenticated remote evidence proves that every
+        acquired token remains and no SELL trade or open order exists.
+        """
+        if not identity_verified:
+            raise RuntimeError("remote identity is not verified")
+        if matching_open_orders != 0:
+            raise RuntimeError("matching remote order still exists")
+        if matching_sell_trades != 0:
+            raise RuntimeError("matching remote SELL trade exists")
+
+        ts = now_iso()
+        before: dict[str, Any] = {}
+        after: dict[str, Any] = {}
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT
+                    i.*,
+                    p.state AS position_state,
+                    p.acquired_shares_text,
+                    p.remaining_shares_text AS position_remaining_shares_text,
+                    p.exit_value_text,
+                    p.cost_all_in_text,
+                    p.realized_pnl_text AS position_realized_pnl_text,
+                    p.resolved_winner,
+                    p.active_exit_intent_id,
+                    p.tp_intent_id
+                FROM live_strategy_intents AS i
+                JOIN live_strategy_positions AS p
+                  ON p.position_id=i.position_id
+                WHERE i.intent_id=?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise KeyError(intent_id)
+
+            market = conn.execute(
+                "SELECT market_resolved,accepting_orders,winning_asset_id,"
+                "yes_token_id,no_token_id,source "
+                "FROM live_markets WHERE condition_id=?",
+                (str(row["condition_id"]),),
+            ).fetchone()
+            attempt = conn.execute(
+                """
+                SELECT result_status,success,error_code
+                FROM live_order_attempts
+                WHERE intent_id=? AND operation='CREATE_ORDER' AND phase='RESULT'
+                ORDER BY occurred_at DESC LIMIT 1
+                """,
+                (intent_id,),
+            ).fetchone()
+            fill_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM live_strategy_fills WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()[0]
+                or 0
+            )
+
+            failures: list[str] = []
+            if str(row["state"] or "").upper() != "RECONCILIATION_REQUIRED":
+                failures.append("intent is not RECONCILIATION_REQUIRED")
+            if row["remote_order_id"]:
+                failures.append("intent already has remote_order_id")
+            if str(row["action"] or "").upper() != "EXIT":
+                failures.append("intent is not EXIT")
+            if str(row["purpose"] or "").upper() != "STOP_066":
+                failures.append("intent is not STOP_066")
+            if str(row["order_type"] or "").upper() != "FAK":
+                failures.append("intent is not FAK")
+            if not row["submitted_at"]:
+                failures.append("intent was never submitted")
+            if (decimal_value(row["filled_shares_text"]) or Decimal("0")) != 0:
+                failures.append("intent has local filled shares")
+            if fill_count != 0:
+                failures.append("intent has durable fills")
+            if attempt is None or str(attempt["result_status"] or "").upper() != "UNKNOWN":
+                failures.append("latest CREATE_ORDER attempt is not UNKNOWN")
+            if attempt is not None and attempt["success"] not in {None, 0}:
+                failures.append("UNKNOWN attempt is marked successful")
+            if market is None or not (
+                bool(market["market_resolved"])
+                or not bool(market["accepting_orders"])
+            ):
+                failures.append("market is still open")
+            if market is not None and str(market["source"] or "").upper() not in {
+                "PUBLIC_REST",
+                "POLYMARKET_PUBLIC_REST",
+            }:
+                failures.append("market result is not from public REST")
+            if market is not None and str(row["token_id"] or "") not in {
+                str(market["yes_token_id"] or ""),
+                str(market["no_token_id"] or ""),
+            }:
+                failures.append("position token is outside the resolved market")
+            if str(row["position_state"] or "").upper() != "REDEEM_PENDING":
+                failures.append("position is not REDEEM_PENDING")
+            if int(row["resolved_winner"] or 0) != 1:
+                failures.append("position is not a resolved winner")
+            if str(row["active_exit_intent_id"] or "") != intent_id:
+                failures.append("intent is not the active exit link")
+
+            acquired = decimal_value(row["acquired_shares_text"]) or Decimal("0")
+            if authoritative_balance != acquired:
+                failures.append(
+                    "authoritative balance does not equal acquired shares"
+                )
+            if failures:
+                conn.rollback()
+                raise RuntimeError("; ".join(failures))
+
+            official_winner = (
+                str(market["winning_asset_id"] or "")
+                == str(row["token_id"] or "")
+            )
+            target_position_state = (
+                "REDEEM_PENDING" if official_winner else "RESOLVED_LOSER"
+            )
+            if official_winner:
+                corrected_pnl = (
+                    decimal_value(row["position_realized_pnl_text"])
+                    or Decimal("0")
+                )
+            else:
+                corrected_pnl = (
+                    decimal_value(row["exit_value_text"])
+                    or Decimal("0")
+                ) - (
+                    decimal_value(row["cost_all_in_text"])
+                    or Decimal("0")
+                )
+
+            before = {
+                "intent_state": str(row["state"]),
+                "position_state": str(row["position_state"]),
+                "active_exit_intent_id": str(row["active_exit_intent_id"]),
+                "authoritative_balance": canonical_decimal(
+                    authoritative_balance
+                ),
+                "acquired_shares": canonical_decimal(acquired),
+                "official_winner": official_winner,
+            }
+            conn.execute(
+                """
+                UPDATE live_strategy_intents
+                SET state='ZERO_FILL',
+                    reason_code='OPERATOR_VERIFIED_UNKNOWN_FAK_ZERO_FILL',
+                    final_at=?,updated_at=?
+                WHERE intent_id=? AND state='RECONCILIATION_REQUIRED'
+                """,
+                (ts, ts, intent_id),
+            )
+            conn.execute(
+                """
+                UPDATE live_strategy_positions
+                SET active_exit_intent_id=NULL,
+                    state=?,
+                    resolved_winner=?,
+                    realized_pnl_text=?,
+                    updated_at=?
+                WHERE position_id=?
+                  AND active_exit_intent_id=?
+                  AND state='REDEEM_PENDING'
+                  AND resolved_winner=1
+                """,
+                (
+                    target_position_state,
+                    1 if official_winner else 0,
+                    canonical_decimal(corrected_pnl),
+                    ts,
+                    str(row["position_id"]),
+                    intent_id,
+                ),
+            )
+            if not official_winner:
+                conn.execute(
+                    "UPDATE live_event_states SET status='RESOLVED_LOSER',"
+                    "resolved_at=COALESCE(resolved_at,?),updated_at=? "
+                    "WHERE event_id=?",
+                    (ts, ts, str(row["event_id"])),
+                )
+                conn.execute(
+                    """
+                    UPDATE live_strategy_deals
+                    SET state='RESOLVED_LOSER',
+                        realized_pnl_text=?,
+                        final_reason='MARKET_RESOLUTION',
+                        closed_at=COALESCE(closed_at,?),
+                        updated_at=?
+                    WHERE event_id=?
+                    """,
+                    (
+                        canonical_decimal(corrected_pnl),
+                        ts,
+                        ts,
+                        str(row["event_id"]),
+                    ),
+                )
+                day_key = datetime.now(
+                    ZoneInfo("Asia/Jerusalem")
+                ).date().isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO live_daily_limits(
+                        day_key,timezone,created_at,updated_at
+                    ) VALUES(?,'Asia/Jerusalem',?,?)
+                    ON CONFLICT(day_key) DO NOTHING
+                    """,
+                    (day_key, ts, ts),
+                )
+                conn.execute(
+                    """
+                    UPDATE live_daily_limits
+                    SET realized_pnl_usd=realized_pnl_usd+?,
+                        consecutive_losing_deals=consecutive_losing_deals+1,
+                        updated_at=?
+                    WHERE day_key=?
+                    """,
+                    (canonical_decimal(corrected_pnl), ts, day_key),
+                )
+            updated = conn.execute(
+                """
+                SELECT i.state AS intent_state,p.state AS position_state,
+                       p.active_exit_intent_id
+                FROM live_strategy_intents AS i
+                JOIN live_strategy_positions AS p ON p.position_id=i.position_id
+                WHERE i.intent_id=?
+                """,
+                (intent_id,),
+            ).fetchone()
+            if (
+                updated is None
+                or str(updated["intent_state"]) != "ZERO_FILL"
+                or str(updated["position_state"]) != target_position_state
+                or updated["active_exit_intent_id"] is not None
+            ):
+                conn.rollback()
+                raise RuntimeError("recovery postcondition failed")
+            after = row_to_dict(updated) or {}
+            conn.commit()
+
+        evidence = {
+            "intent_id": intent_id,
+            "identity_verified": identity_verified,
+            "matching_open_orders": matching_open_orders,
+            "matching_sell_trades": matching_sell_trades,
+            "before": before,
+            "after": after,
+        }
+        self.base.audit(
+            actor,
+            "resolve_unknown_closed_fak_zero_fill",
+            "ok",
+            "OPERATOR_VERIFIED_UNKNOWN_FAK_ZERO_FILL",
+            evidence,
+        )
+        self.timeline(
+            severity="WARNING",
+            category="RECONCILIATION",
+            component="operator_recovery",
+            source=actor,
+            event_id=str(row["event_id"]),
+            condition_id=str(row["condition_id"]),
+            token_id=str(row["token_id"]),
+            side="SELL",
+            position_id=str(row["position_id"]),
+            intent_id=intent_id,
+            requested_action="RESOLVE_UNKNOWN_FAK_ZERO_FILL",
+            reason_code="OPERATOR_VERIFIED_UNKNOWN_FAK_ZERO_FILL",
+            previous_state="RECONCILIATION_REQUIRED",
+            new_state="ZERO_FILL",
+            result_status="VERIFIED",
+            requested_shares_text=str(row["requested_shares_text"] or "0"),
+            filled_shares_text="0",
+            remaining_shares_text=str(
+                row["position_remaining_shares_text"] or "0"
+            ),
+            parameters_json=evidence,
+        )
+        return evidence
+
     def cancel_tp(self, position_id: str, reason: str) -> dict[str, Any] | None:
         ts = now_iso()
         with self.base.connect() as conn:
@@ -3325,7 +3640,9 @@ class StrategyRepository:
                 conn.execute(
                     """
                     UPDATE live_strategy_deals SET state=?,total_fees_text=?,
-                        realized_pnl_text=?,final_reason=?,closed_at=?,updated_at=?
+                        realized_pnl_text=?,final_reason=?,
+                        closed_at=CASE WHEN ? IN ('CLOSED','DUST') THEN ?
+                            ELSE closed_at END,updated_at=?
                     WHERE event_id=?
                     """,
                     (
@@ -3333,7 +3650,8 @@ class StrategyRepository:
                         canonical_decimal(
                             (decimal_value(row["entry_fees_text"]) or Decimal("0")) + exit_fees
                         ),
-                        canonical_decimal(pnl), purpose, ts, ts, row["event_id"],
+                        canonical_decimal(pnl), purpose,
+                        position_state, ts, ts, row["event_id"],
                     ),
                 )
                 conn.execute(
@@ -3347,7 +3665,12 @@ class StrategyRepository:
         return row_to_dict(updated) or {}
 
     def mark_position_resolved(
-        self, position_id: str, *, winner: bool, redeem_pending: bool
+        self,
+        position_id: str,
+        *,
+        winner: bool,
+        redeem_pending: bool,
+        authoritative: bool = False,
     ) -> dict[str, Any]:
         ts = now_iso()
         state = "REDEEM_PENDING" if winner and redeem_pending else ("RESOLVED_WINNER" if winner else "RESOLVED_LOSER")
@@ -3359,7 +3682,39 @@ class StrategyRepository:
             if row is None:
                 conn.rollback()
                 raise KeyError(position_id)
-            if str(row["state"]) in {"RESOLVED_LOSER", "RESOLVED_WINNER", "REDEEM_PENDING", "REDEEMED"}:
+            # Resolution must never bury an exit that may already exist
+            # remotely: that is how a lost SELL turned into a silently
+            # "settled" position. Only submission evidence blocks, though. An
+            # intent that is still purely local (a TAKE_PROFIT parked in
+            # WAITING_SELLABLE, say) has no remote effect to protect, so it
+            # must not wedge the position out of resolution forever; the
+            # caller cancels it once the market has resolved.
+            final_states = tuple(sorted(FINAL_INTENT_STATES))
+            blocking = conn.execute(
+                "SELECT intent_id,state FROM live_strategy_intents "
+                "WHERE intent_id IN (?,?) "
+                "AND UPPER(state) NOT IN ("
+                + ",".join("?" for _ in final_states)
+                + ") AND (submitted_at IS NOT NULL "
+                "OR remote_order_id IS NOT NULL "
+                "OR UPPER(state)='RECONCILIATION_REQUIRED') LIMIT 1",
+                (
+                    str(row["active_exit_intent_id"] or ""),
+                    str(row["tp_intent_id"] or ""),
+                    *final_states,
+                ),
+            ).fetchone()
+            if blocking is not None:
+                conn.rollback()
+                return row_to_dict(row) or {}
+            current_state = str(row["state"]).upper()
+            if (
+                current_state in {"EXIT_RECONCILIATION_REQUIRED", "QUARANTINED"}
+                and not authoritative
+            ):
+                conn.rollback()
+                return row_to_dict(row) or {}
+            if current_state in {"RESOLVED_LOSER", "RESOLVED_WINNER", "REDEEM_PENDING", "REDEEMED"}:
                 conn.rollback()
                 return row_to_dict(row) or {}
             remaining = decimal_value(row["remaining_shares_text"]) or Decimal("0")
@@ -3578,7 +3933,7 @@ class StrategyRepository:
                     tp_intent_id=NULL,last_exit_book_hash=?,
                     updated_at=?,closed_at=CASE
                         WHEN ? IN ('CLOSED','DUST') THEN ?
-                        ELSE NULL END
+                        ELSE closed_at END
                 WHERE position_id=?
                 """,
                 (
@@ -3621,7 +3976,9 @@ class StrategyRepository:
                     """
                     UPDATE live_strategy_deals SET state=?,
                         total_fees_text=?,realized_pnl_text=?,
-                        final_reason=?,closed_at=?,updated_at=?
+                        final_reason=?,
+                        closed_at=CASE WHEN ? IN ('CLOSED','DUST') THEN ?
+                            ELSE closed_at END,updated_at=?
                     WHERE event_id=?
                     """,
                     (
@@ -3632,6 +3989,7 @@ class StrategyRepository:
                         ),
                         canonical_decimal(pnl),
                         purpose,
+                        position_state,
                         ts,
                         ts,
                         str(position["event_id"]),
@@ -3737,6 +4095,84 @@ class StrategyRepository:
             audit_id = int(cursor.lastrowid)
             conn.commit()
         return audit_id
+
+    def latest_persisted_trade(self) -> dict[str, Any] | None:
+        """Newest account trade this DB can prove it already holds.
+
+        Bootstraps the reconciliation trade watermark, so it must only consider
+        fills that carry a real remote Trade ID -- locally synthesised fill ids
+        are not evidence of anything having been read from the account feed.
+        """
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT remote_trade_id,matched_at FROM live_strategy_fills "
+                "WHERE remote_trade_id IS NOT NULL AND remote_trade_id <> '' "
+                "AND matched_at IS NOT NULL AND matched_at <> '' "
+                "ORDER BY matched_at DESC LIMIT 1"
+            ).fetchone()
+        return row_to_dict(row)
+
+    def known_remote_trade_ids(self, trade_ids: Iterable[str]) -> set[str]:
+        """Which of these Trade IDs are already persisted as fills."""
+        ids = tuple(dict.fromkeys(str(item) for item in trade_ids if str(item)))
+        if not ids:
+            return set()
+        known: set[str] = set()
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            with self.base.connect() as conn:
+                rows = conn.execute(
+                    "SELECT remote_trade_id FROM live_strategy_fills "
+                    f"WHERE remote_trade_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            known.update(str(row["remote_trade_id"]) for row in rows)
+        return known
+
+    MAKER_CHILD_FEE_SOURCE = "maker_child_fee_not_reported"
+
+    def exit_intents_with_maker_fill_drift(
+        self, *, since: str, limit: int = 200
+    ) -> dict[str, dict[str, Any]]:
+        """Exits carrying a maker-child fill that was never applied to the position.
+
+        Full-history trade reads used to re-offer every maker child on every
+        run, which incidentally retried any exit repair that had been skipped.
+        Windowed reads cannot do that, so the retry is derived from the local
+        fills instead.
+
+        Deliberately narrow: only intents with at least one maker-child-sourced
+        fill qualify, which is exactly the set the old refetch could retry.
+        Taker fills are owned by the main reconciliation path and must not be
+        pulled into the maker repair. The SQL sum ignores fill_summary()'s
+        duplicate collapsing, so this over-selects; the caller re-checks with
+        fill_summary() and skips intents that are already applied.
+        """
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT i.* FROM live_strategy_intents AS i
+                WHERE UPPER(COALESCE(i.action,'')) IN ('EXIT','TP')
+                  AND EXISTS (
+                      SELECT 1 FROM live_strategy_fills AS f
+                      WHERE f.intent_id = i.intent_id
+                        AND f.created_at >= ?
+                        AND f.fee_source = ?
+                  )
+                  AND (
+                      SELECT SUM(CAST(COALESCE(f2.shares_text,'0') AS REAL))
+                      FROM live_strategy_fills AS f2
+                      WHERE f2.intent_id = i.intent_id
+                  ) > CAST(COALESCE(i.filled_shares_text,'0') AS REAL) + 1e-9
+                LIMIT ?
+                """,
+                (str(since), self.MAKER_CHILD_FEE_SOURCE, int(limit)),
+            ).fetchall()
+        return {
+            str(row["intent_id"]): row_to_dict(row) or {}
+            for row in rows
+        }
 
     def intents_by_remote_orders(
         self, remote_order_ids: Iterable[str]
@@ -4576,4 +5012,22 @@ class StrategyRepository:
             "heartbeat_status": self.base.get_state("order_heartbeat_status", "DISABLED"),
             "last_reconciliation": self.base.get_state("last_successful_reconciliation_at", ""),
             "last_archive": row_to_dict(archive),
+        }
+
+    def stop_attempt_state(self, position_id: str) -> dict[str, Any]:
+        """Return submitted STOP attempts; local WAITING intents do not count."""
+        with self.base.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS attempt_count,
+                       MAX(COALESCE(final_at,updated_at,submitted_at)) AS last_attempt_at
+                FROM live_strategy_intents
+                WHERE position_id=? AND action='EXIT' AND purpose='STOP_066'
+                  AND submitted_at IS NOT NULL
+                """,
+                (position_id,),
+            ).fetchone()
+        return row_to_dict(row) or {
+            "attempt_count": 0,
+            "last_attempt_at": None,
         }

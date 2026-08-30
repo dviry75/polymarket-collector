@@ -1,6 +1,12 @@
 # Polymarket LIVE Agent Rules
 
-Before starting any task, read this entire file and `SYSTEM_CONTEXT.md`.
+Before starting any task, read the operational documentation in this order:
+
+1. `AGENTS.md`
+2. `SYSTEM_CONTEXT.md`
+3. `CURRENT_STATE.md`
+
+`CURRENT_STATE.md` is informational only. All dynamic state relevant to the task must still be re-verified before acting.
 Never assume documented runtime values are current.
 Always verify live runtime state directly before acting.
 This is a **REAL_TRADING production system**.

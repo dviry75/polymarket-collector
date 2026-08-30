@@ -271,6 +271,50 @@ def test_partial_tp_cancel_race_no_oversell_and_dust():
 
 
 
+def test_cancel_local_waiting_tp_preserves_resolved_position_state():
+    temp, _base, strategy = build_repo()
+    try:
+        position = reserve_and_open(
+            strategy,
+            event="resolved-waiting-tp",
+            shares=Decimal("5"),
+            sellable=Decimal("0"),
+        )
+        tp = strategy.reserve_position_intent(
+            position,
+            action="TP",
+            purpose="TAKE_PROFIT",
+            order_type="GTC",
+            shares=Decimal("5"),
+            price_limit=Decimal("0.96"),
+            book_hash="entry",
+        )
+        strategy.mark_waiting_sellable(
+            tp["intent_id"],
+            reason="TAKE_PROFIT_WAITING_FOR_FULL_SELLABLE_BALANCE",
+        )
+        resolved = strategy.mark_position_resolved(
+            position["position_id"],
+            winner=True,
+            redeem_pending=True,
+        )
+        assert resolved["state"] == "REDEEM_PENDING"
+
+        strategy.finalize_cancel(
+            tp["intent_id"],
+            True,
+            "RESOLVED_POSITION_LOCAL_TP_CLEANUP",
+        )
+
+        refreshed = strategy.position_for_token(position["token_id"])
+        assert refreshed["state"] == "REDEEM_PENDING"
+        assert refreshed["tp_intent_id"] is None
+        assert strategy.intent(tp["intent_id"])["state"] == "CANCELED"
+    finally:
+        temp.cleanup()
+
+
+
 def test_reconciled_exit_fill_is_idempotent_and_preserves_true_dust():
     temp, _base, strategy = build_repo()
     try:
@@ -553,15 +597,26 @@ def test_partial_emergency_allows_new_book_only_and_never_parallel():
         temp.cleanup()
 
 
-def test_partial_entry_under_minimum_is_dust_and_does_not_count_exposure():
+def test_partial_entry_under_minimum_stays_risk_managed_and_counts_exposure():
+    """A sub-minimum partial BUY is still money at risk, not a write-off.
+
+    Treating it as weightless is what let a 3.68-share partial entry drop out
+    of exit management entirely, so the remainder must keep its full cost in
+    exposure and stay in the risk-managed view until it is actually settled.
+    """
     temp, _base, strategy = build_repo()
     try:
         position = reserve_and_open(strategy, shares=Decimal("3"), minimum=Decimal("5"))
         assert position["state"] == "DUST"
         assert position["sellable_shares_text"] == "0"
         assert position["dust_shares_text"] == "3"
-        assert strategy.exposure() == 0
-        assert strategy.active_positions() == []
+        assert position["closed_at"] is None
+        assert strategy.exposure() == Decimal("5")
+        managed = strategy.risk_managed_positions()
+        assert [row["position_id"] for row in managed] == [position["position_id"]]
+        assert [row["position_id"] for row in strategy.active_positions()] == [
+            position["position_id"]
+        ]
         assert strategy.unresolved_positions()[0]["position_id"] == position["position_id"]
     finally:
         temp.cleanup()
@@ -1064,6 +1119,22 @@ def test_entry_schedule_blocks_weekdays_14_to_23_jerusalem():
     )["allowed"]
     assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 8, 16, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+
+
+def test_entry_schedule_is_unrestricted_only_on_2026_08_21_jerusalem():
+    jerusalem = ZoneInfo("Asia/Jerusalem")
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 21, 14, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 21, 22, 59, 59, tzinfo=jerusalem)
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 20, 16, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 8, 24, 16, 0, 0, tzinfo=jerusalem)
     )["allowed"]
 
 
@@ -1702,6 +1773,22 @@ def test_hot_state_snapshot_contains_active_position_and_tp_state():
         temp.cleanup()
 
 
+class _NullExitTracker:
+    """Exit supervision heartbeat stub: records nothing, touches no DB."""
+
+    def note(self, position, *, update, decision):
+        return None
+
+    def fault(self, position, *, reason, message):
+        return None
+
+    def unsellable_remainder(self, position, minimum):
+        return False
+
+    def waiting_sellable_sla_exceeded(self, position):
+        return False
+
+
 def test_manage_position_neutral_frame_uses_ram_only():
     runtime = LiveStrategyRuntime.__new__(
         LiveStrategyRuntime
@@ -1730,6 +1817,15 @@ def test_manage_position_neutral_frame_uses_ram_only():
     }
 
     runtime.paper_mode = lambda: False
+    # Production always installs the RAM market cache, and exit supervision now
+    # needs the market's minimum order size to tell an unsellable remainder
+    # from a sellable one. Serve it from the cache so the assertion under test
+    # stays "no SQLite on a neutral frame" rather than "no minimum lookup".
+    runtime._market_provider = lambda condition_id: {
+        "condition_id": condition_id,
+        "minimum_order_size": "5",
+    }
+    runtime._exit_tracker = _NullExitTracker()
 
     class ExplodingRepo:
         def __getattr__(self, name):

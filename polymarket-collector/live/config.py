@@ -82,6 +82,14 @@ class LiveConfig:
     max_exit_slippage: Decimal = Decimal("0.05")
     max_stop_loss_attempts: int = 3
     stop_loss_retry_delay_ms: int = 500
+    stop_optimistic_submit_enabled: bool = True
+    stop_capitulation_enabled: bool = True
+    stop_capitulation_seconds_before_close: int = 45
+    exit_supervisor_sla_seconds: float = 2.0
+    waiting_sellable_sla_seconds: float = 2.0
+    require_clean_runtime: bool = True
+    approved_git_sha: str = ""
+    approved_runtime_hash: str = ""
     redemption_mode: str = "manual"
     adapter_scenario: str = "filled"
     operator_token: str = ""
@@ -107,6 +115,13 @@ class LiveConfig:
     max_reconciliation_age_seconds: int = 30
     reconciliation_interval_seconds: int = 15
     reconciliation_active_interval_seconds: int = 3
+    trade_fetch_incremental_enabled: bool = True
+    trade_fetch_overlap_seconds: float = 300.0
+    trade_fetch_max_pages: int = 25
+    trade_fetch_max_trades: int = 2500
+    trade_fetch_time_budget_seconds: float = 10.0
+    trade_fetch_min_slice_seconds: float = 60.0
+    trade_fill_drift_lookback_hours: float = 24.0
     order_heartbeat_interval_seconds: int = 5
     recovery_stability_seconds: float = 4.0
     recovery_detection_debounce_seconds: float = 2.0
@@ -177,6 +192,24 @@ class LiveConfig:
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
             max_stop_loss_attempts=int(_env("LIVE_MAX_STOP_LOSS_ATTEMPTS", "3") or "3"),
             stop_loss_retry_delay_ms=int(_env("LIVE_STOP_LOSS_RETRY_DELAY_MS", "500") or "500"),
+            stop_optimistic_submit_enabled=_bool_env(
+                "LIVE_STOP_OPTIMISTIC_SUBMIT_ENABLED", True
+            ),
+            stop_capitulation_enabled=_bool_env(
+                "LIVE_STOP_CAPITULATION_ENABLED", True
+            ),
+            stop_capitulation_seconds_before_close=int(
+                _env("LIVE_STOP_CAPITULATION_SECONDS_BEFORE_CLOSE", "45") or "45"
+            ),
+            exit_supervisor_sla_seconds=float(
+                _env("LIVE_EXIT_SUPERVISOR_SLA_SECONDS", "2") or "2"
+            ),
+            waiting_sellable_sla_seconds=float(
+                _env("LIVE_WAITING_SELLABLE_SLA_SECONDS", "2") or "2"
+            ),
+            require_clean_runtime=_bool_env("LIVE_REQUIRE_CLEAN_RUNTIME", True),
+            approved_git_sha=_env("LIVE_APPROVED_GIT_SHA", "").strip(),
+            approved_runtime_hash=_env("LIVE_APPROVED_RUNTIME_HASH", "").strip(),
             redemption_mode=_env("LIVE_REDEMPTION_MODE", "manual").lower(),
             adapter_scenario=_env("LIVE_MOCK_SCENARIO", "filled").lower(),
             operator_token=_env("LIVE_OPERATOR_TOKEN", ""),
@@ -202,6 +235,13 @@ class LiveConfig:
             max_reconciliation_age_seconds=int(_env("LIVE_RECONCILIATION_MAX_AGE_SECONDS", _env("LIVE_MAX_RECONCILIATION_AGE_SECONDS", "30")) or "30"),
             reconciliation_interval_seconds=int(_env("LIVE_RECONCILIATION_INTERVAL_SECONDS", "15") or "15"),
             reconciliation_active_interval_seconds=int(_env("LIVE_RECONCILIATION_ACTIVE_INTERVAL_SECONDS", "3") or "3"),
+            trade_fetch_incremental_enabled=_bool_env("LIVE_TRADE_FETCH_INCREMENTAL_ENABLED", True),
+            trade_fetch_overlap_seconds=float(_env("LIVE_TRADE_FETCH_OVERLAP_SECONDS", "300") or "300"),
+            trade_fetch_max_pages=int(_env("LIVE_TRADE_FETCH_MAX_PAGES", "25") or "25"),
+            trade_fetch_max_trades=int(_env("LIVE_TRADE_FETCH_MAX_TRADES", "2500") or "2500"),
+            trade_fetch_time_budget_seconds=float(_env("LIVE_TRADE_FETCH_TIME_BUDGET_SECONDS", "10") or "10"),
+            trade_fetch_min_slice_seconds=float(_env("LIVE_TRADE_FETCH_MIN_SLICE_SECONDS", "60") or "60"),
+            trade_fill_drift_lookback_hours=float(_env("LIVE_TRADE_FILL_DRIFT_LOOKBACK_HOURS", "24") or "24"),
             order_heartbeat_interval_seconds=int(_env("LIVE_ORDER_HEARTBEAT_INTERVAL_SECONDS", "5") or "5"),
             recovery_stability_seconds=float(_env("LIVE_RECOVERY_STABILITY_SECONDS", "4") or "4"),
             recovery_detection_debounce_seconds=float(
@@ -308,6 +348,33 @@ class LiveConfig:
             errors.append("LIVE_CANARY_EVENT_LIMIT must remain exactly 1")
         if self.max_exit_slippage > Decimal("0.05"):
             errors.append("LIVE_MAX_EXIT_SLIPPAGE must be <= 0.05")
+        if self.stop_loss_initial_slippage < 0:
+            errors.append(
+                "LIVE_STOP_LOSS_INITIAL_SLIPPAGE must be >= 0"
+            )
+        if self.stop_loss_initial_slippage > self.max_exit_slippage:
+            errors.append(
+                "LIVE_STOP_LOSS_INITIAL_SLIPPAGE must be <= LIVE_MAX_EXIT_SLIPPAGE"
+            )
+        if self.max_stop_loss_attempts < 1:
+            errors.append("LIVE_MAX_STOP_LOSS_ATTEMPTS must be >= 1")
+        if self.stop_loss_retry_delay_ms < 0:
+            errors.append(
+                "LIVE_STOP_LOSS_RETRY_DELAY_MS must be >= 0"
+            )
+        if not 0 <= self.stop_capitulation_seconds_before_close <= 300:
+            errors.append(
+                "LIVE_STOP_CAPITULATION_SECONDS_BEFORE_CLOSE must be "
+                "between 0 and 300"
+            )
+        if not 0.25 <= self.exit_supervisor_sla_seconds <= 30:
+            errors.append(
+                "LIVE_EXIT_SUPERVISOR_SLA_SECONDS must be between 0.25 and 30"
+            )
+        if not 0.25 <= self.waiting_sellable_sla_seconds <= 30:
+            errors.append(
+                "LIVE_WAITING_SELLABLE_SLA_SECONDS must be between 0.25 and 30"
+            )
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -380,6 +447,16 @@ class LiveConfig:
             "max_exit_slippage": str(self.max_exit_slippage),
             "max_stop_loss_attempts": self.max_stop_loss_attempts,
             "stop_loss_retry_delay_ms": self.stop_loss_retry_delay_ms,
+            "stop_optimistic_submit_enabled": self.stop_optimistic_submit_enabled,
+            "stop_capitulation_enabled": self.stop_capitulation_enabled,
+            "stop_capitulation_seconds_before_close": (
+                self.stop_capitulation_seconds_before_close
+            ),
+            "exit_supervisor_sla_seconds": self.exit_supervisor_sla_seconds,
+            "waiting_sellable_sla_seconds": self.waiting_sellable_sla_seconds,
+            "require_clean_runtime": self.require_clean_runtime,
+            "approved_git_sha_configured": bool(self.approved_git_sha),
+            "approved_runtime_hash_configured": bool(self.approved_runtime_hash),
             "redemption_mode": self.redemption_mode,
             "operator_auth_configured": bool(self.operator_token),
             "login_configured": bool(self.login_password_hash and self.session_secret),

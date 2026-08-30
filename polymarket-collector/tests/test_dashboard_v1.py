@@ -62,6 +62,32 @@ def seed_verified_lifecycle(repo: LiveRepository) -> None:
     mark_reconciled_provenance(repo)
 
 
+def test_mark_reconciled_provenance_does_not_rewrite_verified_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+
+        assert mark_reconciled_provenance(repo) == {
+            "account_snapshots": 0,
+            "intents": 0,
+            "fills": 0,
+            "positions": 0,
+            "deals": 0,
+        }
+
+        repo.store_account_snapshot({
+            "sampled_at": NOW.isoformat(),
+            "account_identity_status": "VERIFIED",
+            "status": "ok",
+        })
+        counts = mark_reconciled_provenance(repo)
+        assert counts["account_snapshots"] == 1
+        assert all(
+            counts[name] == 0
+            for name in ("intents", "fills", "positions", "deals")
+        )
+
+
 def test_migration_is_idempotent_and_does_not_invent_legacy_provenance():
     with tempfile.TemporaryDirectory() as tmp:
         repo = LiveRepository(Path(tmp) / "db.sqlite3")

@@ -405,8 +405,41 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         return self._normalize_order(result)
 
     async def get_trades(self) -> list[dict[str, Any]]:
+        """Full account trade history.
+
+        Retained for the operator-triggered recovery commands that genuinely
+        need the whole ledger. Reconciliation uses get_trades_page() so its
+        cost tracks new activity instead of lifetime activity.
+        """
         pages = (await self._client()).list_account_trades()
         return [self._normalize_trade(trade) async for trade in pages.iter_items()]
+
+    async def get_trades_page(
+        self,
+        *,
+        after: str | None = None,
+        before: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """One page of account trades, filtered server-side by match time.
+
+        ``after``/``before`` are unix-second strings; the CLOB /data/trades
+        contract takes them as integers and the SDK forwards them verbatim.
+        Pages are driven one at a time (rather than via iter_items()) because
+        the SDK paginator loops unconditionally on whatever cursor the server
+        returns, and the caller needs page-level guardrails.
+        """
+        paginator = (await self._client()).list_account_trades(
+            after=after, before=before
+        )
+        if cursor:
+            paginator = paginator.from_cursor(cursor)
+        page = await paginator.first_page()
+        return {
+            "trades": [self._normalize_trade(trade) for trade in page.items],
+            "has_more": bool(page.has_more),
+            "next_cursor": page.next_cursor,
+        }
 
     async def get_positions(self) -> list[dict[str, Any]]:
         pages = (await self._client()).list_positions(
@@ -852,6 +885,15 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             "status": str(payload.get("status") or "matched").lower(),
             "matched_at": payload.get("matched_at"),
             "transaction_hash": payload.get("transaction_hash"),
+            # Canonical account-trade metadata. These were only reachable by
+            # re-parsing raw_message; promoting them costs nothing and keeps
+            # liquidity role and fee provenance addressable.
+            "liquidity_role": str(payload.get("trader_side") or "").upper() or None,
+            "maker_address": payload.get("maker_address"),
+            "owner": payload.get("owner"),
+            "outcome": payload.get("outcome"),
+            "bucket_index": payload.get("bucket_index"),
+            "last_update_at": payload.get("updated_at"),
             "maker_order_ids": [
                 item.get("order_id") for item in maker_orders if isinstance(item, dict)
             ],

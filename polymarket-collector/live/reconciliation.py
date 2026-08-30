@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import math
 import random
@@ -21,9 +22,18 @@ from .reconciliation_stability import (
     authoritative_token_balance, classify_missing_position,
     ingest_maker_exit_fills,
 )
+from .unknown_exit_recovery import resolve_unknown_open_exit_zero_effect
 from .reconciliation_coordinator import GapBackoffTracker
+from .trade_window import (
+    STATE_WATERMARK_SOURCE, WATERMARK_STATE_DEFAULTS, TradeWindowPolicy,
+    bootstrap_watermark, dedupe_by_trade_id, fetch_trade_window,
+    next_watermark_state, plan_trade_window, read_watermark_state,
+    telemetry as trade_window_telemetry,
+)
 
 
+
+logger = logging.getLogger(__name__)
 
 POSITION_PROPAGATION_GRACE_SECONDS = 15.0
 
@@ -177,10 +187,15 @@ class ReconciliationWorker:
         repo: LiveRepository,
         adapter: TradingAdapter,
         strategy_repo: StrategyRepository | None = None,
+        trade_window: TradeWindowPolicy | None = None,
+        fill_drift_lookback_hours: float = 24.0,
     ):
         self.repo = repo
         self.adapter = adapter
         self.strategy_repo = strategy_repo
+        self.trade_window = trade_window or TradeWindowPolicy()
+        self.fill_drift_lookback_hours = float(fill_drift_lookback_hours)
+        self._last_trade_fetch: dict[str, Any] = {}
         self._run_lock = asyncio.Lock()
         self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
@@ -190,12 +205,111 @@ class ReconciliationWorker:
         self._exit_repair_observations: dict[
             str, tuple[tuple[str, ...], int, float]
         ] = {}
+        self._unknown_zero_effect_observations: dict[
+            str, tuple[tuple[str, int, int], int]
+        ] = {}
         self.reconciliation_started_at: str | None = None
         self.reconciliation_finished_at: str | None = None
         self._reconciliation_duration_ms = {
             "success": _BoundedDurationMetric(),
             "failure": _BoundedDurationMetric(),
         }
+
+    async def _read_account_trades(
+        self, actor: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], Callable[[], None]]:
+        """Read only the account trades this run still needs.
+
+        Returns the trades, the per-run fetch telemetry, and a callback that
+        advances the durable watermark. The callback must be invoked only after
+        every fetched trade has been persisted: an un-called watermark leaves
+        the same range to be re-read next run, which is the safe direction.
+        """
+        policy = self.trade_window
+        if not policy.enabled:
+            # Explicit rollback path: full-history reads, no watermark writes,
+            # identical to the pre-incremental behaviour.
+            trades = list(await self.adapter.get_trades())
+            return (
+                trades,
+                {"trade_fetch_mode": "full_history", "trade_fetch_remote_count": len(trades)},
+                lambda: None,
+            )
+
+        states = self.repo.get_states(dict(WATERMARK_STATE_DEFAULTS))
+        watermark, slice_seconds = read_watermark_state(states)
+        source = str(states.get(STATE_WATERMARK_SOURCE) or "")
+        if watermark is None:
+            latest = (
+                self.strategy_repo.latest_persisted_trade()
+                if self.strategy_repo else None
+            ) or {}
+            watermark, source = bootstrap_watermark(latest.get("matched_at"), policy)
+
+        plan = plan_trade_window(
+            watermark_at=watermark, slice_seconds=slice_seconds, policy=policy
+        )
+        effective_policy = policy.for_bootstrap() if plan.bootstrap else policy
+        result = await fetch_trade_window(self.adapter, plan, effective_policy)
+        trades = dedupe_by_trade_id(result.trades)
+
+        known: set[str] = set()
+        if self.strategy_repo and trades:
+            known = self.strategy_repo.known_remote_trade_ids(
+                str(trade.get("polymarket_trade_id") or "") for trade in trades
+            )
+        duplicate_count = sum(
+            1 for trade in trades
+            if str(trade.get("polymarket_trade_id") or "") in known
+        )
+        metrics = trade_window_telemetry(
+            plan, result, effective_policy, duplicate_count=duplicate_count
+        )
+        metrics["trade_fetch_mode"] = (
+            "bootstrap" if plan.bootstrap else "incremental"
+        )
+        metrics["trade_fetch_watermark_source"] = source
+        self._last_trade_fetch = dict(metrics)
+
+        if result.truncated or metrics["trade_fetch_new_count"]:
+            # Silent in the steady state (no new trades, no limits hit); the
+            # reconciliation cadence is seconds, so unconditional logging here
+            # would be pure noise.
+            logger.info(
+                "TRADE_FETCH_WINDOW actor=%s mode=%s after=%s before=%s pages=%s "
+                "remote=%s new=%s duplicate=%s duration_ms=%s limit=%s",
+                actor, metrics["trade_fetch_mode"], metrics["trade_fetch_after"],
+                metrics["trade_fetch_before"], metrics["trade_fetch_pages"],
+                metrics["trade_fetch_remote_count"], metrics["trade_fetch_new_count"],
+                metrics["trade_fetch_duplicate_count"],
+                metrics["trade_fetch_duration_ms"],
+                metrics["trade_fetch_backlog_or_limit_hit"] or "none",
+            )
+
+        def commit() -> None:
+            advanced = next_watermark_state(plan, result, effective_policy)
+            if source:
+                advanced.setdefault(STATE_WATERMARK_SOURCE, source)
+            self.repo.set_states(
+                {key: str(value) for key, value in advanced.items()}, actor
+            )
+
+        return trades, metrics, commit
+
+    def _drifted_exit_intents(self) -> dict[str, dict[str, Any]]:
+        """Exits with a maker-child fill that never reached the position.
+
+        Replaces the incidental retry that full-history trade reads used to
+        provide. Bounded by a recency cutoff so it cannot become the same
+        unbounded scan in SQL form.
+        """
+        if not self.strategy_repo:
+            return {}
+        since = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=max(0.0, self.fill_drift_lookback_hours))
+        ).isoformat()
+        return self.strategy_repo.exit_intents_with_maker_fill_drift(since=since)
 
     def _schedule_backoff(self, actor: str, error: str) -> float:
         self._consecutive_retries += 1
@@ -677,6 +791,7 @@ class ReconciliationWorker:
                     str(local["position_id"]),
                     winner=True,
                     redeem_pending=True,
+                    authoritative=True,
                 )
                 if str(updated.get("state") or "") != before_state:
                     repair = {
@@ -725,6 +840,7 @@ class ReconciliationWorker:
                 str(local["position_id"]),
                 winner=False,
                 redeem_pending=False,
+                authoritative=True,
             )
             self._resolved_zero_observations.pop(token_id, None)
             repair = {
@@ -796,6 +912,7 @@ class ReconciliationWorker:
                 for outcome, metric in self._reconciliation_duration_ms.items()
             },
             "sample_capacity_per_outcome": RECONCILIATION_TELEMETRY_CAPACITY,
+            "trade_fetch": dict(self._last_trade_fetch),
         }
 
     async def _run_once_serialized(
@@ -844,7 +961,9 @@ class ReconciliationWorker:
             balance = await self.adapter.get_balance()
             allowances = await self.adapter.get_allowances()
             remote_open = await self.adapter.get_open_orders()
-            remote_trades = await self.adapter.get_trades()
+            remote_trades, trade_fetch, commit_trade_watermark = (
+                await self._read_account_trades(actor)
+            )
             remote_positions = await self.adapter.get_positions()
             self.repo.store_account_snapshot({
                 "sampled_at": now_iso(),
@@ -863,9 +982,12 @@ class ReconciliationWorker:
                 "raw_payload": {
                     "wallet_type": identity.get("wallet_type"),
                     "open_orders_count": len(remote_open),
+                    # Window-scoped now, not lifetime: the account's whole trade
+                    # history is no longer re-read on every run.
                     "trades_count": len(remote_trades),
                     "positions_count": len(remote_positions),
                     "allowance_contracts": len(allowances.get("allowances_raw") or {}),
+                    "trade_fetch": trade_fetch,
                 },
             })
 
@@ -946,7 +1068,15 @@ class ReconciliationWorker:
                 repairs.extend(ingest_maker_exit_fills(
                     self.repo, self.strategy_repo, remote_trades, remote_by_id,
                     strategy_intents_by_remote_id,
+                    self._drifted_exit_intents(),
                 ))
+
+            # Every trade in the fetched window is now persisted. Only here may
+            # the watermark move; anything that raised above leaves it behind so
+            # the next run re-reads the same range instead of skipping it.
+            commit_trade_watermark()
+
+            if self.strategy_repo:
                 for repair in repairs:
                     repaired_position = self.strategy_repo.position_for_token(
                         str(repair.get("token_id") or "")
@@ -1014,6 +1144,90 @@ class ReconciliationWorker:
                                     "WAITING_SELLABLE_MARKET_CLOSED",
                                 )
                             continue
+
+                        if (
+                            intent_state == "RECONCILIATION_REQUIRED"
+                            and str(intent.get("action") or "").upper() in {"EXIT", "TP"}
+                            and str(intent.get("order_type") or "").upper() == "FAK"
+                        ):
+                            intent_id = str(intent["intent_id"])
+                            proof_timestamp = str(
+                                intent.get("submitted_at")
+                                or intent.get("updated_at")
+                                or intent.get("created_at")
+                                or ""
+                            )
+                            if _within_intent_submission_grace(proof_timestamp):
+                                self._unknown_zero_effect_observations.pop(intent_id, None)
+                                continue
+                            token_id = str(intent.get("token_id") or "")
+                            matching_open = sum(
+                                1
+                                for item in remote_open
+                                if str(item.get("token_id") or item.get("asset_id") or "") == token_id
+                                and str(item.get("side") or "").upper() == "SELL"
+                            )
+                            matching_trades = sum(
+                                1
+                                for item in remote_trades
+                                if str(item.get("token_id") or item.get("asset_id") or "") == token_id
+                                and str(item.get("side") or "").upper() == "SELL"
+                            )
+                            authoritative = await authoritative_token_balance(
+                                self.adapter, token_id
+                            )
+                            if authoritative is not None:
+                                signature = (
+                                    canonical_decimal(authoritative),
+                                    matching_open,
+                                    matching_trades,
+                                )
+                                previous = self._unknown_zero_effect_observations.get(
+                                    intent_id
+                                )
+                                observations = (
+                                    previous[1] + 1
+                                    if previous is not None and previous[0] == signature
+                                    else 1
+                                )
+                                self._unknown_zero_effect_observations[intent_id] = (
+                                    signature,
+                                    observations,
+                                )
+                                if observations >= 2:
+                                    try:
+                                        repaired = resolve_unknown_open_exit_zero_effect(
+                                            self.strategy_repo,
+                                            intent_id,
+                                            authoritative_balance=authoritative,
+                                            identity_verified=identity.get("status") == "VERIFIED",
+                                            matching_open_orders=matching_open,
+                                            matching_sell_trades=matching_trades,
+                                            confirmations=observations,
+                                            actor=actor,
+                                        )
+                                    except (RuntimeError, ValueError) as exc:
+                                        gaps.append({
+                                            "type": "unknown_exit_zero_effect_proof_rejected",
+                                            "intent_id": intent_id,
+                                            "reason": str(exc),
+                                        })
+                                    else:
+                                        repairs.append({
+                                            "type": "unknown_exit_zero_effect_resolved",
+                                            **repaired,
+                                        })
+                                        self._unknown_zero_effect_observations.pop(
+                                            intent_id, None
+                                        )
+                                        continue
+                                else:
+                                    gaps.append({
+                                        "type": "unknown_exit_zero_effect_confirmation_pending",
+                                        "intent_id": intent_id,
+                                        "confirmations": observations,
+                                    })
+                                    continue
 
                         if (
                             intent_state in {"RESERVED", "SUBMITTING"}
@@ -1361,12 +1575,11 @@ class ReconciliationWorker:
                         if correction_is_bounded_propagation:
                             auto_recoverable_gaps += 1
                     if bool(remote.get("redeemable")):
-                        current_value = decimal_value(remote.get("current_value")) or Decimal("0")
-                        self.strategy_repo.mark_position_resolved(
-                            str(position["position_id"]),
-                            winner=current_value > 0,
-                            redeem_pending=current_value > 0,
-                        )
+                        gaps.append({
+                            "type": "redeemable_position_awaiting_authoritative_resolution",
+                            "position_id": position["position_id"],
+                            "condition_id": condition_id,
+                        })
                 for local in self.strategy_repo.reconciliation_positions():
                     remaining = (
                         decimal_value(
@@ -1518,6 +1731,7 @@ class ReconciliationWorker:
                         "open_orders": len(remote_open),
                         "trades": len(remote_trades),
                         "positions": len(remote_positions),
+                        "trade_fetch": trade_fetch,
                     },
                 )
             self.repo.audit(

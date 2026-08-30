@@ -30,6 +30,7 @@ from .trading_engine import TradingEngine
 from .secrets import EnvSecretProvider, GoogleSecretManagerProvider, secret_readiness
 from .strategy_repository import StrategyRepository, sanitize
 from .strategy_runtime import LiveStrategyRuntime
+from .trade_window import TradeWindowPolicy
 from .dashboard_schema import migrate_dashboard_schema
 from .dashboard_facades import (
     RemoteDryRun, RemoteHealth, RemoteReconciliation, RemoteStrategyRuntime,
@@ -84,7 +85,11 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     )
     _risk = RiskManager(_config, _repo)
     _orders = OrderManager(_repo, _risk, _adapter)
-    _reconciliation = ReconciliationWorker(_repo, _adapter, _strategy_repo)
+    _reconciliation = ReconciliationWorker(
+        _repo, _adapter, _strategy_repo,
+        trade_window=TradeWindowPolicy.from_config(_config),
+        fill_drift_lookback_hours=_config.trade_fill_drift_lookback_hours,
+    )
     _reconciliation_coordinator = ReconciliationCoordinator(
         _reconciliation,
         current_generation=lambda: (
@@ -119,6 +124,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
     )
     _strategy_runtime.set_market_freshness_provider(_market_ws.event_freshness)
     _strategy_runtime.set_market_provider(_market_ws.market_for_condition)
+    _strategy_runtime.set_exit_book_provider(_market_ws.exit_book)
     _user_ws = UserWebSocketManager(
         _repo, stale_after_seconds=_config.max_user_state_age_seconds,
         reconciliation=lambda reason="reconnect": _reconciliation_coordinator.request(
