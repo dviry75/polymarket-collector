@@ -3714,7 +3714,18 @@ class StrategyRepository:
             ):
                 conn.rollback()
                 return row_to_dict(row) or {}
-            if current_state in {"RESOLVED_LOSER", "RESOLVED_WINNER", "REDEEM_PENDING", "REDEEMED"}:
+            correcting_authoritative_terminal_loser = bool(
+                authoritative
+                and not winner
+                and current_state in {"RESOLVED_WINNER", "REDEEM_PENDING"}
+            )
+            if current_state == "REDEEMED":
+                conn.rollback()
+                return row_to_dict(row) or {}
+            if (
+                current_state in {"RESOLVED_LOSER", "RESOLVED_WINNER", "REDEEM_PENDING"}
+                and not correcting_authoritative_terminal_loser
+            ):
                 conn.rollback()
                 return row_to_dict(row) or {}
             remaining = decimal_value(row["remaining_shares_text"]) or Decimal("0")
@@ -3741,7 +3752,7 @@ class StrategyRepository:
                 """,
                 (state, canonical_decimal(pnl), state, ts, ts, row["event_id"]),
             )
-            if not winner:
+            if not winner and not correcting_authoritative_terminal_loser:
                 day_key = datetime.now(ZoneInfo("Asia/Jerusalem")).date().isoformat()
                 conn.execute(
                     """

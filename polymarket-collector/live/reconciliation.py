@@ -778,6 +778,21 @@ class ReconciliationWorker:
             if observed > 0:
                 self._resolved_zero_observations.pop(token_id, None)
                 if not winner:
+                    min_order = decimal_value(market.get("min_order_size")) or Decimal("0")
+                    local_state = str(local.get("state") or "").upper()
+                    terminal_dust = bool(
+                        local_state == "DUST"
+                        and local.get("closed_at")
+                        and (
+                            decimal_value(local.get("sellable_shares_text"))
+                            or Decimal("0")
+                        ) <= 0
+                        and min_order > 0
+                        and observed < min_order
+                    )
+                    if terminal_dust:
+                        handled_tokens.add(token_id)
+                        continue
                     gaps.append({
                         "type": "resolved_loser_authoritative_balance_active",
                         "position_id": local["position_id"],
@@ -1548,6 +1563,78 @@ class ReconciliationWorker:
                                 "remote_shares": canonical_decimal(shares),
                             })
                             continue
+                    if (
+                        bool(market.get("market_resolved"))
+                        and str(market.get("winning_asset_id") or "")
+                        and token_id != str(market.get("winning_asset_id") or "")
+                        and existing_position is not None
+                    ):
+                        existing_state = str(
+                            existing_position.get("state") or ""
+                        ).upper()
+                        min_order = decimal_value(market.get("min_order_size")) or Decimal("0")
+
+                        terminal_dust = bool(
+                            existing_state == "DUST"
+                            and existing_position.get("closed_at")
+                            and (
+                                decimal_value(
+                                    existing_position.get("sellable_shares_text")
+                                )
+                                or Decimal("0")
+                            ) <= 0
+                            and min_order > 0
+                            and shares < min_order
+                        )
+                        if terminal_dust:
+                            continue
+
+                        if existing_state in {"RESOLVED_WINNER", "REDEEM_PENDING"}:
+                            corrected = self.strategy_repo.mark_position_resolved(
+                                str(existing_position["position_id"]),
+                                winner=False,
+                                redeem_pending=False,
+                                authoritative=True,
+                            )
+                            after_state = str(corrected.get("state") or "").upper()
+                            if after_state == "RESOLVED_LOSER":
+                                repair = {
+                                    "type": "authoritative_terminal_loser_correction",
+                                    "position_id": existing_position["position_id"],
+                                    "token_id": token_id,
+                                    "before_state": existing_state,
+                                    "after_state": after_state,
+                                }
+                                repairs.append(repair)
+                                self.repo.audit(
+                                    actor,
+                                    "resolved_position_repair",
+                                    "ok",
+                                    "AUTHORITATIVE_TERMINAL_LOSER_CORRECTION",
+                                    repair,
+                                )
+                                continue
+
+                            gaps.append({
+                                "type": "authoritative_terminal_loser_correction_blocked",
+                                "position_id": existing_position["position_id"],
+                                "token_id": token_id,
+                                "before_state": existing_state,
+                                "after_state": after_state,
+                            })
+                            continue
+
+                        if existing_state == "RESOLVED_LOSER":
+                            continue
+
+                        if existing_state == "REDEEMED":
+                            gaps.append({
+                                "type": "redeemed_loser_remote_balance_contradiction",
+                                "position_id": existing_position["position_id"],
+                                "token_id": token_id,
+                            })
+                            continue
+
                     position, changed = self.strategy_repo.reconcile_remote_position(
                         event_id=str(market.get("event_id") or condition_id),
                         condition_id=condition_id,

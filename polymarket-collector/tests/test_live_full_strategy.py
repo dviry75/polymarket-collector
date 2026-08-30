@@ -3462,3 +3462,74 @@ def test_resolved_winner_authoritative_zero_remains_fail_closed():
         ] == "OPEN"
     finally:
         temp.cleanup()
+
+
+
+def test_resolved_loser_closed_dust_positive_balance_is_not_a_gap():
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-loser-terminal-dust",
+        winner_is_local=False,
+        balance="0.006664",
+    )
+    try:
+        with base.connect() as conn:
+            conn.execute(
+                """
+                UPDATE live_strategy_positions
+                SET state='DUST',
+                    remaining_shares_text='0.006664',
+                    sellable_shares_text='0',
+                    dust_shares_text='0.006664',
+                    closed_at='2026-08-01T00:00:00+00:00'
+                WHERE position_id=?
+                """,
+                (position["position_id"],),
+            )
+            conn.commit()
+
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
+
+        assert result["status"] == "ok", result
+        current = strategy.position_for_token(position["token_id"])
+        assert current["state"] == "DUST"
+        assert current["closed_at"]
+
+        assert not any(
+            gap["type"] in {
+                "resolved_loser_authoritative_balance_active",
+                "local_position_missing_remote",
+            }
+            for gap in result["gaps"]
+        )
+    finally:
+        temp.cleanup()
+
+
+def test_authoritative_resolution_corrects_wrong_redeem_pending_to_loser():
+    temp, _base, strategy, _adapter, position = _resolved_position_case(
+        event_id="authoritative-corrects-wrong-terminal-winner",
+        winner_is_local=False,
+        balance="5",
+    )
+    try:
+        wrong = strategy.mark_position_resolved(
+            str(position["position_id"]),
+            winner=True,
+            redeem_pending=True,
+        )
+        assert wrong["state"] == "REDEEM_PENDING"
+        assert int(wrong["resolved_winner"]) == 1
+
+        corrected = strategy.mark_position_resolved(
+            str(position["position_id"]),
+            winner=False,
+            redeem_pending=False,
+            authoritative=True,
+        )
+
+        assert corrected["state"] == "RESOLVED_LOSER"
+        assert int(corrected["resolved_winner"] or 0) == 0
+    finally:
+        temp.cleanup()
