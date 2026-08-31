@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 import json
 import logging
 import re
@@ -2032,14 +2032,15 @@ class LiveStrategyRuntime:
         closes_at = start_epoch + minutes * 60
         return closes_at - datetime.now(timezone.utc).timestamp()
 
-    def _stop_capitulation_due(self, position: dict[str, Any]) -> bool:
-        """True once protected attempts are spent and the window is closing.
+    def _stop_optimistic_submit_allowed(self, purpose: str) -> bool:
+        """Risk exits may be submitted before local sellability is confirmed."""
+        if not self.config.stop_optimistic_submit_enabled:
+            return False
+        name = str(purpose or "").upper()
+        return name == "STOP_066" or name.startswith("EMERGENCY_")
 
-        The protected ladder refuses to sell below its floor. That is correct
-        while there is still time for liquidity to return, but holding a losing
-        binary into resolution realises the full loss, so the floor is dropped
-        for the last seconds of the window.
-        """
+    def _stop_capitulation_due(self, position: dict[str, Any]) -> bool:
+        """Compatibility safety hook retained for historical pause handling."""
         if not self.config.stop_capitulation_enabled:
             return False
         remaining = self._seconds_to_market_close(
@@ -2051,33 +2052,21 @@ class LiveStrategyRuntime:
             self.config.stop_capitulation_seconds_before_close
         )
 
-    def _stop_optimistic_submit_allowed(self, purpose: str) -> bool:
-        """Risk exits may be submitted before local sellability is confirmed."""
-        if not self.config.stop_optimistic_submit_enabled:
-            return False
-        name = str(purpose or "").upper()
-        return name == "STOP_066" or name.startswith("EMERGENCY_")
-
     def _stop_attempt_plan(
         self,
         position: dict[str, Any],
     ) -> dict[str, Any]:
+        """Plan the next aggressive market-equivalent STOP attempt.
+
+        Polymarket implements a SELL market order as a FAK with a minimum
+        price.  A latched STOP therefore uses the lowest configured legal
+        price from the first attempt.  Retry timing and the executable-book
+        hash still prevent a tight duplicate loop, but there is no price
+        ladder or terminal attempt budget: the durable obligation remains
+        active until the position is flat or the market resolves.
+        """
         state = self.repo.stop_attempt_state(str(position["position_id"]))
         attempt_count = int(state.get("attempt_count") or 0)
-        max_attempts = max(1, int(self.config.max_stop_loss_attempts))
-
-        exhausted = attempt_count >= max_attempts
-        # The market deadline outranks the retry counter. Once the configured
-        # emergency window begins, waiting to exhaust protected attempts can
-        # strand a losing binary through resolution.
-        capitulation = self._stop_capitulation_due(position)
-
-        if exhausted and not capitulation:
-            return {
-                "ready": False,
-                "exhausted": True,
-                "attempt_count": attempt_count,
-            }
 
         last_attempt_at = str(state.get("last_attempt_at") or "")
         if last_attempt_at and self.config.stop_loss_retry_delay_ms > 0:
@@ -2093,63 +2082,19 @@ class LiveStrategyRuntime:
                 if elapsed_ms < self.config.stop_loss_retry_delay_ms:
                     return {
                         "ready": False,
-                        "exhausted": False,
                         "attempt_count": attempt_count,
                     }
             except ValueError:
                 return {
                     "ready": False,
-                    "exhausted": False,
                     "attempt_count": attempt_count,
                 }
 
-        if capitulation:
-            # Protected attempts are spent and the window is about to close:
-            # take the best available bid rather than ride the position to
-            # resolution.
-            return {
-                "ready": True,
-                "exhausted": False,
-                "capitulation": True,
-                "attempt_count": attempt_count,
-                "min_price": self.policy.stop_min_price,
-            }
-
-        initial = max(
-            Decimal("0"),
-            min(
-                self.config.stop_loss_initial_slippage,
-                self.config.max_exit_slippage,
-            ),
-        )
-        maximum = max(initial, self.config.max_exit_slippage)
-        if max_attempts == 1:
-            slippage = initial
-        else:
-            slippage = initial + (
-                (maximum - initial)
-                * Decimal(attempt_count)
-                / Decimal(max_attempts - 1)
-            )
-
-        market = self._market(str(position.get("condition_id") or "")) or {}
-        tick = decimal_value(market.get("min_tick_size")) or Decimal("0.01")
-        if tick <= 0:
-            tick = Decimal("0.01")
-        raw_floor = max(
-            self.policy.stop_min_price,
-            self.policy.stop_price - slippage,
-        )
-        floor = (
-            raw_floor / tick
-        ).to_integral_value(rounding=ROUND_DOWN) * tick
-        floor = max(self.policy.stop_min_price, floor)
-
         return {
             "ready": True,
-            "exhausted": False,
             "attempt_count": attempt_count,
-            "min_price": floor,
+            "min_price": self.policy.stop_min_price,
+            "execution_style": "AGGRESSIVE_MARKET_FAK",
         }
 
     def _note_stop_capitulation(
@@ -2191,7 +2136,7 @@ class LiveStrategyRuntime:
         )
 
     def _release_stop_protection_pause(self, position_id: str) -> None:
-        """Clear the exhaustion pause once its position is no longer open."""
+        """Clear a historical exhaustion pause once its position is flat."""
         self._stop_exhausted_positions.discard(position_id)
         self._stop_capitulation_logged.discard(position_id)
         reason = "STOP_EXIT_PRICE_PROTECTION_EXHAUSTED"

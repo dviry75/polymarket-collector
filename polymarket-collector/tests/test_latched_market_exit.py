@@ -171,7 +171,7 @@ def test_02_bid_066_latches_and_market_sells_all():
         assert intents[0]["purpose"] == "STOP_066"
         assert intents[0]["order_type"] == "FAK"
         assert intents[0]["requested_shares_text"] == "5"
-        assert intents[0]["price_limit_text"] == "0.64"
+        assert intents[0]["price_limit_text"] == "0.01"
     finally:
         temp.cleanup()
 
@@ -209,7 +209,7 @@ def test_04_latched_stop_submits_before_local_sellability_is_confirmed():
     Local sellable_shares only turns positive after a reconciliation pass
     reads remote position truth, which trails on-chain settlement of the
     entry by 8-30 seconds. The exchange is the authority on balance, so the
-    SELL goes out immediately at the first protected floor.
+    SELL goes out immediately at the market-equivalent floor.
     """
     adapter = RecordingSellAdapter()
     temp, _base, repo, runtime, position = _case(
@@ -227,7 +227,7 @@ def test_04_latched_stop_submits_before_local_sellability_is_confirmed():
         )
         assert len(adapter.create_calls) == 1
         assert adapter.create_calls[0]["requested_size"] == "5"
-        assert adapter.create_calls[0]["min_price"] == "0.64"
+        assert adapter.create_calls[0]["min_price"] == "0.01"
         assert adapter.create_calls[0]["order_type"] == "FAK"
         assert repo.position_for_token(
             position["token_id"]
@@ -280,8 +280,8 @@ def test_04b_exchange_balance_rejection_waits_and_costs_no_attempt():
             _book(position["token_id"], "0.40", [("0.40", "5")]),
             "sellable-at-040",
         )
-        # Still the first rung: the rejected submission consumed no attempt.
-        assert adapter.create_calls[-1]["min_price"] == "0.64"
+        # Balance propagation must not restore the retired protected ladder.
+        assert adapter.create_calls[-1]["min_price"] == "0.01"
     finally:
         temp.cleanup()
 
@@ -309,7 +309,7 @@ def test_04c_optimistic_submit_can_be_disabled():
     finally:
         temp.cleanup()
 
-def test_05_market_exit_does_not_sweep_below_protected_floor():
+def test_05_market_exit_sweeps_flash_crash_liquidity():
     temp, base, repo, runtime, position = _case("sweep")
     try:
         _manage(
@@ -323,10 +323,10 @@ def test_05_market_exit_does_not_sweep_below_protected_floor():
         )
         current = repo.position_for_token(position["token_id"])
         intent = _exit_intents(base, position["position_id"])[0]
-        assert current["state"] == "EXITING"
-        assert current["remaining_shares_text"] == "5"
-        assert intent["state"] == "ZERO_FILL"
-        assert intent["price_limit_text"] == "0.64"
+        assert current["state"] == "CLOSED"
+        assert current["remaining_shares_text"] == "0"
+        assert intent["state"] == "FILLED"
+        assert intent["price_limit_text"] == "0.01"
     finally:
         temp.cleanup()
 
@@ -663,28 +663,30 @@ def test_16_sellability_refresh_resumes_without_new_market_frame():
 
         assert len(adapter.create_calls) == 1
         assert adapter.create_calls[0]["requested_size"] == "5"
-        assert adapter.create_calls[0]["min_price"] == "0.64"
+        assert adapter.create_calls[0]["min_price"] == "0.01"
     finally:
         temp.cleanup()
 
 
-def test_17_rest_watchdog_latches_and_uses_bounded_retry_ladder():
+def test_17_rest_watchdog_retries_market_floor_when_liquidity_changes():
     adapter = RecordingSellAdapter({
         "success": False,
         "status": "rejected",
         "failure_reason": "FAK_NOT_FILLED",
     })
+    books = iter(("0.60", "0.20", "0.05"))
 
     async def falling_book(token_id):
+        bid = next(books, "0.05")
         return {
             "asset_id": token_id,
-            "bids": [{"price": "0.60", "size": "5"}],
+            "bids": [{"price": bid, "size": "5"}],
             "asks": [],
         }
 
     adapter.get_order_book = falling_book
     temp, base, repo, runtime, position = _case(
-        "rest-ladder",
+        "rest-market-retry",
         paper=False,
         adapter=adapter,
         reconciliation=_ok_reconcile,
@@ -703,9 +705,9 @@ def test_17_rest_watchdog_latches_and_uses_bounded_retry_ladder():
 
         assert repo.position_for_token(position["token_id"])["stop_stage"] == 1
         assert [call["min_price"] for call in adapter.create_calls] == [
-            "0.64",
-            "0.62",
-            "0.61",
+            "0.01",
+            "0.01",
+            "0.01",
         ]
         with base.connect() as conn:
             alert_count = conn.execute(
@@ -715,7 +717,7 @@ def test_17_rest_watchdog_latches_and_uses_bounded_retry_ladder():
                   AND active=1
                 """
             ).fetchone()[0]
-        assert alert_count == 1
+        assert alert_count == 0
     finally:
         temp.cleanup()
 
@@ -726,8 +728,8 @@ def _closing_event_id(seconds_from_now):
     return f"btc-updown-5m-{start}"
 
 
-def _spend_protected_attempts(repo, position, count=3):
-    """Record `count` submitted STOP attempts against the position."""
+def _record_zero_fill_market_attempts(repo, position, count=3):
+    """Record prior market-style zero fills against the durable STOP."""
     for index in range(count):
         intent = repo.reserve_position_intent(
             position,
@@ -735,7 +737,7 @@ def _spend_protected_attempts(repo, position, count=3):
             purpose="STOP_066",
             order_type="FAK",
             shares=Decimal("5"),
-            price_limit=Decimal("0.61"),
+            price_limit=Decimal("0.01"),
             book_hash=f"attempt-{index}",
         )
         repo.update_intent(
@@ -755,149 +757,126 @@ def _spend_protected_attempts(repo, position, count=3):
             conn.commit()
 
 
-def test_20_capitulation_drops_the_floor_near_market_close():
-    """A spent ladder must not ride a losing binary into resolution."""
+def test_20_prior_zero_fills_never_exhaust_the_stop_obligation():
     temp, _base, repo, runtime, position = _case(
-        "capitulation",
+        "unbounded-market-obligation",
         event_id=_closing_event_id(30),
     )
     try:
-        _spend_protected_attempts(repo, position)
+        _record_zero_fill_market_attempts(repo, position)
         position = repo.position_for_token(position["token_id"])
         plan = runtime._stop_attempt_plan(position)
         assert plan["ready"] is True
-        assert plan["capitulation"] is True
+        assert plan["min_price"] == Decimal("0.01")
+        assert plan["execution_style"] == "AGGRESSIVE_MARKET_FAK"
+        assert "exhausted" not in plan
+    finally:
+        temp.cleanup()
+
+
+def test_21_market_floor_is_immediate_long_before_close():
+    temp, _base, repo, runtime, position = _case(
+        "market-early",
+        event_id=_closing_event_id(200),
+    )
+    try:
+        plan = runtime._stop_attempt_plan(position)
+        assert plan["ready"] is True
         assert plan["min_price"] == Decimal("0.01")
     finally:
         temp.cleanup()
 
 
-def test_21_no_capitulation_while_the_window_is_still_open():
+def test_22_legacy_capitulation_flag_cannot_restore_price_protection():
     temp, _base, repo, runtime, position = _case(
-        "capitulation-early",
-        event_id=_closing_event_id(200),
-    )
-    try:
-        _spend_protected_attempts(repo, position)
-        position = repo.position_for_token(position["token_id"])
-        plan = runtime._stop_attempt_plan(position)
-        assert plan["ready"] is False
-        assert plan["exhausted"] is True
-    finally:
-        temp.cleanup()
-
-
-def test_22_capitulation_can_be_disabled():
-    temp, _base, repo, runtime, position = _case(
-        "capitulation-off",
+        "legacy-capitulation-off",
         event_id=_closing_event_id(30),
         config_overrides={"stop_capitulation_enabled": False},
     )
     try:
-        _spend_protected_attempts(repo, position)
-        position = repo.position_for_token(position["token_id"])
         plan = runtime._stop_attempt_plan(position)
-        assert plan["ready"] is False
-        assert plan["exhausted"] is True
+        assert plan["ready"] is True
+        assert plan["min_price"] == Decimal("0.01")
     finally:
         temp.cleanup()
 
 
-def test_23_unparseable_slug_keeps_the_protected_floor():
+def test_23_unparseable_slug_still_uses_market_floor():
     temp, _base, repo, runtime, position = _case(
-        "capitulation-unknown-slug",
+        "market-unknown-slug",
     )
     try:
-        _spend_protected_attempts(repo, position)
-        position = repo.position_for_token(position["token_id"])
         assert runtime._seconds_to_market_close(position["event_id"]) is None
         plan = runtime._stop_attempt_plan(position)
-        assert plan["ready"] is False
-        assert plan["exhausted"] is True
+        assert plan["ready"] is True
+        assert plan["min_price"] == Decimal("0.01")
     finally:
         temp.cleanup()
 
 
-def test_24_exhaustion_pause_is_released_once_the_position_is_flat():
-    temp, _base, repo, runtime, position = _case("exhaustion-release")
+def test_24_restart_recovery_keeps_market_style_stop():
+    temp, base, repo, runtime, position = _case("restart-market-style")
     try:
-        # Clear the startup pause: a MANUAL_ONLY cause outranks this one.
-        repo.set_pause_entries(False, "operator", "TEST_SETUP")
-        runtime._stop_protection_exhausted(position)
-        record = repo.pause_record()
-        assert record["pause_entries"] is True
-        assert record["pause_cause"] == "STOP_EXIT_PRICE_PROTECTION_EXHAUSTED"
-        assert position["position_id"] in runtime._stop_exhausted_positions
+        repo.latch_stop_exit(position["position_id"])
+        restarted_repo = StrategyRepository(base)
+        restarted = LiveStrategyRuntime(
+            runtime.config,
+            base,
+            restarted_repo,
+            MockTradingAdapter(),
+            reconciliation=_ok_reconcile,
+        )
+        _manage(
+            restarted,
+            _book(position["token_id"], "0.05", [("0.05", "5")]),
+            "restart-flash-crash",
+        )
+        current = restarted_repo.position_for_token(position["token_id"])
+        intent = _exit_intents(base, position["position_id"])[0]
+        assert current["state"] == "CLOSED"
+        assert current["stop_stage"] == 1
+        assert intent["price_limit_text"] == "0.01"
+    finally:
+        temp.cleanup()
 
-        # The position flattens; nothing is left to protect.
+
+def test_25_zero_liquidity_stays_managed_then_retries_new_liquidity():
+    adapter = RecordingSellAdapter({
+        "success": False,
+        "status": "rejected",
+        "failure_reason": "FAK_NOT_FILLED",
+    })
+    temp, _base, repo, runtime, position = _case(
+        "zero-then-return",
+        paper=False,
+        adapter=adapter,
+        reconciliation=_ok_reconcile,
+    )
+    try:
         _manage(
             runtime,
             _book(position["token_id"], "0.66", [("0.66", "5")]),
-            "flatten",
+            "trigger-zero-fill",
         )
-        assert repo.position_for_token(
-            position["token_id"]
-        )["state"] == "CLOSED"
-        asyncio.run(runtime._refresh_hot_state_once())
-        asyncio.run(runtime._drive_latched_exits_once())
-
-        released = repo.pause_record()
-        assert released["pause_entries"] is False
-        assert position["position_id"] not in runtime._stop_exhausted_positions
-    finally:
-        temp.cleanup()
-
-
-def test_25_capitulation_sells_into_a_thin_book_before_close():
-    """End to end: spent ladder + closing window => the position flattens."""
-    temp, base, repo, runtime, position = _case(
-        "capitulation-e2e",
-        event_id=_closing_event_id(20),
-    )
-    try:
-        repo.latch_stop_exit(position["position_id"])
-        _spend_protected_attempts(repo, position)
+        managed = repo.position_for_token(position["token_id"])
+        assert managed["state"] == "EXITING"
+        assert managed["stop_stage"] == 1
         asyncio.run(runtime._refresh_hot_state_once())
         _manage(
             runtime,
-            _book(position["token_id"], "0.30", [("0.30", "5")]),
-            "capitulate",
+            _book(position["token_id"], None, []),
+            "no-liquidity",
         )
-        closed = repo.position_for_token(position["token_id"])
-        assert closed["state"] == "CLOSED"
-        assert closed["remaining_shares_text"] == "0"
-
-        with base.connect() as conn:
-            reasons = [
-                row["reason_code"]
-                for row in conn.execute(
-                    "SELECT reason_code FROM live_audit_timeline "
-                    "WHERE event_id=? ORDER BY id",
-                    (position["event_id"],),
-                ).fetchall()
-            ]
-        assert "STOP_EXIT_CAPITULATION_BEFORE_CLOSE" in reasons
-    finally:
-        temp.cleanup()
-
-
-def test_26_protected_floor_still_refuses_a_thin_book_mid_window():
-    """The same book, with time left, must not be swept."""
-    temp, _base, repo, runtime, position = _case(
-        "capitulation-e2e-early",
-        event_id=_closing_event_id(200),
-    )
-    try:
-        repo.latch_stop_exit(position["position_id"])
-        _spend_protected_attempts(repo, position)
-        asyncio.run(runtime._refresh_hot_state_once())
         _manage(
             runtime,
-            _book(position["token_id"], "0.30", [("0.30", "5")]),
-            "no-capitulation",
+            _book(position["token_id"], "0.05", [("0.05", "5")]),
+            "liquidity-returned",
         )
-        held = repo.position_for_token(position["token_id"])
-        assert held["state"] != "CLOSED"
-        assert held["remaining_shares_text"] == "5"
+        assert len(adapter.create_calls) == 2
+        assert [call["min_price"] for call in adapter.create_calls] == [
+            "0.01",
+            "0.01",
+        ]
+        assert repo.position_for_token(position["token_id"])["stop_stage"] == 1
     finally:
         temp.cleanup()
