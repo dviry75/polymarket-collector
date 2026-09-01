@@ -3793,6 +3793,9 @@ class StrategyRepository:
 
     def mark_position_redeemed(self, position_id: str, transaction_hash: str) -> dict[str, Any]:
         ts = now_iso()
+        transaction_hash = str(transaction_hash or "").strip()
+        if not transaction_hash:
+            raise ValueError("redemption transaction hash is required")
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -3801,6 +3804,13 @@ class StrategyRepository:
             if row is None:
                 conn.rollback()
                 raise KeyError(position_id)
+            if (
+                str(row["state"] or "").upper()
+                not in {"REDEEM_PENDING", "RESOLVED_WINNER"}
+                or int(row["resolved_winner"] or 0) != 1
+            ):
+                conn.rollback()
+                raise ValueError("position is not a verified resolved winner")
             conn.execute(
                 """
                 UPDATE live_strategy_positions SET state='REDEEMED',
@@ -3821,6 +3831,16 @@ class StrategyRepository:
                 "UPDATE live_event_states SET status='CLOSED',updated_at=? WHERE event_id=?",
                 (ts, row["event_id"]),
             )
+            redemption_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='live_redemptions'"
+            ).fetchone()
+            if redemption_table is not None:
+                conn.execute(
+                    "UPDATE live_redemptions SET transaction_hash=?,completed_at=?,"
+                    "verification_status='VERIFIED' WHERE position_id=?",
+                    (transaction_hash, ts, position_id),
+                )
             updated = conn.execute(
                 "SELECT * FROM live_strategy_positions WHERE position_id=?", (position_id,)
             ).fetchone()

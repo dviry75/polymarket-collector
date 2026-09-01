@@ -84,6 +84,39 @@ class PublicAccountIdentityClient:
             raw_public_payload={"positions_sample": positions[:5], "trades_sample": trades[:5] if isinstance(trades, list) else []},
         )
 
+    async def redemption_activity(
+        self, profile_address: str, condition_id: str
+    ) -> list[dict[str, Any]]:
+        """Return public on-chain redemption evidence for one account/market."""
+        if not self.validate_address(profile_address):
+            raise ValueError("invalid profile address")
+        if not re.match(r"^0x[a-fA-F0-9]{64}$", condition_id or ""):
+            raise ValueError("invalid condition id")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(
+                    f"{self.data_host}/activity",
+                    params={
+                        "user": profile_address,
+                        "market": condition_id,
+                        "type": "REDEEM",
+                        "limit": 100,
+                        "sortBy": "TIMESTAMP",
+                        "sortDirection": "DESC",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise RuntimeError("public redemption request timed out") from exc
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"public redemption request failed: HTTP {exc.response.status_code}"
+            ) from exc
+        if not isinstance(payload, list):
+            raise RuntimeError("public redemption response was not a list")
+        return [dict(item) for item in payload if isinstance(item, dict)]
+
 
 class MockPublicAccountIdentityClient(PublicAccountIdentityClient):
     async def resolve(self, profile_address: str) -> AccountIdentityResult:

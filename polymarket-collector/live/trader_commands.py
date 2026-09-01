@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from .account_identity import MockPublicAccountIdentityClient, PublicAccountIdentityClient
@@ -10,6 +11,42 @@ from .pause_recovery import PauseRecoveryCoordinator, request_manual_resume
 from .repository import now_iso
 from .secrets import EnvSecretProvider, GoogleSecretManagerProvider, secret_readiness
 from .strategy_repository import sanitize
+
+
+REDEMPTION_SIZE_TOLERANCE = Decimal("0.0001")
+
+
+def select_verified_redemption(
+    activities: list[dict[str, Any]],
+    *,
+    wallet: str,
+    condition_id: str,
+    token_id: str,
+    remaining_shares: Decimal,
+) -> dict[str, Any] | None:
+    """Select exact public redemption proof; reject approximate identities."""
+    for item in activities:
+        if str(item.get("type") or "").upper() != "REDEEM":
+            continue
+        if str(item.get("proxyWallet") or "").lower() != wallet.lower():
+            continue
+        if str(item.get("conditionId") or "").lower() != condition_id.lower():
+            continue
+        if str(item.get("asset") or "") != token_id:
+            continue
+        transaction_hash = str(item.get("transactionHash") or "")
+        try:
+            redeemed_shares = Decimal(str(item.get("size")))
+        except Exception:
+            continue
+        if not transaction_hash.startswith("0x") or len(transaction_hash) != 66:
+            continue
+        if redeemed_shares < remaining_shares:
+            continue
+        if redeemed_shares - remaining_shares > REDEMPTION_SIZE_TOLERANCE:
+            continue
+        return {**item, "redeemed_shares": str(redeemed_shares)}
+    return None
 
 
 class TraderCommandHandler:
@@ -150,6 +187,115 @@ class TraderCommandHandler:
             return sanitize({
                 "ok": reconciliation_result.get("status") == "ok",
                 "recovery": recovery,
+                "reconciliation": reconciliation_result,
+            })
+        if command == "RESOLVE_REDEEMED_POSITION":
+            position_id = str(payload.get("position_id") or "")
+            position = next(
+                (
+                    item for item in strategy_repo.active_positions()
+                    if str(item.get("position_id") or "") == position_id
+                ),
+                None,
+            )
+            if position is None:
+                raise KeyError(position_id)
+            condition_id = str(position.get("condition_id") or "")
+            token_id = str(position.get("token_id") or "")
+            remaining = Decimal(
+                str(position.get("remaining_shares_text") or "0")
+            )
+            market = repo.latest_market(condition_id)
+            if (
+                not market
+                or not bool(market.get("market_resolved"))
+                or str(market.get("winning_asset_id") or "") != token_id
+            ):
+                raise RuntimeError(
+                    "position is not the verified market winner"
+                )
+            unresolved = [
+                item for item in strategy_repo.unresolved_intents()
+                if str(item.get("position_id") or "") == position_id
+            ]
+            if unresolved:
+                raise RuntimeError("position has unresolved execution intents")
+            identity = await adapter.identity_preflight()
+            if str(identity.get("status") or "").upper() != "VERIFIED":
+                raise RuntimeError("account identity is not verified")
+            wallet = str(identity.get("wallet") or "")
+            if not wallet:
+                raise RuntimeError("verified account wallet is missing")
+            authoritative_balance = await authoritative_token_balance(
+                adapter, token_id
+            )
+            if authoritative_balance != Decimal("0"):
+                raise RuntimeError(
+                    "authoritative token balance is not zero"
+                )
+            matching_open_orders = [
+                order for order in await adapter.get_open_orders()
+                if (
+                    str(order.get("token_id") or "") == token_id
+                    or str(order.get("condition_id") or "") == condition_id
+                )
+            ]
+            if matching_open_orders:
+                raise RuntimeError("matching remote order is still open")
+            activity = await PublicAccountIdentityClient(
+                config.data_api_host
+            ).redemption_activity(wallet, condition_id)
+            proof = select_verified_redemption(
+                activity,
+                wallet=wallet,
+                condition_id=condition_id,
+                token_id=token_id,
+                remaining_shares=remaining,
+            )
+            if proof is None:
+                raise RuntimeError(
+                    "matching public redemption proof was not found"
+                )
+            resolved = strategy_repo.mark_position_resolved(
+                position_id,
+                winner=True,
+                redeem_pending=True,
+                authoritative=True,
+            )
+            if str(resolved.get("state") or "").upper() != "REDEEM_PENDING":
+                raise RuntimeError(
+                    "position did not enter redeem-pending state"
+                )
+            transaction_hash = str(proof["transactionHash"])
+            redeemed = strategy_repo.mark_position_redeemed(
+                position_id, transaction_hash
+            )
+            repo.audit(
+                str(payload.get("actor") or "operator"),
+                "verified_external_redemption_recovery",
+                "ok",
+                "PUBLIC_REDEMPTION_AND_ZERO_BALANCE_VERIFIED",
+                {
+                    "position_id": position_id,
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "transaction_hash": transaction_hash,
+                    "redeemed_shares": proof.get("redeemed_shares"),
+                    "authoritative_balance": "0",
+                },
+            )
+            reconciliation_result = await reconciliation_coordinator().request(
+                actor="operator:external_redemption_recovery",
+                evidence_changed=True,
+                force=True,
+            )
+            return sanitize({
+                "ok": reconciliation_result.get("status") == "ok",
+                "position": redeemed,
+                "redemption": {
+                    "transaction_hash": transaction_hash,
+                    "redeemed_shares": proof.get("redeemed_shares"),
+                },
                 "reconciliation": reconciliation_result,
             })
         if command == "CREATE_RULE":
