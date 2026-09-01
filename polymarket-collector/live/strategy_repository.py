@@ -703,6 +703,234 @@ class StrategyRepository:
             )
         return repaired
 
+    def terminalize_exit_residue(
+        self,
+        *,
+        position_id: str,
+        authoritative_balance: Decimal,
+        min_order_size: Decimal,
+        actor: str,
+        evidence_source: str,
+        market_resolved: bool = False,
+        winning_asset_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Close a proven, non-actionable post-exit remainder as DUST.
+
+        This is deliberately narrower than generic DUST handling. A partial
+        entry, an unresolved/unknown SELL, a winner awaiting redemption, or a
+        remainder large enough for a legal order stays fail-closed.
+        """
+        reason = "TERMINAL_EXIT_RESIDUE_BELOW_MIN_ORDER"
+        ts = now_iso()
+        blockers: list[str] = []
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            position = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (str(position_id),),
+            ).fetchone()
+            if position is None:
+                conn.rollback()
+                raise KeyError(position_id)
+
+            before = row_to_dict(position) or {}
+            state = str(position["state"] or "").upper()
+            token_id = str(position["token_id"] or "")
+            remaining = (
+                decimal_value(position["remaining_shares_text"])
+                or Decimal("0")
+            )
+            if state != "EXITING":
+                blockers.append("POSITION_NOT_POST_EXITING")
+            if remaining <= 0:
+                blockers.append("NO_POSITIVE_RESIDUE")
+            if min_order_size <= 0 or remaining >= min_order_size:
+                blockers.append("RESIDUE_IS_ACTIONABLE")
+            if authoritative_balance < 0 or authoritative_balance != remaining:
+                blockers.append("AUTHORITATIVE_BALANCE_MISMATCH")
+            if (
+                market_resolved
+                and winning_asset_id
+                and token_id == str(winning_asset_id)
+            ):
+                blockers.append("RESOLVED_WINNER_REQUIRES_REDEMPTION")
+
+            intent_rows = conn.execute(
+                "SELECT * FROM live_strategy_intents WHERE position_id=? "
+                "AND action IN ('EXIT','TP') ORDER BY created_at",
+                (str(position_id),),
+            ).fetchall()
+            unresolved = [
+                row for row in intent_rows
+                if str(row["state"] or "").upper() not in FINAL_INTENT_STATES
+            ]
+            if unresolved:
+                blockers.append("UNRESOLVED_EXIT_INTENT")
+                if any(
+                    row["submitted_at"]
+                    or row["remote_order_id"]
+                    or "RECONCILIATION" in str(row["state"] or "").upper()
+                    or "UNKNOWN" in str(row["normalized_error"] or "").upper()
+                    for row in unresolved
+                ):
+                    blockers.append("UNRESOLVED_SUBMITTED_SELL")
+
+            intents_by_id = {
+                str(row["intent_id"]): row for row in intent_rows
+            }
+            for pointer in (
+                position["active_exit_intent_id"], position["tp_intent_id"]
+            ):
+                if not pointer:
+                    continue
+                linked = intents_by_id.get(str(pointer))
+                if linked is None:
+                    blockers.append("ORPHANED_EXIT_INTENT_POINTER")
+                elif str(linked["state"] or "").upper() not in FINAL_INTENT_STATES:
+                    blockers.append("ACTIVE_EXIT_INTENT_POINTER")
+
+            confirmed_exit_intent_id = ""
+            for intent in intent_rows:
+                intent_id = str(intent["intent_id"])
+                if (
+                    str(intent["state"] or "").upper() not in FINAL_INTENT_STATES
+                    or (
+                        decimal_value(intent["filled_shares_text"])
+                        or Decimal("0")
+                    ) <= 0
+                ):
+                    continue
+                fill_rows = conn.execute(
+                    "SELECT shares_text FROM live_strategy_fills "
+                    "WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchall()
+                durable_filled = sum(
+                    (
+                        decimal_value(fill["shares_text"])
+                        or Decimal("0")
+                        for fill in fill_rows
+                    ),
+                    Decimal("0"),
+                )
+                if durable_filled > 0:
+                    confirmed_exit_intent_id = intent_id
+                    break
+            if not confirmed_exit_intent_id or (
+                decimal_value(position["exit_value_text"])
+                or Decimal("0")
+            ) <= 0:
+                blockers.append("CONFIRMED_PARTIAL_EXIT_REQUIRED")
+
+            quarantine = conn.execute(
+                "SELECT quarantine_id FROM live_quarantines "
+                "WHERE status='OPEN' AND (position_id=? OR token_id=?) LIMIT 1",
+                (str(position_id), token_id),
+            ).fetchone()
+            if quarantine is not None:
+                blockers.append("OPEN_QUARANTINE")
+
+            blockers = list(dict.fromkeys(blockers))
+            if blockers:
+                conn.rollback()
+                return {
+                    "status": "not_eligible",
+                    "position_id": str(position_id),
+                    "blockers": blockers,
+                }
+
+            # Preserve all partial-exit accounting. The residue was not sold;
+            # only its lifecycle/risk classification changes.
+            conn.execute(
+                """
+                UPDATE live_strategy_positions
+                SET state='DUST',
+                    dust_shares_text=remaining_shares_text,
+                    active_exit_intent_id=NULL,
+                    tp_intent_id=NULL,
+                    exit_obligation_reason=?,
+                    closed_at=COALESCE(closed_at,?),
+                    updated_at=?
+                WHERE position_id=? AND state='EXITING'
+                """,
+                (reason, ts, ts, str(position_id)),
+            )
+            conn.execute(
+                """
+                UPDATE live_strategy_deals
+                SET state='DUST',final_reason=?,
+                    closed_at=COALESCE(closed_at,?),updated_at=?
+                WHERE event_id=?
+                """,
+                (reason, ts, ts, str(position["event_id"])),
+            )
+            conn.execute(
+                "UPDATE live_event_states SET status='DUST',updated_at=? "
+                "WHERE event_id=?",
+                (ts, str(position["event_id"])),
+            )
+            updated = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (str(position_id),),
+            ).fetchone()
+            after = row_to_dict(updated) or {}
+            audit_evidence = sanitize({
+                "position_id": str(position_id),
+                "before": before,
+                "after": after,
+                "remaining": canonical_decimal(remaining),
+                "min_order_size": canonical_decimal(min_order_size),
+                "authoritative_balance": canonical_decimal(
+                    authoritative_balance
+                ),
+                "evidence_source": str(evidence_source),
+                "confirmed_exit_intent_id": confirmed_exit_intent_id,
+                "market_resolved": bool(market_resolved),
+                "winning_asset_id": str(winning_asset_id or ""),
+            })
+            conn.execute(
+                "INSERT INTO live_audit_log "
+                "(occurred_at,actor,action,status,reason,details_json) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    ts, actor, "terminalize_exit_residue", "ok", reason,
+                    json.dumps(audit_evidence, sort_keys=True),
+                ),
+            )
+            conn.commit()
+
+        self.timeline(
+            severity="INFO",
+            category="RECONCILIATION",
+            component="strategy_state_repair",
+            source=actor,
+            event_id=str(before.get("event_id") or ""),
+            condition_id=str(before.get("condition_id") or ""),
+            token_id=token_id,
+            side=str(before.get("outcome") or ""),
+            deal_id=stable_id("deal", str(before.get("event_id") or "")),
+            requested_action="TERMINALIZE_EXIT_RESIDUE",
+            reason_code=reason,
+            previous_state=state,
+            new_state="DUST",
+            result_status="REPAIRED",
+            remaining_shares_text=canonical_decimal(remaining),
+            parameters_json=audit_evidence,
+        )
+        return {
+            "status": "repaired",
+            "type": "terminal_exit_residue",
+            "reason": reason,
+            "position_id": str(position_id),
+            "before_state": state,
+            "after_state": "DUST",
+            "remaining": canonical_decimal(remaining),
+            "min_order_size": canonical_decimal(min_order_size),
+            "authoritative_balance": canonical_decimal(
+                authoritative_balance
+            ),
+        }
+
     def hot_state_snapshot(self) -> dict[str, Any]:
         """Load latency-sensitive strategy state using one SQLite connection.
 
@@ -2311,7 +2539,20 @@ class StrategyRepository:
     def entry_blocking_positions(
         self, token_id: str | None = None
     ) -> list[dict[str, Any]]:
-        return self._positions_in_states(OPEN_POSITION_STATES, token_id)
+        query = (
+            "SELECT * FROM live_strategy_positions WHERE "
+            "(state IN ('OPEN','TP_OPEN','EXITING',"
+            "'EXIT_RECONCILIATION_REQUIRED') "
+            "OR (state='DUST' AND closed_at IS NULL))"
+        )
+        params: tuple[Any, ...] = ()
+        if token_id is not None:
+            query += " AND token_id=?"
+            params = (str(token_id),)
+        query += " ORDER BY created_at"
+        with self.base.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [row_to_dict(row) or {} for row in rows]
 
     def fast_reconciliation_positions(self) -> list[dict[str, Any]]:
         return self.entry_blocking_positions()
@@ -2320,8 +2561,17 @@ class StrategyRepository:
         return self._positions_in_states({"QUARANTINED"})
 
     def active_positions(self, token_id: str | None = None) -> list[dict[str, Any]]:
-        """Backward-compatible risk-managed view; quarantines stay visible."""
-        return self.risk_managed_positions(token_id)
+        """Actionable positions; terminal DUST remains in risk-managed history."""
+        rows = [
+            *self.entry_blocking_positions(token_id),
+            *self.quarantined_positions(),
+        ]
+        if token_id is not None:
+            rows = [
+                row for row in rows
+                if str(row.get("token_id") or "") == str(token_id)
+            ]
+        return sorted(rows, key=lambda row: str(row.get("created_at") or ""))
 
     def quarantine_records(
         self, *, status: str = "OPEN", limit: int = 200
@@ -2606,7 +2856,7 @@ class StrategyRepository:
 
     def exposure(self) -> Decimal:
         total = Decimal("0")
-        for position in self.risk_managed_positions():
+        for position in self.active_positions():
             remaining = decimal_value(position["remaining_shares_text"]) or Decimal("0")
             acquired = decimal_value(position["acquired_shares_text"]) or Decimal("0")
             cost = decimal_value(position["cost_all_in_text"]) or Decimal("0")

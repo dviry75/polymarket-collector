@@ -435,8 +435,8 @@ def _supervisor_case(n_dust, *, closed_dust=True):
     return temp, runtime, order, concurrency
 
 
-def test_K_supervisor_evaluates_active_open_before_historical_dust():
-    temp, runtime, order, _c = _supervisor_case(30, closed_dust=True)
+def test_G_fifty_terminal_dust_positions_never_precede_one_open():
+    temp, runtime, order, _c = _supervisor_case(50, closed_dust=True)
     try:
         asyncio.run(runtime._drive_latched_exits_once())
         assert "active" in order

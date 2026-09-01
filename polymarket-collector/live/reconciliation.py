@@ -794,6 +794,24 @@ class ReconciliationWorker:
                     if terminal_dust:
                         handled_tokens.add(token_id)
                         continue
+                    if local_state == "EXITING":
+                        residue_repair = (
+                            self.strategy_repo.terminalize_exit_residue(
+                                position_id=str(local["position_id"]),
+                                authoritative_balance=observed,
+                                min_order_size=min_order,
+                                actor=actor,
+                                evidence_source=evidence_source,
+                                market_resolved=bool(
+                                    market.get("market_resolved")
+                                ),
+                                winning_asset_id=winner_token,
+                            )
+                        )
+                        if residue_repair.get("status") == "repaired":
+                            repairs.append(residue_repair)
+                            handled_tokens.add(token_id)
+                            continue
                     acquired_local = (
                         decimal_value(local.get("acquired_shares_text"))
                         or Decimal("0")
