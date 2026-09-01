@@ -191,6 +191,36 @@ class StrategyRepository:
                     FOREIGN KEY(intent_id) REFERENCES live_strategy_intents(intent_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS live_strategy_entry_audit (
+                    intent_id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    condition_id TEXT,
+                    token_id TEXT,
+                    side TEXT,
+                    signal_price_text TEXT,
+                    signal_observed_at TEXT,
+                    signal_exchange_timestamp_ms INTEGER,
+                    signal_book_generation INTEGER,
+                    signal_book_hash TEXT,
+                    signal_market_age_ms INTEGER,
+                    revalidation_result TEXT,
+                    revalidation_ask_text TEXT,
+                    revalidation_age_ms INTEGER,
+                    revalidation_generation INTEGER,
+                    signal_age_ms INTEGER,
+                    submitted_at TEXT,
+                    clob_status TEXT,
+                    fill_price_text TEXT,
+                    fill_shares_text TEXT,
+                    signal_to_fill_ms INTEGER,
+                    fill_deviation_text TEXT,
+                    entry_validity TEXT,
+                    hot_state_published_at TEXT,
+                    first_exit_evaluation_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS live_strategy_positions (
                     position_id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,
@@ -369,6 +399,28 @@ class StrategyRepository:
                     conn.execute(
                         f"ALTER TABLE live_alerts ADD COLUMN {column} {definition}"
                     )
+            # P0 hardening — additive position columns for the invalid-entry
+            # exit obligation and durable entry-policy classification.
+            position_columns = {
+                "entry_policy_status": "TEXT NOT NULL DEFAULT 'VALID'",
+                "exit_obligation_reason": "TEXT",
+            }
+            existing_position_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(live_strategy_positions)"
+                ).fetchall()
+            }
+            for column, definition in position_columns.items():
+                if column not in existing_position_columns:
+                    conn.execute(
+                        "ALTER TABLE live_strategy_positions "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_entry_audit_event "
+                "ON live_strategy_entry_audit(event_id, created_at DESC)"
+            )
             conn.execute(
                 "UPDATE live_alerts SET status=CASE "
                 "WHEN active=1 THEN 'OPEN' "
@@ -2619,6 +2671,127 @@ class StrategyRepository:
             **(row_to_dict(updated) or {}),
             "_newly_latched": newly_latched,
         }
+
+    def latch_invalid_entry_exit(
+        self,
+        position_id: str,
+        *,
+        reason: str = "EMERGENCY_INVALID_ENTRY",
+    ) -> dict[str, Any]:
+        """Durably latch an aggressive liquidation for a fill that broke entry
+        policy (e.g. signal 0.74 -> fill 0.36). Reuses the latched-stop
+        machinery: sets stop_stage>=1 and an exit obligation that the strategy
+        drives at the emergency floor immediately, without waiting for the
+        0.66 STOP threshold.
+        """
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (position_id,),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                raise KeyError(position_id)
+            remaining = (
+                decimal_value(current["remaining_shares_text"]) or Decimal("0")
+            )
+            prior_stage = int(current["stop_stage"] or 0)
+            newly_latched = (
+                prior_stage < 1
+                or str(current["entry_policy_status"] or "VALID") != "OUTSIDE_POLICY"
+            ) and remaining > 0
+            if remaining > 0:
+                conn.execute(
+                    """
+                    UPDATE live_strategy_positions
+                    SET stop_stage=MAX(stop_stage,1),
+                        entry_policy_status='OUTSIDE_POLICY',
+                        exit_obligation_reason=?,
+                        state=CASE
+                            WHEN state='EXIT_RECONCILIATION_REQUIRED'
+                                THEN state
+                            ELSE 'EXITING'
+                        END,
+                        updated_at=?
+                    WHERE position_id=?
+                    """,
+                    (reason, ts, position_id),
+                )
+                conn.execute(
+                    "UPDATE live_event_states SET status='EXITING',updated_at=? "
+                    "WHERE event_id=?",
+                    (ts, current["event_id"]),
+                )
+            updated = conn.execute(
+                "SELECT * FROM live_strategy_positions WHERE position_id=?",
+                (position_id,),
+            ).fetchone()
+            conn.commit()
+        return {
+            **(row_to_dict(updated) or {}),
+            "_newly_latched": newly_latched,
+        }
+
+    def record_entry_audit(
+        self,
+        intent_id: str,
+        *,
+        event_id: str,
+        condition_id: str | None = None,
+        token_id: str | None = None,
+        side: str | None = None,
+        **fields: Any,
+    ) -> None:
+        """Create or refresh the per-entry decision/execution audit row."""
+        allowed = {
+            "signal_price_text", "signal_observed_at",
+            "signal_exchange_timestamp_ms", "signal_book_generation",
+            "signal_book_hash", "signal_market_age_ms", "revalidation_result",
+            "revalidation_ask_text", "revalidation_age_ms",
+            "revalidation_generation", "signal_age_ms", "submitted_at",
+            "clob_status", "fill_price_text", "fill_shares_text",
+            "signal_to_fill_ms", "fill_deviation_text", "entry_validity",
+            "hot_state_published_at", "first_exit_evaluation_at",
+        }
+        payload = {key: fields[key] for key in fields if key in allowed}
+        ts = now_iso()
+        columns = ["intent_id", "event_id", "condition_id", "token_id", "side",
+                   "created_at", "updated_at", *payload.keys()]
+        values = [intent_id, event_id, condition_id, token_id, side, ts, ts,
+                  *payload.values()]
+        updates = ",".join(f"{key}=excluded.{key}" for key in payload)
+        set_clause = f"updated_at=excluded.updated_at,{updates}" if updates else "updated_at=excluded.updated_at"
+        placeholders = ",".join("?" for _ in columns)
+        with self.base.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO live_strategy_entry_audit({",".join(columns)})
+                VALUES({placeholders})
+                ON CONFLICT(intent_id) DO UPDATE SET {set_clause}
+                """,
+                values,
+            )
+            conn.commit()
+
+    def entry_audit(self, intent_id: str) -> dict[str, Any] | None:
+        if not intent_id:
+            return None
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM live_strategy_entry_audit WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def entry_intent_id_for_event(self, event_id: str) -> str:
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT entry_intent_id FROM live_event_states WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        return str(row["entry_intent_id"]) if row and row["entry_intent_id"] else ""
 
     def require_exit_reconciliation(
         self,

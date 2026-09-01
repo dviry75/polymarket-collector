@@ -3039,6 +3039,7 @@ class UserWebSocketManager:
                  reconciliation: Callable[..., Awaitable[Any]] | None = None,
                  condition_ids_provider: Callable[[], list[str]] | None = None,
                  market_provider: Callable[[str], dict[str, Any] | None] | None = None,
+                 on_trade_hint: Callable[[str], Awaitable[Any]] | None = None,
                  event_queue_capacity: int = 1024):
         self.repo, self.stale_after_seconds = repo, stale_after_seconds
         self.status = WebSocketStatus(channel="user", status="DISABLED")
@@ -3050,6 +3051,7 @@ class UserWebSocketManager:
         self._ws = None
         self._lock = asyncio.Lock()
         self._reconciliation = reconciliation
+        self._on_trade_hint = on_trade_hint
         try:
             self._reconciliation_accepts_reason = bool(
                 reconciliation is not None
@@ -3329,6 +3331,22 @@ class UserWebSocketManager:
                 )
             except RuntimeError:
                 pass
+        # P0-C: a trade event is authoritative fill evidence. Nudge the
+        # strategy runtime to publish/evaluate the position immediately,
+        # independent of the reconciliation coordinator's own cadence.
+        if (
+            stored
+            and normalized.get("event_type") == "trade"
+            and self._on_trade_hint is not None
+        ):
+            token_id = str(normalized.get("asset_id") or "")
+            if token_id:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._on_trade_hint(token_id)
+                    )
+                except RuntimeError:
+                    pass
         self.status.status, self.status.last_message_at, self.status.stale = "CONNECTED", now_iso(), False
         self._persist_state()
         return stored

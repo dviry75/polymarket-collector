@@ -26,12 +26,45 @@ class ExitSupervisionTracker:
         *,
         monitor_sla_seconds: float,
         waiting_sla_seconds: float,
+        first_eval_sla_seconds: float = 2.0,
+        stop_to_submit_sla_seconds: float = 2.0,
     ):
         self.repo = repo
         self.monitor_sla_seconds = float(monitor_sla_seconds)
         self.waiting_sla_seconds = float(waiting_sla_seconds)
+        self.first_eval_sla_seconds = float(first_eval_sla_seconds)
+        self.stop_to_submit_sla_seconds = float(stop_to_submit_sla_seconds)
         self.records: dict[str, dict[str, Any]] = {}
         self.alerted: set[tuple[str, str]] = set()
+        # P0-E SLA timing (monotonic seconds), keyed by position_id.
+        self.detected_monotonic: dict[str, float] = {}
+        self.first_eval_monotonic: dict[str, float] = {}
+        self.stop_latched_monotonic: dict[str, float] = {}
+        self.first_sell_submit_monotonic: dict[str, float] = {}
+
+    def mark_detected(self, position_id: str) -> None:
+        self.detected_monotonic.setdefault(str(position_id), time.monotonic())
+
+    def mark_first_eval(self, position_id: str) -> float | None:
+        pid = str(position_id)
+        if pid in self.first_eval_monotonic:
+            return None
+        now = time.monotonic()
+        self.first_eval_monotonic[pid] = now
+        anchor = self.detected_monotonic.get(pid)
+        return None if anchor is None else max(0.0, now - anchor)
+
+    def mark_stop_latched(self, position_id: str) -> None:
+        self.stop_latched_monotonic.setdefault(str(position_id), time.monotonic())
+
+    def mark_sell_submitted(self, position_id: str) -> float | None:
+        pid = str(position_id)
+        if pid in self.first_sell_submit_monotonic:
+            return None
+        now = time.monotonic()
+        self.first_sell_submit_monotonic[pid] = now
+        anchor = self.stop_latched_monotonic.get(pid)
+        return None if anchor is None else max(0.0, now - anchor)
 
     @staticmethod
     def iso_age_seconds(value: Any) -> float | None:
@@ -161,6 +194,15 @@ class ExitSupervisionTracker:
         for position_id in list(self.records):
             if position_id not in active_position_ids:
                 self.records.pop(position_id, None)
+        for mapping in (
+            self.detected_monotonic,
+            self.first_eval_monotonic,
+            self.stop_latched_monotonic,
+            self.first_sell_submit_monotonic,
+        ):
+            for position_id in list(mapping):
+                if position_id not in active_position_ids:
+                    mapping.pop(position_id, None)
 
     def health(self) -> list[dict[str, Any]]:
         now = time.monotonic()

@@ -133,6 +133,7 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         ),
         condition_ids_provider=_market_ws.cached_condition_ids,
         market_provider=_market_ws.market_for_condition,
+        on_trade_hint=_strategy_runtime.on_authoritative_fill_hint,
     )
     _engine = TradingEngine(_repo, _orders)
     _auth = LiveAuthManager(_config, session_version_getter=lambda: _repo.get_state("session_version", "1") if _repo else "1")

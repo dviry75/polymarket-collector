@@ -87,6 +87,13 @@ class LiveConfig:
     stop_capitulation_seconds_before_close: int = 45
     exit_supervisor_sla_seconds: float = 2.0
     waiting_sellable_sla_seconds: float = 2.0
+    # P0 hardening — explicit, env-overridable safety knobs.
+    entry_signal_max_age_ms: int = 1500
+    entry_fill_max_adverse_deviation: Decimal = Decimal("0.03")
+    exit_supervisor_max_concurrent_book_fetches: int = 4
+    exit_supervisor_tick_budget_seconds: float = 3.0
+    exit_supervisor_first_eval_sla_seconds: float = 2.0
+    exit_supervisor_stop_to_submit_sla_seconds: float = 2.0
     require_clean_runtime: bool = True
     approved_git_sha: str = ""
     approved_runtime_hash: str = ""
@@ -206,6 +213,24 @@ class LiveConfig:
             ),
             waiting_sellable_sla_seconds=float(
                 _env("LIVE_WAITING_SELLABLE_SLA_SECONDS", "2") or "2"
+            ),
+            entry_signal_max_age_ms=int(
+                _env("LIVE_ENTRY_SIGNAL_MAX_AGE_MS", "1500") or "1500"
+            ),
+            entry_fill_max_adverse_deviation=_decimal_env(
+                "LIVE_ENTRY_FILL_MAX_ADVERSE_DEVIATION", "0.03"
+            ),
+            exit_supervisor_max_concurrent_book_fetches=int(
+                _env("LIVE_EXIT_SUPERVISOR_MAX_CONCURRENT_BOOK_FETCHES", "4") or "4"
+            ),
+            exit_supervisor_tick_budget_seconds=float(
+                _env("LIVE_EXIT_SUPERVISOR_TICK_BUDGET_SECONDS", "3") or "3"
+            ),
+            exit_supervisor_first_eval_sla_seconds=float(
+                _env("LIVE_EXIT_SUPERVISOR_FIRST_EVAL_SLA_SECONDS", "2") or "2"
+            ),
+            exit_supervisor_stop_to_submit_sla_seconds=float(
+                _env("LIVE_EXIT_SUPERVISOR_STOP_TO_SUBMIT_SLA_SECONDS", "2") or "2"
             ),
             require_clean_runtime=_bool_env("LIVE_REQUIRE_CLEAN_RUNTIME", True),
             approved_git_sha=_env("LIVE_APPROVED_GIT_SHA", "").strip(),
@@ -375,6 +400,30 @@ class LiveConfig:
             errors.append(
                 "LIVE_WAITING_SELLABLE_SLA_SECONDS must be between 0.25 and 30"
             )
+        if not 250 <= self.entry_signal_max_age_ms <= 10000:
+            errors.append(
+                "LIVE_ENTRY_SIGNAL_MAX_AGE_MS must be between 250 and 10000"
+            )
+        if not Decimal("0") < self.entry_fill_max_adverse_deviation <= Decimal("0.10"):
+            errors.append(
+                "LIVE_ENTRY_FILL_MAX_ADVERSE_DEVIATION must be > 0 and <= 0.10"
+            )
+        if not 1 <= self.exit_supervisor_max_concurrent_book_fetches <= 16:
+            errors.append(
+                "LIVE_EXIT_SUPERVISOR_MAX_CONCURRENT_BOOK_FETCHES must be between 1 and 16"
+            )
+        if not 0.5 <= self.exit_supervisor_tick_budget_seconds <= 30:
+            errors.append(
+                "LIVE_EXIT_SUPERVISOR_TICK_BUDGET_SECONDS must be between 0.5 and 30"
+            )
+        if not 0.25 <= self.exit_supervisor_first_eval_sla_seconds <= 30:
+            errors.append(
+                "LIVE_EXIT_SUPERVISOR_FIRST_EVAL_SLA_SECONDS must be between 0.25 and 30"
+            )
+        if not 0.25 <= self.exit_supervisor_stop_to_submit_sla_seconds <= 30:
+            errors.append(
+                "LIVE_EXIT_SUPERVISOR_STOP_TO_SUBMIT_SLA_SECONDS must be between 0.25 and 30"
+            )
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -454,6 +503,22 @@ class LiveConfig:
             ),
             "exit_supervisor_sla_seconds": self.exit_supervisor_sla_seconds,
             "waiting_sellable_sla_seconds": self.waiting_sellable_sla_seconds,
+            "entry_signal_max_age_ms": self.entry_signal_max_age_ms,
+            "entry_fill_max_adverse_deviation": str(
+                self.entry_fill_max_adverse_deviation
+            ),
+            "exit_supervisor_max_concurrent_book_fetches": (
+                self.exit_supervisor_max_concurrent_book_fetches
+            ),
+            "exit_supervisor_tick_budget_seconds": (
+                self.exit_supervisor_tick_budget_seconds
+            ),
+            "exit_supervisor_first_eval_sla_seconds": (
+                self.exit_supervisor_first_eval_sla_seconds
+            ),
+            "exit_supervisor_stop_to_submit_sla_seconds": (
+                self.exit_supervisor_stop_to_submit_sla_seconds
+            ),
             "require_clean_runtime": self.require_clean_runtime,
             "approved_git_sha_configured": bool(self.approved_git_sha),
             "approved_runtime_hash_configured": bool(self.approved_runtime_hash),

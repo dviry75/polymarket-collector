@@ -3419,7 +3419,11 @@ def test_resolved_remote_absence_without_balance_never_closes():
         temp.cleanup()
 
 
-def test_resolved_loser_positive_authoritative_balance_stays_active():
+def test_resolved_loser_full_balance_terminalizes_instead_of_wedging():
+    # P0 hardening: a losing position that rode to resolution without a STOP
+    # still holds its full, now-worthless token balance. That is expected for a
+    # loser and must terminalize as RESOLVED_LOSER rather than wedge
+    # reconciliation forever with an unrepairable contradiction.
     temp, base, strategy, adapter, position = _resolved_position_case(
         event_id="resolved-loser-active",
         winner_is_local=False,
@@ -3429,14 +3433,43 @@ def test_resolved_loser_positive_authoritative_balance_stays_active():
         result = asyncio.run(
             ReconciliationWorker(base, adapter, strategy).run_once("test")
         )
+        assert result["status"] == "ok", result
+        assert any(
+            repair["type"] == "resolved_loser_full_balance_terminal"
+            for repair in result["repairs"]
+        )
+        assert strategy.position_for_token(position["token_id"])[
+            "state"
+        ] == "RESOLVED_LOSER"
+    finally:
+        temp.cleanup()
+
+
+def test_resolved_loser_partial_exit_balance_still_gaps():
+    # A loser whose local remaining no longer matches its acquired shares (a
+    # partial exit happened) is NOT a clean full-loss case: keep it a gap.
+    temp, base, strategy, adapter, position = _resolved_position_case(
+        event_id="resolved-loser-partial",
+        winner_is_local=False,
+        balance="5",
+    )
+    try:
+        with base.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_positions "
+                "SET remaining_shares_text='3',exit_value_text='1.2' "
+                "WHERE position_id=?",
+                (position["position_id"],),
+            )
+            conn.commit()
+        result = asyncio.run(
+            ReconciliationWorker(base, adapter, strategy).run_once("test")
+        )
         assert result["status"] == "gaps"
         assert any(
             gap["type"] == "resolved_loser_authoritative_balance_active"
             for gap in result["gaps"]
         )
-        assert strategy.position_for_token(position["token_id"])[
-            "state"
-        ] == "OPEN"
     finally:
         temp.cleanup()
 

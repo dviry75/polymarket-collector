@@ -516,6 +516,15 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             client = await self._client()
             if order_type == "FAK":
                 if side == "BUY":
+                    # P0-B: Polymarket's CLOB has no minimum-fill-price / price
+                    # band / maker-only constraint for a BUY. A marketable limit
+                    # BUY at ``max_price`` fills against every resting ask at or
+                    # below it, so a book that collapsed while the request was in
+                    # flight can fill far under the signalled price and it is a
+                    # valid ("price improved") execution. The mitigation is
+                    # layered in the strategy runtime: tight signal TTL +
+                    # pre-submission revalidation + post-fill invalid-entry
+                    # liquidation. There is deliberately no fake band here.
                     signed = await client.create_limit_order(
                         token_id=token_id,
                         price=canonical_decimal(_d(order.get("max_price"))),
@@ -865,9 +874,18 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         fee_rate_bps = decimal_value(payload.get("fee_rate_bps"))
         price = decimal_value(payload.get("price"))
         size = decimal_value(payload.get("size"))
+        # Only a positive bps on the trade message is authoritative here. A zero
+        # (or missing) bps in a fee-enabled crypto market is not proof the fill
+        # was free -- that fee is computed from a formula, not carried on the
+        # trade. Leave those UNKNOWN and let reconciliation resolve them with
+        # market fee context (see live/fee_accounting.py). This keeps the DB
+        # from ever recording a false "0 / VERIFIED" for a fee-bearing taker.
         fee = (
             fee_amount(size, price, fee_rate_bps / Decimal("10000"))
-            if fee_rate_bps is not None and price is not None and size is not None
+            if fee_rate_bps is not None
+            and fee_rate_bps > 0
+            and price is not None
+            and size is not None
             else None
         )
         return {

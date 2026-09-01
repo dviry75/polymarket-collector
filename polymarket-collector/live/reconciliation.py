@@ -22,6 +22,7 @@ from .reconciliation_stability import (
     authoritative_token_balance, classify_missing_position,
     ingest_maker_exit_fills,
 )
+from .fee_accounting import resolve_trade_fee
 from .unknown_exit_recovery import resolve_unknown_open_exit_zero_effect
 from .reconciliation_coordinator import GapBackoffTracker
 from .trade_window import (
@@ -793,6 +794,71 @@ class ReconciliationWorker:
                     if terminal_dust:
                         handled_tokens.add(token_id)
                         continue
+                    acquired_local = (
+                        decimal_value(local.get("acquired_shares_text"))
+                        or Decimal("0")
+                    )
+                    remaining_local = (
+                        decimal_value(local.get("remaining_shares_text"))
+                        or Decimal("0")
+                    )
+                    never_partially_exited = (
+                        acquired_local > 0
+                        and abs(remaining_local - acquired_local)
+                        <= Decimal("0.001")
+                        and (
+                            decimal_value(local.get("exit_value_text"))
+                            or Decimal("0")
+                        )
+                        <= 0
+                    )
+                    full_balance_still_held = (
+                        abs(observed - acquired_local) <= Decimal("0.001")
+                    )
+                    if (
+                        evidence_source == "conditional_token_balance"
+                        and not linked_intent_id
+                        and local_state not in {"QUARANTINED", "RESOLVED_LOSER"}
+                        and never_partially_exited
+                        and full_balance_still_held
+                        and not _within_position_propagation_grace(
+                            local.get("created_at")
+                        )
+                    ):
+                        # A losing position that rode all the way to resolution
+                        # without a STOP still holds its full, now-worthless
+                        # token balance. That balance is expected for a loser --
+                        # you do not redeem losers -- so it is not a contra-
+                        # diction. Terminalize it as RESOLVED_LOSER (booking the
+                        # already-realised total loss) instead of wedging
+                        # reconciliation forever. The strategy hardening
+                        # (state-based STOP, immediate hot-state publication)
+                        # is what prevents new positions from reaching this
+                        # state; this only unblocks the ones that already did.
+                        updated = self.strategy_repo.mark_position_resolved(
+                            str(local["position_id"]),
+                            winner=False,
+                            redeem_pending=False,
+                            authoritative=True,
+                        )
+                        repair = {
+                            "type": "resolved_loser_full_balance_terminal",
+                            "position_id": local["position_id"],
+                            "token_id": token_id,
+                            "before_state": local_state,
+                            "after_state": updated.get("state"),
+                            "authoritative_balance": canonical_decimal(observed),
+                        }
+                        repairs.append(repair)
+                        self.repo.audit(
+                            actor,
+                            "resolved_position_repair",
+                            "ok",
+                            "RESOLVED_LOSER_FULL_BALANCE_TERMINAL",
+                            repair,
+                        )
+                        handled_tokens.add(token_id)
+                        continue
                     gaps.append({
                         "type": "resolved_loser_authoritative_balance_active",
                         "position_id": local["position_id"],
@@ -1065,14 +1131,20 @@ class ReconciliationWorker:
                 if self.strategy_repo and order_id:
                     intent = strategy_intents_by_remote_id.get(order_id)
                     if intent and trade.get("price") is not None and trade.get("size") is not None:
+                        trade_market = self.repo.latest_market(
+                            str(trade.get("condition_id") or intent.get("condition_id") or "")
+                        )
+                        fee_value, fee_status, fee_source = resolve_trade_fee(
+                            trade, trade_market
+                        )
                         self.strategy_repo.add_fill(
                             intent_id=str(intent["intent_id"]),
                             remote_trade_id=str(trade.get("polymarket_trade_id") or "") or None,
                             shares=decimal_value(trade.get("size")) or Decimal("0"),
                             price=decimal_value(trade.get("price")) or Decimal("0"),
-                            fee=decimal_value(trade.get("fee")) or Decimal("0"),
-                            fee_verification_status=str(trade.get("fee_verification_status") or "UNKNOWN"),
-                            fee_source=trade.get("fee_source"),
+                            fee=fee_value,
+                            fee_verification_status=fee_status,
+                            fee_source=fee_source,
                             status=str(trade.get("status") or "MATCHED").upper(),
                             transaction_hash=trade.get("transaction_hash"),
                             matched_at=trade.get("matched_at"),

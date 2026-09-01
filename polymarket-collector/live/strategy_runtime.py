@@ -108,7 +108,23 @@ class LiveStrategyRuntime:
             strategy_repo,
             monitor_sla_seconds=config.exit_supervisor_sla_seconds,
             waiting_sla_seconds=config.waiting_sellable_sla_seconds,
+            first_eval_sla_seconds=config.exit_supervisor_first_eval_sla_seconds,
+            stop_to_submit_sla_seconds=(
+                config.exit_supervisor_stop_to_submit_sla_seconds
+            ),
         )
+        # P0-C/D: positions already published into hot state, and those still
+        # awaiting their first current-state exit evaluation.
+        self._known_position_ids: set[str] = set()
+        self._pending_initial_eval: set[str] = set()
+        # P0-E: bounded book-fetch concurrency + supervisor observability.
+        self._exit_book_semaphore = asyncio.Semaphore(
+            max(1, int(config.exit_supervisor_max_concurrent_book_fetches))
+        )
+        self.exit_supervisor_max_observed_concurrency = 0
+        self.exit_supervisor_worst_eval_latency_ms = 0.0
+        self.exit_supervisor_deferred_low_priority = 0
+        self._exit_book_inflight = 0
         self._stop_exhausted_positions: set[str] = set()
         self._stop_capitulation_logged: set[str] = set()
         self._frame_event = asyncio.Event()
@@ -313,17 +329,55 @@ class LiveStrategyRuntime:
         # Atomic reference replacement. Readers never see a half-built state.
         self._hot_state = snapshot
         self._hot_state_refreshed_monotonic = time.monotonic()
-        if any(
-            int(position.get("stop_stage") or 0) >= 1
-            and (
-                decimal_value(position.get("remaining_shares_text"))
-                or Decimal("0")
-            ) > 0
+
+        all_positions = [
+            position
             for positions in (
                 snapshot.get("positions_by_token") or {}
             ).values()
             for position in positions
             if isinstance(position, dict)
+        ]
+        def _live(position: dict[str, Any]) -> bool:
+            return (
+                bool(position.get("position_id"))
+                and (
+                    decimal_value(position.get("remaining_shares_text"))
+                    or Decimal("0")
+                ) > 0
+                and str(position.get("state") or "").upper()
+                not in {"CLOSED", "RESOLVED_LOSER", "REDEEMED"}
+            )
+
+        current_ids = {
+            str(position["position_id"])
+            for position in all_positions
+            if _live(position)
+        }
+        # P0-C/D: a position that just appeared in hot state (fill publish,
+        # reconciliation recovery, restart) needs an immediate current-state
+        # exit evaluation. Terminal historical DUST does not -- it must never
+        # trigger an expensive book fetch.
+        eval_ids = {
+            str(position["position_id"])
+            for position in all_positions
+            if _live(position)
+            and self._exit_priority_tier(position) < 4
+        }
+        new_ids = current_ids - self._known_position_ids
+        newly_eval = (new_ids & eval_ids)
+        if newly_eval:
+            self._pending_initial_eval |= newly_eval
+        self._known_position_ids = current_ids
+        self._pending_initial_eval &= eval_ids
+
+        if new_ids or any(
+            int(position.get("stop_stage") or 0) >= 1
+            and (
+                decimal_value(position.get("remaining_shares_text"))
+                or Decimal("0")
+            ) > 0
+            for position in all_positions
         ):
             # Reconciliation can make shares sellable without a market frame.
             self._exit_wakeup.set()
@@ -797,6 +851,11 @@ class LiveStrategyRuntime:
                     item[
                         "_critical_trigger_latched"
                     ] = True
+                    # P0-A: wall-clock instant the signal was latched, used by
+                    # the pre-submission signal-TTL check.
+                    item["_critical_latched_at_ms"] = int(
+                        datetime.now(timezone.utc).timestamp() * 1000
+                    )
                     item["_critical_trigger_id"] = (
                         str(item.get("correlation_id") or "")
                         or stable_id(
@@ -1440,6 +1499,380 @@ class LiveStrategyRuntime:
             details = {}
         return decimal_value(details.get("rate") or details.get("r")) or Decimal("0")
 
+    def _current_top_of_book(self, token_id: str) -> dict[str, Any] | None:
+        """Current fresh, aligned top-of-book for a token, or None.
+
+        Reuses the exit-book provider, which already enforces book READY,
+        internal alignment, current connection generation and freshness.
+        """
+        provider = self._exit_book_provider
+        if provider is None:
+            return None
+        try:
+            book = provider(str(token_id))
+        except Exception as exc:
+            self.last_error = (
+                f"TOP_OF_BOOK:{type(exc).__name__}:{exc}"
+            )[:500]
+            return None
+        return dict(book) if book else None
+
+    def _revalidate_entry_signal(
+        self, market: dict[str, Any], update: dict[str, Any], token_id: str
+    ) -> dict[str, Any]:
+        """P0-A: re-assert the exact-0.74 entry condition against the current
+        authoritative book immediately before submission."""
+        book = self._current_top_of_book(token_id)
+        if not book:
+            return {"ok": False, "reason": "ENTRY_REVALIDATION_BOOK_NOT_READY"}
+        if not book.get("book_ready", True):
+            return {"ok": False, "reason": "ENTRY_REVALIDATION_BOOK_NOT_READY"}
+        age_ms = book.get("exchange_age_ms")
+        max_age_ms = int(self.config.max_market_data_age_seconds * 1000)
+        if age_ms is not None and int(age_ms) > max_age_ms:
+            return {
+                "ok": False, "reason": "ENTRY_REVALIDATION_STALE",
+                "age_ms": int(age_ms),
+            }
+        latched_generation = update.get("generation")
+        current_generation = book.get("generation")
+        if (
+            latched_generation is not None
+            and current_generation is not None
+            and int(current_generation) < int(latched_generation)
+        ):
+            return {
+                "ok": False, "reason": "ENTRY_REVALIDATION_GENERATION_CHANGED",
+                "generation": int(current_generation),
+            }
+        current_ask = book.get("best_ask")
+        if not exact_trigger(current_ask, self.policy.entry_price):
+            return {
+                "ok": False, "reason": "ENTRY_REVALIDATION_PRICE_CHANGED",
+                "current_ask": (
+                    canonical_decimal(decimal_value(current_ask))
+                    if decimal_value(current_ask) is not None else None
+                ),
+                "age_ms": int(age_ms) if age_ms is not None else None,
+                "generation": (
+                    int(current_generation)
+                    if current_generation is not None else None
+                ),
+            }
+        return {
+            "ok": True, "reason": "ENTRY_REVALIDATION_PASSED",
+            "current_ask": canonical_decimal(self.policy.entry_price),
+            "age_ms": int(age_ms) if age_ms is not None else None,
+            "generation": (
+                int(current_generation) if current_generation is not None else None
+            ),
+        }
+
+    def _abort_entry(
+        self,
+        intent_id: str,
+        event_id: str,
+        update: dict[str, Any],
+        *,
+        reason: str,
+        detail: dict[str, Any] | None = None,
+        fail_closed: bool = False,
+        market: dict[str, Any] | None = None,
+    ) -> None:
+        """Cleanly abandon an entry attempt before order submission.
+
+        Releases the single-position / event reservation so the next valid
+        trigger is not permanently blocked by an aborted attempt. The intent
+        terminates as ZERO_FILL (no order ever reached the exchange).
+        """
+        try:
+            self.repo.mark_zero_fill(event_id, reason, intent_id=intent_id)
+        except Exception:
+            self.repo.update_intent(
+                intent_id, state="REJECTED", reason_code=reason,
+                normalized_error=f"Entry aborted before submission: {reason}",
+                final_at=now_iso(),
+            )
+        self._mark_event_unlocked_ram(event_id)
+        self._trace_critical(
+            "TERMINAL_RESULT", update=update, reason=reason,
+            result="ABORTED", intent_id=intent_id,
+        )
+        self.repo.timeline(
+            severity="WARNING", category="DECISION", component="strategy",
+            source="entry_revalidation", event_id=event_id,
+            condition_id=str((market or {}).get("condition_id") or update.get("condition_id") or ""),
+            token_id=str(update.get("asset_id") or ""),
+            intent_id=intent_id, requested_action="ENTRY",
+            reason_code=reason, result_status="ABORTED",
+            parameters_json=detail or {},
+        )
+        if fail_closed and not self.paper_mode():
+            self.repo.set_pause_entries(
+                True, "strategy", reason, owner="MACHINE", auto_recoverable=True
+            )
+            self.base.set_states({
+                "canary_armed": "false",
+                "strategy_readiness": "NOT_READY",
+                "strategy_block_reason": reason,
+            }, "strategy")
+
+    def _response_fill_evidence(
+        self, response: dict[str, Any]
+    ) -> tuple[Decimal, Decimal] | None:
+        """(shares, avg_price) from an authoritative CLOB BUY response, or None.
+
+        For a marketable BUY, ``taking_amount`` is shares acquired and
+        ``making_amount`` is USDC spent. Values are sanity-bounded against the
+        canary caps; anything outside falls back to the balance path.
+        """
+        taking = decimal_value(response.get("taking_amount"))
+        making = decimal_value(response.get("making_amount"))
+        if taking is None or making is None or taking <= 0 or making <= 0:
+            return None
+        cap_shares = self.policy.max_shares * 4
+        cap_spend = self.policy.max_spend * Decimal("1.05")
+        if taking > cap_shares or making > cap_spend:
+            return None
+        avg = (making / taking).quantize(Decimal("0.0001"))
+        if avg <= 0 or avg > Decimal("1"):
+            return None
+        return taking, avg
+
+    async def _publish_entry_position_from_response(
+        self,
+        intent_id: str,
+        market: dict[str, Any],
+        side: str,
+        token_id: str,
+        response: dict[str, Any],
+    ) -> None:
+        evidence = self._response_fill_evidence(response)
+        source = "clob_response"
+        if evidence is None:
+            try:
+                from .reconciliation_stability import authoritative_token_balance
+                balance = await asyncio.wait_for(
+                    authoritative_token_balance(self.adapter, token_id),
+                    timeout=1.5,
+                )
+            except Exception:
+                balance = None
+            if balance is None or balance <= 0:
+                return
+            book = self._current_top_of_book(token_id) or {}
+            ask = decimal_value(book.get("best_ask")) or self.policy.entry_price
+            evidence = (balance, ask)
+            source = "authoritative_token_balance"
+        shares, avg_price = evidence
+        await self._publish_entry_position(
+            intent_id, market, side, token_id,
+            shares=shares, avg_price=avg_price,
+            fee=Decimal("0"), fee_status="UNKNOWN",
+            fee_source="entry_fill_pending_reconciliation",
+            evidence_source=source,
+        )
+
+    async def _publish_entry_position(
+        self,
+        intent_id: str,
+        market: dict[str, Any],
+        side: str,
+        token_id: str,
+        *,
+        shares: Decimal,
+        avg_price: Decimal,
+        fee: Decimal,
+        fee_status: str,
+        fee_source: str,
+        evidence_source: str,
+    ) -> None:
+        event_id = str(market["event_id"])
+        existing = self.repo.position_for_token(token_id)
+        if existing is None:
+            self.repo.open_position(
+                event_id=event_id,
+                condition_id=str(market["condition_id"]),
+                token_id=token_id,
+                outcome=side,
+                shares=shares,
+                average_price=avg_price,
+                cost_all_in=shares * avg_price + fee,
+                fees=fee,
+                sellable_shares=Decimal("0"),
+                min_sellable=self._min_order(str(market["condition_id"])),
+                entry_intent_id=intent_id,
+            )
+        await self._refresh_hot_state_once()
+        published = self.repo.position_for_token(token_id)
+        if published is None:
+            return
+        self.repo.record_entry_audit(
+            intent_id, event_id=event_id,
+            fill_price_text=canonical_decimal(avg_price),
+            fill_shares_text=canonical_decimal(shares),
+            hot_state_published_at=now_iso(),
+        )
+        self.repo.timeline(
+            severity="INFO", category="FILL", component="strategy",
+            source=evidence_source, event_id=event_id,
+            condition_id=str(market["condition_id"]), token_id=token_id,
+            side=side, intent_id=intent_id,
+            deal_id=stable_id("deal", event_id),
+            requested_action="PUBLISH_POSITION",
+            reason_code="POSITION_HOT_STATE_PUBLISHED",
+            result_status="PUBLISHED",
+            filled_shares_text=canonical_decimal(shares),
+            average_price_text=canonical_decimal(avg_price),
+        )
+        hot = (
+            self._position_from_ram(token_id, str(published["position_id"]))
+            or published
+        )
+        await self._evaluate_new_position_exit_state(hot)
+
+    async def _evaluate_new_position_exit_state(
+        self, position: dict[str, Any]
+    ) -> None:
+        """P0-B/P0-D: force a current-state exit evaluation the moment a
+        position enters hot state (fill publish, reconciliation recovery,
+        restart). Latches STOP / invalid-entry immediately if already breached,
+        without waiting for the next market frame."""
+        position_id = str(position.get("position_id") or "")
+        if not position_id:
+            return
+        token_id = str(position.get("token_id") or "")
+        state = str(position.get("state") or "").upper()
+        remaining = decimal_value(position.get("remaining_shares_text")) or Decimal("0")
+        self._exit_tracker.mark_detected(position_id)
+        latency = self._exit_tracker.mark_first_eval(position_id)
+        self._pending_initial_eval.discard(position_id)
+        if latency is not None and latency > self.config.exit_supervisor_first_eval_sla_seconds:
+            self.repo.timeline(
+                severity="WARNING", category="EXIT", component="strategy",
+                source="exit_supervisor", event_id=str(position.get("event_id") or ""),
+                token_id=token_id, requested_action="FIRST_EXIT_EVALUATION",
+                reason_code="ACTIVE_POSITION_SLA_BREACH", result_status="LATE",
+                parameters_json={"first_eval_latency_ms": round(latency * 1000, 1)},
+            )
+        if remaining <= 0 or state in {"CLOSED", "RESOLVED_LOSER", "REDEEMED"}:
+            return
+
+        # P0-B — invalid entry: the recorded fill price is materially worse
+        # than the signal. Latch an aggressive liquidation immediately.
+        if str(position.get("entry_policy_status") or "VALID") != "OUTSIDE_POLICY":
+            fill_price = decimal_value(position.get("average_entry_price_text"))
+            if fill_price is not None and fill_price > 0:
+                floor = (
+                    self.policy.entry_price
+                    - self.config.entry_fill_max_adverse_deviation
+                )
+                if fill_price < floor:
+                    self._latch_invalid_entry(position, fill_price, floor)
+                    return
+
+        if int(position.get("stop_stage") or 0) >= 1:
+            self._exit_tracker.mark_stop_latched(position_id)
+            self._exit_wakeup.set()
+            return
+
+        book = await self._exit_book_for_position(
+            position, rest_allowed=self._exit_priority_tier(position) < 4
+        )
+        bid = decimal_value((book or {}).get("best_bid"))
+        if bid is not None and bid <= self.policy.stop_price:
+            latched = self.repo.latch_stop_exit(position_id)
+            self._exit_tracker.mark_stop_latched(position_id)
+            if latched.pop("_newly_latched", False):
+                self.repo.timeline(
+                    severity="WARNING", category="EXIT", component="strategy",
+                    source="exit_state_evaluation",
+                    event_id=str(position.get("event_id") or ""),
+                    condition_id=str(position.get("condition_id") or ""),
+                    token_id=token_id, side="SELL",
+                    requested_action="LATCH_MARKET_EXIT",
+                    reason_code="STOP_LATCHED_ON_RECOVERY",
+                    result_status="LATCHED",
+                    remaining_shares_text=position.get("remaining_shares_text"),
+                    parameters_json={"trigger_bid": canonical_decimal(bid)},
+                )
+            await self._refresh_hot_state_once()
+            self._exit_wakeup.set()
+
+    def _entry_intent_for_position(self, position: dict[str, Any]) -> str:
+        try:
+            return self.repo.entry_intent_id_for_event(
+                str(position.get("event_id") or "")
+            )
+        except Exception:
+            return ""
+
+    def _latch_invalid_entry(
+        self, position: dict[str, Any], fill_price: Decimal, floor: Decimal
+    ) -> None:
+        position_id = str(position["position_id"])
+        result = self.repo.latch_invalid_entry_exit(position_id)
+        self._exit_tracker.mark_stop_latched(position_id)
+        if result.pop("_newly_latched", False):
+            self.repo.alert(
+                alert_type="EXIT", severity="CRITICAL",
+                reason_code="ENTRY_FILL_OUTSIDE_POLICY",
+                message=(
+                    f"Entry fill {canonical_decimal(fill_price)} is below the "
+                    f"acceptable floor {canonical_decimal(floor)} "
+                    f"(signal {canonical_decimal(self.policy.entry_price)}); "
+                    "immediate liquidation latched"
+                ),
+                entity_type="position", entity_id=position_id,
+            )
+            audit_intent = self._entry_intent_for_position(position)
+            if audit_intent:
+                self.repo.record_entry_audit(
+                    audit_intent,
+                    event_id=str(position.get("event_id") or ""),
+                    entry_validity="OUTSIDE_POLICY",
+                    fill_deviation_text=canonical_decimal(
+                        self.policy.entry_price - fill_price
+                    ),
+                )
+            self.repo.timeline(
+                severity="CRITICAL", category="EXIT", component="strategy",
+                source="exit_state_evaluation",
+                event_id=str(position.get("event_id") or ""),
+                condition_id=str(position.get("condition_id") or ""),
+                token_id=str(position.get("token_id") or ""), side="SELL",
+                requested_action="LATCH_MARKET_EXIT",
+                reason_code="ENTRY_FILL_OUTSIDE_POLICY",
+                result_status="LATCHED",
+                remaining_shares_text=position.get("remaining_shares_text"),
+                parameters_json={
+                    "fill_price": canonical_decimal(fill_price),
+                    "acceptable_floor": canonical_decimal(floor),
+                    "signal_price": canonical_decimal(self.policy.entry_price),
+                },
+            )
+        self._exit_wakeup.set()
+
+    async def on_authoritative_fill_hint(self, token_id: str) -> None:
+        """User-WS trade event fast path: publish/evaluate without waiting for
+        the reconciliation coordinator to drain."""
+        if self.paper_mode() or not token_id:
+            return
+        try:
+            await self._refresh_hot_state_once()
+            position = self.repo.position_for_token(str(token_id))
+            if position is None:
+                return
+            hot = (
+                self._position_from_ram(str(token_id), str(position["position_id"]))
+                or position
+            )
+            await self._evaluate_new_position_exit_state(hot)
+        except Exception as exc:
+            self.last_error = (
+                f"FILL_HINT:{type(exc).__name__}:{exc}"
+            )[:500]
+
     async def _submit_entry(
         self,
         *,
@@ -1450,6 +1883,87 @@ class LiveStrategyRuntime:
         fee_rate: Decimal,
     ) -> None:
         event_id = str(market["event_id"])
+        condition_id = str(market["condition_id"])
+        token_id = str(update.get("asset_id") or "")
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        signal_observed_ms = update.get("_critical_latched_at_ms")
+        try:
+            self.repo.record_entry_audit(
+                intent_id,
+                event_id=event_id,
+                condition_id=condition_id,
+                token_id=token_id,
+                side=side,
+                signal_price_text=canonical_decimal(self.policy.entry_price),
+                signal_observed_at=(
+                    datetime.fromtimestamp(
+                        int(signal_observed_ms) / 1000, tz=timezone.utc
+                    ).isoformat()
+                    if signal_observed_ms is not None else now_iso()
+                ),
+                signal_exchange_timestamp_ms=update.get("exchange_timestamp_ms"),
+                signal_book_generation=update.get("generation"),
+                signal_book_hash=str(update.get("message_hash") or ""),
+                signal_market_age_ms=update.get("exchange_age_ms"),
+            )
+        except Exception as exc:  # audit must never block the entry path
+            self.last_error = f"ENTRY_AUDIT:{type(exc).__name__}:{exc}"[:500]
+
+        # P0-A — explicit signal TTL. A trigger that sat too long between
+        # observation and submission (queued critical frame, alignment grace,
+        # durable gate) can no longer be trusted: abort cleanly.
+        if not self.paper_mode() and signal_observed_ms is not None:
+            signal_age_ms = now_ms - int(signal_observed_ms)
+            if signal_age_ms > self.config.entry_signal_max_age_ms:
+                self._abort_entry(
+                    intent_id, event_id, update,
+                    reason="ENTRY_SIGNAL_EXPIRED",
+                    detail={
+                        "signal_age_ms": signal_age_ms,
+                        "max_age_ms": self.config.entry_signal_max_age_ms,
+                    },
+                )
+                self.repo.record_entry_audit(
+                    intent_id, event_id=event_id,
+                    signal_age_ms=signal_age_ms,
+                    entry_validity="ABORTED_SIGNAL_EXPIRED",
+                )
+                return
+
+        # P0-A — pre-submission revalidation against the current authoritative
+        # book. The strategy enters only on an exact 0.74 ask; re-assert that
+        # right before post_order. Only runs when a live top-of-book provider is
+        # wired (always true in the trader process); the existing freshness
+        # provider check below still fails closed if nothing is configured.
+        if not self.paper_mode() and self._exit_book_provider is not None:
+            reval = self._revalidate_entry_signal(market, update, token_id)
+            self.repo.record_entry_audit(
+                intent_id, event_id=event_id,
+                revalidation_result=reval["reason"],
+                revalidation_ask_text=reval.get("current_ask"),
+                revalidation_age_ms=reval.get("age_ms"),
+                revalidation_generation=reval.get("generation"),
+                signal_age_ms=(
+                    now_ms - int(signal_observed_ms)
+                    if signal_observed_ms is not None else None
+                ),
+            )
+            if not reval["ok"]:
+                fail_closed = reval["reason"] in {
+                    "ENTRY_REVALIDATION_BOOK_NOT_READY",
+                    "ENTRY_REVALIDATION_STALE",
+                }
+                self._abort_entry(
+                    intent_id, event_id, update,
+                    reason=reval["reason"], detail=reval,
+                    fail_closed=fail_closed, market=market,
+                )
+                self.repo.record_entry_audit(
+                    intent_id, event_id=event_id,
+                    entry_validity=f"ABORTED_{reval['reason']}",
+                )
+                return
+
         freshness = await self._freshness_with_alignment_grace(
             str(market["condition_id"]), update
         )
@@ -1623,47 +2137,57 @@ class LiveStrategyRuntime:
             reason=str(response.get("failure_reason") or status),
             result=status.upper(), intent_id=intent_id,
         )
+        self.repo.record_entry_audit(
+            intent_id, event_id=event_id, clob_status=status,
+            submitted_at=now_iso(),
+        )
         if status == "rejected" and _is_confirmed_fak_zero_fill_response(response):
             self.repo.mark_zero_fill(
                 event_id, "FAK_ZERO_FILL", intent_id=intent_id
             )
             self._mark_event_unlocked_ram(event_id)
-        else:
-            self.repo.update_intent(
-                intent_id, state=(
-                    "RECONCILIATION_REQUIRED"
-                    if status in {"matched", "delayed", "unknown", "live"}
-                    else "REJECTED"
-                ),
-                remote_order_id=remote_id,
-                reason_code=str(response.get("failure_reason") or status).upper(),
-                normalized_error=response.get("message"),
-            )
+            return
+        self.repo.update_intent(
+            intent_id, state=(
+                "RECONCILIATION_REQUIRED"
+                if status in {"matched", "delayed", "unknown", "live"}
+                else "REJECTED"
+            ),
+            remote_order_id=remote_id,
+            reason_code=str(response.get("failure_reason") or status).upper(),
+            normalized_error=response.get("message"),
+        )
+        if status in {"rejected", "failed", "blocked"}:
+            return
+
+        # P0-C — publish the position into hot state from authoritative fill
+        # evidence NOW, without waiting for a full reconciliation pass. This is
+        # also where the post-fill entry-policy check (P0-B) and the immediate
+        # state-based STOP evaluation (P0-D) happen.
+        await self._publish_entry_position_from_response(
+            intent_id, market, side, token_id, response,
+        )
+
         reconciled = await self._reconcile("entry_submission")
 
-        if reconciled.get("status") == "ok":
-            recovered = self.repo.position_for_token(
-                str(update["asset_id"])
+        # Always resynchronise hot state after reconciliation, even when it
+        # reported gaps for an unrelated reason: a position it created/updated
+        # for THIS entry must not stay invisible to the exit supervisor.
+        await self._refresh_hot_state_once()
+        recovered = self.repo.position_for_token(str(token_id))
+        if recovered:
+            recovered = (
+                self._position_from_ram(str(token_id), str(recovered["position_id"]))
+                or recovered
             )
-
-            if recovered:
-                # Position recovery is durable action-path work. Publish it
-                # into RAM before creating/observing its TP.
-                await self._refresh_hot_state_once()
-
-                recovered = (
-                    self._position_from_ram(
-                        str(update["asset_id"]),
-                        str(recovered["position_id"]),
-                    )
-                    or recovered
-                )
-
-                await self._ensure_take_profit(
-                    recovered
-                )
-
-                await self._refresh_hot_state_once()
+            await self._evaluate_new_position_exit_state(recovered)
+            recovered = (
+                self._position_from_ram(str(token_id), str(recovered["position_id"]))
+                or recovered
+            )
+            if int(recovered.get("stop_stage") or 0) == 0:
+                await self._ensure_take_profit(recovered)
+            await self._refresh_hot_state_once()
 
     @staticmethod
     def _is_waiting_sellable_response(
@@ -2196,6 +2720,8 @@ class LiveStrategyRuntime:
     async def _exit_book_for_position(
         self,
         position: dict[str, Any],
+        *,
+        rest_allowed: bool = True,
     ) -> dict[str, Any] | None:
         token_id = str(position["token_id"])
         if self._exit_book_provider is not None:
@@ -2208,6 +2734,11 @@ class LiveStrategyRuntime:
             else:
                 if update:
                     return dict(update)
+
+        if not rest_allowed:
+            # Terminal historical DUST never justifies an expensive REST book
+            # fetch: it cannot starve an active OPEN/EXITING position.
+            return None
 
         now = time.monotonic()
         last_attempt = self._exit_rest_last_attempt.get(token_id, 0.0)
@@ -2253,8 +2784,79 @@ class LiveStrategyRuntime:
             "event_type": "exit_supervisor_rest",
         }
 
+    @staticmethod
+    def _exit_priority_tier(position: dict[str, Any]) -> int:
+        """Lower is more urgent. Real risk exits must never queue behind DUST."""
+        state = str(position.get("state") or "").upper()
+        stop_stage = int(position.get("stop_stage") or 0)
+        if (
+            state == "EXIT_RECONCILIATION_REQUIRED"
+            or stop_stage >= 1
+            or state == "EXITING"
+        ):
+            return 0
+        if state in {"OPEN", "TP_OPEN"}:
+            return 1
+        if state == "DUST":
+            return 3 if not position.get("closed_at") else 4
+        return 2
+
+    async def _supervise_exit_position(
+        self, position: dict[str, Any], *, rest_allowed: bool
+    ) -> None:
+        position_id = str(position["position_id"])
+        self._exit_tracker.note(
+            position, update=None, decision="CHECKING_EXIT_OBLIGATION"
+        )
+        async with self._exit_book_semaphore:
+            self._exit_book_inflight += 1
+            self.exit_supervisor_max_observed_concurrency = max(
+                self.exit_supervisor_max_observed_concurrency,
+                self._exit_book_inflight,
+            )
+            try:
+                update = await self._exit_book_for_position(
+                    position, rest_allowed=rest_allowed
+                )
+            finally:
+                self._exit_book_inflight -= 1
+        if not update:
+            if self._exit_tracker.monitoring_sla_exceeded(position_id):
+                self._exit_tracker.fault(
+                    position,
+                    reason="EXIT_SUPERVISOR_SLA_EXCEEDED",
+                    message=(
+                        "Exit supervisor has no usable WS or REST book "
+                        "within the configured SLA; new entries remain blocked"
+                    ),
+                )
+            return
+        self._exit_tracker.note(
+            position, update=update, decision="USABLE_BOOK_OBSERVED"
+        )
+        started = time.monotonic()
+        event_id = str(position["event_id"])
+        lock = self._event_locks.setdefault(event_id, asyncio.Lock())
+        async with lock:
+            await self._manage_position(
+                market=self._market(
+                    str(position.get("condition_id") or "")
+                ) or {},
+                update=update,
+                event_ready=True,
+                frame_hash=self._exit_liquidity_hash(update),
+            )
+        self.exit_supervisor_worst_eval_latency_ms = max(
+            self.exit_supervisor_worst_eval_latency_ms,
+            (time.monotonic() - started) * 1000,
+        )
+        self._exit_tracker.note(
+            position, update=update, decision="EXIT_POLICY_EVALUATED"
+        )
+
     async def _drive_latched_exits_once(self) -> None:
         self.exit_supervisor_runs += 1
+        tick_started = time.monotonic()
         positions_by_token = self._hot_state.get("positions_by_token") or {}
         positions = [
             dict(position)
@@ -2279,41 +2881,49 @@ class LiveStrategyRuntime:
 
         active_ids = {str(position["position_id"]) for position in positions}
         self._exit_tracker.prune(active_ids)
-        for position in positions:
-            self._exit_tracker.note(
-                position, update=None, decision="CHECKING_EXIT_OBLIGATION"
-            )
-            update = await self._exit_book_for_position(position)
-            if not update:
-                if self._exit_tracker.monitoring_sla_exceeded(
-                    str(position["position_id"])
-                ):
-                    self._exit_tracker.fault(
-                        position,
-                        reason="EXIT_SUPERVISOR_SLA_EXCEEDED",
-                        message=(
-                            "Exit supervisor has no usable WS or REST book "
-                            "within the configured SLA; new entries remain blocked"
-                        ),
-                    )
+
+        by_id = {str(p["position_id"]): p for p in positions}
+
+        # P0-D: freshly appeared positions (fill publish / reconciliation
+        # recovery / restart) get an immediate current-state exit evaluation
+        # before anything else this tick.
+        for position_id in list(self._pending_initial_eval):
+            position = by_id.get(position_id)
+            if position is None:
+                self._pending_initial_eval.discard(position_id)
                 continue
-            self._exit_tracker.note(
-                position, update=update, decision="USABLE_BOOK_OBSERVED"
+            await self._evaluate_new_position_exit_state(position)
+
+        # P0-E: strict priority ordering + bounded concurrency + tick budget.
+        tiers: dict[int, list[dict[str, Any]]] = {}
+        for position in positions:
+            tiers.setdefault(self._exit_priority_tier(position), []).append(
+                position
             )
-            event_id = str(position["event_id"])
-            lock = self._event_locks.setdefault(event_id, asyncio.Lock())
-            async with lock:
-                await self._manage_position(
-                    market=self._market(
-                        str(position.get("condition_id") or "")
-                    ) or {},
-                    update=update,
-                    event_ready=True,
-                    frame_hash=self._exit_liquidity_hash(update),
+        for tier in sorted(tiers):
+            if tier >= 2 and (
+                time.monotonic() - tick_started
+                > self.config.exit_supervisor_tick_budget_seconds
+            ):
+                self.exit_supervisor_deferred_low_priority += 1
+                self._exit_wakeup.set()
+                break
+            rest_allowed = tier < 4
+            tier_positions = sorted(
+                tiers[tier],
+                key=lambda item: str(item.get("created_at") or ""),
+            )
+            results = await asyncio.gather(*(
+                self._supervise_exit_position(
+                    position, rest_allowed=rest_allowed
                 )
-            self._exit_tracker.note(
-                position, update=update, decision="EXIT_POLICY_EVALUATED"
-            )
+                for position in tier_positions
+            ), return_exceptions=True)
+            for outcome in results:
+                if isinstance(outcome, Exception):
+                    self.last_error = (
+                        f"EXIT_SUPERVISE:{type(outcome).__name__}:{outcome}"
+                    )[:500]
 
     async def _exit_supervisor_loop(self) -> None:
         while not self._stop.is_set():
@@ -2585,10 +3195,43 @@ class LiveStrategyRuntime:
                 if position.get("active_exit_intent_id"):
                     continue
 
+                obligation = str(
+                    position.get("exit_obligation_reason") or ""
+                ).strip().upper()
+                latched_purpose = (
+                    obligation
+                    if obligation.startswith("EMERGENCY_")
+                    else "STOP_066"
+                )
+                self._exit_tracker.mark_stop_latched(
+                    str(position["position_id"])
+                )
+                submit_latency = self._exit_tracker.mark_sell_submitted(
+                    str(position["position_id"])
+                )
+                if (
+                    submit_latency is not None
+                    and submit_latency
+                    > self.config.exit_supervisor_stop_to_submit_sla_seconds
+                ):
+                    self.repo.timeline(
+                        severity="WARNING", category="EXIT", component="strategy",
+                        source="exit_supervisor",
+                        event_id=str(position.get("event_id") or ""),
+                        token_id=str(position.get("token_id") or ""),
+                        side="SELL", requested_action="SELL_MARKET_FAK",
+                        reason_code="ACTIVE_POSITION_SLA_BREACH",
+                        result_status="LATE",
+                        parameters_json={
+                            "stop_to_submit_latency_ms": round(
+                                submit_latency * 1000, 1
+                            ),
+                        },
+                    )
                 await self._market_exit_fak(
                     position,
                     update,
-                    purpose="STOP_066",
+                    purpose=latched_purpose,
                     min_price=protected_min_price,
                     frame_hash=protected_book_hash,
                 )
@@ -3185,6 +3828,29 @@ class LiveStrategyRuntime:
         # Refresh once before workers begin consuming market frames.
         await self._refresh_hot_state_once()
 
+        # P0-D restart recovery: every position that survived the restart gets
+        # an immediate current-state exit evaluation. A STOP / invalid-entry
+        # obligation latches now if the market is already through the level --
+        # it must not wait for a fresh crossing frame.
+        try:
+            for token_positions in list(
+                (self._hot_state.get("positions_by_token") or {}).values()
+            ):
+                for position in list(token_positions):
+                    if not isinstance(position, dict):
+                        continue
+                    if (
+                        decimal_value(position.get("remaining_shares_text"))
+                        or Decimal("0")
+                    ) <= 0:
+                        continue
+                    await self._evaluate_new_position_exit_state(dict(position))
+            await self._refresh_hot_state_once()
+        except Exception as exc:
+            self.last_error = (
+                f"RESTART_EXIT_RECOVERY:{type(exc).__name__}:{exc}"
+            )[:500]
+
         if self._hot_state_task is None or self._hot_state_task.done():
             self._hot_state_task = asyncio.create_task(
                 self._hot_state_loop(),
@@ -3303,6 +3969,21 @@ class LiveStrategyRuntime:
             "exit_supervisor_runs": self.exit_supervisor_runs,
             "exit_rest_fallbacks": self.exit_rest_fallbacks,
             "exit_rest_failures": self.exit_rest_failures,
+            "exit_supervisor_max_concurrent_book_fetches": (
+                self.config.exit_supervisor_max_concurrent_book_fetches
+            ),
+            "exit_supervisor_max_observed_concurrency": (
+                self.exit_supervisor_max_observed_concurrency
+            ),
+            "exit_supervisor_worst_eval_latency_ms": round(
+                self.exit_supervisor_worst_eval_latency_ms, 1
+            ),
+            "exit_supervisor_deferred_low_priority": (
+                self.exit_supervisor_deferred_low_priority
+            ),
+            "exit_supervisor_pending_initial_eval": len(
+                self._pending_initial_eval
+            ),
             "exit_supervision": self._exit_tracker.health(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
