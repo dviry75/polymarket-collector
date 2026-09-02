@@ -691,6 +691,7 @@ class ReconciliationWorker:
                 or local.get("tp_intent_id")
                 or ""
             )
+            linked = None
             if (
                 not linked_intent_id
                 and str(local.get("state") or "").upper() == "QUARANTINED"
@@ -719,9 +720,13 @@ class ReconciliationWorker:
                     linked is not None
                     and str(linked.get("state") or "").upper()
                     not in FINAL_INTENT_STATES
+                    and str(local.get("state") or "").upper()
+                    not in {"EXIT_RECONCILIATION_REQUIRED", "QUARANTINED"}
                 ):
                     # Never race a still-unresolved remote exit with resolution
-                    # cleanup. Its order/fill identity must settle first.
+                    # cleanup. A reconciliation-required exit is the narrow
+                    # exception handled below: the authoritative repair exists
+                    # specifically to settle that otherwise-stuck identity.
                     continue
 
             balance = await authoritative_token_balance(self.adapter, token_id)
@@ -773,6 +778,15 @@ class ReconciliationWorker:
                     })
                     handled_tokens.add(token_id)
                     continue
+            if (
+                linked is not None
+                and str(linked.get("state") or "").upper()
+                not in FINAL_INTENT_STATES
+            ):
+                # The narrow authoritative repair above did not resolve the
+                # live exit, so ordinary market-resolution cleanup must still
+                # fail closed rather than race it.
+                continue
             if str(local.get("state") or "").upper() == "QUARANTINED":
                 handled_tokens.add(token_id)
                 continue

@@ -234,6 +234,32 @@ def test_authoritative_matched_exit_repair_matches_live_gap_arithmetic():
         temporary.cleanup()
 
 
+def test_authoritative_matched_exit_repair_accepts_reconciliation_required_intent():
+    temporary, base, strategy, adapter, position, intent = build_matched_exit_case(
+        valid_proof=True
+    )
+    try:
+        strategy.update_intent(
+            intent["intent_id"],
+            state="RECONCILIATION_REQUIRED",
+            reason_code="REMOTE_MATCHED_FILL_PROPAGATION_PENDING",
+        )
+
+        first, second = confirm(
+            ReconciliationWorker(base, adapter, strategy), position["token_id"]
+        )
+
+        assert any(
+            gap["type"] == "authoritative_exit_repair_confirmation_pending"
+            for gap in first["gaps"]
+        )
+        assert second["status"] == "ok", second
+        assert strategy.position_for_token(position["token_id"])["state"] == "DUST"
+        assert strategy.intent(intent["intent_id"])["state"] == "PARTIAL_FINAL"
+    finally:
+        temporary.cleanup()
+
+
 def test_authoritative_repair_recovers_existing_fill_and_prior_double_count():
     temporary, base, strategy, adapter, position, intent = build_matched_exit_case(
         valid_proof=True
