@@ -17,6 +17,7 @@ from .config import LiveConfig
 from .dashboard_infrastructure import InfrastructureSampler
 from .dashboard_read_model import DashboardQueryError, DashboardReadModel, resolve_window
 from .repository import LiveRepository
+from .trade_export_queue import ExportQueueError, enqueue as enqueue_export, list_recipients
 
 
 class DashboardMeta(BaseModel):
@@ -227,6 +228,54 @@ def trades(
     key = f"trades:{window.start_utc.isoformat()}:{window.end_utc.isoformat()}:{page}:{page_size}"
     return _response(_response_cache.get(key, 2.0, lambda: model.trade_history(window, page=page, page_size=page_size)))
 
+
+@router.get("/external/deals", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def external_deals(
+    range: str = Query("7d", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    from_date: str | None = None,
+    to_date: str | None = None,
+    page: int = Query(1, ge=1, le=1_000_000),
+    page_size: int = Query(25, ge=1, le=100),
+) -> DashboardResponse:
+    model, _infra, _auth_value = _services()
+    window = _window(range, from_date, to_date)
+    key = f"external_deals:{window.start_utc.isoformat()}:{window.end_utc.isoformat()}:{page}:{page_size}"
+    return _response(_response_cache.get(key, 2.0, lambda: model.external_deal_history(window, page=page, page_size=page_size)))
+
+
+@router.get("/external/summary", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def external_summary(
+    range: str = Query("today", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> DashboardResponse:
+    model, _infra, _auth_value = _services()
+    window = _window(range, from_date, to_date)
+    key = f"external_summary:{window.start_utc.isoformat()}:{window.end_utc.isoformat()}"
+    return _response(_response_cache.get(key, 2.0, lambda: model.external_summary(window)))
+
+
+class ExportRequestBody(BaseModel):
+    recipient: str = Field(min_length=3, max_length=254)
+
+
+@router.get("/external/export/recipients", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def external_export_recipients() -> DashboardResponse:
+    recipients = list_recipients()
+    return _response({"recipients": recipients, "quality": "REAL" if recipients else "UNAVAILABLE"})
+
+
+@router.post("/external/export", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def external_export(body: ExportRequestBody, request: Request) -> DashboardResponse:
+    _model_value, _infra_value, auth = _services()
+    token = request.cookies.get(COOKIE_NAME)
+    if not auth.verify_csrf(token, request.headers.get("x-live-csrf-token")):
+        raise HTTPException(status_code=403, detail="csrf verification failed")
+    try:
+        result = enqueue_export(body.recipient.strip())
+    except ExportQueueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _response(result)
 
 
 @router.get("/trade-statistics", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])

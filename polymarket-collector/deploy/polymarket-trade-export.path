@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for pending Polymarket trade-history export requests
+
+[Path]
+PathExistsGlob=/opt/polymarket-btc-live/export-requests/*.json
+Unit=polymarket-trade-export.service
+
+[Install]
+WantedBy=paths.target

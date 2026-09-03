@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 import time as monotonic_time
@@ -475,6 +476,137 @@ class DashboardReadModel:
             "fee_status": row.get("fee_verification_status"), "fee_source": row.get("fee_source"),
         } for row in rows]
         return {"items": items, "page": page, "page_size": page_size, "total": int(count.get("total") or 0), "quality": "REAL"}
+
+    # ------------------------------------------------------------------ #
+    # External Polymarket fill history (analytics-only; table populated
+    # out-of-band by scripts.ingest_external_fills). "Deal" = every fill on
+    # one condition_id. Cash-flow only: sell notional - buy notional - fees;
+    # NOT realized P&L (no resolution / redemption payout).
+    # ------------------------------------------------------------------ #
+    def _external_ready(self) -> bool:
+        return bool(self._one("SELECT name FROM sqlite_master WHERE type='table' AND name='external_fills'"))
+
+    def _external_floor(self) -> str:
+        override = os.environ.get("EXTERNAL_FILLS_SINCE")
+        if override:
+            return override
+        return self.repo.get_state("dashboard_cutover_at", "") or ""
+
+    def external_deal_history(self, window: DateWindow, *, page: int = 1, page_size: int = 25) -> dict[str, Any]:
+        page_size = max(1, min(page_size, 100)); page = max(1, page)
+        if not self._external_ready():
+            return {"items": [], "page": page, "page_size": page_size, "total": 0,
+                    "quality": "UNAVAILABLE", "reason": "external fills are not initialised"}
+        start, end = window.sql()
+        floor = self._external_floor()
+        if floor:
+            start = max(start, floor)
+        count = self._one(
+            """SELECT COUNT(*) AS total FROM (
+                   SELECT condition_id FROM external_fills
+                   WHERE matched_at>=? AND matched_at<? GROUP BY condition_id)""",
+            (start, end),
+        ) or {"total": 0}
+        rows = self._all(
+            """SELECT condition_id,
+                      MAX(event_slug)   AS event_slug,
+                      MAX(market_title) AS market_title,
+                      MIN(matched_at)   AS first_action_at,
+                      MAX(matched_at)   AS last_action_at,
+                      COUNT(*)          AS action_count,
+                      SUM(CASE WHEN side='BUY'  THEN size         ELSE 0 END) AS buy_size,
+                      SUM(CASE WHEN side='SELL' THEN size         ELSE 0 END) AS sell_size,
+                      SUM(CASE WHEN side='BUY'  THEN notional_usd ELSE 0 END) AS buy_notional,
+                      SUM(CASE WHEN side='SELL' THEN notional_usd ELSE 0 END) AS sell_notional,
+                      SUM(COALESCE(fee_usd,0)) AS fees_usd,
+                      SUM(CASE WHEN side='SELL' THEN notional_usd ELSE -notional_usd END)
+                          - SUM(COALESCE(fee_usd,0)) AS cash_flow_usd,
+                      GROUP_CONCAT(DISTINCT outcome) AS outcomes,
+                      SUM(CASE WHEN fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
+               FROM external_fills
+               WHERE matched_at>=? AND matched_at<?
+               GROUP BY condition_id
+               ORDER BY MAX(matched_at) DESC
+               LIMIT ? OFFSET ?""",
+            (start, end, page_size, (page - 1) * page_size),
+        )
+        items = []
+        for row in rows:
+            buy_size = float(row.get("buy_size") or 0.0)
+            sell_size = float(row.get("sell_size") or 0.0)
+            net_size = buy_size - sell_size
+            fee_gaps = int(row.get("fee_gaps") or 0)
+            items.append({
+                "deal_key": masked(row.get("condition_id")),
+                "event_slug": row.get("event_slug"),
+                "market_title": row.get("market_title"),
+                "first_action_at": row.get("first_action_at"),
+                "last_action_at": row.get("last_action_at"),
+                "action_count": int(row.get("action_count") or 0),
+                "outcomes": row.get("outcomes"),
+                "buy_size": buy_size,
+                "sell_size": sell_size,
+                "net_size": net_size,
+                "buy_notional_usd": number_value(row.get("buy_notional")),
+                "sell_notional_usd": number_value(row.get("sell_notional")),
+                "fees_usd": number_value(row.get("fees_usd")),
+                "cash_flow_usd": number_value(row.get("cash_flow_usd")),
+                "state": "CLOSED" if abs(net_size) < 1e-6 else "OPEN",
+                "quality": "REAL" if fee_gaps == 0 else "PARTIAL",
+                "verified": True,
+            })
+        return {
+            "items": items, "page": page, "page_size": page_size,
+            "total": int(count.get("total") or 0), "quality": "REAL",
+            "timezone": DISPLAY_TIMEZONE, "range": window.key, "from": start, "to": end,
+        }
+
+    def external_summary(self, window: DateWindow) -> dict[str, Any]:
+        if not self._external_ready():
+            return {"quality": "UNAVAILABLE", "reason": "external fills are not initialised"}
+        start, end = window.sql()
+        floor = self._external_floor()
+        if floor:
+            start = max(start, floor)
+        row = self._one(
+            """WITH deals AS (
+                   SELECT condition_id,
+                          SUM(CASE WHEN side='SELL' THEN notional_usd ELSE -notional_usd END)
+                              - SUM(COALESCE(fee_usd,0)) AS cash_flow_usd,
+                          SUM(COALESCE(fee_usd,0))       AS fees_usd,
+                          SUM(CASE WHEN fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
+                   FROM external_fills
+                   WHERE matched_at>=? AND matched_at<?
+                   GROUP BY condition_id)
+               SELECT COUNT(*) AS deal_count,
+                      SUM(CASE WHEN cash_flow_usd>0 THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN cash_flow_usd<0 THEN 1 ELSE 0 END) AS losses,
+                      SUM(CASE WHEN cash_flow_usd>0 THEN cash_flow_usd  ELSE 0 END) AS gross_profit,
+                      SUM(CASE WHEN cash_flow_usd<0 THEN -cash_flow_usd ELSE 0 END) AS gross_loss,
+                      SUM(fees_usd)      AS fees_usd,
+                      SUM(cash_flow_usd) AS total_cash_flow_usd,
+                      SUM(fee_gaps)      AS fee_gaps
+               FROM deals""",
+            (start, end),
+        ) or {}
+        wins = int(row.get("wins") or 0)
+        losses = int(row.get("losses") or 0)
+        decided = wins + losses
+        gross_profit = decimal_value(row.get("gross_profit")) or Decimal("0")
+        gross_loss = decimal_value(row.get("gross_loss")) or Decimal("0")
+        fee_gaps = int(row.get("fee_gaps") or 0)
+        return {
+            "quality": "REAL" if fee_gaps == 0 else "PARTIAL",
+            "reason": None if fee_gaps == 0 else "one or more fills have no fee rate",
+            "deal_count": int(row.get("deal_count") or 0), "wins": wins, "losses": losses,
+            "win_rate_percent": (wins / decided * 100) if decided else None,
+            "average_win_usd": number_value(gross_profit / wins) if wins else None,
+            "average_loss_usd": number_value(gross_loss / losses) if losses else None,
+            "profit_factor": number_value(gross_profit / gross_loss) if gross_loss else None,
+            "fees_usd": number_value(row.get("fees_usd")),
+            "total_cash_flow_usd": number_value(row.get("total_cash_flow_usd")),
+            "timezone": DISPLAY_TIMEZONE, "range": window.key, "from": start, "to": end,
+        }
 
     def markets(self, *, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)

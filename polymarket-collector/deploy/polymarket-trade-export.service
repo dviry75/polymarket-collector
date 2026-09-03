@@ -1,0 +1,43 @@
+[Unit]
+Description=Export the full Polymarket trade history and email it (on-demand, resource-capped)
+After=network-online.target
+Wants=network-online.target
+# Stop a broken deploy from looping forever via the .path trigger.
+StartLimitIntervalSec=600
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+User=dvir
+Group=dvir
+WorkingDirectory=/opt/polymarket-btc-live/repo/polymarket-collector
+EnvironmentFile=/etc/polymarket-live/trader.env
+EnvironmentFile=/etc/polymarket-live/smtp.env
+ExecStart=/opt/polymarket-btc-live/.venv/bin/python -m scripts.email_trade_export --drain /opt/polymarket-btc-live/export-requests
+
+# Hard resource ceiling — this job must never compete with the trader.
+Nice=19
+CPUWeight=10
+IOWeight=10
+CPUQuota=25%
+MemoryMax=384M
+TasksMax=32
+
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/polymarket-btc-live
+ReadOnlyPaths=/opt/polymarket-btc-live/poly_live.sqlite3
+TimeoutStartSec=900

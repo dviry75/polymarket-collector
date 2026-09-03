@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Polymarket external-fills ingestion every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=30
+Unit=polymarket-external-fills.service
+
+[Install]
+WantedBy=timers.target
