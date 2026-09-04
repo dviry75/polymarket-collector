@@ -457,6 +457,48 @@ def test_09_unknown_tp_cancel_is_fail_closed():
         temp.cleanup()
 
 
+def test_08a_sla_breach_is_anchored_on_the_stop_eligible_frame():
+    """The SLA clock starts at the frame, not the latch.
+
+    A frame that showed the position STOP-eligible seconds before it finally
+    latched must be reflected in the breach telemetry -- latch->submit alone
+    would read ~0ms and hide the wait.
+    """
+    adapter = RecordingSellAdapter()
+    temp, base, repo, runtime, position = _case(
+        "sla-frame", paper=False, adapter=adapter, reconciliation=_ok_reconcile
+    )
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        stale = (
+            datetime.now(timezone.utc) - timedelta(seconds=6)
+        ).isoformat()
+        runtime._exit_tracker.stop_eligible_frame_iso[
+            str(position["position_id"])
+        ] = stale
+        _manage(
+            runtime,
+            _book(position["token_id"], "0.66", [("0.66", "5")]),
+            "sla-frame",
+        )
+        with runtime.base.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT parameters_json FROM live_audit_timeline
+                WHERE reason_code='ACTIVE_POSITION_SLA_BREACH'
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        assert row is not None
+        import json
+
+        params = json.loads(row[0])
+        assert params["frame_to_sell_submit_ms"] >= 5000
+    finally:
+        temp.cleanup()
+
+
 def _counting_reconcile():
     calls = []
 

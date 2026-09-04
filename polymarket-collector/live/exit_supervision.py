@@ -41,6 +41,11 @@ class ExitSupervisionTracker:
         self.first_eval_monotonic: dict[str, float] = {}
         self.stop_latched_monotonic: dict[str, float] = {}
         self.first_sell_submit_monotonic: dict[str, float] = {}
+        # Wall-clock of the earliest WS frame that already showed this position
+        # STOP-eligible (best_bid <= stop). This -- not the latch -- is where the
+        # SLA clock must start: a frame can wait in the critical queue for
+        # seconds before it latches, and latch->submit alone hides that.
+        self.stop_eligible_frame_iso: dict[str, str] = {}
 
     def mark_detected(self, position_id: str) -> None:
         self.detected_monotonic.setdefault(str(position_id), time.monotonic())
@@ -53,6 +58,20 @@ class ExitSupervisionTracker:
         self.first_eval_monotonic[pid] = now
         anchor = self.detected_monotonic.get(pid)
         return None if anchor is None else max(0.0, now - anchor)
+
+    def mark_stop_eligible_frame(
+        self, position_id: str, frame_iso: Any
+    ) -> None:
+        if not frame_iso:
+            return
+        self.stop_eligible_frame_iso.setdefault(
+            str(position_id), str(frame_iso)
+        )
+
+    def frame_to_now_seconds(self, position_id: str) -> float | None:
+        return self.iso_age_seconds(
+            self.stop_eligible_frame_iso.get(str(position_id))
+        )
 
     def mark_stop_latched(self, position_id: str) -> None:
         self.stop_latched_monotonic.setdefault(str(position_id), time.monotonic())
@@ -199,6 +218,7 @@ class ExitSupervisionTracker:
             self.first_eval_monotonic,
             self.stop_latched_monotonic,
             self.first_sell_submit_monotonic,
+            self.stop_eligible_frame_iso,
         ):
             for position_id in list(mapping):
                 if position_id not in active_position_ids:

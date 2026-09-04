@@ -1213,7 +1213,8 @@ class LiveStrategyRuntime:
 
         for update in updates:
             await self._manage_position(
-                market=market, update=update, event_ready=event_ready, frame_hash=frame_hash
+                market=market, update=update, event_ready=event_ready,
+                frame_hash=frame_hash, received_at=received_at,
             )
 
         if market.get("market_resolved"):
@@ -2864,6 +2865,11 @@ class LiveStrategyRuntime:
                 update=update,
                 event_ready=True,
                 frame_hash=self._exit_liquidity_hash(update),
+                received_at=str(
+                    update.get("received_at")
+                    or update.get("observed_at")
+                    or now_iso()
+                ),
             )
         self.exit_supervisor_worst_eval_latency_ms = max(
             self.exit_supervisor_worst_eval_latency_ms,
@@ -3034,6 +3040,7 @@ class LiveStrategyRuntime:
         update: dict[str, Any],
         event_ready: bool,
         frame_hash: str,
+        received_at: str | None = None,
     ) -> None:
         token_id = str(update.get("asset_id") or "")
         positions = self._positions_from_ram(token_id)
@@ -3043,6 +3050,17 @@ class LiveStrategyRuntime:
 
         bid = decimal_value(update.get("best_bid"))
         critical_stop = bool(update.get("_critical_stop_latched"))
+
+        # SLA clock: the earliest frame that already showed the position
+        # STOP-eligible, regardless of when it later latches.
+        if bid is not None and bid <= self.policy.stop_price:
+            frame_iso = received_at or str(
+                update.get("received_at") or now_iso()
+            )
+            for _pos in positions:
+                self._exit_tracker.mark_stop_eligible_frame(
+                    str(_pos.get("position_id") or ""), frame_iso
+                )
 
         reconciliation_ready = (
             self.paper_mode()
@@ -3228,9 +3246,19 @@ class LiveStrategyRuntime:
                 submit_latency = self._exit_tracker.mark_sell_submitted(
                     str(position["position_id"])
                 )
+                frame_to_submit = self._exit_tracker.frame_to_now_seconds(
+                    str(position["position_id"])
+                )
+                # Primary SLA is frame-observed -> SELL submit; latch->submit is
+                # kept as a component because it alone hides queue/lock wait.
+                primary_latency = (
+                    frame_to_submit
+                    if frame_to_submit is not None
+                    else submit_latency
+                )
                 if (
-                    submit_latency is not None
-                    and submit_latency
+                    primary_latency is not None
+                    and primary_latency
                     > self.config.exit_supervisor_stop_to_submit_sla_seconds
                 ):
                     self.repo.timeline(
@@ -3242,9 +3270,21 @@ class LiveStrategyRuntime:
                         reason_code="ACTIVE_POSITION_SLA_BREACH",
                         result_status="LATE",
                         parameters_json={
-                            "stop_to_submit_latency_ms": round(
-                                submit_latency * 1000, 1
+                            "frame_to_sell_submit_ms": (
+                                round(frame_to_submit * 1000, 1)
+                                if frame_to_submit is not None else None
                             ),
+                            "stop_to_submit_latency_ms": (
+                                round(submit_latency * 1000, 1)
+                                if submit_latency is not None else None
+                            ),
+                            "stop_eligible_frame_at": (
+                                self._exit_tracker.stop_eligible_frame_iso.get(
+                                    str(position["position_id"])
+                                )
+                            ),
+                            "trigger_bid": canonical_decimal(bid)
+                            if bid is not None else None,
                         },
                     )
                 await self._market_exit_fak(
