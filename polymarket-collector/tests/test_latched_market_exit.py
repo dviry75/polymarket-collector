@@ -510,6 +510,51 @@ def _counting_reconcile():
     return _fn
 
 
+def test_08e_slow_reconciliation_does_not_delay_the_stop_sell():
+    """A multi-second reconciliation must never sit on the SELL path.
+
+    With a resting remote TP that matched nothing, the SELL is submitted after
+    a single targeted get_order(); the (slow) account-wide reconciliation is
+    not awaited before the order goes out.
+    """
+    slow_calls = []
+
+    async def _slow_reconcile(reason):
+        slow_calls.append(reason)
+        await asyncio.sleep(2.0)
+        return {"status": "ok"}
+
+    adapter = RecordingSellAdapter()
+    temp, base, repo, runtime, position = _case(
+        "sla-slow-recon",
+        paper=False,
+        adapter=adapter,
+        reconciliation=_slow_reconcile,
+    )
+    try:
+        _register_remote_tp(repo, adapter, position, filled_size="0")
+        asyncio.run(runtime._refresh_hot_state_once())
+
+        async def run_and_time():
+            start = asyncio.get_event_loop().time()
+            await runtime._manage_position(
+                market={},
+                update=_book(position["token_id"], "0.66", [("0.66", "5")]),
+                event_ready=True,
+                frame_hash="sla-slow-recon",
+            )
+            return asyncio.get_event_loop().time() - start
+
+        elapsed = asyncio.run(run_and_time())
+        assert len(adapter.create_calls) == 1
+        assert "tp_cancel_residual_fill" not in slow_calls
+        # The 2s pre-SELL reconcile is gone; the post-submit exit_submission
+        # reconcile may still run, so allow one slow call but not a stacked wait.
+        assert elapsed < 3.5
+    finally:
+        temp.cleanup()
+
+
 def _register_remote_tp(repo, adapter, position, *, filled_size="0"):
     tp = repo.reserve_position_intent(
         position,
