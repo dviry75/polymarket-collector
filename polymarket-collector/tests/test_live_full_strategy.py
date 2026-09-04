@@ -1327,6 +1327,83 @@ def test_critical_074_frame_survives_regular_frame_conflation():
     asyncio.run(scenario())
 
 
+def test_stop_relatch_suppressed_once_stop_stage_is_latched():
+    """A collapsing book must not re-enqueue a critical STOP every frame.
+
+    Once stop_stage >= 1 the durable obligation exists and the exit supervisor
+    owns retries. Re-latching on each sub-0.66 frame only floods the
+    never-dropped critical FIFO and delays the real SELL submission.
+    """
+    async def scenario():
+        runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
+        runtime.policy = StrategyPolicy()
+        runtime._pending_frames = __import__("collections").OrderedDict()
+        runtime._critical_frames = __import__("collections").deque()
+        runtime._critical_price_state = {}
+        runtime._critical_observed_price_state = {}
+        runtime._frame_queue_capacity = 32
+        runtime.frames_coalesced = 0
+        runtime.frames_dropped = 0
+        runtime.critical_triggers_queued = 0
+        runtime.critical_triggers_processed = 0
+        runtime.critical_triggers_dropped = 0
+        runtime.max_critical_queue_depth = 0
+        runtime._frame_event = asyncio.Event()
+        runtime._frame_task = None
+        runtime._stop = asyncio.Event()
+        runtime._observe_entry_trigger = lambda _context: None
+        runtime.enabled = lambda: True
+        runtime._hot_state = {
+            "positions_by_token": {
+                "yes-token": [{"position_id": "p1", "stop_stage": 1}]
+            }
+        }
+
+        processed = []
+
+        async def fake_process(context):
+            processed.append(context)
+
+        runtime.process_atomic_frame = fake_process
+
+        def frame(bid, number):
+            return {
+                "event_type": "price_change",
+                "message_hash": f"frame-{number}",
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "updates": [{
+                    "condition_id": "condition-1",
+                    "asset_id": "yes-token",
+                    "outcome": "YES",
+                    "best_ask": "0.70",
+                    "best_bid": bid,
+                    "generation": 1,
+                    "update_number": number,
+                    "exchange_timestamp_ms": int(
+                        datetime.now(timezone.utc).timestamp() * 1000
+                    ),
+                }],
+                "event_readiness": {
+                    "condition-1": {"ready": True, "reason": "READY"}
+                },
+            }
+
+        runtime.schedule_frame(frame("0.64", 1))
+        runtime.schedule_frame(frame("0.40", 2))
+        runtime.schedule_frame(frame("0.22", 3))
+
+        runtime._stop.set()
+        runtime._frame_event.set()
+        await asyncio.wait_for(runtime._frame_task, timeout=1)
+
+        assert runtime.critical_triggers_queued == 0
+        for context in processed:
+            for update in context.get("updates", []):
+                assert not update.get("_critical_stop_latched")
+
+    asyncio.run(scenario())
+
+
 def test_latched_critical_trigger_is_not_rejected_as_frame_superseded():
     runtime = LiveStrategyRuntime.__new__(LiveStrategyRuntime)
 

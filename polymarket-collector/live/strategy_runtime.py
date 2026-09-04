@@ -810,6 +810,25 @@ class LiveStrategyRuntime:
                     and previous_bid <= self.policy.stop_price
                 )
 
+                # One STOP edge -> one durable exit lifecycle. Once a position on
+                # this token has a latched STOP (stop_stage >= 1) the durable
+                # obligation exists and the 250 ms exit supervisor owns every
+                # retry. Re-latching on each subsequent sub-0.66 frame only
+                # floods the never-dropped critical FIFO and pushes the real
+                # submission further back (observed on btc-updown-5m-1788507000:
+                # the SELL left ~9.6 s after the latch, into a book that had
+                # already collapsed from 0.66 to 0.22). Suppress the re-latch;
+                # the frame still flows through the normal path for telemetry.
+                if stop_now and not stop_before and getattr(
+                    self, "_hot_state", None
+                ):
+                    already_latched = any(
+                        int(pos.get("stop_stage") or 0) >= 1
+                        for pos in self._positions_from_ram(asset_id)
+                    )
+                    if already_latched:
+                        stop_before = True
+
                 # Always deduplicate observed transitions. Only a READY state
                 # advances the actionable edge state; NOT_READY 0.74/0.66
                 # therefore remains blocked without disappearing after resync.
