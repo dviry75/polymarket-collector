@@ -1122,7 +1122,7 @@ def test_entry_schedule_blocks_weekdays_14_to_23_jerusalem():
     )["allowed"]
 
 
-def test_entry_schedule_is_unrestricted_only_on_2026_08_21_jerusalem():
+def test_entry_schedule_is_unrestricted_on_configured_dates_jerusalem():
     jerusalem = ZoneInfo("Asia/Jerusalem")
     assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 21, 14, 0, 0, tzinfo=jerusalem)
@@ -1130,11 +1130,20 @@ def test_entry_schedule_is_unrestricted_only_on_2026_08_21_jerusalem():
     assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 21, 22, 59, 59, tzinfo=jerusalem)
     )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 9, 4, 14, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 9, 4, 22, 59, 59, tzinfo=jerusalem)
+    )["allowed"]
     assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 20, 16, 0, 0, tzinfo=jerusalem)
     )["allowed"]
     assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 24, 16, 0, 0, tzinfo=jerusalem)
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 9, 3, 16, 0, 0, tzinfo=jerusalem)
     )["allowed"]
 
 

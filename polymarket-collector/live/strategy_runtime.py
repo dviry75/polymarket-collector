@@ -197,7 +197,11 @@ class LiveStrategyRuntime:
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
         instant = at or datetime.now(timezone.utc)
         local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
-        unrestricted_date = local.date().isoformat() == "2026-08-21"
+        unrestricted_dates = {
+            "2026-08-21",
+            "2026-09-04",
+        }
+        unrestricted_date = local.date().isoformat() in unrestricted_dates
         inactive = (
             local.weekday() < 5
             and 14 <= local.hour < 23
