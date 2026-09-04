@@ -457,6 +457,118 @@ def test_09_unknown_tp_cancel_is_fail_closed():
         temp.cleanup()
 
 
+def _counting_reconcile():
+    calls = []
+
+    async def _fn(reason):
+        calls.append(reason)
+        return {"status": "ok"}
+
+    _fn.calls = calls
+    return _fn
+
+
+def _register_remote_tp(repo, adapter, position, *, filled_size="0"):
+    tp = repo.reserve_position_intent(
+        position,
+        action="TP",
+        purpose="TAKE_PROFIT",
+        order_type="GTC",
+        shares=Decimal("5"),
+        price_limit=Decimal("0.96"),
+        book_hash="tp",
+    )
+    repo.update_intent(
+        tp["intent_id"], state="LIVE", remote_order_id="remote-tp"
+    )
+    adapter.orders["remote-tp"] = {
+        "polymarket_order_id": "remote-tp",
+        "status": "live",
+        "original_size": "5",
+        "size_matched": filled_size,
+        "filled_size": filled_size,
+    }
+    return tp
+
+
+def test_08b_remote_tp_cancel_with_zero_residual_sells_without_global_reconcile():
+    adapter = RecordingSellAdapter()
+    reconcile = _counting_reconcile()
+    temp, base, repo, runtime, position = _case(
+        "tp-remote-fast", paper=False, adapter=adapter, reconciliation=reconcile
+    )
+    try:
+        tp = _register_remote_tp(repo, adapter, position, filled_size="0")
+        asyncio.run(runtime._refresh_hot_state_once())
+        _manage(
+            runtime,
+            _book(position["token_id"], "0.66", [("0.66", "5")]),
+            "tp-remote-fast",
+        )
+        assert adapter.cancel_calls == ["remote-tp"]
+        assert repo.intent(tp["intent_id"])["state"] == "CANCELED"
+        assert len(adapter.create_calls) == 1  # FAK SELL went out
+        # The pre-SELL barrier is gone: no account-wide pass before the SELL.
+        assert "tp_cancel_residual_fill" not in reconcile.calls
+    finally:
+        temp.cleanup()
+
+
+def test_08c_remote_tp_cancel_with_residual_fill_falls_back_to_reconcile():
+    adapter = RecordingSellAdapter()
+    reconcile = _counting_reconcile()
+    temp, base, repo, runtime, position = _case(
+        "tp-remote-residual",
+        paper=False,
+        adapter=adapter,
+        reconciliation=reconcile,
+    )
+    try:
+        _register_remote_tp(repo, adapter, position, filled_size="1.5")
+        asyncio.run(runtime._refresh_hot_state_once())
+        _manage(
+            runtime,
+            _book(position["token_id"], "0.66", [("0.66", "5")]),
+            "tp-remote-residual",
+        )
+        assert adapter.cancel_calls == ["remote-tp"]
+        # A canceled order that actually matched forces the account-wide pass
+        # before a replacement SELL can be sized.
+        assert "tp_cancel_residual_fill" in reconcile.calls
+    finally:
+        temp.cleanup()
+
+
+def test_08d_remote_tp_cancel_then_unreadable_order_fails_closed():
+    class BlindGetOrderAdapter(RecordingSellAdapter):
+        async def get_order(self, order_id):
+            raise RuntimeError("clob unreachable")
+
+    adapter = BlindGetOrderAdapter()
+    reconcile = _counting_reconcile()
+    temp, base, repo, runtime, position = _case(
+        "tp-remote-blind",
+        paper=False,
+        adapter=adapter,
+        reconciliation=reconcile,
+    )
+    try:
+        _register_remote_tp(repo, adapter, position, filled_size="0")
+        asyncio.run(runtime._refresh_hot_state_once())
+        _manage(
+            runtime,
+            _book(position["token_id"], "0.66", [("0.66", "5")]),
+            "tp-remote-blind",
+        )
+        current = repo.position_for_token(position["token_id"])
+        assert adapter.cancel_calls == ["remote-tp"]
+        assert adapter.create_calls == []  # no SELL when state is unknown
+        assert current["state"] == "EXIT_RECONCILIATION_REQUIRED"
+        assert current["stop_stage"] == 1
+    finally:
+        temp.cleanup()
+
+
 def test_10_duplicate_stop_frames_do_not_parallel_sell():
     adapter = RecordingSellAdapter()
     temp, _base, repo, runtime, position = _case(

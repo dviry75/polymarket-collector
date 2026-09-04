@@ -3362,6 +3362,81 @@ class LiveStrategyRuntime:
             pnl_text=updated["realized_pnl_text"],
         )
 
+    async def _settle_canceled_exit_order(
+        self,
+        remote_order_id: Any,
+    ) -> dict[str, Any] | None:
+        """Read a just-canceled SELL order's final state without a global pass.
+
+        The pre-SELL reconciliation this replaces existed for one reason: fold
+        any fill the canceled order took before it died into local truth so the
+        replacement FAK is sized against the real remaining balance. A targeted
+        get_order() answers exactly that question in one round-trip instead of a
+        multi-second account-wide reconciliation on the event loop.
+
+        Returns ``{"filled": Decimal, "status": str}`` when the order state is
+        readable (``filled`` is what the exchange says matched), or ``None`` when
+        it could not be read -- the caller must then fail closed exactly as the
+        non-``ok`` reconciliation branch did.
+        """
+        if not remote_order_id:
+            return {"filled": Decimal("0"), "status": "no_remote_order"}
+        try:
+            order = await self.adapter.get_order(str(remote_order_id))
+        except Exception:
+            return None
+        if order is None:
+            # 404: the order is fully gone. A canceled FAK/GTC that the CLOB no
+            # longer knows about never left a resting residual.
+            return {"filled": Decimal("0"), "status": "not_found"}
+        return {
+            "filled": decimal_value(order.get("filled_size")) or Decimal("0"),
+            "status": str(order.get("status") or ""),
+        }
+
+    async def _post_cancel_settle_or_reconcile(
+        self,
+        position: dict[str, Any],
+        remote_order_id: Any,
+        *,
+        reconcile_reason: str,
+    ) -> bool:
+        """Bridge a CANCEL_ACK to the market SELL.
+
+        Fast path (the common one when a STOP fires: the canceled order is a
+        0.96 TP or an un-hit exit and matched nothing): a single get_order()
+        confirms zero residual and the SELL proceeds immediately.
+
+        Slow path (the canceled order actually matched something before it
+        died): fall back to the account-wide reconciliation so the fill is
+        booked before a replacement SELL can oversell.
+
+        Returns True when the caller may proceed to reserve the SELL, False
+        when it must return without selling (state already marked for repair).
+        """
+        settled = await self._settle_canceled_exit_order(remote_order_id)
+        if settled is None:
+            self.repo.require_exit_reconciliation(str(position["position_id"]))
+            self.repo.alert(
+                alert_type="EXIT",
+                severity="CRITICAL",
+                reason_code="EXIT_CANCEL_STATE_UNREADABLE",
+                message=(
+                    "Canceled exit order state could not be read; "
+                    "market SELL was not sent"
+                ),
+                entity_type="position",
+                entity_id=position["position_id"],
+            )
+            return False
+        if settled["filled"] > 0:
+            reconciled = await self._reconcile(reconcile_reason)
+            if reconciled.get("status") != "ok":
+                self.repo.require_exit_reconciliation(
+                    str(position["position_id"])
+                )
+                return False
+        return True
 
     async def _market_exit_fak(
         self,
@@ -3474,11 +3549,11 @@ class LiveStrategyRuntime:
                         self.repo.finalize_cancel(
                             str(active["intent_id"]), True, "CANCEL_ACK"
                         )
-                        reconciled = await self._reconcile("exit_cancel_before_market_sell")
-                        if reconciled.get("status") != "ok":
-                            self.repo.require_exit_reconciliation(
-                                str(position["position_id"])
-                            )
+                        if not await self._post_cancel_settle_or_reconcile(
+                            position,
+                            active.get("remote_order_id"),
+                            reconcile_reason="exit_cancel_residual_fill",
+                        ):
                             return
             refreshed = self.repo.active_positions(str(position["token_id"]))
             position = next(
@@ -3562,13 +3637,11 @@ class LiveStrategyRuntime:
                             )
                             return
                         self.repo.finalize_cancel(str(tp["intent_id"]), True, "CANCEL_ACK")
-                        reconciled = await self._reconcile(
-                            "tp_cancel_before_market_sell"
-                        )
-                        if reconciled.get("status") != "ok":
-                            self.repo.require_exit_reconciliation(
-                                str(position["position_id"])
-                            )
+                        if not await self._post_cancel_settle_or_reconcile(
+                            position,
+                            tp.get("remote_order_id"),
+                            reconcile_reason="tp_cancel_residual_fill",
+                        ):
                             return
             refreshed = self.repo.active_positions(str(position["token_id"]))
             position = next(
