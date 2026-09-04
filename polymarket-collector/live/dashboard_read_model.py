@@ -16,6 +16,10 @@ from .repository import LiveRepository, row_to_dict
 
 DISPLAY_TIMEZONE = "Asia/Jerusalem"
 VERIFIED = {"VERIFIED", "RECONCILED", "DERIVED_VERIFIED"}
+# Deal count is small (grouped by condition_id, not raw fills) — a generous cap
+# lets the dashboard pull the whole date window in one call and filter/paginate
+# client-side, while still bounding one query's result size.
+EXTERNAL_DEALS_MAX_PAGE_SIZE = 5000
 ACTIVE_INTENT_STATES = {
     "RESERVED", "SUBMITTING", "SUBMITTED", "LIVE", "PARTIAL",
     "RECONCILIATION_REQUIRED", "CANCEL_REQUESTED", "CANCEL_UNCERTAIN",
@@ -493,7 +497,7 @@ class DashboardReadModel:
         return self.repo.get_state("dashboard_cutover_at", "") or ""
 
     def external_deal_history(self, window: DateWindow, *, page: int = 1, page_size: int = 25) -> dict[str, Any]:
-        page_size = max(1, min(page_size, 100)); page = max(1, page)
+        page_size = max(1, min(page_size, EXTERNAL_DEALS_MAX_PAGE_SIZE)); page = max(1, page)
         if not self._external_ready():
             return {"items": [], "page": page, "page_size": page_size, "total": 0,
                     "quality": "UNAVAILABLE", "reason": "external fills are not initialised"}
@@ -507,28 +511,40 @@ class DashboardReadModel:
                    WHERE matched_at>=? AND matched_at<? GROUP BY condition_id)""",
             (start, end),
         ) or {"total": 0}
+        # `seq` is a permanent, all-time ordinal (1 = the very first deal ever,
+        # post-floor) — independent of the date window/pagination — so it stays
+        # stable across ranges and pages.
         rows = self._all(
-            """SELECT condition_id,
-                      MAX(event_slug)   AS event_slug,
-                      MAX(market_title) AS market_title,
-                      MIN(matched_at)   AS first_action_at,
-                      MAX(matched_at)   AS last_action_at,
-                      COUNT(*)          AS action_count,
-                      SUM(CASE WHEN side='BUY'  THEN size         ELSE 0 END) AS buy_size,
-                      SUM(CASE WHEN side='SELL' THEN size         ELSE 0 END) AS sell_size,
-                      SUM(CASE WHEN side='BUY'  THEN notional_usd ELSE 0 END) AS buy_notional,
-                      SUM(CASE WHEN side='SELL' THEN notional_usd ELSE 0 END) AS sell_notional,
-                      SUM(COALESCE(fee_usd,0)) AS fees_usd,
-                      SUM(CASE WHEN side='SELL' THEN notional_usd ELSE -notional_usd END)
-                          - SUM(COALESCE(fee_usd,0)) AS cash_flow_usd,
-                      GROUP_CONCAT(DISTINCT outcome) AS outcomes,
-                      SUM(CASE WHEN fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
-               FROM external_fills
-               WHERE matched_at>=? AND matched_at<?
-               GROUP BY condition_id
-               ORDER BY MAX(matched_at) DESC
+            """WITH deal_rank AS (
+                   SELECT condition_id,
+                          ROW_NUMBER() OVER (ORDER BY MIN(matched_at) ASC, condition_id ASC) AS seq
+                   FROM external_fills
+                   WHERE matched_at>=?
+                   GROUP BY condition_id
+               )
+               SELECT ef.condition_id AS condition_id,
+                      dr.seq AS seq,
+                      MAX(ef.event_slug)   AS event_slug,
+                      MAX(ef.market_title) AS market_title,
+                      MIN(ef.matched_at)   AS first_action_at,
+                      MAX(ef.matched_at)   AS last_action_at,
+                      COUNT(*)             AS action_count,
+                      SUM(CASE WHEN ef.side='BUY'  THEN ef.size         ELSE 0 END) AS buy_size,
+                      SUM(CASE WHEN ef.side='SELL' THEN ef.size         ELSE 0 END) AS sell_size,
+                      SUM(CASE WHEN ef.side='BUY'  THEN ef.notional_usd ELSE 0 END) AS buy_notional,
+                      SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE 0 END) AS sell_notional,
+                      SUM(COALESCE(ef.fee_usd,0)) AS fees_usd,
+                      SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE -ef.notional_usd END)
+                          - SUM(COALESCE(ef.fee_usd,0)) AS cash_flow_usd,
+                      GROUP_CONCAT(DISTINCT ef.outcome) AS outcomes,
+                      SUM(CASE WHEN ef.fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
+               FROM external_fills ef
+               JOIN deal_rank dr ON dr.condition_id = ef.condition_id
+               WHERE ef.matched_at>=? AND ef.matched_at<?
+               GROUP BY ef.condition_id, dr.seq
+               ORDER BY MAX(ef.matched_at) DESC
                LIMIT ? OFFSET ?""",
-            (start, end, page_size, (page - 1) * page_size),
+            (floor or "0000", start, end, page_size, (page - 1) * page_size),
         )
         items = []
         for row in rows:
@@ -537,6 +553,7 @@ class DashboardReadModel:
             net_size = buy_size - sell_size
             fee_gaps = int(row.get("fee_gaps") or 0)
             items.append({
+                "seq": int(row.get("seq") or 0),
                 "deal_key": masked(row.get("condition_id")),
                 "event_slug": row.get("event_slug"),
                 "market_title": row.get("market_title"),

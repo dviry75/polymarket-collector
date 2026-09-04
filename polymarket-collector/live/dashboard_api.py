@@ -159,9 +159,11 @@ def _window(
     range_key: str,
     from_date: str | None,
     to_date: str | None,
+    *,
+    max_days: int = 90,
 ):
     try:
-        return resolve_window(range_key, from_date=from_date, to_date=to_date)
+        return resolve_window(range_key, from_date=from_date, to_date=to_date, max_days=max_days)
     except DashboardQueryError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -229,16 +231,19 @@ def trades(
     return _response(_response_cache.get(key, 2.0, lambda: model.trade_history(window, page=page, page_size=page_size)))
 
 
+EXTERNAL_MAX_CUSTOM_DAYS = 3650  # deals are cheap (grouped), so don't artificially cap custom ranges
+
+
 @router.get("/external/deals", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def external_deals(
     range: str = Query("7d", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
     from_date: str | None = None,
     to_date: str | None = None,
     page: int = Query(1, ge=1, le=1_000_000),
-    page_size: int = Query(25, ge=1, le=100),
+    page_size: int = Query(25, ge=1, le=5000),
 ) -> DashboardResponse:
     model, _infra, _auth_value = _services()
-    window = _window(range, from_date, to_date)
+    window = _window(range, from_date, to_date, max_days=EXTERNAL_MAX_CUSTOM_DAYS)
     key = f"external_deals:{window.start_utc.isoformat()}:{window.end_utc.isoformat()}:{page}:{page_size}"
     return _response(_response_cache.get(key, 2.0, lambda: model.external_deal_history(window, page=page, page_size=page_size)))
 
@@ -250,7 +255,7 @@ def external_summary(
     to_date: str | None = None,
 ) -> DashboardResponse:
     model, _infra, _auth_value = _services()
-    window = _window(range, from_date, to_date)
+    window = _window(range, from_date, to_date, max_days=EXTERNAL_MAX_CUSTOM_DAYS)
     key = f"external_summary:{window.start_utc.isoformat()}:{window.end_utc.isoformat()}"
     return _response(_response_cache.get(key, 2.0, lambda: model.external_summary(window)))
 
