@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Optional
 
 
@@ -1742,6 +1743,31 @@ class LiveRepository:
             else:
                 row = conn.execute("SELECT * FROM live_markets ORDER BY last_update_at DESC LIMIT 1").fetchone()
         return row_to_dict(row)
+
+    def latest_markets(
+        self, condition_ids: Iterable[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Batch form of latest_market(): one query for many condition_ids.
+
+        Used by reconciliation's per-position loops so a single pass opens one
+        connection instead of one per position. Unknown condition_ids are
+        simply absent from the returned mapping.
+        """
+        ids = sorted({str(cid) for cid in condition_ids if cid})
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM live_markets WHERE condition_id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            market = row_to_dict(row)
+            if market and market.get("condition_id"):
+                result[str(market["condition_id"])] = market
+        return result
 
     def non_final_orders(self) -> list[dict[str, Any]]:
         with self.connect() as conn:

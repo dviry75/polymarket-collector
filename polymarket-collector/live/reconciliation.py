@@ -672,8 +672,14 @@ class ReconciliationWorker:
             for item in remote_positions
             if (decimal_value(item.get("size")) or Decimal("0")) > 0
         }
-        for local in self.strategy_repo.reconciliation_positions():
-            market = self.repo.latest_market(str(local.get("condition_id") or ""))
+        local_positions = self.strategy_repo.reconciliation_positions()
+        # One query for every market this pass touches instead of one
+        # sqlite3.connect() per position on the event-loop thread.
+        markets_by_condition = self.repo.latest_markets(
+            local.get("condition_id") for local in local_positions
+        )
+        for local in local_positions:
+            market = markets_by_condition.get(str(local.get("condition_id") or ""))
             if not market or not bool(market.get("market_resolved")):
                 continue
             winner_token = str(market.get("winning_asset_id") or "")
