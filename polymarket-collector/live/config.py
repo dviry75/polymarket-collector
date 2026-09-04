@@ -74,13 +74,19 @@ class LiveConfig:
     strategy_take_profit_price: Decimal = Decimal("0.96")
     strategy_stop_price: Decimal = Decimal("0.66")
     strategy_emergency_price: Decimal = Decimal("0.60")
+    # STOP / EMERGENCY exits are an intentional aggressive market-equivalent
+    # liquidation: a FAK SELL with the minimum legal price as its floor. The
+    # 0.66 / 0.60 prices above are the *trigger*, never an execution guarantee.
+    # If the market is genuinely through the level, exiting fast below it beats
+    # holding to settlement/0. Do not raise these min prices to create a soft
+    # floor -- there is deliberately no slippage cap on this path.
     strategy_stop_min_price: Decimal = Decimal("0.01")
     strategy_emergency_min_price: Decimal = Decimal("0.01")
     strategy_entry_window_seconds: int = 120
     stop_loss_order_type: str = "FAK"
-    stop_loss_initial_slippage: Decimal = Decimal("0.02")
+    # NOTE: max_exit_slippage bounds the *rules/dashboard* projection only; it
+    # does NOT constrain STOP_066 / EMERGENCY execution (see strategy_stop_min_price).
     max_exit_slippage: Decimal = Decimal("0.05")
-    max_stop_loss_attempts: int = 3
     stop_loss_retry_delay_ms: int = 500
     stop_optimistic_submit_enabled: bool = True
     stop_capitulation_enabled: bool = True
@@ -195,9 +201,7 @@ class LiveConfig:
             strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.01"),
             strategy_entry_window_seconds=int(_env("LIVE_STRATEGY_ENTRY_WINDOW_SECONDS", "120") or "120"),
             stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "FAK").upper(),
-            stop_loss_initial_slippage=_decimal_env("LIVE_STOP_LOSS_INITIAL_SLIPPAGE", "0.02"),
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
-            max_stop_loss_attempts=int(_env("LIVE_MAX_STOP_LOSS_ATTEMPTS", "3") or "3"),
             stop_loss_retry_delay_ms=int(_env("LIVE_STOP_LOSS_RETRY_DELAY_MS", "500") or "500"),
             stop_optimistic_submit_enabled=_bool_env(
                 "LIVE_STOP_OPTIMISTIC_SUBMIT_ENABLED", True
@@ -373,16 +377,6 @@ class LiveConfig:
             errors.append("LIVE_CANARY_EVENT_LIMIT must remain exactly 1")
         if self.max_exit_slippage > Decimal("0.05"):
             errors.append("LIVE_MAX_EXIT_SLIPPAGE must be <= 0.05")
-        if self.stop_loss_initial_slippage < 0:
-            errors.append(
-                "LIVE_STOP_LOSS_INITIAL_SLIPPAGE must be >= 0"
-            )
-        if self.stop_loss_initial_slippage > self.max_exit_slippage:
-            errors.append(
-                "LIVE_STOP_LOSS_INITIAL_SLIPPAGE must be <= LIVE_MAX_EXIT_SLIPPAGE"
-            )
-        if self.max_stop_loss_attempts < 1:
-            errors.append("LIVE_MAX_STOP_LOSS_ATTEMPTS must be >= 1")
         if self.stop_loss_retry_delay_ms < 0:
             errors.append(
                 "LIVE_STOP_LOSS_RETRY_DELAY_MS must be >= 0"
@@ -492,9 +486,7 @@ class LiveConfig:
             "strategy_stop_price": str(self.strategy_stop_price),
             "strategy_emergency_price": str(self.strategy_emergency_price),
             "stop_loss_order_type": self.stop_loss_order_type,
-            "stop_loss_initial_slippage": str(self.stop_loss_initial_slippage),
             "max_exit_slippage": str(self.max_exit_slippage),
-            "max_stop_loss_attempts": self.max_stop_loss_attempts,
             "stop_loss_retry_delay_ms": self.stop_loss_retry_delay_ms,
             "stop_optimistic_submit_enabled": self.stop_optimistic_submit_enabled,
             "stop_capitulation_enabled": self.stop_capitulation_enabled,
