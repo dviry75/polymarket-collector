@@ -100,6 +100,12 @@ class LiveConfig:
     exit_supervisor_tick_budget_seconds: float = 3.0
     exit_supervisor_first_eval_sla_seconds: float = 2.0
     exit_supervisor_stop_to_submit_sla_seconds: float = 2.0
+    # Stop-loss exit forensics. Full order-book depth at cross/latch/submit is
+    # only persisted when the exit was pathological: fill VWAP below
+    # deep_capture_max_vwap, or a zero-fill / reject. The acceptable cutoff only
+    # labels the outcome axis (ACCEPTABLE vs BAD_EXIT); it constrains nothing.
+    exit_forensic_deep_capture_max_vwap: Decimal = Decimal("0.55")
+    exit_forensic_acceptable_min_vwap: Decimal = Decimal("0.60")
     require_clean_runtime: bool = True
     approved_git_sha: str = ""
     approved_runtime_hash: str = ""
@@ -235,6 +241,12 @@ class LiveConfig:
             ),
             exit_supervisor_stop_to_submit_sla_seconds=float(
                 _env("LIVE_EXIT_SUPERVISOR_STOP_TO_SUBMIT_SLA_SECONDS", "2") or "2"
+            ),
+            exit_forensic_deep_capture_max_vwap=_decimal_env(
+                "LIVE_EXIT_FORENSIC_DEEP_CAPTURE_MAX_VWAP", "0.55"
+            ),
+            exit_forensic_acceptable_min_vwap=_decimal_env(
+                "LIVE_EXIT_FORENSIC_ACCEPTABLE_MIN_VWAP", "0.60"
             ),
             require_clean_runtime=_bool_env("LIVE_REQUIRE_CLEAN_RUNTIME", True),
             approved_git_sha=_env("LIVE_APPROVED_GIT_SHA", "").strip(),
@@ -510,6 +522,12 @@ class LiveConfig:
             ),
             "exit_supervisor_stop_to_submit_sla_seconds": (
                 self.exit_supervisor_stop_to_submit_sla_seconds
+            ),
+            "exit_forensic_deep_capture_max_vwap": str(
+                self.exit_forensic_deep_capture_max_vwap
+            ),
+            "exit_forensic_acceptable_min_vwap": str(
+                self.exit_forensic_acceptable_min_vwap
             ),
             "require_clean_runtime": self.require_clean_runtime,
             "approved_git_sha_configured": bool(self.approved_git_sha),

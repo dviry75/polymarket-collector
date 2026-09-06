@@ -221,6 +221,111 @@ class StrategyRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS live_strategy_exit_audit (
+                    exit_audit_id TEXT PRIMARY KEY,
+                    position_id TEXT NOT NULL,
+                    episode_seq INTEGER NOT NULL DEFAULT 1,
+                    deal_id TEXT,
+                    event_id TEXT NOT NULL,
+                    condition_id TEXT,
+                    token_id TEXT,
+                    entry_intent_id TEXT,
+                    exit_intent_id TEXT,
+                    exit_purpose TEXT,
+                    min_price_floor_text TEXT,
+                    cross_detected_at TEXT,
+                    cross_exchange_timestamp_ms INTEGER,
+                    cross_book_generation INTEGER,
+                    cross_book_hash TEXT,
+                    cross_book_age_ms INTEGER,
+                    cross_receive_latency_ms INTEGER,
+                    cross_best_bid_text TEXT,
+                    cross_best_bid_size_text TEXT,
+                    cross_trigger_id TEXT,
+                    cross_frame_source TEXT,
+                    latched_at TEXT,
+                    latch_best_bid_text TEXT,
+                    latch_book_generation INTEGER,
+                    latch_book_hash TEXT,
+                    latch_book_age_ms INTEGER,
+                    latch_source TEXT,
+                    latch_liquidity_hash TEXT,
+                    tp_cancel_intent_id TEXT,
+                    tp_cancel_started_at TEXT,
+                    tp_cancel_confirmed_at TEXT,
+                    tp_cancel_result TEXT,
+                    prior_exit_cancel_intent_id TEXT,
+                    prior_exit_cancel_result TEXT,
+                    submitted_at TEXT,
+                    submit_best_bid_text TEXT,
+                    submit_best_bid_size_text TEXT,
+                    submit_book_generation INTEGER,
+                    submit_book_hash TEXT,
+                    submit_book_age_ms INTEGER,
+                    submit_frame_hash TEXT,
+                    requested_shares_text TEXT,
+                    clob_status TEXT,
+                    remote_order_id TEXT,
+                    expected_vwap_at_submit_text TEXT,
+                    expected_vwap_method TEXT,
+                    expected_fillable_shares_text TEXT,
+                    first_fill_at TEXT,
+                    last_fill_at TEXT,
+                    actual_fill_shares_text TEXT,
+                    actual_fill_vwap_text TEXT,
+                    actual_fill_fees_text TEXT,
+                    detection_latency_ms INTEGER,
+                    execution_latency_ms INTEGER,
+                    frame_to_submit_ms INTEGER,
+                    stop_to_submit_latency_ms INTEGER,
+                    first_eval_latency_ms INTEGER,
+                    settlement_wait INTEGER NOT NULL DEFAULT 0,
+                    cross_count INTEGER NOT NULL DEFAULT 1,
+                    uncross_count INTEGER NOT NULL DEFAULT 0,
+                    min_bid_seen_text TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    loss_detection_text TEXT,
+                    loss_execution_text TEXT,
+                    loss_fill_text TEXT,
+                    root_cause TEXT,
+                    primary_cause TEXT,
+                    exit_outcome TEXT NOT NULL DEFAULT 'PENDING',
+                    technical_behavior TEXT,
+                    classified_at TEXT,
+                    classifier_version TEXT,
+                    evidence_quality TEXT NOT NULL DEFAULT 'PENDING',
+                    deep_capture INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(position_id, episode_seq)
+                );
+
+                CREATE TABLE IF NOT EXISTS live_strategy_exit_book_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    exit_audit_id TEXT NOT NULL,
+                    position_id TEXT NOT NULL,
+                    exit_intent_id TEXT,
+                    phase TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    materialized_at TEXT,
+                    book_source TEXT,
+                    book_generation INTEGER,
+                    book_update_number INTEGER,
+                    book_message_hash TEXT,
+                    exchange_timestamp_ms INTEGER,
+                    exchange_age_ms INTEGER,
+                    receive_latency_ms INTEGER,
+                    best_bid_text TEXT,
+                    best_ask_text TEXT,
+                    best_bid_size_text TEXT,
+                    bids_json TEXT,
+                    asks_json TEXT,
+                    level_count INTEGER,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(exit_audit_id, phase)
+                );
+
                 CREATE TABLE IF NOT EXISTS live_strategy_positions (
                     position_id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,
@@ -420,6 +525,26 @@ class StrategyRepository:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_live_strategy_entry_audit_event "
                 "ON live_strategy_entry_audit(event_id, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_exit_audit_event "
+                "ON live_strategy_exit_audit(event_id, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_exit_audit_outcome "
+                "ON live_strategy_exit_audit(exit_outcome, evidence_quality, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_exit_audit_position "
+                "ON live_strategy_exit_audit(position_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_exit_audit_intent "
+                "ON live_strategy_exit_audit(exit_intent_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_exit_book_snap_position "
+                "ON live_strategy_exit_book_snapshots(position_id, phase)"
             )
             conn.execute(
                 "UPDATE live_alerts SET status=CASE "
@@ -3034,6 +3159,150 @@ class StrategyRepository:
                 (intent_id,),
             ).fetchone()
         return row_to_dict(row) if row is not None else None
+
+    # ------------------------------------------------------------------ #
+    # Stop-loss exit forensics. Written exclusively by the async exit-
+    # evidence drain task (never on the SELL submission path). The audit
+    # row is built incrementally CROSS -> LATCH -> TP_CANCEL -> SUBMIT ->
+    # FILLS -> FINALIZE; full order-book depth is stored in
+    # live_strategy_exit_book_snapshots only when the exit was pathological
+    # (fill VWAP below the deep-capture threshold, or zero-fill / reject).
+    # ------------------------------------------------------------------ #
+    _EXIT_AUDIT_FIELDS = {
+        "min_price_floor_text", "exit_intent_id", "exit_purpose",
+        "entry_intent_id", "deal_id", "condition_id", "token_id",
+        "cross_detected_at", "cross_exchange_timestamp_ms",
+        "cross_book_generation", "cross_book_hash", "cross_book_age_ms",
+        "cross_receive_latency_ms", "cross_best_bid_text",
+        "cross_best_bid_size_text", "cross_trigger_id", "cross_frame_source",
+        "latched_at", "latch_best_bid_text", "latch_book_generation",
+        "latch_book_hash", "latch_book_age_ms", "latch_source",
+        "latch_liquidity_hash",
+        "tp_cancel_intent_id", "tp_cancel_started_at", "tp_cancel_confirmed_at",
+        "tp_cancel_result", "prior_exit_cancel_intent_id",
+        "prior_exit_cancel_result",
+        "submitted_at", "submit_best_bid_text", "submit_best_bid_size_text",
+        "submit_book_generation", "submit_book_hash", "submit_book_age_ms",
+        "submit_frame_hash", "requested_shares_text", "clob_status",
+        "remote_order_id",
+        "expected_vwap_at_submit_text", "expected_vwap_method",
+        "expected_fillable_shares_text",
+        "first_fill_at", "last_fill_at", "actual_fill_shares_text",
+        "actual_fill_vwap_text", "actual_fill_fees_text",
+        "detection_latency_ms", "execution_latency_ms", "frame_to_submit_ms",
+        "stop_to_submit_latency_ms", "first_eval_latency_ms", "settlement_wait",
+        "cross_count", "uncross_count", "min_bid_seen_text", "attempt_count",
+        "loss_detection_text", "loss_execution_text", "loss_fill_text",
+        "root_cause", "primary_cause", "exit_outcome", "technical_behavior",
+        "classified_at", "classifier_version",
+        "evidence_quality", "deep_capture",
+    }
+
+    _EXIT_BOOK_SNAPSHOT_FIELDS = {
+        "exit_intent_id", "materialized_at", "book_source", "book_generation",
+        "book_update_number", "book_message_hash", "exchange_timestamp_ms",
+        "exchange_age_ms", "receive_latency_ms", "best_bid_text",
+        "best_ask_text", "best_bid_size_text", "bids_json", "asks_json",
+        "level_count", "truncated",
+    }
+
+    def record_exit_audit(
+        self,
+        exit_audit_id: str,
+        *,
+        position_id: str,
+        event_id: str,
+        episode_seq: int = 1,
+        **fields: Any,
+    ) -> None:
+        payload = {
+            key: fields[key] for key in fields if key in self._EXIT_AUDIT_FIELDS
+        }
+        ts = now_iso()
+        columns = [
+            "exit_audit_id", "position_id", "episode_seq", "event_id",
+            "created_at", "updated_at", *payload.keys(),
+        ]
+        values = [
+            exit_audit_id, position_id, int(episode_seq), event_id,
+            ts, ts, *payload.values(),
+        ]
+        updates = ",".join(f"{key}=excluded.{key}" for key in payload)
+        set_clause = (
+            f"updated_at=excluded.updated_at,{updates}"
+            if updates
+            else "updated_at=excluded.updated_at"
+        )
+        placeholders = ",".join("?" for _ in columns)
+        with self.base.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO live_strategy_exit_audit({",".join(columns)})
+                VALUES({placeholders})
+                ON CONFLICT(exit_audit_id) DO UPDATE SET {set_clause}
+                """,
+                values,
+            )
+            conn.commit()
+
+    def record_exit_book_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        exit_audit_id: str,
+        position_id: str,
+        phase: str,
+        captured_at: str,
+        **fields: Any,
+    ) -> None:
+        payload = {
+            key: fields[key]
+            for key in fields
+            if key in self._EXIT_BOOK_SNAPSHOT_FIELDS
+        }
+        columns = [
+            "snapshot_id", "exit_audit_id", "position_id", "phase",
+            "captured_at", "created_at", *payload.keys(),
+        ]
+        values = [
+            snapshot_id, exit_audit_id, position_id, phase,
+            captured_at, now_iso(), *payload.values(),
+        ]
+        placeholders = ",".join("?" for _ in columns)
+        with self.base.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO live_strategy_exit_book_snapshots(
+                    {",".join(columns)}
+                ) VALUES({placeholders})
+                """,
+                values,
+            )
+            conn.commit()
+
+    def exit_audit(
+        self, position_id: str, *, episode_seq: int = 1
+    ) -> dict[str, Any] | None:
+        if not position_id:
+            return None
+        with self.base.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM live_strategy_exit_audit "
+                "WHERE position_id=? AND episode_seq=?",
+                (position_id, int(episode_seq)),
+            ).fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def exit_book_snapshots(self, exit_audit_id: str) -> list[dict[str, Any]]:
+        if not exit_audit_id:
+            return []
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM live_strategy_exit_book_snapshots "
+                "WHERE exit_audit_id=? ORDER BY captured_at",
+                (exit_audit_id,),
+            ).fetchall()
+        return [row_to_dict(row) for row in rows]
 
     def entry_intent_id_for_event(self, event_id: str) -> str:
         with self.base.connect() as conn:

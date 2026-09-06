@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters.base import TradingAdapter
 from .config import LiveConfig
+from .exit_forensics import ExitEvidenceCollector
 from .exit_supervision import ExitSupervisionTracker
 from .order_book import canonical_decimal, decimal_value
 from .repository import LiveRepository, now_iso
@@ -113,6 +114,16 @@ class LiveStrategyRuntime:
                 config.exit_supervisor_stop_to_submit_sla_seconds
             ),
         )
+        # Stop-loss exit forensics: write-only telemetry, drained off the hot
+        # path by a dedicated task. Every note_* call below is a synchronous
+        # dict update + deque.append; nothing here touches the DB or the SELL.
+        self._exit_evidence = ExitEvidenceCollector(
+            strategy_repo,
+            deep_capture_max_vwap=config.exit_forensic_deep_capture_max_vwap,
+            acceptable_min_vwap=config.exit_forensic_acceptable_min_vwap,
+            logger=logging.getLogger(f"{__name__}.exit_evidence"),
+        )
+        self._exit_evidence_task: asyncio.Task[Any] | None = None
         # P0-C/D: positions already published into hot state, and those still
         # awaiting their first current-state exit evaluation.
         self._known_position_ids: set[str] = set()
@@ -200,6 +211,7 @@ class LiveStrategyRuntime:
         unrestricted_dates = {
             "2026-08-21",
             "2026-09-04",
+            "2026-09-07",
         }
         unrestricted_date = local.date().isoformat() in unrestricted_dates
         inactive = (
@@ -228,6 +240,7 @@ class LiveStrategyRuntime:
         self, provider: Callable[[str], dict[str, Any] | None]
     ) -> None:
         self._exit_book_provider = provider
+        self._exit_evidence.set_book_provider(provider)
 
     def _market(self, condition_id: str) -> dict[str, Any] | None:
         """Use the in-memory market cache on the hot path.
@@ -1820,8 +1833,25 @@ class LiveStrategyRuntime:
                     remaining_shares_text=position.get("remaining_shares_text"),
                     parameters_json={"trigger_bid": canonical_decimal(bid)},
                 )
+                self._note_exit_evidence(
+                    "latch", position, bid=bid, update=book,
+                    source="recovery_eval",
+                    latched_at=latched.get("updated_at"),
+                )
             await self._refresh_hot_state_once()
             self._exit_wakeup.set()
+
+    def _note_exit_evidence(
+        self, kind: str, position: dict[str, Any], **kwargs: Any
+    ) -> None:
+        """Fire-and-forget stop-exit telemetry. Never allowed to raise onto
+        the exit path — every failure is swallowed into ``last_error``."""
+        try:
+            getattr(self._exit_evidence, f"note_{kind}")(position, **kwargs)
+        except Exception as exc:
+            self.last_error = (
+                f"EXIT_EVIDENCE_NOTE:{type(exc).__name__}:{exc}"
+            )[:500]
 
     def _entry_intent_for_position(self, position: dict[str, Any]) -> str:
         try:
@@ -1874,6 +1904,11 @@ class LiveStrategyRuntime:
                     "acceptable_floor": canonical_decimal(floor),
                     "signal_price": canonical_decimal(self.policy.entry_price),
                 },
+            )
+            self._note_exit_evidence(
+                "latch", position, bid=None, update=None,
+                source="invalid_entry",
+                latched_at=result.get("updated_at"),
             )
         self._exit_wakeup.set()
 
@@ -2910,6 +2945,12 @@ class LiveStrategyRuntime:
 
         active_ids = {str(position["position_id"]) for position in positions}
         self._exit_tracker.prune(active_ids)
+        try:
+            self._exit_evidence.reconcile_active(active_ids)
+        except Exception as exc:
+            self.last_error = (
+                f"EXIT_EVIDENCE_RECONCILE:{type(exc).__name__}:{exc}"
+            )[:500]
 
         by_id = {str(p["position_id"]): p for p in positions}
 
@@ -3065,6 +3106,24 @@ class LiveStrategyRuntime:
                 self._exit_tracker.mark_stop_eligible_frame(
                     str(_pos.get("position_id") or ""), frame_iso
                 )
+                self._note_exit_evidence(
+                    "cross", _pos,
+                    bid=bid,
+                    bid_size=update.get("best_bid_size"),
+                    update=update,
+                    received_at=frame_iso,
+                    stop_price=self.policy.stop_price,
+                )
+        elif bid is not None:
+            for _pos in positions:
+                try:
+                    self._exit_evidence.observe_bid(
+                        str(_pos.get("position_id") or ""),
+                        bid=bid,
+                        stop_price=self.policy.stop_price,
+                    )
+                except Exception:
+                    pass
 
         reconciliation_ready = (
             self.paper_mode()
@@ -3145,6 +3204,11 @@ class LiveStrategyRuntime:
                             "min_price": canonical_decimal(initial_stop_floor),
                             "liquidity_hash": exit_book_hash,
                         },
+                    )
+                    self._note_exit_evidence(
+                        "latch", position, bid=bid, update=update,
+                        source="supervisor", liquidity_hash=exit_book_hash,
+                        latched_at=position.get("updated_at"),
                     )
                 await self._refresh_hot_state_once()
 
@@ -3291,6 +3355,19 @@ class LiveStrategyRuntime:
                             if bid is not None else None,
                         },
                     )
+                self._note_exit_evidence(
+                    "submit", position,
+                    exit_intent_id=None,
+                    purpose=latched_purpose,
+                    min_price=protected_min_price,
+                    requested_shares=position.get("sellable_shares_text"),
+                    frame_hash=protected_book_hash,
+                    update=update,
+                    submitted_at=None,
+                    stop_to_submit_seconds=submit_latency,
+                    frame_to_submit_seconds=frame_to_submit,
+                    attempt_count=stop_plan.get("attempt_count"),
+                )
                 await self._market_exit_fak(
                     position,
                     update,
@@ -3562,6 +3639,11 @@ class LiveStrategyRuntime:
                         self.repo.finalize_cancel(
                             str(active["intent_id"]), True, "PAPER_CANCEL_ACK"
                         )
+                        self._note_exit_evidence(
+                            "prior_exit_cancel", position,
+                            intent_id=active.get("intent_id"),
+                            result="PAPER_CANCEL_ACK",
+                        )
                     else:
                         response = await self.adapter.cancel_order_with_context(
                             active.get("remote_order_id"),
@@ -3581,6 +3663,11 @@ class LiveStrategyRuntime:
                             self.repo.finalize_cancel(
                                 str(active["intent_id"]), False, "CANCEL_UNCERTAIN"
                             )
+                            self._note_exit_evidence(
+                                "prior_exit_cancel", position,
+                                intent_id=active.get("intent_id"),
+                                result="CANCEL_UNCERTAIN",
+                            )
                             self.repo.alert(
                                 alert_type="EXIT",
                                 severity="CRITICAL",
@@ -3590,6 +3677,11 @@ class LiveStrategyRuntime:
                                 entity_id=position["position_id"],
                             )
                             return
+                        self._note_exit_evidence(
+                            "prior_exit_cancel", position,
+                            intent_id=active.get("intent_id"),
+                            result="CANCEL_ACK",
+                        )
                         self.repo.finalize_cancel(
                             str(active["intent_id"]), True, "CANCEL_ACK"
                         )
@@ -3652,8 +3744,16 @@ class LiveStrategyRuntime:
                     purpose,
                 )
                 if tp:
+                    self._note_exit_evidence(
+                        "tp_cancel", position,
+                        intent_id=tp.get("intent_id"), event="started",
+                    )
                     if self.paper_mode():
                         self.repo.finalize_cancel(str(tp["intent_id"]), True, "PAPER_CANCEL_ACK")
+                        self._note_exit_evidence(
+                            "tp_cancel", position, intent_id=tp.get("intent_id"),
+                            event="confirmed", result="PAPER_CANCEL_ACK",
+                        )
                     else:
                         response = await self.adapter.cancel_order_with_context(
                             tp.get("remote_order_id"),
@@ -3673,6 +3773,11 @@ class LiveStrategyRuntime:
                             self.repo.finalize_cancel(
                                 str(tp["intent_id"]), False, "CANCEL_UNCERTAIN"
                             )
+                            self._note_exit_evidence(
+                                "tp_cancel", position,
+                                intent_id=tp.get("intent_id"),
+                                event="confirmed", result="CANCEL_UNCERTAIN",
+                            )
                             self.repo.alert(
                                 alert_type="EXIT", severity="CRITICAL",
                                 reason_code="EXIT_RECONCILIATION_REQUIRED",
@@ -3681,6 +3786,10 @@ class LiveStrategyRuntime:
                             )
                             return
                         self.repo.finalize_cancel(str(tp["intent_id"]), True, "CANCEL_ACK")
+                        self._note_exit_evidence(
+                            "tp_cancel", position, intent_id=tp.get("intent_id"),
+                            event="confirmed", result="CANCEL_ACK",
+                        )
                         if not await self._post_cancel_settle_or_reconcile(
                             position,
                             tp.get("remote_order_id"),
@@ -3750,6 +3859,10 @@ class LiveStrategyRuntime:
                     str(intent["intent_id"]),
                     reason=f"{purpose}_WAITING_FOR_SELLABLE_BALANCE",
                 )
+                try:
+                    self._exit_evidence.note_waiting_sellable(position)
+                except Exception:
+                    pass
 
                 self.repo.timeline(
                     severity="CRITICAL",
@@ -3788,6 +3901,12 @@ class LiveStrategyRuntime:
             state="SUBMITTING",
             submitted_at=now_iso(),
         )
+        self._note_exit_evidence(
+            "submit_result", position,
+            exit_intent_id=intent["intent_id"],
+            requested_shares=shares,
+            submitted_at=intent.get("submitted_at"),
+        )
         if self.paper_mode():
             fill = simulate_sell_fak(
                 update.get("bids") or [], shares=shares, min_price=min_price,
@@ -3822,6 +3941,14 @@ class LiveStrategyRuntime:
                 pnl_text=updated["realized_pnl_text"],
                 parameters_json={"min_price": canonical_decimal(min_price)},
             )
+            self._note_exit_evidence(
+                "submit_result", position,
+                exit_intent_id=intent["intent_id"],
+                clob_status=(
+                    "ZERO_FILL" if fill.filled_shares == 0
+                    else "FILLED" if updated["state"] == "CLOSED" else "PARTIAL"
+                ),
+            )
             return
 
         response = await self.adapter.create_order({
@@ -3839,6 +3966,14 @@ class LiveStrategyRuntime:
             "requested_size": canonical_decimal(shares),
             "min_price": canonical_decimal(min_price),
         })
+        self._note_exit_evidence(
+            "submit_result", position,
+            exit_intent_id=intent["intent_id"],
+            clob_status=(
+                response.get("status") or response.get("failure_reason")
+            ),
+            remote_order_id=response.get("polymarket_order_id"),
+        )
         if self._is_waiting_sellable_response(response):
             self.repo.mark_waiting_sellable(
                 str(intent["intent_id"]),
@@ -3848,6 +3983,10 @@ class LiveStrategyRuntime:
                 ),
                 normalized_error=response.get("message"),
             )
+            try:
+                self._exit_evidence.note_waiting_sellable(position)
+            except Exception:
+                pass
             self.repo.update_intent(
                 str(intent["intent_id"]),
                 submitted_at=None,
@@ -4002,6 +4141,14 @@ class LiveStrategyRuntime:
                 self._exit_supervisor_loop(),
                 name="strategy-exit-supervisor",
             )
+        if (
+            self._exit_evidence_task is None
+            or self._exit_evidence_task.done()
+        ):
+            self._exit_evidence_task = asyncio.create_task(
+                self._exit_evidence.run(self._stop),
+                name="strategy-exit-evidence",
+            )
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="polymarket-order-heartbeat"
         )
@@ -4017,6 +4164,19 @@ class LiveStrategyRuntime:
             except asyncio.CancelledError:
                 pass
             self._exit_task = None
+
+        if self._exit_evidence_task:
+            self._exit_evidence.wakeup.set()
+            self._exit_evidence_task.cancel()
+            try:
+                await self._exit_evidence_task
+            except asyncio.CancelledError:
+                pass
+            self._exit_evidence_task = None
+            try:
+                self._exit_evidence.drain_pending()
+            except Exception:
+                pass
 
         if self._hot_state_task:
             self._hot_state_task.cancel()
@@ -4121,6 +4281,7 @@ class LiveStrategyRuntime:
                 self._pending_initial_eval
             ),
             "exit_supervision": self._exit_tracker.health(),
+            "exit_evidence": self._exit_evidence.stats(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
             "frames_dropped": self.frames_dropped,

@@ -490,6 +490,54 @@ class DashboardReadModel:
     def _external_ready(self) -> bool:
         return bool(self._one("SELECT name FROM sqlite_master WHERE type='table' AND name='external_fills'"))
 
+    def _exit_audit_enrichment(
+        self, condition_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Per-condition stop-exit root-cause overlay for the deal table.
+
+        Isolated from the money aggregates: the newest exit-audit episode per
+        condition_id is looked up separately and merged in Python, so the
+        external_fills SUM()s are never touched. Returns {} if the trader has
+        not created the table yet (pre-deploy dashboards).
+        """
+        ids = [c for c in dict.fromkeys(condition_ids) if c]
+        if not ids or not self._one(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='live_strategy_exit_audit'"
+        ):
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._all(
+            f"""
+            SELECT condition_id, root_cause, primary_cause, exit_outcome,
+                   technical_behavior, detection_latency_ms, execution_latency_ms,
+                   settlement_wait, evidence_quality, deep_capture,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY condition_id
+                       ORDER BY episode_seq DESC, created_at DESC
+                   ) AS rn
+            FROM live_strategy_exit_audit
+            WHERE condition_id IN ({placeholders})
+            """,
+            tuple(ids),
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if int(row.get("rn") or 0) != 1:
+                continue
+            out[str(row.get("condition_id"))] = {
+                "exit_root_cause": row.get("root_cause"),
+                "exit_primary_cause": row.get("primary_cause"),
+                "exit_technical_behavior": row.get("technical_behavior"),
+                "exit_analysis_outcome": row.get("exit_outcome"),
+                "exit_detection_ms": row.get("detection_latency_ms"),
+                "exit_execution_ms": row.get("execution_latency_ms"),
+                "exit_settlement_wait": bool(row.get("settlement_wait")),
+                "exit_evidence_quality": row.get("evidence_quality"),
+                "exit_deep_capture": bool(row.get("deep_capture")),
+            }
+        return out
+
     def _external_floor(self) -> str:
         override = os.environ.get("EXTERNAL_FILLS_SINCE")
         if override:
@@ -546,13 +594,16 @@ class DashboardReadModel:
                LIMIT ? OFFSET ?""",
             (floor or "0000", start, end, page_size, (page - 1) * page_size),
         )
+        enrichment = self._exit_audit_enrichment(
+            [row.get("condition_id") for row in rows if row.get("condition_id")]
+        )
         items = []
         for row in rows:
             buy_size = float(row.get("buy_size") or 0.0)
             sell_size = float(row.get("sell_size") or 0.0)
             net_size = buy_size - sell_size
             fee_gaps = int(row.get("fee_gaps") or 0)
-            items.append({
+            item = {
                 "seq": int(row.get("seq") or 0),
                 "deal_key": masked(row.get("condition_id")),
                 "event_slug": row.get("event_slug"),
@@ -571,7 +622,9 @@ class DashboardReadModel:
                 "state": "CLOSED" if abs(net_size) < 1e-6 else "OPEN",
                 "quality": "REAL" if fee_gaps == 0 else "PARTIAL",
                 "verified": True,
-            })
+            }
+            item.update(enrichment.get(row.get("condition_id"), {}))
+            items.append(item)
         return {
             "items": items, "page": page, "page_size": page_size,
             "total": int(count.get("total") or 0), "quality": "REAL",

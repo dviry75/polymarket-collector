@@ -6,6 +6,7 @@ from typing import Any
 import json
 from zoneinfo import ZoneInfo
 
+from .book_walk import book_walk_vwap
 from .repository import LiveRepository
 
 
@@ -278,30 +279,13 @@ class PaperTradingEngine:
 
         raw_levels = snapshot.get("bids")
         if raw_levels is None and snapshot.get("bids_json"):
-            try:
-                raw_levels = json.loads(str(snapshot["bids_json"]))
-            except (TypeError, ValueError):
-                raw_levels = []
+            raw_levels = snapshot.get("bids_json")
 
-        levels: list[tuple[Decimal, Decimal]] = []
-        for level in raw_levels or []:
-            if not isinstance(level, dict):
-                continue
-            price = self._valid_probability(level.get("price"))
-            size = self._decimal(level.get("size"))
-            if price is not None and size is not None and size > 0:
-                levels.append((price, size))
-
-        if levels:
-            remaining = requested_size
-            notional = Decimal("0")
-            for price, available in sorted(levels, key=lambda item: item[0], reverse=True):
-                filled = min(remaining, available)
-                notional += filled * price
-                remaining -= filled
-                if remaining <= 0:
-                    return notional / requested_size, "ORDER_BOOK_VWAP"
-
+        vwap, method, _ = book_walk_vwap(
+            raw_levels, requested_size, best_bid=best_bid
+        )
+        if method == "ORDER_BOOK_VWAP":
+            return vwap, "ORDER_BOOK_VWAP"
         return best_bid, "BEST_BID_FALLBACK"
 
     @staticmethod

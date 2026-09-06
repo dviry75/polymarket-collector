@@ -1540,6 +1540,7 @@ class LiveRepository:
             "live_event_states", "live_strategy_intents", "live_strategy_fills",
             "live_strategy_positions", "live_strategy_deals", "live_audit_timeline",
             "live_alerts", "live_archive_runs",
+            "live_strategy_exit_audit", "live_strategy_exit_book_snapshots",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -1560,6 +1561,10 @@ class LiveRepository:
             order_col = "created_at"
         if table == "live_strategy_deals":
             order_col = "created_at"
+        if table == "live_strategy_exit_audit":
+            order_col = "created_at"
+        if table == "live_strategy_exit_book_snapshots":
+            order_col = "captured_at"
         with self.connect() as conn:
             rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order_col} DESC LIMIT ?", (limit,)).fetchall()
         return [row_to_dict(row) or {} for row in rows]
