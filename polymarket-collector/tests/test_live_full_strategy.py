@@ -1263,6 +1263,7 @@ def test_critical_074_frame_survives_regular_frame_conflation():
         runtime.critical_triggers_queued = 0
         runtime.critical_triggers_processed = 0
         runtime.critical_triggers_dropped = 0
+        runtime.critical_frames_coalesced = 0
         runtime.max_critical_queue_depth = 0
         runtime._frame_event = asyncio.Event()
         runtime._frame_task = None
@@ -1356,6 +1357,7 @@ def test_stop_relatch_suppressed_once_stop_stage_is_latched():
         runtime.critical_triggers_queued = 0
         runtime.critical_triggers_processed = 0
         runtime.critical_triggers_dropped = 0
+        runtime.critical_frames_coalesced = 0
         runtime.max_critical_queue_depth = 0
         runtime._frame_event = asyncio.Event()
         runtime._frame_task = None
@@ -1544,6 +1546,7 @@ def test_single_stop_edge_survives_conflation():
         runtime.critical_triggers_queued = 0
         runtime.critical_triggers_processed = 0
         runtime.critical_triggers_dropped = 0
+        runtime.critical_frames_coalesced = 0
         runtime.max_critical_queue_depth = 0
 
         runtime._frame_event = asyncio.Event()
@@ -1644,6 +1647,7 @@ def test_entry_exact_price_is_edge_triggered_not_level_triggered():
         runtime.critical_triggers_queued = 0
         runtime.critical_triggers_processed = 0
         runtime.critical_triggers_dropped = 0
+        runtime.critical_frames_coalesced = 0
         runtime.max_critical_queue_depth = 0
 
         runtime._frame_event = asyncio.Event()
@@ -1701,13 +1705,16 @@ def test_entry_exact_price_is_edge_triggered_not_level_triggered():
             if context.get("_critical_trigger")
         ]
 
-        assert len(critical) == 2
-        assert all(
-            context["_critical_trigger_types"] == ["ENTRY_074"]
-            for context in critical
-        )
+        # Edge-triggering: 0.74 -> 0.74 raises no edge, 0.75 -> 0.74 does, so
+        # exactly two ENTRY_074 edges are latched (never one, never three).
         assert runtime.critical_triggers_queued == 2
         assert runtime.critical_triggers_dropped == 0
+        # Both edges share a coalesce key, so the newest supersedes the older
+        # in the queue and a single ENTRY_074 frame is actually processed.
+        assert runtime.critical_frames_coalesced == 1
+        assert len(critical) == 1
+        assert critical[0]["_critical_trigger_types"] == ["ENTRY_074"]
+        assert critical[0]["updates"][0]["best_ask"] == "0.74"
 
     asyncio.run(scenario())
 

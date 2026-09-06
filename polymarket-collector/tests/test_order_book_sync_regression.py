@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict, deque
 from decimal import Decimal
+from types import SimpleNamespace
 
 from live.order_book import OrderBookSet
 from live.strategy import StrategyPolicy
@@ -262,7 +263,12 @@ def runtime_fixture() -> LiveStrategyRuntime:
     runtime.critical_triggers_queued = 0
     runtime.critical_triggers_processed = 0
     runtime.critical_triggers_dropped = 0
+    runtime.critical_frames_coalesced = 0
     runtime.max_critical_queue_depth = 0
+    runtime.config = SimpleNamespace(
+        critical_frame_coalesce_enabled=True,
+        critical_frame_max_depth=24,
+    )
     runtime.enabled = lambda: True
     runtime._observe_entry_trigger = lambda _context: None
     return runtime
@@ -351,6 +357,116 @@ def test_below_stop_during_mismatch_remains_fail_closed_then_rearms_ready():
             False, True,
         ]
         assert all("STOP_066" in item["_critical_trigger_types"] for item in critical)
+    asyncio.run(scenario())
+
+
+def _oscillate_stop(runtime, bids, *, ready=True, reason="READY"):
+    """Drive the book above then back through the stop for each entry in
+    ``bids``, so every value is a fresh STOP_066 re-crossing edge."""
+    number = 0
+    for bid in bids:
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.70", ready=ready, reason=reason, number=number,
+            correlation_id=f"above-{number}",
+        ))
+        number += 1
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid=bid, ready=ready, reason=reason, number=number,
+            correlation_id=f"cross-{number}",
+        ))
+        number += 1
+
+
+def test_oscillating_book_coalesces_repeat_stop_edges_to_the_newest_frame():
+    """A book flapping around 0.66 fires a fresh STOP_066 edge on every
+    re-crossing. Only the newest still-queued frame is actionable (the latch is
+    durable once processed), so repeats collapse in place instead of burying
+    the real SELL seconds deep in the FIFO."""
+    async def scenario():
+        runtime = runtime_fixture()
+        _oscillate_stop(runtime, ("0.65", "0.55", "0.40", "0.20"))
+
+        critical = list(runtime._critical_frames)
+        assert len(critical) == 1
+        assert critical[0]["updates"][0]["best_bid"] == "0.20"
+        assert "STOP_066" in critical[0]["_critical_trigger_types"]
+        assert runtime.critical_frames_coalesced == 3
+        assert runtime.critical_triggers_queued == 4
+        assert runtime.critical_triggers_dropped == 0
+    asyncio.run(scenario())
+
+
+def test_coalescing_never_collapses_across_a_readiness_boundary():
+    async def scenario():
+        runtime = runtime_fixture()
+        # A READY re-crossing edge, then the same edge while NOT_READY.
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.70", ready=True, reason="READY", number=0,
+            correlation_id="above-ready",
+        ))
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.60", ready=True, reason="READY", number=1,
+            correlation_id="cross-ready",
+        ))
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.70", ready=False, reason="BEST_PRICE_MISMATCH",
+            number=2, correlation_id="above-not-ready",
+        ))
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.58", ready=False, reason="BEST_PRICE_MISMATCH",
+            number=3, correlation_id="cross-not-ready",
+        ))
+        critical = list(runtime._critical_frames)
+        assert [f["event_readiness"]["condition"]["ready"] for f in critical] == [
+            True, False,
+        ]
+        assert runtime.critical_frames_coalesced == 0
+    asyncio.run(scenario())
+
+
+def test_coalescing_can_be_disabled_by_config():
+    async def scenario():
+        runtime = runtime_fixture()
+        runtime.config.critical_frame_coalesce_enabled = False
+        _oscillate_stop(runtime, ("0.65", "0.55", "0.40"))
+        assert len(list(runtime._critical_frames)) == 3
+        assert runtime.critical_frames_coalesced == 0
+    asyncio.run(scenario())
+
+
+def test_critical_queue_cap_evicts_oldest_non_stop_frame_only():
+    async def scenario():
+        runtime = runtime_fixture()
+        runtime.config.critical_frame_coalesce_enabled = False
+        runtime.config.critical_frame_max_depth = 4
+        # One STOP edge first — it must survive every eviction.
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.70", ready=True, reason="READY", number=0,
+            correlation_id="above-stop",
+        ))
+        runtime.schedule_frame(strategy_frame(
+            ask="0.75", bid="0.64", ready=True, reason="READY", number=1,
+            correlation_id="the-stop",
+        ))
+        # Then a run of distinct ENTRY_074 re-crossings that overflow the cap.
+        n = 2
+        for _ in range(8):
+            runtime.schedule_frame(strategy_frame(
+                ask="0.72", bid="0.71", ready=True, reason="READY", number=n,
+                correlation_id=f"below-{n}",
+            ))
+            n += 1
+            runtime.schedule_frame(strategy_frame(
+                ask="0.74", bid="0.71", ready=True, reason="READY", number=n,
+                correlation_id=f"entry-{n}",
+            ))
+            n += 1
+        frames = list(runtime._critical_frames)
+        assert len(frames) <= 4
+        assert any(
+            "STOP_066" in f["_critical_trigger_types"] for f in frames
+        )
+        assert runtime.critical_triggers_dropped > 0
     asyncio.run(scenario())
 
 

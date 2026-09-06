@@ -122,6 +122,11 @@ class LiveConfig:
     exit_supervisor_tick_budget_seconds: float = 3.0
     exit_supervisor_first_eval_sla_seconds: float = 2.0
     exit_supervisor_stop_to_submit_sla_seconds: float = 2.0
+    # Critical-frame FIFO: collapse repeat frames for the same (market, trigger
+    # type) to the newest one so a volatile book cannot bury a latched SELL
+    # behind seconds of stale frames. The cap only ever evicts non-STOP frames.
+    critical_frame_coalesce_enabled: bool = True
+    critical_frame_max_depth: int = 24
     # Stop-loss exit forensics. Full order-book depth at cross/latch/submit is
     # only persisted when the exit was pathological: fill VWAP below
     # deep_capture_max_vwap, or a zero-fill / reject. The acceptable cutoff only
@@ -275,6 +280,12 @@ class LiveConfig:
             ),
             exit_supervisor_stop_to_submit_sla_seconds=float(
                 _env("LIVE_EXIT_SUPERVISOR_STOP_TO_SUBMIT_SLA_SECONDS", "2") or "2"
+            ),
+            critical_frame_coalesce_enabled=_bool_env(
+                "LIVE_CRITICAL_FRAME_COALESCE_ENABLED", True
+            ),
+            critical_frame_max_depth=int(
+                _env("LIVE_CRITICAL_FRAME_MAX_DEPTH", "24") or "24"
             ),
             exit_forensic_deep_capture_max_vwap=_decimal_env(
                 "LIVE_EXIT_FORENSIC_DEEP_CAPTURE_MAX_VWAP", "0.55"
@@ -505,6 +516,10 @@ class LiveConfig:
             errors.append(
                 "LIVE_ENTRY_LIQUIDITY_DEEP_CAPTURE_MAX_VWAP must be > 0 and <= 1"
             )
+        if not 4 <= self.critical_frame_max_depth <= 1024:
+            errors.append(
+                "LIVE_CRITICAL_FRAME_MAX_DEPTH must be between 4 and 1024"
+            )
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -598,6 +613,10 @@ class LiveConfig:
             "exit_supervisor_stop_to_submit_sla_seconds": (
                 self.exit_supervisor_stop_to_submit_sla_seconds
             ),
+            "critical_frame_coalesce_enabled": (
+                self.critical_frame_coalesce_enabled
+            ),
+            "critical_frame_max_depth": self.critical_frame_max_depth,
             "exit_forensic_deep_capture_max_vwap": str(
                 self.exit_forensic_deep_capture_max_vwap
             ),

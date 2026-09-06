@@ -168,6 +168,7 @@ class LiveStrategyRuntime:
         self.critical_triggers_queued = 0
         self.critical_triggers_processed = 0
         self.critical_triggers_dropped = 0
+        self.critical_frames_coalesced = 0
         self.max_critical_queue_depth = 0
         self.critical_alignment_waits = 0
         self.critical_alignment_recoveries = 0
@@ -977,13 +978,19 @@ class LiveStrategyRuntime:
                     ],
                 ]
 
+                critical_trigger_types = sorted(critical_types)
                 critical = {
                     **context,
                     "_critical_trigger": True,
-                    "_critical_trigger_types": (
-                        sorted(
-                            critical_types
-                        )
+                    "_critical_trigger_types": critical_trigger_types,
+                    # Readiness is part of the key: a NOT_READY edge is
+                    # fail-closed evidence and must never be replaced by a
+                    # later READY frame (or vice-versa). Only same-readiness
+                    # repeats of the same edge collapse.
+                    "_coalesce_key": (
+                        condition_id,
+                        tuple(critical_trigger_types),
+                        bool(readiness.get("ready")),
                     ),
                     "updates": context_updates,
                     "_critical_trigger_id": (
@@ -995,11 +1002,39 @@ class LiveStrategyRuntime:
                     },
                 }
 
-                # Critical edges are strict FIFO and never dropped because
-                # of normal latest-state queue pressure.
-                self._critical_frames.append(
-                    critical
-                )
+                # A volatile book fires the same critical edge (same market,
+                # same trigger type) many times per second. The STOP obligation
+                # is durable once processed (stop_stage in the DB, owned by the
+                # 250 ms exit supervisor) and an ENTRY edge is bounded by the
+                # signal-TTL check, so only the *newest* still-queued frame for
+                # a given edge is actionable. Replacing the stale one in place —
+                # rather than appending — keeps its FIFO position but stops a
+                # collapsing book from pushing the real SELL 7-17 s down the
+                # queue (observed on btc-updown-5m-1788699900: SELL left 9.1 s
+                # after the latch, into a book already at 0.45).
+                superseded_index = None
+                if getattr(
+                    getattr(self, "config", None),
+                    "critical_frame_coalesce_enabled",
+                    True,
+                ):
+                    for index, queued in enumerate(self._critical_frames):
+                        if queued.get("_coalesce_key") == critical["_coalesce_key"]:
+                            superseded_index = index
+                            break
+
+                if superseded_index is not None:
+                    self._trace_critical(
+                        "CRITICAL_FRAME_SUPERSEDED",
+                        update=latched_updates[0] if latched_updates else None,
+                        context=self._critical_frames[superseded_index],
+                        result="SUPERSEDED",
+                    )
+                    self._critical_frames[superseded_index] = critical
+                    self.critical_frames_coalesced += 1
+                else:
+                    self._critical_frames.append(critical)
+                    self._enforce_critical_queue_cap()
 
                 self.critical_triggers_queued += 1
                 self._trace_critical(
@@ -1053,6 +1088,35 @@ class LiveStrategyRuntime:
 
         if grouped_observed:
             self._frame_event.set()
+
+    def _enforce_critical_queue_cap(self) -> None:
+        """Bound the critical FIFO. A STOP_066 edge is never dropped — the SELL
+        obligation depends on it — so eviction only ever removes the oldest
+        queued frame that carries no STOP edge. If the queue is entirely STOP
+        edges (should not happen once coalescing collapses same-market repeats)
+        it is left to grow rather than lose a loss-exit signal."""
+        cap = getattr(
+            getattr(self, "config", None), "critical_frame_max_depth", 24
+        )
+        while len(self._critical_frames) > cap:
+            victim = next(
+                (
+                    index
+                    for index, frame in enumerate(self._critical_frames)
+                    if "STOP_066"
+                    not in (frame.get("_critical_trigger_types") or [])
+                ),
+                None,
+            )
+            if victim is None:
+                return
+            self._trace_critical(
+                "CRITICAL_FRAME_DROPPED",
+                context=self._critical_frames[victim],
+                result="DROPPED_QUEUE_CAP",
+            )
+            del self._critical_frames[victim]
+            self.critical_triggers_dropped += 1
 
     def _observe_entry_trigger(self, context: dict[str, Any]) -> None:
         """Log the 0.74 decision path, including while execution is READ_ONLY."""
@@ -4413,6 +4477,7 @@ class LiveStrategyRuntime:
             "critical_triggers_queued": self.critical_triggers_queued,
             "critical_triggers_processed": self.critical_triggers_processed,
             "critical_triggers_dropped": self.critical_triggers_dropped,
+            "critical_frames_coalesced": self.critical_frames_coalesced,
             "max_critical_queue_depth": self.max_critical_queue_depth,
             "critical_alignment_waits": self.critical_alignment_waits,
             "critical_alignment_recoveries": (
