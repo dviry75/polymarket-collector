@@ -281,6 +281,9 @@ class ExitEvidenceCollector:
         if update is not None:
             episode.fields.update(
                 {
+                    "latch_exchange_timestamp_ms": _int(
+                        update.get("exchange_timestamp_ms")
+                    ),
                     "latch_book_generation": _int(update.get("generation")),
                     "latch_book_hash": update.get("message_hash"),
                     "latch_book_age_ms": _int(update.get("exchange_age_ms")),
@@ -351,6 +354,10 @@ class ExitEvidenceCollector:
     ) -> None:
         pid = str(position.get("position_id") or "")
         episode = self._episode(position)
+        # Reaching a real stop/emergency SELL submit is itself a committed exit
+        # obligation: keep the episode even if note_latch never ran (operator
+        # emergency close, or a latch site we do not hook).
+        episode.latched = True
         if exit_intent_id:
             episode.exit_intent_id = str(exit_intent_id)
         episode.fields.update(

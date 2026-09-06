@@ -203,6 +203,25 @@ def _resolve_component(
     detection_ms, execution_ms, sla_ms, fresh_max_age, reasons,
 ) -> str:
     if name == "DETECTION_DELAY":
+        # Exchange-time elapsed between the cross book and the latch book. If the
+        # price moved over real market time we tracked it (MARKET); if our wall
+        # clock ran far ahead of exchange time, our processing lagged the feed
+        # (DETECTION_DELAY / stale data).
+        x_cross = _int(row.get("cross_exchange_timestamp_ms"))
+        x_latch = _int(row.get("latch_exchange_timestamp_ms"))
+        exch_ms = (x_latch - x_cross) if (x_cross and x_latch) else None
+        if exch_ms is not None and detection_ms is not None:
+            if detection_ms - exch_ms > sla_ms:
+                reasons.append(
+                    f"wall cross->latch {detection_ms}ms vs exchange-time "
+                    f"{exch_ms}ms: our processing lagged the feed"
+                )
+                return "DETECTION_DELAY"
+            reasons.append(
+                f"cross->latch {detection_ms}ms tracks exchange-time {exch_ms}ms: "
+                "the market moved, not our detection"
+            )
+            return "MARKET"
         if detection_ms is not None and detection_ms <= sla_ms:
             reasons.append(
                 f"price fell {row.get('loss_detection_text')} cross->latch in "

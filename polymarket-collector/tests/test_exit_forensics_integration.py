@@ -15,7 +15,26 @@ from live.strategy_repository import StrategyRepository
 from live.strategy_runtime import LiveStrategyRuntime
 
 
-def _case(name, *, bids, best_bid, shares=Decimal("5")):
+class _RecordingSellAdapter(MockTradingAdapter):
+    def __init__(self, response=None):
+        super().__init__(scenario="delayed")
+        self.create_calls = []
+        self.response = response
+
+    async def create_order(self, order):
+        self.create_calls.append(dict(order))
+        if self.response is not None:
+            return dict(self.response)
+        return {"success": True, "status": "delayed",
+                "polymarket_order_id": f"remote-{len(self.create_calls)}"}
+
+
+async def _ok_reconcile(_reason):
+    return {"status": "ok"}
+
+
+def _case(name, *, bids, best_bid, shares=Decimal("5"), sellable=None,
+          paper=True, adapter=None, reconciliation=None):
     temporary = tempfile.TemporaryDirectory()
     base = LiveRepository(Path(temporary.name) / "live.sqlite3")
     base.migrate()
@@ -38,13 +57,18 @@ def _case(name, *, bids, best_bid, shares=Decimal("5")):
         event_id=event_id, condition_id=condition_id, token_id=token_id,
         outcome="YES", shares=shares, average_price=Decimal("0.74"),
         cost_all_in=Decimal("3.70"), fees=Decimal("0"),
-        sellable_shares=shares, min_sellable=Decimal("1"),
+        sellable_shares=shares if sellable is None else sellable,
+        min_sellable=Decimal("1"),
     )
     config = LiveConfig(
-        live_module_enabled=True, execution_mode="PAPER_TRADING",
-        paper_trading_enabled=True, stop_loss_retry_delay_ms=0,
+        live_module_enabled=True,
+        execution_mode="PAPER_TRADING" if paper else "READ_ONLY",
+        paper_trading_enabled=paper, stop_loss_retry_delay_ms=0,
     )
-    runtime = LiveStrategyRuntime(config, base, repo, MockTradingAdapter())
+    runtime = LiveStrategyRuntime(
+        config, base, repo, adapter or MockTradingAdapter(),
+        reconciliation=reconciliation,
+    )
     update = {
         "asset_id": token_id,
         "best_bid": best_bid,
@@ -128,6 +152,88 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             ))
             self._finish(runtime)
             self.assertIsNone(repo.exit_audit(position["position_id"]))
+        finally:
+            temp.cleanup()
+
+    def test_waiting_sellable_resume_still_captures_submit(self):
+        adapter = _RecordingSellAdapter(response={
+            "success": False, "status": "blocked",
+            "submission_state": "NOT_SUBMITTED",
+            "failure_reason": "INSUFFICIENT_BALANCE", "message": "INSUFFICIENT_BALANCE",
+        })
+        temp, base, repo, runtime, position, update = _case(
+            "resume", bids=[("0.66", "5")], best_bid="0.66",
+            sellable=Decimal("0"), paper=False, adapter=adapter,
+            reconciliation=_ok_reconcile,
+        )
+        try:
+            asyncio.run(runtime._manage_position(
+                market={}, update=update, event_ready=True, frame_hash="f1",
+            ))
+            # parked WAITING_SELLABLE
+            self.assertEqual(
+                repo.intent(repo.position_for_token(position["token_id"])
+                            ["active_exit_intent_id"])["state"],
+                "WAITING_SELLABLE",
+            )
+            # shares settle; a fresh sub-stop frame resumes the SELL
+            adapter.response = None
+            repo.reconcile_remote_position(
+                event_id=position["event_id"], condition_id=position["condition_id"],
+                token_id=position["token_id"], outcome="YES",
+                remote_shares=Decimal("5"), average_price=Decimal("0.74"),
+            )
+            asyncio.run(runtime._refresh_hot_state_once())
+            crash = {**update, "best_bid": "0.40",
+                     "bids": [{"price": "0.40", "size": "5"}], "message_hash": "h2"}
+            asyncio.run(runtime._manage_position(
+                market={}, update=crash, event_ready=True, frame_hash="f2",
+            ))
+            self.assertTrue(adapter.create_calls)
+            self._finish(runtime)
+
+            row = repo.exit_audit(position["position_id"])
+            self.assertIsNotNone(row)
+            self.assertEqual(row["exit_purpose"], "STOP_066")
+            self.assertIsNotNone(row["submitted_at"])
+            self.assertEqual(row["submit_best_bid_text"], "0.40")
+            self.assertEqual(row["settlement_wait"], 1)
+        finally:
+            temp.cleanup()
+
+    def test_operator_emergency_close_captures_submit(self):
+        adapter = _RecordingSellAdapter()
+        temp, base, repo, runtime, position, update = _case(
+            "operator", bids=[("0.50", "5")], best_bid="0.50",
+            paper=False, adapter=adapter, reconciliation=_ok_reconcile,
+        )
+
+        class _Book:
+            ready = True
+            generation = 3
+            update_number = 3
+            last_message_hash = "mh"
+
+            def view(self, **_):
+                return {**update, "event_type": "operator_emergency"}
+
+        class _Books:
+            books = {position["token_id"]: _Book()}
+
+        try:
+            res = asyncio.run(runtime.emergency_close_all(_Books(), actor="op"))
+            self.assertEqual(res["status"], "executed")
+            self.assertTrue(adapter.create_calls)
+            self._finish(runtime)
+
+            row = repo.exit_audit(position["position_id"])
+            self.assertIsNotNone(row)
+            self.assertEqual(row["exit_purpose"], "EMERGENCY_OPERATOR")
+            self.assertIsNotNone(row["submitted_at"])
+            self.assertEqual(row["submit_best_bid_text"], "0.50")
+            self.assertIn("0.50", {
+                s["phase"]: s for s in repo.exit_book_snapshots(row["exit_audit_id"])
+            }.get("SUBMIT", {}).get("bids_json", ""))
         finally:
             temp.cleanup()
 

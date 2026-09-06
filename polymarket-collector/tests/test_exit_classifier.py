@@ -62,6 +62,20 @@ class ExitClassifierTests(unittest.TestCase):
         self.assertEqual(out["root_cause"], "MARKET")
         self.assertEqual(out["technical_behavior"], "MARKET")
 
+    def test_detection_delay_vs_market_by_exchange_time(self):
+        # big price drop cross->latch; wall clock tracks exchange time -> MARKET
+        market = dict(
+            BASE, latch_best_bid_text="0.40", submit_best_bid_text="0.39",
+            actual_fill_vwap_text="0.39", expected_vwap_at_submit_text="0.39",
+            loss_detection_text="0.26", detection_latency_ms=2100,
+            cross_exchange_timestamp_ms=1_000_000, latch_exchange_timestamp_ms=1_002_000,
+        )
+        self.assertEqual(classify_exit(market)["root_cause"], "MARKET")
+        # same drop, but wall clock ran 3s ahead of exchange time -> DETECTION_DELAY
+        lag = dict(market, detection_latency_ms=5000,
+                   latch_exchange_timestamp_ms=1_000_300)
+        self.assertEqual(classify_exit(lag)["root_cause"], "DETECTION_DELAY")
+
     def test_detection_delay(self):
         row = dict(
             BASE,

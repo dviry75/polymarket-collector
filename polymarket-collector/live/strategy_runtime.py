@@ -3355,25 +3355,15 @@ class LiveStrategyRuntime:
                             if bid is not None else None,
                         },
                     )
-                self._note_exit_evidence(
-                    "submit", position,
-                    exit_intent_id=None,
-                    purpose=latched_purpose,
-                    min_price=protected_min_price,
-                    requested_shares=position.get("sellable_shares_text"),
-                    frame_hash=protected_book_hash,
-                    update=update,
-                    submitted_at=None,
-                    stop_to_submit_seconds=submit_latency,
-                    frame_to_submit_seconds=frame_to_submit,
-                    attempt_count=stop_plan.get("attempt_count"),
-                )
                 await self._market_exit_fak(
                     position,
                     update,
                     purpose=latched_purpose,
                     min_price=protected_min_price,
                     frame_hash=protected_book_hash,
+                    submit_latency=submit_latency,
+                    frame_to_submit=frame_to_submit,
+                    attempt_count=stop_plan.get("attempt_count"),
                 )
                 await self._refresh_hot_state_once()
                 continue
@@ -3567,6 +3557,9 @@ class LiveStrategyRuntime:
         purpose: str,
         min_price: Decimal,
         frame_hash: str,
+        submit_latency: float | None = None,
+        frame_to_submit: float | None = None,
+        attempt_count: int | None = None,
     ) -> None:
         remaining_obligation = (
             decimal_value(position.get("remaining_shares_text"))
@@ -3901,11 +3894,32 @@ class LiveStrategyRuntime:
             state="SUBMITTING",
             submitted_at=now_iso(),
         )
+        # Single sell_submit hook covering every _market_exit_fak caller
+        # (manage_position, waiting-sellable resume, operator emergency).
         self._note_exit_evidence(
-            "submit_result", position,
+            "submit", position,
             exit_intent_id=intent["intent_id"],
+            purpose=purpose,
+            min_price=min_price,
             requested_shares=shares,
+            frame_hash=frame_hash,
+            update=update,
             submitted_at=intent.get("submitted_at"),
+            attempt_count=attempt_count,
+            stop_to_submit_seconds=(
+                submit_latency
+                if submit_latency is not None
+                else self._exit_tracker.mark_sell_submitted(
+                    str(position["position_id"])
+                )
+            ),
+            frame_to_submit_seconds=(
+                frame_to_submit
+                if frame_to_submit is not None
+                else self._exit_tracker.frame_to_now_seconds(
+                    str(position["position_id"])
+                )
+            ),
         )
         if self.paper_mode():
             fill = simulate_sell_fak(

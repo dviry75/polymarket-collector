@@ -245,6 +245,7 @@ class StrategyRepository:
                     cross_frame_source TEXT,
                     latched_at TEXT,
                     latch_best_bid_text TEXT,
+                    latch_exchange_timestamp_ms INTEGER,
                     latch_book_generation INTEGER,
                     latch_book_hash TEXT,
                     latch_book_age_ms INTEGER,
@@ -520,6 +521,23 @@ class StrategyRepository:
                 if column not in existing_position_columns:
                     conn.execute(
                         "ALTER TABLE live_strategy_positions "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            # Additive columns for the exit-audit table (safe if it predates them).
+            exit_audit_columns = {
+                "settlement_wait": "INTEGER NOT NULL DEFAULT 0",
+                "latch_exchange_timestamp_ms": "INTEGER",
+            }
+            existing_exit_audit_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(live_strategy_exit_audit)"
+                ).fetchall()
+            }
+            for column, definition in exit_audit_columns.items():
+                if column not in existing_exit_audit_columns:
+                    conn.execute(
+                        "ALTER TABLE live_strategy_exit_audit "
                         f"ADD COLUMN {column} {definition}"
                     )
             conn.execute(
@@ -3175,9 +3193,9 @@ class StrategyRepository:
         "cross_book_generation", "cross_book_hash", "cross_book_age_ms",
         "cross_receive_latency_ms", "cross_best_bid_text",
         "cross_best_bid_size_text", "cross_trigger_id", "cross_frame_source",
-        "latched_at", "latch_best_bid_text", "latch_book_generation",
-        "latch_book_hash", "latch_book_age_ms", "latch_source",
-        "latch_liquidity_hash",
+        "latched_at", "latch_best_bid_text", "latch_exchange_timestamp_ms",
+        "latch_book_generation", "latch_book_hash", "latch_book_age_ms",
+        "latch_source", "latch_liquidity_hash",
         "tp_cancel_intent_id", "tp_cancel_started_at", "tp_cancel_confirmed_at",
         "tp_cancel_result", "prior_exit_cancel_intent_id",
         "prior_exit_cancel_result",
