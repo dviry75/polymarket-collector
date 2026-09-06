@@ -29,7 +29,7 @@ from decimal import Decimal
 import json
 from typing import Any, Callable
 
-from .book_walk import book_walk_vwap
+from .book_walk import book_walk_vwap, cumulative_bid_depth
 from .repository import now_iso
 from .strategy_repository import StrategyRepository, stable_id
 
@@ -37,6 +37,10 @@ _MAX_QUEUE = 512
 _MAX_LADDER_LEVELS = 250
 _DEFAULT_DEEP_CAPTURE_MAX_VWAP = Decimal("0.55")
 _DEFAULT_ACCEPTABLE_MIN_VWAP = Decimal("0.60")
+# Bid-depth buckets recorded at SUBMIT for entry-liquidity parity.
+_SUBMIT_DEPTH_LEVELS = (
+    Decimal("0.66"), Decimal("0.60"), Decimal("0.55"), Decimal("0.46"),
+)
 
 
 def _dec(value: Any) -> Decimal | None:
@@ -567,6 +571,22 @@ class ExitEvidenceCollector:
         expected_vwap = None
         submit_book = episode.books.get("SUBMIT")
         requested = _dec(row.get("requested_shares_text"))
+        if submit_book:
+            final["full_ladder_captured_synchronously"] = (
+                1 if submit_book.get("_inline") else 0
+            )
+            submit_ask = submit_book.get("best_ask_text")
+            if submit_ask is not None:
+                final["submit_best_ask_text"] = _text(submit_ask)
+            depth = cumulative_bid_depth(
+                submit_book.get("bids_json"), _SUBMIT_DEPTH_LEVELS
+            )
+            for column, level in zip(
+                ("submit_depth_at_066_text", "submit_depth_at_060_text",
+                 "submit_depth_at_055_text", "submit_depth_at_046_text"),
+                _SUBMIT_DEPTH_LEVELS,
+            ):
+                final[column] = _text(depth.get(level))
         if submit_book and requested:
             ev, method, fillable = book_walk_vwap(
                 submit_book.get("bids_json"),
@@ -674,6 +694,7 @@ class ExitEvidenceCollector:
     ) -> dict[str, Any] | None:
         if not ref:
             return None
+        inline = ref.get("mode") == "inline"
         if ref.get("mode") == "callable":
             provider = self._book_provider
             if provider is None:
@@ -702,6 +723,7 @@ class ExitEvidenceCollector:
                 "asks_json": json.dumps(asks[:_MAX_LADDER_LEVELS]),
                 "level_count": len(bids),
                 "truncated": truncated,
+                "_inline": inline,
             }
         )
         return meta

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters.base import TradingAdapter
 from .config import LiveConfig
+from .entry_liquidity import EntryLiquidityCollector
 from .exit_forensics import ExitEvidenceCollector
 from .exit_supervision import ExitSupervisionTracker
 from .order_book import canonical_decimal, decimal_value
@@ -124,6 +125,20 @@ class LiveStrategyRuntime:
             logger=logging.getLogger(f"{__name__}.exit_evidence"),
         )
         self._exit_evidence_task: asyncio.Task[Any] | None = None
+        # Entry-liquidity instrumentation: write-only telemetry, drained off the
+        # hot path. Every note_* call is a synchronous dict update + deque
+        # append; nothing here touches the DB or the BUY submission.
+        self._entry_liquidity = EntryLiquidityCollector(
+            strategy_repo,
+            bucket_levels=config.entry_liquidity_bucket_levels,
+            buffer_multiples=config.entry_liquidity_buffer_multiples,
+            deep_capture_max_vwap=config.entry_liquidity_deep_capture_max_vwap,
+            logger=logging.getLogger(f"{__name__}.entry_liquidity"),
+        )
+        self._entry_liquidity_task: asyncio.Task[Any] | None = None
+        self._entry_liquidity_enabled = bool(
+            config.entry_liquidity_capture_enabled
+        )
         # P0-C/D: positions already published into hot state, and those still
         # awaiting their first current-state exit evaluation.
         self._known_position_ids: set[str] = set()
@@ -241,6 +256,7 @@ class LiveStrategyRuntime:
     ) -> None:
         self._exit_book_provider = provider
         self._exit_evidence.set_book_provider(provider)
+        self._entry_liquidity.set_book_provider(provider)
 
     def _market(self, condition_id: str) -> dict[str, Any] | None:
         """Use the in-memory market cache on the hot path.
@@ -1563,13 +1579,16 @@ class LiveStrategyRuntime:
         if not book:
             return {"ok": False, "reason": "ENTRY_REVALIDATION_BOOK_NOT_READY"}
         if not book.get("book_ready", True):
-            return {"ok": False, "reason": "ENTRY_REVALIDATION_BOOK_NOT_READY"}
+            return {
+                "ok": False, "reason": "ENTRY_REVALIDATION_BOOK_NOT_READY",
+                "book": book,
+            }
         age_ms = book.get("exchange_age_ms")
         max_age_ms = int(self.config.max_market_data_age_seconds * 1000)
         if age_ms is not None and int(age_ms) > max_age_ms:
             return {
                 "ok": False, "reason": "ENTRY_REVALIDATION_STALE",
-                "age_ms": int(age_ms),
+                "age_ms": int(age_ms), "book": book,
             }
         latched_generation = update.get("generation")
         current_generation = book.get("generation")
@@ -1580,7 +1599,7 @@ class LiveStrategyRuntime:
         ):
             return {
                 "ok": False, "reason": "ENTRY_REVALIDATION_GENERATION_CHANGED",
-                "generation": int(current_generation),
+                "generation": int(current_generation), "book": book,
             }
         current_ask = book.get("best_ask")
         if not exact_trigger(current_ask, self.policy.entry_price):
@@ -1595,6 +1614,7 @@ class LiveStrategyRuntime:
                     int(current_generation)
                     if current_generation is not None else None
                 ),
+                "book": book,
             }
         return {
             "ok": True, "reason": "ENTRY_REVALIDATION_PASSED",
@@ -1603,6 +1623,7 @@ class LiveStrategyRuntime:
             "generation": (
                 int(current_generation) if current_generation is not None else None
             ),
+            "book": book,
         }
 
     def _abort_entry(
@@ -1750,6 +1771,11 @@ class LiveStrategyRuntime:
             fill_shares_text=canonical_decimal(shares),
             hot_state_published_at=now_iso(),
         )
+        self._note_entry_liquidity(
+            "note_fill", intent_id,
+            filled_shares=shares, fill_price=avg_price,
+            update=self._current_top_of_book(token_id),
+        )
         self.repo.timeline(
             severity="INFO", category="FILL", component="strategy",
             source=evidence_source, event_id=event_id,
@@ -1851,6 +1877,18 @@ class LiveStrategyRuntime:
         except Exception as exc:
             self.last_error = (
                 f"EXIT_EVIDENCE_NOTE:{type(exc).__name__}:{exc}"
+            )[:500]
+
+    def _note_entry_liquidity(self, method: str, *args: Any, **kwargs: Any) -> None:
+        """Fire-and-forget entry-liquidity telemetry. Never raises onto the
+        BUY path — every failure is swallowed into ``last_error``."""
+        if not self._entry_liquidity_enabled:
+            return
+        try:
+            getattr(self._entry_liquidity, method)(*args, **kwargs)
+        except Exception as exc:
+            self.last_error = (
+                f"ENTRY_LIQUIDITY_NOTE:{type(exc).__name__}:{exc}"
             )[:500]
 
     def _entry_intent_for_position(self, position: dict[str, Any]) -> str:
@@ -1968,6 +2006,15 @@ class LiveStrategyRuntime:
         except Exception as exc:  # audit must never block the entry path
             self.last_error = f"ENTRY_AUDIT:{type(exc).__name__}:{exc}"[:500]
 
+        # Entry-liquidity: snapshot the bid side at the signal instant. In REAL
+        # mode the hot-path update is top-of-book only; the full ladder is
+        # fetched off the hot path by the drain task via the exit-book provider.
+        self._note_entry_liquidity(
+            "note_signal", intent_id,
+            event_id=event_id, condition_id=condition_id, token_id=token_id,
+            side=side, requested_shares=self.policy.max_shares, update=update,
+        )
+
         # P0-A — explicit signal TTL. A trigger that sat too long between
         # observation and submission (queued critical frame, alignment grace,
         # durable gate) can no longer be trusted: abort cleanly.
@@ -1987,6 +2034,9 @@ class LiveStrategyRuntime:
                     signal_age_ms=signal_age_ms,
                     entry_validity="ABORTED_SIGNAL_EXPIRED",
                 )
+                self._note_entry_liquidity(
+                    "note_abort", intent_id, reason="ENTRY_SIGNAL_EXPIRED",
+                )
                 return
 
         # P0-A — pre-submission revalidation against the current authoritative
@@ -1994,8 +2044,10 @@ class LiveStrategyRuntime:
         # right before post_order. Only runs when a live top-of-book provider is
         # wired (always true in the trader process); the existing freshness
         # provider check below still fails closed if nothing is configured.
+        revalidation_book: dict[str, Any] | None = None
         if not self.paper_mode() and self._exit_book_provider is not None:
             reval = self._revalidate_entry_signal(market, update, token_id)
+            revalidation_book = reval.pop("book", None)
             self.repo.record_entry_audit(
                 intent_id, event_id=event_id,
                 revalidation_result=reval["reason"],
@@ -2006,6 +2058,10 @@ class LiveStrategyRuntime:
                     now_ms - int(signal_observed_ms)
                     if signal_observed_ms is not None else None
                 ),
+            )
+            self._note_entry_liquidity(
+                "note_revalidation", intent_id,
+                update=revalidation_book, result_reason=reval["reason"],
             )
             if not reval["ok"]:
                 fail_closed = reval["reason"] in {
@@ -2020,6 +2076,9 @@ class LiveStrategyRuntime:
                 self.repo.record_entry_audit(
                     intent_id, event_id=event_id,
                     entry_validity=f"ABORTED_{reval['reason']}",
+                )
+                self._note_entry_liquidity(
+                    "note_abort", intent_id, reason=reval["reason"],
                 )
                 return
 
@@ -2046,6 +2105,7 @@ class LiveStrategyRuntime:
                     "strategy_readiness": "NOT_READY",
                     "strategy_block_reason": reason,
                 }, "strategy")
+            self._note_entry_liquidity("note_abort", intent_id, reason=reason)
             return
         schedule = self.entry_schedule_status()
         if not schedule["allowed"]:
@@ -2055,6 +2115,7 @@ class LiveStrategyRuntime:
                 normalized_error="Blocked by entry schedule before submission",
                 final_at=now_iso(),
             )
+            self._note_entry_liquidity("note_abort", intent_id, reason=reason)
             self.repo.timeline(
                 severity="WARNING", category="DECISION", component="strategy",
                 source="schedule", event_id=str(market.get("event_id") or ""),
@@ -2064,6 +2125,10 @@ class LiveStrategyRuntime:
             )
             return
         if self.paper_mode():
+            self._note_entry_liquidity(
+                "note_submit", intent_id, update=update,
+                requested_shares=self.policy.max_shares,
+            )
             fill = simulate_buy_fak(
                 update.get("asks") or [],
                 max_price=self.policy.entry_max_price,
@@ -2085,12 +2150,20 @@ class LiveStrategyRuntime:
                     requested_amount_text="3.8", requested_shares_text="5", filled_shares_text="0",
                     remaining_shares_text="0",
                 )
+                self._note_entry_liquidity(
+                    "note_abort", intent_id, reason="FAK_ZERO_FILL",
+                )
                 return
             self.repo.add_fill(
                 intent_id=intent_id, remote_trade_id=f"paper-{intent_id}-fill-1",
                 shares=fill.filled_shares, price=fill.average_price, fee=fill.fee,
                 status="SETTLED", matched_at=now_iso(),
                 raw={"source": "deterministic_order_book"},
+            )
+            self._note_entry_liquidity(
+                "note_fill", intent_id,
+                filled_shares=fill.filled_shares,
+                fill_price=fill.average_price, update=update,
             )
             position = self.repo.open_position(
                 event_id=event_id, condition_id=str(market["condition_id"]),
@@ -2155,6 +2228,9 @@ class LiveStrategyRuntime:
                 reason_code=durable_reason,
                 result_status="SKIPPED",
             )
+            self._note_entry_liquidity(
+                "note_abort", intent_id, reason=durable_reason,
+            )
             return
 
         self.repo.update_intent(
@@ -2170,6 +2246,14 @@ class LiveStrategyRuntime:
         entry_params = AllInBudget(
             self.policy.max_spend, self.policy.max_shares
         ).sdk_buy_parameters(self.policy.entry_max_price)
+        # Entry-liquidity: the SUBMIT-phase bid ladder. Reuse the book the
+        # revalidation step already fetched synchronously; fall back to the
+        # top-of-book hot frame (drain task then walks the exit-book provider).
+        self._note_entry_liquidity(
+            "note_submit", intent_id,
+            update=revalidation_book or update,
+            requested_shares=self.policy.max_shares,
+        )
         response = await self.adapter.create_order({
             "idempotency_key": intent_id,
             "durable_intent_reserved": True,
@@ -2199,6 +2283,10 @@ class LiveStrategyRuntime:
         self.repo.record_entry_audit(
             intent_id, event_id=event_id, clob_status=status,
             submitted_at=now_iso(),
+        )
+        self._note_entry_liquidity(
+            "note_submit_result", intent_id,
+            clob_status=status, remote_order_id=remote_id,
         )
         if status == "rejected" and _is_confirmed_fak_zero_fill_response(response):
             self.repo.mark_zero_fill(
@@ -4163,6 +4251,14 @@ class LiveStrategyRuntime:
                 self._exit_evidence.run(self._stop),
                 name="strategy-exit-evidence",
             )
+        if self._entry_liquidity_enabled and (
+            self._entry_liquidity_task is None
+            or self._entry_liquidity_task.done()
+        ):
+            self._entry_liquidity_task = asyncio.create_task(
+                self._entry_liquidity.run(self._stop),
+                name="strategy-entry-liquidity",
+            )
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="polymarket-order-heartbeat"
         )
@@ -4189,6 +4285,19 @@ class LiveStrategyRuntime:
             self._exit_evidence_task = None
             try:
                 self._exit_evidence.drain_pending()
+            except Exception:
+                pass
+
+        if self._entry_liquidity_task:
+            self._entry_liquidity.wakeup.set()
+            self._entry_liquidity_task.cancel()
+            try:
+                await self._entry_liquidity_task
+            except asyncio.CancelledError:
+                pass
+            self._entry_liquidity_task = None
+            try:
+                self._entry_liquidity.drain_pending()
             except Exception:
                 pass
 
@@ -4296,6 +4405,7 @@ class LiveStrategyRuntime:
             ),
             "exit_supervision": self._exit_tracker.health(),
             "exit_evidence": self._exit_evidence.stats(),
+            "entry_liquidity": self._entry_liquidity.stats(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
             "frames_dropped": self.frames_dropped,

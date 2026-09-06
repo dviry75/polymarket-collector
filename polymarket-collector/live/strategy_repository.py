@@ -327,6 +327,34 @@ class StrategyRepository:
                     UNIQUE(exit_audit_id, phase)
                 );
 
+                CREATE TABLE IF NOT EXISTS live_strategy_entry_book_snapshots (
+                    snapshot_id TEXT PRIMARY KEY,
+                    entry_intent_id TEXT NOT NULL,
+                    event_id TEXT,
+                    phase TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    materialized_at TEXT,
+                    book_source TEXT,
+                    book_generation INTEGER,
+                    book_update_number INTEGER,
+                    book_message_hash TEXT,
+                    exchange_timestamp_ms INTEGER,
+                    exchange_age_ms INTEGER,
+                    receive_latency_ms INTEGER,
+                    best_bid_text TEXT,
+                    best_ask_text TEXT,
+                    best_bid_size_text TEXT,
+                    bids_json TEXT,
+                    asks_json TEXT,
+                    level_count INTEGER,
+                    truncated INTEGER NOT NULL DEFAULT 0,
+                    cumulative_depth_json TEXT,
+                    sim_exit_json TEXT,
+                    full_ladder_captured_synchronously INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(entry_intent_id, phase)
+                );
+
                 CREATE TABLE IF NOT EXISTS live_strategy_positions (
                     position_id TEXT PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,
@@ -527,6 +555,15 @@ class StrategyRepository:
             exit_audit_columns = {
                 "settlement_wait": "INTEGER NOT NULL DEFAULT 0",
                 "latch_exchange_timestamp_ms": "INTEGER",
+                # Entry-liquidity parity: spread + cumulative bid depth at the
+                # SUBMIT phase, computed by the exit-forensics drain task.
+                "submit_best_ask_text": "TEXT",
+                "submit_depth_at_066_text": "TEXT",
+                "submit_depth_at_060_text": "TEXT",
+                "submit_depth_at_055_text": "TEXT",
+                "submit_depth_at_046_text": "TEXT",
+                "full_ladder_captured_synchronously":
+                    "INTEGER NOT NULL DEFAULT 0",
             }
             existing_exit_audit_columns = {
                 str(row[1])
@@ -538,6 +575,63 @@ class StrategyRepository:
                 if column not in existing_exit_audit_columns:
                     conn.execute(
                         "ALTER TABLE live_strategy_exit_audit "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            # Additive columns for the entry-audit table: bid-side liquidity /
+            # simulated-exit metrics captured at entry time. Written only by the
+            # async entry-liquidity drain task, never on the BUY submission path.
+            entry_audit_columns = {
+                "signal_best_bid_text": "TEXT",
+                "signal_best_bid_size_text": "TEXT",
+                "signal_best_ask_text": "TEXT",
+                "signal_spread_text": "TEXT",
+                "reval_best_bid_text": "TEXT",
+                "reval_best_bid_size_text": "TEXT",
+                "reval_best_ask_text": "TEXT",
+                "reval_spread_text": "TEXT",
+                "reval_book_age_ms": "INTEGER",
+                "reval_book_generation": "INTEGER",
+                "reval_book_hash": "TEXT",
+                "submit_best_bid_text": "TEXT",
+                "submit_best_bid_size_text": "TEXT",
+                "submit_best_ask_text": "TEXT",
+                "submit_spread_text": "TEXT",
+                "submit_book_age_ms": "INTEGER",
+                "submit_book_generation": "INTEGER",
+                "submit_book_hash": "TEXT",
+                "fill_best_bid_text": "TEXT",
+                "fill_book_age_ms": "INTEGER",
+                "entry_liquidity_captured_at": "TEXT",
+                "entry_liquidity_phase_primary": "TEXT",
+                "liquidity_bucket_levels_text": "TEXT",
+                "liquidity_buffer_multiples_text": "TEXT",
+                "depth_at_066_text": "TEXT",
+                "depth_at_060_text": "TEXT",
+                "depth_at_055_text": "TEXT",
+                "depth_at_046_text": "TEXT",
+                "sim_exit_shares_text": "TEXT",
+                "sim_exit_vwap_text": "TEXT",
+                "sim_exit_method": "TEXT",
+                "sim_exit_fillable_shares_text": "TEXT",
+                "sim_exit_worst_price_text": "TEXT",
+                "sim_exit_slippage_text": "TEXT",
+                "sim_exit_buffers_json": "TEXT",
+                "entry_liquidity_deep_capture": "INTEGER NOT NULL DEFAULT 0",
+                "entry_liquidity_evidence_quality":
+                    "TEXT NOT NULL DEFAULT 'PENDING'",
+                "full_ladder_captured_synchronously":
+                    "INTEGER NOT NULL DEFAULT 0",
+            }
+            existing_entry_audit_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(live_strategy_entry_audit)"
+                ).fetchall()
+            }
+            for column, definition in entry_audit_columns.items():
+                if column not in existing_entry_audit_columns:
+                    conn.execute(
+                        "ALTER TABLE live_strategy_entry_audit "
                         f"ADD COLUMN {column} {definition}"
                     )
             conn.execute(
@@ -563,6 +657,18 @@ class StrategyRepository:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_live_exit_book_snap_position "
                 "ON live_strategy_exit_book_snapshots(position_id, phase)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_entry_audit_intent "
+                "ON live_strategy_entry_audit(intent_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_entry_audit_cond "
+                "ON live_strategy_entry_audit(condition_id, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_entry_book_snap_intent "
+                "ON live_strategy_entry_book_snapshots(entry_intent_id, phase)"
             )
             conn.execute(
                 "UPDATE live_alerts SET status=CASE "
@@ -3127,6 +3233,45 @@ class StrategyRepository:
             "_newly_latched": newly_latched,
         }
 
+    _ENTRY_AUDIT_FIELDS = {
+        "signal_price_text", "signal_observed_at",
+        "signal_exchange_timestamp_ms", "signal_book_generation",
+        "signal_book_hash", "signal_market_age_ms", "revalidation_result",
+        "revalidation_ask_text", "revalidation_age_ms",
+        "revalidation_generation", "signal_age_ms", "submitted_at",
+        "clob_status", "fill_price_text", "fill_shares_text",
+        "signal_to_fill_ms", "fill_deviation_text", "entry_validity",
+        "hot_state_published_at", "first_exit_evaluation_at",
+        # Entry-liquidity instrumentation (async drain task only).
+        "signal_best_bid_text", "signal_best_bid_size_text",
+        "signal_best_ask_text", "signal_spread_text",
+        "reval_best_bid_text", "reval_best_bid_size_text",
+        "reval_best_ask_text", "reval_spread_text", "reval_book_age_ms",
+        "reval_book_generation", "reval_book_hash",
+        "submit_best_bid_text", "submit_best_bid_size_text",
+        "submit_best_ask_text", "submit_spread_text", "submit_book_age_ms",
+        "submit_book_generation", "submit_book_hash",
+        "fill_best_bid_text", "fill_book_age_ms",
+        "entry_liquidity_captured_at", "entry_liquidity_phase_primary",
+        "liquidity_bucket_levels_text", "liquidity_buffer_multiples_text",
+        "depth_at_066_text", "depth_at_060_text", "depth_at_055_text",
+        "depth_at_046_text", "sim_exit_shares_text", "sim_exit_vwap_text",
+        "sim_exit_method", "sim_exit_fillable_shares_text",
+        "sim_exit_worst_price_text", "sim_exit_slippage_text",
+        "sim_exit_buffers_json", "entry_liquidity_deep_capture",
+        "entry_liquidity_evidence_quality",
+        "full_ladder_captured_synchronously",
+    }
+
+    _ENTRY_BOOK_SNAPSHOT_FIELDS = {
+        "event_id", "materialized_at", "book_source", "book_generation",
+        "book_update_number", "book_message_hash", "exchange_timestamp_ms",
+        "exchange_age_ms", "receive_latency_ms", "best_bid_text",
+        "best_ask_text", "best_bid_size_text", "bids_json", "asks_json",
+        "level_count", "truncated", "cumulative_depth_json", "sim_exit_json",
+        "full_ladder_captured_synchronously",
+    }
+
     def record_entry_audit(
         self,
         intent_id: str,
@@ -3138,17 +3283,11 @@ class StrategyRepository:
         **fields: Any,
     ) -> None:
         """Create or refresh the per-entry decision/execution audit row."""
-        allowed = {
-            "signal_price_text", "signal_observed_at",
-            "signal_exchange_timestamp_ms", "signal_book_generation",
-            "signal_book_hash", "signal_market_age_ms", "revalidation_result",
-            "revalidation_ask_text", "revalidation_age_ms",
-            "revalidation_generation", "signal_age_ms", "submitted_at",
-            "clob_status", "fill_price_text", "fill_shares_text",
-            "signal_to_fill_ms", "fill_deviation_text", "entry_validity",
-            "hot_state_published_at", "first_exit_evaluation_at",
+        payload = {
+            key: fields[key]
+            for key in fields
+            if key in self._ENTRY_AUDIT_FIELDS
         }
-        payload = {key: fields[key] for key in fields if key in allowed}
         ts = now_iso()
         columns = ["intent_id", "event_id", "condition_id", "token_id", "side",
                    "created_at", "updated_at", *payload.keys()]
@@ -3177,6 +3316,53 @@ class StrategyRepository:
                 (intent_id,),
             ).fetchone()
         return row_to_dict(row) if row is not None else None
+
+    def record_entry_book_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        entry_intent_id: str,
+        phase: str,
+        captured_at: str,
+        **fields: Any,
+    ) -> None:
+        payload = {
+            key: fields[key]
+            for key in fields
+            if key in self._ENTRY_BOOK_SNAPSHOT_FIELDS
+        }
+        columns = [
+            "snapshot_id", "entry_intent_id", "phase", "captured_at",
+            "created_at", *payload.keys(),
+        ]
+        values = [
+            snapshot_id, entry_intent_id, phase, captured_at,
+            now_iso(), *payload.values(),
+        ]
+        placeholders = ",".join("?" for _ in columns)
+        with self.base.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT OR IGNORE INTO live_strategy_entry_book_snapshots(
+                    {",".join(columns)}
+                ) VALUES({placeholders})
+                """,
+                values,
+            )
+            conn.commit()
+
+    def entry_book_snapshots(
+        self, entry_intent_id: str
+    ) -> list[dict[str, Any]]:
+        if not entry_intent_id:
+            return []
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM live_strategy_entry_book_snapshots "
+                "WHERE entry_intent_id=? ORDER BY captured_at",
+                (entry_intent_id,),
+            ).fetchall()
+        return [row_to_dict(row) for row in rows]
 
     # ------------------------------------------------------------------ #
     # Stop-loss exit forensics. Written exclusively by the async exit-
@@ -3214,6 +3400,10 @@ class StrategyRepository:
         "root_cause", "primary_cause", "exit_outcome", "technical_behavior",
         "classified_at", "classifier_version",
         "evidence_quality", "deep_capture",
+        # Entry-liquidity parity (async exit-forensics drain task only).
+        "submit_best_ask_text", "submit_depth_at_066_text",
+        "submit_depth_at_060_text", "submit_depth_at_055_text",
+        "submit_depth_at_046_text", "full_ladder_captured_synchronously",
     }
 
     _EXIT_BOOK_SNAPSHOT_FIELDS = {

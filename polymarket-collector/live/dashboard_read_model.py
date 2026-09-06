@@ -506,12 +506,34 @@ class DashboardReadModel:
             "AND name='live_strategy_exit_audit'"
         ):
             return {}
+        columns = {
+            str(row.get("name"))
+            for row in self._all(
+                "PRAGMA table_info(live_strategy_exit_audit)"
+            )
+        }
+        # Parity columns land with the entry-liquidity migration; degrade to the
+        # base overlay until the trader has restarted onto it.
+        parity = "submit_depth_at_066_text" in columns
+        parity_select = (
+            """,
+                   submit_best_ask_text, submit_best_bid_size_text,
+                   submit_depth_at_066_text, submit_depth_at_060_text,
+                   submit_depth_at_055_text, submit_depth_at_046_text,
+                   full_ladder_captured_synchronously"""
+            if parity
+            else ""
+        )
         placeholders = ",".join("?" for _ in ids)
         rows = self._all(
             f"""
             SELECT condition_id, root_cause, primary_cause, exit_outcome,
                    technical_behavior, detection_latency_ms, execution_latency_ms,
                    settlement_wait, evidence_quality, deep_capture,
+                   cross_best_bid_text, submit_best_bid_text, min_bid_seen_text,
+                   expected_vwap_at_submit_text, expected_fillable_shares_text,
+                   actual_fill_vwap_text, loss_fill_text,
+                   stop_to_submit_latency_ms, frame_to_submit_ms{parity_select},
                    ROW_NUMBER() OVER (
                        PARTITION BY condition_id
                        ORDER BY episode_seq DESC, created_at DESC
@@ -535,6 +557,170 @@ class DashboardReadModel:
                 "exit_settlement_wait": bool(row.get("settlement_wait")),
                 "exit_evidence_quality": row.get("evidence_quality"),
                 "exit_deep_capture": bool(row.get("deep_capture")),
+                "stop_trigger_bid": number_value(
+                    decimal_value(row.get("cross_best_bid_text"))
+                ),
+                "stop_submit_bid": number_value(
+                    decimal_value(row.get("submit_best_bid_text"))
+                ),
+                "stop_submit_ask": number_value(
+                    decimal_value(row.get("submit_best_ask_text"))
+                ),
+                "stop_min_bid_seen": number_value(
+                    decimal_value(row.get("min_bid_seen_text"))
+                ),
+                "stop_submit_bid_size": number_value(
+                    decimal_value(row.get("submit_best_bid_size_text"))
+                ),
+                "stop_submit_depth_066": number_value(
+                    decimal_value(row.get("submit_depth_at_066_text"))
+                ),
+                "stop_submit_depth_060": number_value(
+                    decimal_value(row.get("submit_depth_at_060_text"))
+                ),
+                "stop_submit_depth_055": number_value(
+                    decimal_value(row.get("submit_depth_at_055_text"))
+                ),
+                "stop_submit_depth_046": number_value(
+                    decimal_value(row.get("submit_depth_at_046_text"))
+                ),
+                "stop_expected_vwap": number_value(
+                    decimal_value(row.get("expected_vwap_at_submit_text"))
+                ),
+                "stop_expected_fillable": number_value(
+                    decimal_value(row.get("expected_fillable_shares_text"))
+                ),
+                "stop_actual_vwap": number_value(
+                    decimal_value(row.get("actual_fill_vwap_text"))
+                ),
+                "stop_loss_fill": number_value(
+                    decimal_value(row.get("loss_fill_text"))
+                ),
+                "stop_to_submit_ms": row.get("stop_to_submit_latency_ms"),
+                "stop_frame_to_submit_ms": row.get("frame_to_submit_ms"),
+                "stop_ladder_synchronous": bool(
+                    row.get("full_ladder_captured_synchronously")
+                ),
+            }
+        return out
+
+    def _entry_liquidity_enrichment(
+        self, condition_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Per-condition entry-liquidity overlay for the deal table.
+
+        The newest entry-audit row per condition_id, merged in Python next to
+        the exit overlay. Returns {} if the trader has not created the columns
+        yet (pre-deploy dashboards).
+        """
+        ids = [c for c in dict.fromkeys(condition_ids) if c]
+        if not ids or not self._one(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='live_strategy_entry_audit'"
+        ):
+            return {}
+        columns = {
+            str(row.get("name"))
+            for row in self._all(
+                "PRAGMA table_info(live_strategy_entry_audit)"
+            )
+        }
+        if "sim_exit_vwap_text" not in columns:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._all(
+            f"""
+            SELECT condition_id,
+                   submit_best_bid_text, signal_best_bid_text,
+                   submit_best_ask_text, submit_spread_text, submit_book_age_ms,
+                   depth_at_066_text, depth_at_060_text, depth_at_055_text,
+                   depth_at_046_text, sim_exit_shares_text, sim_exit_vwap_text,
+                   sim_exit_method, sim_exit_fillable_shares_text,
+                   sim_exit_worst_price_text, sim_exit_slippage_text,
+                   sim_exit_buffers_json, entry_liquidity_phase_primary,
+                   entry_liquidity_evidence_quality,
+                   entry_liquidity_deep_capture,
+                   full_ladder_captured_synchronously,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY condition_id
+                       ORDER BY created_at DESC
+                   ) AS rn
+            FROM live_strategy_entry_audit
+            WHERE condition_id IN ({placeholders})
+            """,
+            tuple(ids),
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if int(row.get("rn") or 0) != 1:
+                continue
+            buffers: dict[str, Any] = {}
+            try:
+                buffers = json.loads(row.get("sim_exit_buffers_json") or "{}")
+            except (TypeError, ValueError):
+                buffers = {}
+
+            def _buf(multiple: str, key: str) -> float | None:
+                entry = buffers.get(multiple) or {}
+                return number_value(decimal_value(entry.get(key)))
+
+            out[str(row.get("condition_id"))] = {
+                "entry_best_bid": number_value(
+                    decimal_value(
+                        row.get("submit_best_bid_text")
+                        or row.get("signal_best_bid_text")
+                    )
+                ),
+                "entry_best_ask": number_value(
+                    decimal_value(row.get("submit_best_ask_text"))
+                ),
+                "entry_spread": number_value(
+                    decimal_value(row.get("submit_spread_text"))
+                ),
+                "entry_book_age_ms": row.get("submit_book_age_ms"),
+                "entry_depth_066": number_value(
+                    decimal_value(row.get("depth_at_066_text"))
+                ),
+                "entry_depth_060": number_value(
+                    decimal_value(row.get("depth_at_060_text"))
+                ),
+                "entry_depth_055": number_value(
+                    decimal_value(row.get("depth_at_055_text"))
+                ),
+                "entry_depth_046": number_value(
+                    decimal_value(row.get("depth_at_046_text"))
+                ),
+                "entry_sim_exit_shares": number_value(
+                    decimal_value(row.get("sim_exit_shares_text"))
+                ),
+                "entry_sim_exit_vwap": number_value(
+                    decimal_value(row.get("sim_exit_vwap_text"))
+                ),
+                "entry_sim_exit_method": row.get("sim_exit_method"),
+                "entry_sim_exit_fillable_1x": number_value(
+                    decimal_value(row.get("sim_exit_fillable_shares_text"))
+                ),
+                "entry_sim_exit_worst_price": number_value(
+                    decimal_value(row.get("sim_exit_worst_price_text"))
+                ),
+                "entry_sim_exit_slippage": number_value(
+                    decimal_value(row.get("sim_exit_slippage_text"))
+                ),
+                "entry_sim_exit_fillable_3x": _buf("3", "fillable_shares"),
+                "entry_sim_exit_fillable_5x": _buf("5", "fillable_shares"),
+                "entry_sim_exit_vwap_5x": _buf("5", "vwap"),
+                "entry_liquidity_phase": row.get(
+                    "entry_liquidity_phase_primary"
+                ),
+                "entry_liquidity_quality": row.get(
+                    "entry_liquidity_evidence_quality"
+                ),
+                "entry_liquidity_deep_capture": bool(
+                    row.get("entry_liquidity_deep_capture")
+                ),
+                "entry_liquidity_synchronous": bool(
+                    row.get("full_ladder_captured_synchronously")
+                ),
             }
         return out
 
@@ -594,9 +780,11 @@ class DashboardReadModel:
                LIMIT ? OFFSET ?""",
             (floor or "0000", start, end, page_size, (page - 1) * page_size),
         )
-        enrichment = self._exit_audit_enrichment(
-            [row.get("condition_id") for row in rows if row.get("condition_id")]
-        )
+        condition_ids = [
+            row.get("condition_id") for row in rows if row.get("condition_id")
+        ]
+        enrichment = self._exit_audit_enrichment(condition_ids)
+        entry_enrichment = self._entry_liquidity_enrichment(condition_ids)
         items = []
         for row in rows:
             buy_size = float(row.get("buy_size") or 0.0)
@@ -624,6 +812,7 @@ class DashboardReadModel:
                 "verified": True,
             }
             item.update(enrichment.get(row.get("condition_id"), {}))
+            item.update(entry_enrichment.get(row.get("condition_id"), {}))
             items.append(item)
         return {
             "items": items, "page": page, "page_size": page_size,

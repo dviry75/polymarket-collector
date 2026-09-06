@@ -170,6 +170,12 @@ class ExitForensicsTests(unittest.TestCase):
         self.assertEqual(row["expected_vwap_method"], "ORDER_BOOK_VWAP")
         # book-implied and realized match -> loss_fill == 0
         self.assertEqual(Decimal(row["loss_fill_text"]), Decimal("0.00"))
+        # entry-liquidity parity columns on the submit book (0.50 + 0.30 levels)
+        self.assertEqual(row["full_ladder_captured_synchronously"], 1)
+        self.assertEqual(row["submit_best_ask_text"], "0.70")
+        self.assertEqual(row["submit_depth_at_055_text"], "0")
+        # only the 0.50 level clears the 0.46 floor; the 0.30 level does not
+        self.assertEqual(row["submit_depth_at_046_text"], "1")
 
     def test_acceptable_exit_keeps_only_light_row(self):
         self.collector.note_cross(

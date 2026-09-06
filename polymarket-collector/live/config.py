@@ -29,6 +29,28 @@ def _decimal_env(name: str, default: str) -> Decimal:
     return value if value.is_finite() else Decimal(default)
 
 
+def _decimal_tuple_env(name: str, default_csv: str) -> tuple[Decimal, ...]:
+    raw = _env(name, default_csv) or default_csv
+
+    def _parse(text: str) -> tuple[Decimal, ...]:
+        out: list[Decimal] = []
+        for part in text.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            value = Decimal(part)
+            if not value.is_finite():
+                raise InvalidOperation(part)
+            out.append(value)
+        return tuple(out)
+
+    try:
+        parsed = _parse(raw)
+    except (InvalidOperation, ValueError):
+        parsed = ()
+    return parsed or _parse(default_csv)
+
+
 @dataclass(frozen=True)
 class LiveConfig:
     trading_mode: str = "DEMO"
@@ -106,6 +128,18 @@ class LiveConfig:
     # labels the outcome axis (ACCEPTABLE vs BAD_EXIT); it constrains nothing.
     exit_forensic_deep_capture_max_vwap: Decimal = Decimal("0.55")
     exit_forensic_acceptable_min_vwap: Decimal = Decimal("0.60")
+    # Entry-liquidity instrumentation (Phase 1: measurement only, no gate).
+    # At each entry phase the trader records the bid-side depth of the token it
+    # is buying and a simulated exit walk for the position size and buffer
+    # multiples of it. Nothing here blocks or delays a BUY.
+    entry_liquidity_capture_enabled: bool = True
+    entry_liquidity_bucket_levels: tuple[Decimal, ...] = (
+        Decimal("0.66"), Decimal("0.60"), Decimal("0.55"), Decimal("0.46"),
+    )
+    entry_liquidity_buffer_multiples: tuple[Decimal, ...] = (
+        Decimal("3"), Decimal("4"), Decimal("5"),
+    )
+    entry_liquidity_deep_capture_max_vwap: Decimal = Decimal("0.60")
     require_clean_runtime: bool = True
     approved_git_sha: str = ""
     approved_runtime_hash: str = ""
@@ -247,6 +281,18 @@ class LiveConfig:
             ),
             exit_forensic_acceptable_min_vwap=_decimal_env(
                 "LIVE_EXIT_FORENSIC_ACCEPTABLE_MIN_VWAP", "0.60"
+            ),
+            entry_liquidity_capture_enabled=_bool_env(
+                "LIVE_ENTRY_LIQUIDITY_CAPTURE_ENABLED", True
+            ),
+            entry_liquidity_bucket_levels=_decimal_tuple_env(
+                "LIVE_ENTRY_LIQUIDITY_BUCKET_LEVELS", "0.66,0.60,0.55,0.46"
+            ),
+            entry_liquidity_buffer_multiples=_decimal_tuple_env(
+                "LIVE_ENTRY_LIQUIDITY_BUFFER_MULTIPLES", "3,4,5"
+            ),
+            entry_liquidity_deep_capture_max_vwap=_decimal_env(
+                "LIVE_ENTRY_LIQUIDITY_DEEP_CAPTURE_MAX_VWAP", "0.60"
             ),
             require_clean_runtime=_bool_env("LIVE_REQUIRE_CLEAN_RUNTIME", True),
             approved_git_sha=_env("LIVE_APPROVED_GIT_SHA", "").strip(),
@@ -430,6 +476,35 @@ class LiveConfig:
             errors.append(
                 "LIVE_EXIT_SUPERVISOR_STOP_TO_SUBMIT_SLA_SECONDS must be between 0.25 and 30"
             )
+        bucket_levels = list(self.entry_liquidity_bucket_levels)
+        if not (
+            1 <= len(bucket_levels) <= 8
+            and all(Decimal("0") < lvl < Decimal("1") for lvl in bucket_levels)
+            and all(
+                a > b for a, b in zip(bucket_levels, bucket_levels[1:])
+            )
+        ):
+            errors.append(
+                "LIVE_ENTRY_LIQUIDITY_BUCKET_LEVELS must be 1-8 strictly "
+                "descending values in (0, 1)"
+            )
+        multiples = list(self.entry_liquidity_buffer_multiples)
+        if not (
+            1 <= len(multiples) <= 6
+            and all(m > Decimal("1") for m in multiples)
+            and all(a < b for a, b in zip(multiples, multiples[1:]))
+        ):
+            errors.append(
+                "LIVE_ENTRY_LIQUIDITY_BUFFER_MULTIPLES must be 1-6 ascending "
+                "values greater than 1"
+            )
+        if not (
+            Decimal("0") < self.entry_liquidity_deep_capture_max_vwap
+            <= Decimal("1")
+        ):
+            errors.append(
+                "LIVE_ENTRY_LIQUIDITY_DEEP_CAPTURE_MAX_VWAP must be > 0 and <= 1"
+            )
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -528,6 +603,18 @@ class LiveConfig:
             ),
             "exit_forensic_acceptable_min_vwap": str(
                 self.exit_forensic_acceptable_min_vwap
+            ),
+            "entry_liquidity_capture_enabled": (
+                self.entry_liquidity_capture_enabled
+            ),
+            "entry_liquidity_bucket_levels": ",".join(
+                str(lvl) for lvl in self.entry_liquidity_bucket_levels
+            ),
+            "entry_liquidity_buffer_multiples": ",".join(
+                str(m) for m in self.entry_liquidity_buffer_multiples
+            ),
+            "entry_liquidity_deep_capture_max_vwap": str(
+                self.entry_liquidity_deep_capture_max_vwap
             ),
             "require_clean_runtime": self.require_clean_runtime,
             "approved_git_sha_configured": bool(self.approved_git_sha),
