@@ -373,6 +373,14 @@ class LiveRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_live_rule_evaluations_rule
                 ON live_rule_evaluations(live_rule_id, id DESC);
+
+                -- live_audit_log is an append-only state-change journal that
+                -- grows by millions of rows/day. Any action-filtered lookup
+                -- (auto-repair rate limiting, reporting) otherwise degrades
+                -- into a full scan that runs while holding BEGIN IMMEDIATE and
+                -- stalls the frame worker's timeline writes for ~1s.
+                CREATE INDEX IF NOT EXISTS idx_live_audit_log_action_time
+                ON live_audit_log(action, occurred_at);
                 """
             )
             existing = conn.execute("SELECT value FROM live_system_state WHERE key = 'kill_switch'").fetchone()

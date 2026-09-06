@@ -4999,6 +4999,10 @@ class StrategyRepository:
             "after": after,
             "authoritative_evidence": evidence,
         })
+        cutoff = (
+            datetime.now(timezone.utc).replace(microsecond=0)
+            - timedelta(days=1)
+        ).isoformat()
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
@@ -5010,20 +5014,24 @@ class StrategyRepository:
                     json.dumps(details, sort_keys=True),
                 ),
             )
+            audit_id = int(cursor.lastrowid)
+            conn.commit()
+
+            # The 24h count only feeds a telemetry state value. Run it after
+            # the write lock is released (and served by
+            # idx_live_audit_log_action_time) so a cold index never stalls
+            # every other writer behind BEGIN IMMEDIATE.
             count_24h = int(conn.execute(
                 "SELECT COUNT(*) FROM live_audit_log "
                 "WHERE action='authoritative_exit_auto_repair' "
                 "AND occurred_at>=?",
-                (
-                    (datetime.now(timezone.utc).replace(microsecond=0)
-                     - timedelta(days=1)).isoformat(),
-                ),
+                (cutoff,),
             ).fetchone()[0])
+            conn.execute("BEGIN IMMEDIATE")
             self.base.set_states_on_connection(conn, {
                 "auto_repair_last_at": ts,
                 "auto_repair_count_24h": str(count_24h),
             }, actor)
-            audit_id = int(cursor.lastrowid)
             conn.commit()
         return audit_id
 
