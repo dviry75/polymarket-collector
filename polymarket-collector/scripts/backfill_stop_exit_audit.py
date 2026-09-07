@@ -206,6 +206,11 @@ def main() -> int:
     mode.add_argument("--apply", action="store_true")
     parser.add_argument("--force", action="store_true",
                         help="Rewrite rows that already exist.")
+    parser.add_argument(
+        "--pending-only", action="store_true",
+        help="Only touch rows whose evidence_quality is still PENDING "
+             "(exits captured live but whose episode never finalized).",
+    )
     parser.add_argument("--backup", action="store_true")
     parser.add_argument("--db-path", type=Path,
                         default=Path(LiveConfig.from_env().live_db_path))
@@ -236,8 +241,19 @@ def main() -> int:
                 "SELECT position_id FROM live_strategy_exit_audit"
             )
         }
+        pending = {
+            r[0] for r in conn.execute(
+                "SELECT position_id FROM live_strategy_exit_audit "
+                "WHERE evidence_quality='PENDING'"
+            )
+        }
         for pos in positions:
-            if pos["position_id"] in existing and not args.force:
+            pid = pos["position_id"]
+            if args.pending_only:
+                if pid not in pending:
+                    skipped += 1
+                    continue
+            elif pid in existing and not args.force:
                 skipped += 1
                 continue
             fields = _reconstruct(conn, repo, pos)
