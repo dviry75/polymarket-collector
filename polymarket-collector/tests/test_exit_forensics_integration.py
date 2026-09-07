@@ -85,6 +85,29 @@ def _case(name, *, bids, best_bid, shares=Decimal("5"), sellable=None,
     return temporary, base, repo, runtime, position, update
 
 
+def _latch_then_supervise(runtime, update, frame_hash):
+    async def run():
+        runtime.set_exit_book_provider(
+            lambda token_id: (
+                dict(update)
+                if str(token_id) == str(update.get("asset_id") or "")
+                else None
+            )
+        )
+        await runtime._manage_position(
+            market={}, update=update, event_ready=True, frame_hash=frame_hash,
+        )
+        if any(
+            runtime._exit_priority_tier(position) == 0
+            for position in runtime._positions_from_ram(
+                str(update.get("asset_id") or "")
+            )
+        ):
+            await runtime._drive_latched_exits_once()
+
+    asyncio.run(run())
+
+
 class ExitForensicsIntegrationTests(unittest.TestCase):
     def _finish(self, runtime):
         runtime._exit_evidence.drain_pending()
@@ -96,9 +119,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             "bad", bids=[("0.50", "5")], best_bid="0.50",
         )
         try:
-            asyncio.run(runtime._manage_position(
-                market={}, update=update, event_ready=True, frame_hash="f1",
-            ))
+            _latch_then_supervise(runtime, update, "f1")
             self.assertEqual(
                 repo.position_for_token(position["token_id"])["state"], "CLOSED"
             )
@@ -107,7 +128,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             row = repo.exit_audit(position["position_id"])
             self.assertIsNotNone(row)
             self.assertEqual(row["exit_purpose"], "STOP_066")
-            self.assertEqual(row["latch_source"], "supervisor")
+            self.assertEqual(row["latch_source"], "frame_worker")
             self.assertEqual(row["cross_best_bid_text"], "0.50")
             self.assertEqual(row["cross_book_hash"], "hash-bad")
             self.assertEqual(row["exit_outcome"], "BAD_EXIT")
@@ -130,9 +151,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             "ok", bids=[("0.64", "50")], best_bid="0.64",
         )
         try:
-            asyncio.run(runtime._manage_position(
-                market={}, update=update, event_ready=True, frame_hash="f1",
-            ))
+            _latch_then_supervise(runtime, update, "f1")
             self._finish(runtime)
             row = repo.exit_audit(position["position_id"])
             self.assertEqual(row["exit_outcome"], "ACCEPTABLE")
@@ -147,9 +166,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             "nocross", bids=[("0.70", "5")], best_bid="0.70",
         )
         try:
-            asyncio.run(runtime._manage_position(
-                market={}, update=update, event_ready=True, frame_hash="f1",
-            ))
+            _latch_then_supervise(runtime, update, "f1")
             self._finish(runtime)
             self.assertIsNone(repo.exit_audit(position["position_id"]))
         finally:
@@ -167,9 +184,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             reconciliation=_ok_reconcile,
         )
         try:
-            asyncio.run(runtime._manage_position(
-                market={}, update=update, event_ready=True, frame_hash="f1",
-            ))
+            _latch_then_supervise(runtime, update, "f1")
             # parked WAITING_SELLABLE
             self.assertEqual(
                 repo.intent(repo.position_for_token(position["token_id"])
@@ -186,9 +201,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             asyncio.run(runtime._refresh_hot_state_once())
             crash = {**update, "best_bid": "0.40",
                      "bids": [{"price": "0.40", "size": "5"}], "message_hash": "h2"}
-            asyncio.run(runtime._manage_position(
-                market={}, update=crash, event_ready=True, frame_hash="f2",
-            ))
+            _latch_then_supervise(runtime, crash, "f2")
             self.assertTrue(adapter.create_calls)
             self._finish(runtime)
 
@@ -248,9 +261,7 @@ class ExitForensicsIntegrationTests(unittest.TestCase):
             runtime._exit_evidence.note_cross = boom
             runtime._exit_evidence.note_latch = boom
             # the SELL must still complete despite telemetry raising
-            asyncio.run(runtime._manage_position(
-                market={}, update=update, event_ready=True, frame_hash="f1",
-            ))
+            _latch_then_supervise(runtime, update, "f1")
             self.assertEqual(
                 repo.position_for_token(position["token_id"])["state"], "CLOSED"
             )

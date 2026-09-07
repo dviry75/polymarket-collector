@@ -96,12 +96,29 @@ def _book(token, bid, bids, generation=1):
 
 
 def _manage(runtime, update, label):
-    asyncio.run(runtime._manage_position(
-        market={},
-        update=update,
-        event_ready=True,
-        frame_hash=label,
-    ))
+    async def latch_then_supervise():
+        runtime.set_exit_book_provider(
+            lambda token_id: (
+                dict(update)
+                if str(token_id) == str(update.get("asset_id") or "")
+                else None
+            )
+        )
+        await runtime._manage_position(
+            market={},
+            update=update,
+            event_ready=True,
+            frame_hash=label,
+        )
+        if any(
+            runtime._exit_priority_tier(position) == 0
+            for position in runtime._positions_from_ram(
+                str(update.get("asset_id") or "")
+            )
+        ):
+            await runtime._drive_latched_exits_once()
+
+    asyncio.run(latch_then_supervise())
 
 
 def _exit_intents(base, position_id):
@@ -537,12 +554,17 @@ def test_08e_slow_reconciliation_does_not_delay_the_stop_sell():
 
         async def run_and_time():
             start = asyncio.get_event_loop().time()
+            update = _book(
+                position["token_id"], "0.66", [("0.66", "5")]
+            )
+            runtime.set_exit_book_provider(lambda _token_id: dict(update))
             await runtime._manage_position(
                 market={},
-                update=_book(position["token_id"], "0.66", [("0.66", "5")]),
+                update=update,
                 event_ready=True,
                 frame_hash="sla-slow-recon",
             )
+            await runtime._drive_latched_exits_once()
             return asyncio.get_event_loop().time() - start
 
         elapsed = asyncio.run(run_and_time())
@@ -873,10 +895,10 @@ def test_17_rest_watchdog_retries_market_floor_when_liquidity_changes():
         "status": "rejected",
         "failure_reason": "FAK_NOT_FILLED",
     })
-    books = iter(("0.60", "0.20", "0.05"))
+    books = iter(("0.60", "0.20", "0.05", "0.04"))
 
     async def falling_book(token_id):
-        bid = next(books, "0.05")
+        bid = next(books, "0.04")
         return {
             "asset_id": token_id,
             "bids": [{"price": bid, "size": "5"}],

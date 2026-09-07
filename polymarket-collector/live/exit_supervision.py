@@ -128,6 +128,15 @@ class ExitSupervisionTracker:
         )
         record["last_supervisor_check_at"] = observed_at
         record["last_exit_decision"] = decision
+        milestone = {
+            "LATCHED_EXIT_SELECTED": "latched_exit_selected_at",
+            "LATCHED_EXIT_ORCHESTRATION_STARTED": (
+                "latched_exit_orchestration_started_at"
+            ),
+            "MARKET_EXIT_FAK_STARTED": "market_exit_fak_started_at",
+        }.get(decision)
+        if milestone is not None:
+            record.setdefault(milestone, observed_at)
         record["position_state"] = str(position.get("state") or "")
         record["remaining_shares_text"] = str(
             position.get("remaining_shares_text") or "0"

@@ -19,7 +19,9 @@ from live.strategy_repository import StrategyRepository
 from live.strategy_runtime import LiveStrategyRuntime
 from live.adapters.mock import MockTradingAdapter
 
-from test_latched_market_exit import RecordingSellAdapter, _book, _case, _ok_reconcile
+from test_latched_market_exit import (
+    RecordingSellAdapter, _book, _case, _manage, _ok_reconcile,
+)
 
 
 # --------------------------------------------------------------------------
@@ -326,10 +328,11 @@ def test_I_market_sl_first_sell_is_aggressive_fak_at_floor():
         "I-market-sl", paper=False, adapter=adapter, reconciliation=_ok_reconcile,
     )
     try:
-        asyncio.run(runtime._manage_position(
-            market={}, update=_book(position["token_id"], "0.66", [("0.66", "5")]),
-            event_ready=True, frame_hash="i",
-        ))
+        _manage(
+            runtime,
+            _book(position["token_id"], "0.66", [("0.66", "5")]),
+            "i",
+        )
         assert len(adapter.create_calls) == 1
         call = adapter.create_calls[0]
         assert call["order_type"] == "FAK"
@@ -347,10 +350,11 @@ def test_J_invalid_entry_liquidates_without_waiting_for_stop_threshold():
         repo.latch_invalid_entry_exit(position["position_id"])
         asyncio.run(runtime._refresh_hot_state_once())
         # bid well ABOVE the 0.66 stop threshold — a STOP would not fire here
-        asyncio.run(runtime._manage_position(
-            market={}, update=_book(position["token_id"], "0.80", [("0.80", "5")]),
-            event_ready=True, frame_hash="j",
-        ))
+        _manage(
+            runtime,
+            _book(position["token_id"], "0.80", [("0.80", "5")]),
+            "j",
+        )
         assert len(adapter.create_calls) == 1
         assert adapter.create_calls[0]["purpose"] == "EMERGENCY_INVALID_ENTRY"
         assert adapter.create_calls[0]["min_price"] == "0.01"
