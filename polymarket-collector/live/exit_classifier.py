@@ -109,6 +109,11 @@ def classify_exit(
     loss_fill = (
         _pos(expected_vwap - actual_vwap) if expected_vwap is not None else None
     )
+    # Fallback: even with no book snapshot, if we filled well below the best
+    # bid that was visible at submit (or latch), that gap is a real fill loss.
+    fill_ref = p_submit if p_submit is not None else p_latch
+    if loss_fill is None and fill_ref is not None and actual_vwap is not None:
+        loss_fill = _pos(fill_ref - actual_vwap)
 
     if loss_detection is None and loss_execution is None and loss_fill is None:
         # No book prices (typical for reconstructed history). Fall back to
@@ -120,6 +125,13 @@ def classify_exit(
             return _result(
                 "HEALTHY", "HEALTHY", "HEALTHY", outcome,
                 ["no book depth, but latencies within SLA and price acceptable"],
+                row,
+            )
+        if outcome != "ACCEPTABLE":
+            return _result(
+                "UNKNOWN", "UNKNOWN", "UNKNOWN", outcome,
+                [f"sold at {row.get('actual_fill_vwap_text')} (below acceptable) "
+                 "but no captured book or latency explains it"],
                 row,
             )
         if execution_ms is not None and execution_ms > sla_ms:
@@ -160,12 +172,25 @@ def classify_exit(
         and (execution_ms is None or execution_ms <= sla_ms)
     )
     if top_loss <= eps:
-        if within_sla:
+        if within_sla and outcome == "ACCEPTABLE":
             reasons.append(
-                "all loss components negligible and latencies within SLA"
+                "all loss components negligible, latencies within SLA, "
+                "price acceptable"
             )
             return _result(
                 "HEALTHY", "HEALTHY", "HEALTHY", outcome, reasons, row
+            )
+        if within_sla:
+            # Bad price but nothing measurable to blame — the gap is between
+            # the last book we saw and the matching engine.
+            reasons.append(
+                f"sold at {row.get('actual_fill_vwap_text')} with fast "
+                "latencies and no book-implied loss — market moved between "
+                "our last snapshot and execution"
+            )
+            return _result(
+                "MARKET", "MARKET", "MARKET", outcome, reasons, row,
+                components=components,
             )
         # No measurable price damage, but a latency breached SLA. Name the
         # latency that actually breached — do NOT argmax a set of zeros.

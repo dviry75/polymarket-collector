@@ -181,6 +181,33 @@ class ExitClassifierTests(unittest.TestCase):
         out = classify_exit(row, snaps)
         self.assertEqual(out["root_cause"], "LIQUIDITY")
 
+    def test_bad_exit_is_never_healthy(self):
+        # book best-bid said 0.63 at every captured point, filled at 0.37,
+        # latencies fast, no SUBMIT snapshot -> must NOT be HEALTHY
+        row = {
+            "requested_shares_text": "5",
+            "cross_best_bid_text": "0.63",
+            "latch_best_bid_text": "0.63",
+            "submit_best_bid_text": "0.63",
+            "actual_fill_vwap_text": "0.37",
+            "execution_latency_ms": 90,
+            "detection_latency_ms": 40,
+        }
+        out = classify_exit(row)
+        self.assertEqual(out["exit_outcome"], "BAD_EXIT")
+        self.assertNotEqual(out["root_cause"], "HEALTHY")
+        self.assertIn(out["root_cause"], {"MARKET", "LIQUIDITY", "BOOK_FILL_MISMATCH"})
+
+    def test_bad_exit_no_book_no_latency_is_unknown_not_healthy(self):
+        row = {
+            "requested_shares_text": "5",
+            "actual_fill_vwap_text": "0.22",
+            "execution_latency_ms": 100,
+        }
+        out = classify_exit(row)
+        self.assertEqual(out["exit_outcome"], "BAD_EXIT")
+        self.assertEqual(out["root_cause"], "UNKNOWN")
+
     def test_unknown_when_no_prices(self):
         row = {"requested_shares_text": "5", "actual_fill_vwap_text": "0.40"}
         out = classify_exit(row)
