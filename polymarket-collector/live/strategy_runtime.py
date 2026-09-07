@@ -3081,6 +3081,12 @@ class LiveStrategyRuntime:
         """Lower is more urgent. Real risk exits must never queue behind DUST."""
         state = str(position.get("state") or "").upper()
         stop_stage = int(position.get("stop_stage") or 0)
+        # DUST is terminal. A lingering ``stop_stage >= 1`` latch on historical
+        # DUST must never promote it into the tier-0 latched-exit fast path, so
+        # DUST is classified before any stop_stage / EXITING / reconciliation
+        # check. This keeps DUST on its existing tier 3/4 classification.
+        if state == "DUST":
+            return 3 if not position.get("closed_at") else 4
         if (
             state == "EXIT_RECONCILIATION_REQUIRED"
             or stop_stage >= 1
@@ -3089,8 +3095,6 @@ class LiveStrategyRuntime:
             return 0
         if state in {"OPEN", "TP_OPEN"}:
             return 1
-        if state == "DUST":
-            return 3 if not position.get("closed_at") else 4
         return 2
 
     async def _submit_latched_exit(self, position_id: str) -> None:
@@ -3105,6 +3109,13 @@ class LiveStrategyRuntime:
             await self._refresh_hot_state_once()
             position = self._position_by_id_from_ram(position_id)
             if position is None:
+                return
+
+            # Defense-in-depth: DUST is terminal and must never travel the
+            # latched-exit fast path, even if a future classification
+            # regression hands it back as tier 0. Return before touching the
+            # book, the stop plan, ``_market_exit_fak`` or any EXIT intent.
+            if str(position.get("state") or "").upper() == "DUST":
                 return
 
             remaining = (
