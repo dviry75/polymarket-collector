@@ -122,6 +122,9 @@ class LiveStrategyRuntime:
             strategy_repo,
             deep_capture_max_vwap=config.exit_forensic_deep_capture_max_vwap,
             acceptable_min_vwap=config.exit_forensic_acceptable_min_vwap,
+            classifier_sla_ms=int(
+                config.exit_supervisor_stop_to_submit_sla_seconds * 1000
+            ),
             logger=logging.getLogger(f"{__name__}.exit_evidence"),
         )
         self._exit_evidence_task: asyncio.Task[Any] | None = None

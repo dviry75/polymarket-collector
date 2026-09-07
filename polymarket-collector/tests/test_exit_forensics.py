@@ -176,6 +176,44 @@ class ExitForensicsTests(unittest.TestCase):
         self.assertEqual(row["submit_depth_at_055_text"], "0")
         # only the 0.50 level clears the 0.46 floor; the 0.30 level does not
         self.assertEqual(row["submit_depth_at_046_text"], "1")
+        # _finalize now also classifies in place
+        self.assertIsNotNone(row["classified_at"])
+        self.assertIsNotNone(row["classifier_version"])
+        self.assertIn(row["root_cause"], {
+            "MARKET", "LIQUIDITY", "DETECTION_DELAY", "EXECUTION_DELAY",
+            "BOOK_FILL_MISMATCH", "MIXED", "UNKNOWN", "HEALTHY",
+        })
+        self.assertEqual(row["technical_behavior"], row["technical_behavior"])
+
+    def test_finalizes_lingering_position_after_grace(self):
+        self.collector._finalize_grace_seconds = 0.0  # submit is "old" immediately
+        self.collector.note_cross(
+            self.position, bid=Decimal("0.66"), bid_size="5",
+            update=_book([{"price": "0.66", "size": "5"}]),
+            received_at="2026-09-06T12:00:00.000+00:00", stop_price=STOP,
+        )
+        self.collector.note_latch(
+            self.position, bid=Decimal("0.65"),
+            update=_book([{"price": "0.65", "size": "5"}], gen=2),
+            source="supervisor", latched_at="2026-09-06T12:00:00.030+00:00",
+        )
+        self.collector.note_submit(
+            self.position, exit_intent_id="exit-9", purpose="STOP_066",
+            min_price="0.01", requested_shares="5", frame_hash="fh",
+            update=_book([{"price": "0.64", "size": "30"}], gen=3),
+            submitted_at="2026-09-06T12:00:00.300+00:00",
+            stop_to_submit_seconds=0.2, frame_to_submit_seconds=0.3,
+        )
+        self._add_fill("exit-9", "5", "0.63")
+        # position is STILL reported active (winning side, REDEEM_PENDING)
+        self.collector.reconcile_active({"pos-1"})
+        self.collector.drain_pending()
+
+        row = self.repo.exit_audit("pos-1")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["exit_outcome"], "ACCEPTABLE")
+        self.assertIsNotNone(row["classified_at"])
+        self.assertNotIn("pos-1", self.collector._episodes)
 
     def test_acceptable_exit_keeps_only_light_row(self):
         self.collector.note_cross(

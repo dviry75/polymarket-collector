@@ -159,9 +159,38 @@ def classify_exit(
         (detection_ms is None or detection_ms <= sla_ms)
         and (execution_ms is None or execution_ms <= sla_ms)
     )
-    if top_loss <= eps and within_sla:
-        reasons.append("all loss components negligible and latencies within SLA")
-        return _result("HEALTHY", "HEALTHY", "HEALTHY", outcome, reasons, row)
+    if top_loss <= eps:
+        if within_sla:
+            reasons.append(
+                "all loss components negligible and latencies within SLA"
+            )
+            return _result(
+                "HEALTHY", "HEALTHY", "HEALTHY", outcome, reasons, row
+            )
+        # No measurable price damage, but a latency breached SLA. Name the
+        # latency that actually breached — do NOT argmax a set of zeros.
+        exec_breach = execution_ms is not None and execution_ms > sla_ms
+        det_breach = detection_ms is not None and detection_ms > sla_ms
+        if exec_breach:
+            tech = "SETTLEMENT_WAIT" if settlement_wait else "DELAY"
+            reasons.append(
+                f"SELL {execution_ms}ms after latch (> SLA); no price damage — "
+                + ("on-chain settlement wait (expected)" if settlement_wait
+                   else "slow submit, price held")
+            )
+            return _result(
+                "EXECUTION_DELAY", "EXECUTION_DELAY", tech, outcome, reasons,
+                row, components=components,
+            )
+        if det_breach:
+            reasons.append(
+                f"latch {detection_ms}ms after the cross frame (> SLA); "
+                "no price damage — slow detection, price held"
+            )
+            return _result(
+                "DETECTION_DELAY", "DETECTION_DELAY", "DELAY", outcome, reasons,
+                row, components=components,
+            )
 
     primary = _resolve_component(
         top_name, row, snaps, requested, p_submit,

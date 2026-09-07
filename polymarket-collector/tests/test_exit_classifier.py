@@ -140,6 +140,23 @@ class ExitClassifierTests(unittest.TestCase):
         self.assertIn(out["primary_cause"], {"EXECUTION_DELAY", "DETECTION_DELAY"})
         self.assertIn("secondary_cause", out)
 
+    def test_latency_breach_no_price_damage_names_the_right_latency(self):
+        # invalid-entry style: no cross, latch bid missing, submit bid present,
+        # fill better than book-implied (no damage), but 16s latch->submit.
+        row = {
+            "requested_shares_text": "5",
+            "submit_best_bid_text": "0.69",
+            "expected_vwap_at_submit_text": "0.69",
+            "actual_fill_vwap_text": "0.96",
+            "execution_latency_ms": 16000,
+        }
+        out = classify_exit(row)
+        self.assertEqual(out["root_cause"], "EXECUTION_DELAY")
+        self.assertEqual(out["technical_behavior"], "DELAY")
+        # with the settlement flag it is the expected wait, not a bug
+        out2 = classify_exit(dict(row, settlement_wait=1))
+        self.assertEqual(out2["technical_behavior"], "SETTLEMENT_WAIT")
+
     def test_no_execution_reject(self):
         row = {
             "requested_shares_text": "5",

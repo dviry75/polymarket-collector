@@ -30,6 +30,7 @@ import json
 from typing import Any, Callable
 
 from .book_walk import book_walk_vwap, cumulative_bid_depth
+from .exit_classifier import classify_exit
 from .repository import now_iso
 from .strategy_repository import StrategyRepository, stable_id
 
@@ -37,6 +38,11 @@ _MAX_QUEUE = 512
 _MAX_LADDER_LEVELS = 250
 _DEFAULT_DEEP_CAPTURE_MAX_VWAP = Decimal("0.55")
 _DEFAULT_ACCEPTABLE_MIN_VWAP = Decimal("0.60")
+# A latched exit whose SELL was submitted this long ago is finalized even if
+# its position row still lingers "active" (winning side sits in REDEEM_PENDING
+# with unredeemed shares for minutes).
+_FINALIZE_GRACE_SECONDS = 90.0
+_DEFAULT_CLASSIFIER_SLA_MS = 2000
 # Bid-depth buckets recorded at SUBMIT for entry-liquidity parity.
 _SUBMIT_DEPTH_LEVELS = (
     Decimal("0.66"), Decimal("0.60"), Decimal("0.55"), Decimal("0.46"),
@@ -79,7 +85,7 @@ class _Episode:
         "exit_audit_id", "position_id", "episode_seq", "event_id",
         "condition_id", "token_id", "deal_id", "entry_intent_id",
         "exit_intent_id", "fields", "books", "book_refs",
-        "latched", "finalized", "below_stop",
+        "latched", "finalized", "finalize_requested", "below_stop",
         "last_bid", "cross_count", "uncross_count", "min_bid_seen",
         "degraded",
     )
@@ -104,6 +110,7 @@ class _Episode:
         self.book_refs: dict[str, Any] = {}
         self.latched = False
         self.finalized = False
+        self.finalize_requested = False
         self.below_stop = True
         self.last_bid: Decimal | None = None
         self.cross_count = 1
@@ -142,6 +149,8 @@ class ExitEvidenceCollector:
         acceptable_min_vwap: Decimal | str | float | None = None,
         book_provider: Callable[[str], dict[str, Any] | None] | None = None,
         logger: Any = None,
+        classifier_sla_ms: int | None = None,
+        finalize_grace_seconds: float | None = None,
     ) -> None:
         self.repo = repo
         self.deep_capture_max_vwap = (
@@ -149,6 +158,12 @@ class ExitEvidenceCollector:
         )
         self.acceptable_min_vwap = (
             _dec(acceptable_min_vwap) or _DEFAULT_ACCEPTABLE_MIN_VWAP
+        )
+        self._classifier_sla_ms = int(
+            classifier_sla_ms or _DEFAULT_CLASSIFIER_SLA_MS
+        )
+        self._finalize_grace_seconds = float(
+            finalize_grace_seconds or _FINALIZE_GRACE_SECONDS
         )
         self._book_provider = book_provider
         self._logger = logger
@@ -430,12 +445,30 @@ class ExitEvidenceCollector:
 
     def reconcile_active(self, active_ids: set[str]) -> None:
         for pid, episode in list(self._episodes.items()):
-            if pid in active_ids or episode.finalized:
-                continue
-            if episode.latched:
-                self._enqueue({"kind": "finalize", "position_id": pid})
-            else:
+            if episode.finalized:
                 self._episodes.pop(pid, None)
+                continue
+            if episode.finalize_requested:
+                continue
+            if pid not in active_ids:
+                if episode.latched:
+                    episode.finalize_requested = True
+                    self._enqueue({"kind": "finalize", "position_id": pid})
+                else:
+                    self._episodes.pop(pid, None)
+                continue
+            # Still "active": a latched exit whose SELL went out a while ago is
+            # done even though the position row lingers (REDEEM_PENDING / DUST
+            # with unredeemed shares). Finalize it anyway.
+            submitted_at = episode.fields.get("submitted_at")
+            if (
+                episode.latched
+                and submitted_at
+                and self._age_seconds(submitted_at)
+                > self._finalize_grace_seconds
+            ):
+                episode.finalize_requested = True
+                self._enqueue({"kind": "finalize", "position_id": pid})
 
     # ---------------------------------------------------------------- #
     # Drain task — everything below runs off the hot path
@@ -625,6 +658,36 @@ class ExitEvidenceCollector:
             for phase, book in episode.books.items():
                 self._write_snapshot(episode, phase, book)
 
+        # Classify in place — the row and its snapshots are complete now.
+        # classify_exit is a pure function; the only I/O is the same repo the
+        # drain task already uses. Failure here must not block finalization.
+        try:
+            classified_row = self.repo.exit_audit(
+                episode.position_id, episode_seq=episode.episode_seq
+            ) or {}
+            verdict = classify_exit(
+                classified_row,
+                self.repo.exit_book_snapshots(episode.exit_audit_id),
+                acceptable_min_vwap=self.acceptable_min_vwap,
+                sla_ms=self._classifier_sla_ms,
+            )
+            self.repo.record_exit_audit(
+                episode.exit_audit_id,
+                position_id=episode.position_id,
+                event_id=episode.event_id,
+                episode_seq=episode.episode_seq,
+                root_cause=verdict["root_cause"],
+                primary_cause=verdict["primary_cause"],
+                technical_behavior=verdict["technical_behavior"],
+                exit_outcome=verdict["exit_outcome"],
+                classified_at=now_iso(),
+                classifier_version=verdict["classifier_version"],
+            )
+        except Exception as exc:
+            self.last_error = (
+                f"EXIT_CLASSIFY:{type(exc).__name__}:{exc}"
+            )[:500]
+
         episode.finalized = True
         self._episodes.pop(episode.position_id, None)
 
@@ -748,6 +811,18 @@ class ExitEvidenceCollector:
         if row["last_at"]:
             out["last_fill_at"] = str(row["last_at"])
         return out
+
+    @staticmethod
+    def _age_seconds(iso: Any) -> float:
+        from datetime import datetime, timezone
+
+        try:
+            t = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return 0.0
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - t).total_seconds())
 
     @staticmethod
     def _delta_ms(start: Any, end: Any) -> int | None:
