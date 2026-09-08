@@ -33,10 +33,27 @@ class _EntryAdapter(MockTradingAdapter):
         super().__init__(scenario="delayed")
         self.response = response
         self.create_calls: list[dict] = []
+        self.post_calls = 0
+        self.preflight = lambda: None
         self.token_balance: dict[str, str] = {}
 
-    async def create_order(self, order):
+    async def create_order(self, order, *, pre_post_guard=None):
         self.create_calls.append(dict(order))
+        self.preflight()
+        if pre_post_guard is not None:
+            guard_result = pre_post_guard()
+            if not guard_result["ok"]:
+                return {
+                    "success": False,
+                    "status": "blocked",
+                    "submission_state": "NOT_SUBMITTED",
+                    "failure_reason": guard_result["reason"],
+                    **{
+                        key: value for key, value in guard_result.items()
+                        if key not in {"ok", "reason"}
+                    },
+                }
+        self.post_calls += 1
         return dict(self.response)
 
     async def get_token_balance(self, token_id):
@@ -211,10 +228,53 @@ def test_C_valid_revalidation_allows_submission():
         })
         _submit(runtime, market, "YES", intent_id, _latched_update(tok))
         assert len(adapter.create_calls) == 1
+        assert adapter.post_calls == 1
         position = repo.position_for_token(tok)
         assert position is not None
         assert position["state"] in {"OPEN", "TP_OPEN", "EXITING"}
         assert position["entry_policy_status"] == "VALID"
+    finally:
+        temp.cleanup()
+
+
+def test_final_revalidation_price_changed_after_preflight_aborts_cleanly():
+    temp, base, repo, runtime, adapter, market, intent_id, tok, event_id = _entry_case(
+        "final-price", response=_MATCHED_074, exit_bid="0.73",
+    )
+    book = {
+        "asset_id": tok, "best_ask": "0.74", "best_bid": "0.73",
+        "book_ready": True, "generation": 5, "exchange_age_ms": 10,
+    }
+    try:
+        runtime.set_exit_book_provider(lambda tid: dict(book))
+        adapter.preflight = lambda: book.update(best_ask="0.50")
+        _submit(runtime, market, "YES", intent_id, _latched_update(tok))
+
+        assert adapter.post_calls == 0
+        intent = repo.intent(intent_id)
+        assert intent["state"] in {"ZERO_FILL", "REJECTED"}
+        assert intent["reason_code"] == "ENTRY_FINAL_REVALIDATION_PRICE_CHANGED"
+        assert repo.event_state(event_id)["status"] == "ENTRY_ZERO_FILL"
+        assert event_id not in runtime._hot_state.get("locked_event_ids", set())
+        assert base.get_state("pause_entries") != "true"
+    finally:
+        temp.cleanup()
+
+
+def test_final_revalidation_signal_stale_after_preflight_aborts_cleanly():
+    temp, base, repo, runtime, adapter, market, intent_id, tok, event_id = _entry_case(
+        "final-stale", response=_MATCHED_074, exit_bid="0.73",
+    )
+    try:
+        adapter.preflight = lambda: time.sleep(1.55)
+        _submit(runtime, market, "YES", intent_id, _latched_update(tok, age_ms=50))
+
+        assert adapter.post_calls == 0
+        intent = repo.intent(intent_id)
+        assert intent["state"] in {"ZERO_FILL", "REJECTED"}
+        assert intent["reason_code"] == "ENTRY_FINAL_REVALIDATION_STALE"
+        assert repo.event_state(event_id)["status"] == "ENTRY_ZERO_FILL"
+        assert base.get_state("pause_entries") != "true"
     finally:
         temp.cleanup()
 
@@ -239,6 +299,24 @@ def test_D_adverse_fill_publishes_and_latches_invalid_entry():
         assert position["entry_policy_status"] == "OUTSIDE_POLICY"
         assert int(position["stop_stage"]) >= 1
         assert position["exit_obligation_reason"] == "EMERGENCY_INVALID_ENTRY"
+    finally:
+        temp.cleanup()
+
+
+def test_large_buy_response_fill_evidence_accepts_008_and_004():
+    temp, base, repo, runtime, adapter, market, intent_id, tok, event_id = _entry_case(
+        "large-fill", response=_MATCHED_074, exit_bid="0.73",
+    )
+    try:
+        assert runtime._response_fill_evidence({
+            "making_amount": "3.8", "taking_amount": "47.5",
+        }) == (Decimal("47.5"), Decimal("0.0800"))
+        assert runtime._response_fill_evidence({
+            "making_amount": "3.8", "taking_amount": "95",
+        }) == (Decimal("95"), Decimal("0.0400"))
+        assert runtime._response_fill_evidence({
+            "making_amount": "5.3", "taking_amount": "100",
+        }) is None
     finally:
         temp.cleanup()
 

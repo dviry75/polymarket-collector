@@ -812,6 +812,82 @@ def test_adapter_insufficient_allowance_blocks_before_sign_and_post():
     assert fake.market_calls == [] and fake.posted == []
 
 
+def test_adapter_entry_guard_runs_after_sign_and_before_post():
+    fake = FakeSecureClient()
+    adapter = RealPolymarketTradingAdapter(armed_config(), secure_client=fake)
+    guard_observations = []
+
+    def guard():
+        guard_observations.append(len(fake.limit_calls))
+        return {"ok": False, "reason": "ENTRY_FINAL_REVALIDATION_PRICE_CHANGED"}
+
+    order = {**_adapter_entry_order(), "purpose": "ENTRY"}
+    result = asyncio.run(adapter.create_order(order, pre_post_guard=guard))
+
+    assert guard_observations == [1]
+    assert fake.posted == []
+    assert result["submission_state"] == "NOT_SUBMITTED"
+    assert result["failure_reason"] == "ENTRY_FINAL_REVALIDATION_PRICE_CHANGED"
+
+
+def test_adapter_entry_deadline_blocks_post(monkeypatch):
+    fake = FakeSecureClient()
+    adapter = RealPolymarketTradingAdapter(armed_config(), secure_client=fake)
+    monotonic_values = iter((10.0, 12.6))
+    monkeypatch.setattr(
+        "live.adapters.polymarket.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    order = {**_adapter_entry_order(), "purpose": "ENTRY"}
+    result = asyncio.run(
+        adapter.create_order(order, pre_post_guard=lambda: {"ok": True})
+    )
+
+    assert fake.posted == []
+    assert result["submission_state"] == "NOT_SUBMITTED"
+    assert result["failure_reason"] == "ENTRY_ORDER_DEADLINE_EXCEEDED"
+    assert result["create_order_elapsed_ms"] > 2500
+
+
+def test_adapter_deadline_and_guard_do_not_apply_to_sell(monkeypatch):
+    fake = FakeSecureClient()
+    adapter = RealPolymarketTradingAdapter(armed_config(), secure_client=fake)
+    monotonic_values = iter((10.0, 20.0))
+    monkeypatch.setattr(
+        "live.adapters.polymarket.monotonic",
+        lambda: next(monotonic_values),
+    )
+    result = asyncio.run(adapter.create_order({
+        "durable_intent_reserved": True,
+        "token_id": "token",
+        "side": "SELL",
+        "order_type": "FAK",
+        "purpose": "STOP",
+        "requested_size": "5",
+        "min_price": "0.01",
+    }, pre_post_guard=lambda: {
+        "ok": False, "reason": "MUST_NOT_RUN_FOR_SELL",
+    }))
+
+    assert result["success"]
+    assert len(fake.posted) == 1
+
+
+def test_entry_submit_deadline_config_bounds():
+    assert not any(
+        "LIVE_ENTRY_ORDER_SUBMIT_DEADLINE_MS" in error
+        for error in LiveConfig().validation_errors()
+    )
+    for invalid in (499, 10001):
+        assert any(
+            "LIVE_ENTRY_ORDER_SUBMIT_DEADLINE_MS" in error
+            for error in LiveConfig(
+                entry_order_submit_deadline_ms=invalid
+            ).validation_errors()
+        )
+
+
 class FakeResponseClient(FakeSecureClient):
     def __init__(self, response):
         super().__init__()

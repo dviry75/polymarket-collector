@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from .base import TradingAdapter
 from ..repository import now_iso
@@ -41,7 +41,22 @@ class MockTradingAdapter(TradingAdapter):
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
 
-    async def create_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    async def create_order(
+        self,
+        order: dict[str, Any],
+        *,
+        pre_post_guard: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if pre_post_guard is not None:
+            guarded = pre_post_guard()
+            if not guarded.get("ok"):
+                return {
+                    "success": False,
+                    "status": "blocked",
+                    "submission_state": "NOT_SUBMITTED",
+                    "failure_reason": guarded.get("reason") or "PRE_POST_GUARD_BLOCKED",
+                    **{key: value for key, value in guarded.items() if key != "ok"},
+                }
         order_id = f"mock-{order['idempotency_key']}"
         scenario = order.get("mock_scenario") or self.scenario
         response: dict[str, Any] = {
@@ -130,4 +145,3 @@ class MockTradingAdapter(TradingAdapter):
             "status": "confirmed" if authorized_intent else "blocked",
             "transaction_hash": f"mock-redeem-{condition_id}" if authorized_intent else None,
         }
-

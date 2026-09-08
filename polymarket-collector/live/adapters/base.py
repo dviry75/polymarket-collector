@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 
 class TradingAdapter(ABC):
@@ -60,7 +60,12 @@ class TradingAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def create_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    async def create_order(
+        self,
+        order: dict[str, Any],
+        *,
+        pre_post_guard: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -92,4 +97,3 @@ class TradingAdapter(ABC):
         self, condition_id: str, *, authorized_intent: bool = False
     ) -> dict[str, Any]:
         return {"success": False, "status": "blocked"}
-

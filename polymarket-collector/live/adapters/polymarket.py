@@ -4,7 +4,8 @@ from dataclasses import replace
 from decimal import Decimal
 import asyncio
 import logging
-from typing import Any, Protocol
+from time import monotonic
+from typing import Any, Callable, Protocol
 
 from eth_account import Account
 
@@ -470,7 +471,13 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             # Do not call place_*: those methods perform automatic allowance recovery.
             raise RuntimeError("INSUFFICIENT_ALLOWANCE_APPROVAL_REQUIRED")
 
-    async def create_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    async def create_order(
+        self,
+        order: dict[str, Any],
+        *,
+        pre_post_guard: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        started_monotonic = monotonic()
         if not self.config.real_submission_armed():
             return {
                 "success": False,
@@ -565,6 +572,43 @@ class RealPolymarketTradingAdapter(TradingAdapter):
                 )
             else:
                 raise ValueError("unsupported order contract")
+            is_entry_buy = (
+                side == "BUY"
+                and str(order.get("purpose") or "").upper() == "ENTRY"
+            )
+            elapsed_ms = int((monotonic() - started_monotonic) * 1000)
+            if (
+                is_entry_buy
+                and elapsed_ms > self.config.entry_order_submit_deadline_ms
+            ):
+                result = {
+                    "success": False,
+                    "status": "blocked",
+                    "submission_state": "NOT_SUBMITTED",
+                    "failure_reason": "ENTRY_ORDER_DEADLINE_EXCEEDED",
+                    "create_order_elapsed_ms": elapsed_ms,
+                }
+                self._finish_attempt(attempt, result=result)
+                return result
+            if is_entry_buy and pre_post_guard is not None:
+                guard_result = pre_post_guard()
+                if not guard_result.get("ok"):
+                    result = {
+                        "success": False,
+                        "status": "blocked",
+                        "submission_state": "NOT_SUBMITTED",
+                        "failure_reason": (
+                            guard_result.get("reason")
+                            or "ENTRY_FINAL_REVALIDATION_NOT_READY"
+                        ),
+                        "create_order_elapsed_ms": elapsed_ms,
+                        **{
+                            key: value for key, value in guard_result.items()
+                            if key not in {"ok", "reason"}
+                        },
+                    }
+                    self._finish_attempt(attempt, result=result)
+                    return result
             post_started = True
             response = await client.post_order(signed)
             normalized = self._normalize_response(response)

@@ -117,6 +117,7 @@ class LiveConfig:
     waiting_sellable_sla_seconds: float = 2.0
     # P0 hardening — explicit, env-overridable safety knobs.
     entry_signal_max_age_ms: int = 1500
+    entry_order_submit_deadline_ms: int = 2500
     entry_fill_max_adverse_deviation: Decimal = Decimal("0.03")
     exit_supervisor_max_concurrent_book_fetches: int = 4
     exit_supervisor_tick_budget_seconds: float = 3.0
@@ -265,6 +266,9 @@ class LiveConfig:
             ),
             entry_signal_max_age_ms=int(
                 _env("LIVE_ENTRY_SIGNAL_MAX_AGE_MS", "1500") or "1500"
+            ),
+            entry_order_submit_deadline_ms=int(
+                _env("LIVE_ENTRY_ORDER_SUBMIT_DEADLINE_MS", "2500") or "2500"
             ),
             entry_fill_max_adverse_deviation=_decimal_env(
                 "LIVE_ENTRY_FILL_MAX_ADVERSE_DEVIATION", "0.03"
@@ -467,6 +471,10 @@ class LiveConfig:
             errors.append(
                 "LIVE_ENTRY_SIGNAL_MAX_AGE_MS must be between 250 and 10000"
             )
+        if not 500 <= self.entry_order_submit_deadline_ms <= 10000:
+            errors.append(
+                "LIVE_ENTRY_ORDER_SUBMIT_DEADLINE_MS must be between 500 and 10000"
+            )
         if not Decimal("0") < self.entry_fill_max_adverse_deviation <= Decimal("0.10"):
             errors.append(
                 "LIVE_ENTRY_FILL_MAX_ADVERSE_DEVIATION must be > 0 and <= 0.10"
@@ -598,6 +606,7 @@ class LiveConfig:
             "exit_supervisor_sla_seconds": self.exit_supervisor_sla_seconds,
             "waiting_sellable_sla_seconds": self.waiting_sellable_sla_seconds,
             "entry_signal_max_age_ms": self.entry_signal_max_age_ms,
+            "entry_order_submit_deadline_ms": self.entry_order_submit_deadline_ms,
             "entry_fill_max_adverse_deviation": str(
                 self.entry_fill_max_adverse_deviation
             ),

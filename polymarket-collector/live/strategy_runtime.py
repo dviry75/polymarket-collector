@@ -1781,9 +1781,8 @@ class LiveStrategyRuntime:
         making = decimal_value(response.get("making_amount"))
         if taking is None or making is None or taking <= 0 or making <= 0:
             return None
-        cap_shares = self.policy.max_shares * 4
         cap_spend = self.policy.max_spend * Decimal("1.05")
-        if taking > cap_shares or making > cap_spend:
+        if making > cap_spend:
             return None
         avg = (making / taking).quantize(Decimal("0.0001"))
         if avg <= 0 or avg > Decimal("1"):
@@ -2132,11 +2131,9 @@ class LiveStrategyRuntime:
                 )
                 return
 
-        # P0-A — pre-submission revalidation against the current authoritative
-        # book. The strategy enters only on an exact 0.74 ask; re-assert that
-        # right before post_order. Only runs when a live top-of-book provider is
-        # wired (always true in the trader process); the existing freshness
-        # provider check below still fails closed if nothing is configured.
+        # P0-A — initial revalidation against the current authoritative book
+        # before entering the adapter's preflight. The final guard below repeats
+        # this after signing, immediately before post_order.
         revalidation_book: dict[str, Any] | None = None
         if not self.paper_mode() and self._exit_book_provider is not None:
             reval = self._revalidate_entry_signal(market, update, token_id)
@@ -2347,6 +2344,63 @@ class LiveStrategyRuntime:
             update=revalidation_book or update,
             requested_shares=self.policy.max_shares,
         )
+
+        def final_pre_post_guard() -> dict[str, Any]:
+            guard_now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            if signal_observed_ms is None:
+                return {
+                    "ok": False,
+                    "reason": "ENTRY_FINAL_REVALIDATION_STALE",
+                    "signal_age_ms": None,
+                }
+            signal_age_ms = guard_now_ms - int(signal_observed_ms)
+            if signal_age_ms > self.config.entry_signal_max_age_ms:
+                return {
+                    "ok": False,
+                    "reason": "ENTRY_FINAL_REVALIDATION_STALE",
+                    "signal_age_ms": signal_age_ms,
+                }
+            final_reval = self._revalidate_entry_signal(market, update, token_id)
+            final_reval.pop("book", None)
+            reason_map = {
+                "ENTRY_REVALIDATION_BOOK_NOT_READY": "ENTRY_FINAL_REVALIDATION_NOT_READY",
+                "ENTRY_REVALIDATION_STALE": "ENTRY_FINAL_REVALIDATION_NOT_READY",
+                "ENTRY_REVALIDATION_GENERATION_CHANGED": "ENTRY_FINAL_REVALIDATION_GENERATION_CHANGED",
+                "ENTRY_REVALIDATION_PRICE_CHANGED": "ENTRY_FINAL_REVALIDATION_PRICE_CHANGED",
+            }
+            if not final_reval["ok"]:
+                return {
+                    "ok": False,
+                    "reason": reason_map.get(
+                        str(final_reval.get("reason")),
+                        "ENTRY_FINAL_REVALIDATION_NOT_READY",
+                    ),
+                    "signal_age_ms": signal_age_ms,
+                    "best_ask": final_reval.get("current_ask"),
+                    "book_age_ms": final_reval.get("age_ms"),
+                    "generation": final_reval.get("generation"),
+                }
+            durable_ok, durable_reason = self._durable_entry_gate(
+                check_pause=self.config.continuous_trading_enabled,
+                require_canary=False,
+            )
+            if not durable_ok:
+                return {
+                    "ok": False,
+                    "reason": durable_reason,
+                    "signal_age_ms": signal_age_ms,
+                    "best_ask": final_reval.get("current_ask"),
+                    "book_age_ms": final_reval.get("age_ms"),
+                    "generation": final_reval.get("generation"),
+                }
+            return {
+                "ok": True,
+                "signal_age_ms": signal_age_ms,
+                "best_ask": final_reval.get("current_ask"),
+                "book_age_ms": final_reval.get("age_ms"),
+                "generation": final_reval.get("generation"),
+            }
+
         response = await self.adapter.create_order({
             "idempotency_key": intent_id,
             "durable_intent_reserved": True,
@@ -2362,7 +2416,7 @@ class LiveStrategyRuntime:
             "max_spend": entry_params["max_spend"],
             "max_tokens": canonical_decimal(self.policy.max_shares),
             "max_price": "0.76",
-        })
+        }, pre_post_guard=final_pre_post_guard)
         status = str(response.get("status") or "unknown").lower()
         remote_id = response.get("polymarket_order_id")
         self._trace_critical(
@@ -2381,6 +2435,20 @@ class LiveStrategyRuntime:
             "note_submit_result", intent_id,
             clob_status=status, remote_order_id=remote_id,
         )
+        if str(response.get("submission_state") or "").upper() == "NOT_SUBMITTED":
+            reason = str(
+                response.get("failure_reason") or "ENTRY_NOT_SUBMITTED"
+            ).upper()
+            self._abort_entry(
+                intent_id, event_id, update,
+                reason=reason, detail=response, market=market,
+            )
+            self.repo.record_entry_audit(
+                intent_id, event_id=event_id,
+                entry_validity=f"ABORTED_{reason}",
+            )
+            self._note_entry_liquidity("note_abort", intent_id, reason=reason)
+            return
         if status == "rejected" and _is_confirmed_fak_zero_fill_response(response):
             self.repo.mark_zero_fill(
                 event_id, "FAK_ZERO_FILL", intent_id=intent_id
