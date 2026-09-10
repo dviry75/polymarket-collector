@@ -31,6 +31,7 @@ def reserve_and_open(
     shares=Decimal("10"),
     minimum=Decimal("5"),
     sellable=None,
+    cost_all_in=Decimal("5"),
 ):
     strategy.reserve_event_entry(
         event_id=event, condition_id=f"condition-{event}", token_id=f"token-{event}",
@@ -39,7 +40,7 @@ def reserve_and_open(
     return strategy.open_position(
         event_id=event, condition_id=f"condition-{event}", token_id=f"token-{event}",
         outcome="YES", shares=shares, average_price=Decimal("0.74"),
-        cost_all_in=Decimal("5"), fees=Decimal("0.05"),
+        cost_all_in=cost_all_in, fees=Decimal("0.05"),
         sellable_shares=sellable, min_sellable=minimum,
     )
 
@@ -132,18 +133,18 @@ def test_order_book_snapshot_delta_delete_duplicate_out_of_order_reconnect_two_t
     assert books.event_ready(["yes", "no"])[0] is False
 
 
-def test_five_dollar_all_in_rounding_fees_and_minimum():
-    budget = AllInBudget(Decimal("5"))
-    assert budget.sdk_buy_parameters() == {"amount": "3.8", "max_spend": "5"}
+def test_all_in_rounding_fees_and_minimum():
+    budget = AllInBudget(Decimal("8"))
+    assert budget.sdk_buy_parameters() == {"amount": "6.08", "max_spend": "8"}
     result = simulate_buy_fak(
         [{"price": "0.74", "size": "100"}], max_price=Decimal("0.76"),
-        max_spend=Decimal("5"), fee_rate=Decimal("0.07"),
-        max_shares=Decimal("5"),
+        max_spend=Decimal("8"), fee_rate=Decimal("0.07"),
+        max_shares=Decimal("8"),
     )
-    assert result.all_in <= Decimal("5")
-    assert result.filled_shares <= Decimal("5")
+    assert result.all_in <= Decimal("8")
+    assert result.filled_shares <= Decimal("8")
     assert budget.minimum_viable(
-        min_order_shares=Decimal("5"), maximum_price=Decimal("0.76"),
+        min_order_shares=Decimal("8"), maximum_price=Decimal("0.76"),
         maximum_fee_fraction=Decimal("0.07"),
     ) == (True, "VIABLE")
     assert budget.minimum_viable(
@@ -152,9 +153,9 @@ def test_five_dollar_all_in_rounding_fees_and_minimum():
     )[0] is False
 
     assert budget.minimum_viable(
-        min_order_shares=Decimal("5.000001"), maximum_price=Decimal("0.76"),
+        min_order_shares=Decimal("8.000001"), maximum_price=Decimal("0.76"),
         maximum_fee_fraction=Decimal("0.07"),
-    ) == (False, "MINIMUM_ORDER_EXCEEDS_5_TOKEN_CAP")
+    ) == (False, "MINIMUM_ORDER_EXCEEDS_TOKEN_CAP")
 
 def test_zero_fill_allows_new_unique_entry_attempt_and_preserves_history():
     temp, base, strategy = build_repo()
@@ -657,7 +658,9 @@ def test_resolution_winner_redeem_loser_zero_and_noop_closed():
 def test_exposure_cap_across_events_and_dust_exception():
     temp, _base, strategy = build_repo()
     try:
-        reserve_and_open(strategy, event="one", shares=Decimal("6"))
+        reserve_and_open(
+            strategy, event="one", shares=Decimal("9"), cost_all_in=Decimal("8")
+        )
         decision = choose_entry(
             updates=[{"asset_id": "yes", "best_ask": "0.74"}], yes_token_id="yes",
             no_token_id="no", event_ready=True, paused=False, event_locked=False,

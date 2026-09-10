@@ -315,7 +315,7 @@ def test_large_buy_response_fill_evidence_accepts_008_and_004():
             "making_amount": "3.8", "taking_amount": "95",
         }) == (Decimal("95"), Decimal("0.0400"))
         assert runtime._response_fill_evidence({
-            "making_amount": "5.3", "taking_amount": "100",
+            "making_amount": "8.5", "taking_amount": "100",
         }) is None
     finally:
         temp.cleanup()

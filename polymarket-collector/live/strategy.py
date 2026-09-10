@@ -35,9 +35,9 @@ class StrategyPolicy:
     emergency_price: Decimal = Decimal("0.60")
     stop_min_price: Decimal = Decimal("0.01")
     emergency_min_price: Decimal = Decimal("0.01")
-    max_spend: Decimal = Decimal("5.00")
-    max_exposure: Decimal = Decimal("5.00")
-    max_shares: Decimal = Decimal("5.00")
+    max_spend: Decimal = Decimal("8.00")
+    max_exposure: Decimal = Decimal("8.00")
+    max_shares: Decimal = Decimal("8.00")
     entry_window_seconds: int = 120
 
     def validate(self) -> None:
@@ -71,8 +71,8 @@ class AllInBudget:
 
     def __init__(
         self,
-        max_spend: Decimal = Decimal("5.00"),
-        max_shares: Decimal = Decimal("5.00"),
+        max_spend: Decimal = Decimal("8.00"),
+        max_shares: Decimal = Decimal("8.00"),
     ):
         self.max_spend = max_spend.quantize(MONEY_QUANTUM, rounding=ROUND_DOWN)
         self.max_shares = max_shares.quantize(SHARE_QUANTUM, rounding=ROUND_DOWN)
@@ -100,12 +100,12 @@ class AllInBudget:
         if min_order_shares <= 0 or maximum_price <= 0:
             return False, "INVALID_MARKET_CONSTRAINTS"
         if min_order_shares > self.max_shares:
-            return False, "MINIMUM_ORDER_EXCEEDS_5_TOKEN_CAP"
+            return False, "MINIMUM_ORDER_EXCEEDS_TOKEN_CAP"
         required = min_order_shares * maximum_price * (
             Decimal("1") + maximum_fee_fraction
         )
         if required > self.max_spend:
-            return False, "MINIMUM_ORDER_EXCEEDS_5_DOLLAR_CAP"
+            return False, "MINIMUM_ORDER_EXCEEDS_SPEND_CAP"
         return True, "VIABLE"
 
 

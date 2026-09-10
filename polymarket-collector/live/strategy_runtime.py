@@ -1586,8 +1586,8 @@ class LiveStrategyRuntime:
             intent_id=intent_id, requested_action="BUY_MARKET_FAK",
             reason_code="ENTRY_PRICE_EXACT", previous_state="ELIGIBLE",
             new_state="ENTRY_INTENT_RESERVED", result_status="RESERVED",
-            requested_amount_text="3.8", requested_shares_text="5", parameters_json={
-                "max_price": "0.76", "max_spend": "5", "max_tokens": "5", "all_in": True,
+            requested_amount_text="6.08", requested_shares_text="8", parameters_json={
+                "max_price": "0.76", "max_spend": "8", "max_tokens": "8", "all_in": True,
                 "frame_hash": frame_hash,
             },
         )
@@ -2237,7 +2237,7 @@ class LiveStrategyRuntime:
                     condition_id=market["condition_id"], token_id=update["asset_id"],
                     side=side, intent_id=intent_id, requested_action="BUY_MARKET_FAK",
                     reason_code="FAK_ZERO_FILL", result_status="ZERO_FILL",
-                    requested_amount_text="3.8", requested_shares_text="5", filled_shares_text="0",
+                    requested_amount_text="6.08", requested_shares_text="8", filled_shares_text="0",
                     remaining_shares_text="0",
                 )
                 self._note_entry_liquidity(
@@ -2273,7 +2273,7 @@ class LiveStrategyRuntime:
                 new_state="POSITION_OPEN", result_status=(
                     "PARTIAL" if fill.remaining_request > 0 else "FILLED"
                 ),
-                requested_amount_text="3.8", requested_shares_text="5",
+                requested_amount_text="6.08", requested_shares_text="8",
                 filled_shares_text=canonical_decimal(fill.filled_shares),
                 average_price_text=canonical_decimal(fill.average_price),
                 fees_text=canonical_decimal(fill.fee),

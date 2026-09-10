@@ -79,10 +79,10 @@ class LiveConfig:
     canary_armed: bool = False
     continuous_trading_enabled: bool = False
     canary_event_limit: int = 1
-    default_trade_amount_usd: Decimal = Decimal("5")
-    max_trade_amount_usd: Decimal = Decimal("5")
-    max_total_exposure_usd: Decimal = Decimal("5")
-    max_trade_tokens: Decimal = Decimal("5")
+    default_trade_amount_usd: Decimal = Decimal("8")
+    max_trade_amount_usd: Decimal = Decimal("8")
+    max_total_exposure_usd: Decimal = Decimal("8")
+    max_trade_tokens: Decimal = Decimal("8")
     max_open_deals: int = 1
     max_open_orders: int = 2
     max_active_rules: int = 1
@@ -226,11 +226,11 @@ class LiveConfig:
             canary_armed=_bool_env("LIVE_CANARY_ARMED", False),
             continuous_trading_enabled=_bool_env("LIVE_CONTINUOUS_TRADING_ENABLED", False),
             canary_event_limit=int(_env("LIVE_CANARY_EVENT_LIMIT", "1") or "1"),
-            default_trade_amount_usd=_decimal_env("LIVE_DEFAULT_TRADE_AMOUNT_USD", "5"),
-            max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "5"),
-            max_total_exposure_usd=_decimal_env("LIVE_MAX_TOTAL_EXPOSURE_USD", "5"),
+            default_trade_amount_usd=_decimal_env("LIVE_DEFAULT_TRADE_AMOUNT_USD", "8"),
+            max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "8"),
+            max_total_exposure_usd=_decimal_env("LIVE_MAX_TOTAL_EXPOSURE_USD", "8"),
             max_open_deals=int(_env("LIVE_MAX_OPEN_DEALS", "1") or "1"),
-            max_trade_tokens=_decimal_env("LIVE_MAX_TRADE_TOKENS", "5"),
+            max_trade_tokens=_decimal_env("LIVE_MAX_TRADE_TOKENS", "8"),
             max_open_orders=int(_env("LIVE_MAX_OPEN_ORDERS", "2") or "2"),
             max_active_rules=int(_env("LIVE_MAX_ACTIVE_RULES", "1") or "1"),
             max_daily_realized_loss_usd=_decimal_env("LIVE_MAX_DAILY_REALIZED_LOSS_USD", "10"),
@@ -409,12 +409,12 @@ class LiveConfig:
             errors.append("LIVE_MAX_TRADE_AMOUNT_USD must be positive")
         if self.default_trade_amount_usd > self.max_trade_amount_usd:
             errors.append("default trade amount exceeds max trade amount")
-        if self.default_trade_amount_usd != Decimal("5") or self.max_trade_amount_usd != Decimal("5"):
-            errors.append("entry amount and cap must remain exactly $5 All-In")
-        if self.max_total_exposure_usd != Decimal("5"):
-            errors.append("LIVE_MAX_TOTAL_EXPOSURE_USD must remain exactly 5")
-        if self.max_trade_tokens != Decimal("5"):
-            errors.append("LIVE_MAX_TRADE_TOKENS must remain exactly 5")
+        if self.default_trade_amount_usd != Decimal("8") or self.max_trade_amount_usd != Decimal("8"):
+            errors.append("entry amount and cap must remain exactly $8 All-In")
+        if self.max_total_exposure_usd != Decimal("8"):
+            errors.append("LIVE_MAX_TOTAL_EXPOSURE_USD must remain exactly 8")
+        if self.max_trade_tokens != Decimal("8"):
+            errors.append("LIVE_MAX_TRADE_TOKENS must remain exactly 8")
         if self.max_open_deals != 1:
             errors.append("LIVE_MAX_OPEN_DEALS must remain exactly 1")
         if self.max_active_rules != 1:
