@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -14,6 +15,54 @@ from .strategy_repository import sanitize
 
 
 REDEMPTION_SIZE_TOLERANCE = Decimal("0.0001")
+ENTRY_POSITION_SIZE_TOLERANCE = Decimal("0.001")
+
+
+def select_verified_unknown_entry_trade(
+    trades: list[dict[str, Any]],
+    *,
+    intent: dict[str, Any],
+    position: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Select one exact remote BUY that explains an UNKNOWN entry position."""
+    try:
+        submitted = datetime.fromisoformat(str(intent["submitted_at"]))
+        if submitted.tzinfo is None:
+            submitted = submitted.replace(tzinfo=timezone.utc)
+        acquired = Decimal(str(position["acquired_shares_text"]))
+        price_limit = Decimal(str(intent["price_limit_text"]))
+    except Exception:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for trade in trades:
+        if str(trade.get("token_id") or "") != str(intent.get("token_id") or ""):
+            continue
+        if str(trade.get("condition_id") or "").lower() != str(intent.get("condition_id") or "").lower():
+            continue
+        if str(trade.get("side") or "").upper() != "BUY":
+            continue
+        if str(trade.get("status") or "MATCHED").upper() not in {"MATCHED", "CONFIRMED", "SETTLED"}:
+            continue
+        transaction_hash = str(trade.get("transaction_hash") or "")
+        if not transaction_hash.startswith("0x") or len(transaction_hash) != 66:
+            continue
+        try:
+            shares = Decimal(str(trade.get("size")))
+            price = Decimal(str(trade.get("price")))
+            matched = datetime.fromisoformat(str(trade.get("matched_at")))
+            if matched.tzinfo is None:
+                matched = matched.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if shares <= 0 or abs(shares - acquired) > ENTRY_POSITION_SIZE_TOLERANCE:
+            continue
+        if price <= 0 or price > price_limit:
+            continue
+        age = (matched - submitted).total_seconds()
+        if age < -5 or age > 120:
+            continue
+        candidates.append({**trade, "verified_shares": str(shares)})
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def select_verified_redemption(
@@ -187,6 +236,141 @@ class TraderCommandHandler:
             return sanitize({
                 "ok": reconciliation_result.get("status") == "ok",
                 "recovery": recovery,
+                "reconciliation": reconciliation_result,
+            })
+        if command == "RESOLVE_UNKNOWN_REDEEMED_ENTRY":
+            intent_id = str(payload.get("intent_id") or "")
+            intent = strategy_repo.intent(intent_id)
+            if not intent:
+                raise KeyError(intent_id)
+            if (
+                str(intent.get("state") or "").upper() != "RECONCILIATION_REQUIRED"
+                or str(intent.get("action") or "").upper() != "ENTRY"
+                or str(intent.get("purpose") or "").upper() != "ENTRY"
+                or str(intent.get("order_type") or "").upper() != "FAK"
+                or intent.get("remote_order_id")
+                or not intent.get("submitted_at")
+                or Decimal(str(intent.get("filled_shares_text") or "0")) != 0
+            ):
+                raise RuntimeError("intent is not an eligible UNKNOWN entry FAK")
+            position = strategy_repo.position_for_token(str(intent.get("token_id") or ""))
+            if (
+                not position
+                or str(position.get("event_id") or "") != str(intent.get("event_id") or "")
+                or str(position.get("state") or "").upper() != "OPEN"
+            ):
+                raise RuntimeError("matching recovered OPEN position was not found")
+            market = repo.latest_market(str(intent.get("condition_id") or ""))
+            if (
+                not market
+                or not bool(market.get("market_resolved"))
+                or str(market.get("winning_asset_id") or "") != str(intent.get("token_id") or "")
+            ):
+                raise RuntimeError("position is not the verified market winner")
+            identity = await adapter.identity_preflight()
+            if str(identity.get("status") or "").upper() != "VERIFIED":
+                raise RuntimeError("account identity is not verified")
+            wallet = str(identity.get("wallet") or "")
+            if not wallet:
+                raise RuntimeError("verified account wallet is missing")
+            matching_open_orders = [
+                order for order in await adapter.get_open_orders()
+                if (
+                    str(order.get("token_id") or "") == str(intent.get("token_id") or "")
+                    or str(order.get("condition_id") or "").lower()
+                    == str(intent.get("condition_id") or "").lower()
+                )
+            ]
+            if matching_open_orders:
+                raise RuntimeError("matching remote order is still open")
+            authoritative_balance = await authoritative_token_balance(
+                adapter, str(intent.get("token_id") or "")
+            )
+            if authoritative_balance != Decimal("0"):
+                raise RuntimeError("authoritative token balance is not zero")
+            trade = select_verified_unknown_entry_trade(
+                await adapter.get_trades(), intent=intent, position=position
+            )
+            if trade is None:
+                raise RuntimeError("one exact matching remote entry trade was not found")
+            remaining = Decimal(str(position.get("remaining_shares_text") or "0"))
+            proof = select_verified_redemption(
+                await PublicAccountIdentityClient(config.data_api_host).redemption_activity(
+                    wallet, str(intent.get("condition_id") or "")
+                ),
+                wallet=wallet,
+                condition_id=str(intent.get("condition_id") or ""),
+                token_id=str(intent.get("token_id") or ""),
+                remaining_shares=remaining,
+            )
+            if proof is None:
+                raise RuntimeError("matching public redemption proof was not found")
+            shares = Decimal(str(trade["verified_shares"]))
+            price = Decimal(str(trade.get("price")))
+            fee = Decimal(str(trade.get("fee") or "0"))
+            remote_trade_id = str(trade.get("polymarket_trade_id") or "") or None
+            remote_order_id = str(trade.get("polymarket_order_id") or "") or None
+            strategy_repo.add_fill(
+                intent_id=intent_id,
+                remote_trade_id=remote_trade_id,
+                shares=shares,
+                price=price,
+                fee=fee,
+                fee_verification_status="REMOTE_ACCOUNT_TRADE",
+                fee_source="operator_verified_remote_trade",
+                status=str(trade.get("status") or "MATCHED").upper(),
+                transaction_hash=str(trade.get("transaction_hash") or ""),
+                matched_at=str(trade.get("matched_at") or ""),
+                raw={},
+            )
+            if remote_order_id:
+                strategy_repo.update_intent(intent_id, remote_order_id=remote_order_id)
+            linked = strategy_repo.open_position(
+                event_id=str(intent["event_id"]),
+                condition_id=str(intent["condition_id"]),
+                token_id=str(intent["token_id"]),
+                outcome=str(intent.get("side") or position.get("outcome") or ""),
+                shares=shares,
+                average_price=price,
+                cost_all_in=(shares * price) + fee,
+                fees=fee,
+                sellable_shares=shares,
+                entry_intent_id=intent_id,
+            )
+            resolved = strategy_repo.mark_position_resolved(
+                str(linked["position_id"]), winner=True,
+                redeem_pending=True, authoritative=True,
+            )
+            if str(resolved.get("state") or "").upper() != "REDEEM_PENDING":
+                raise RuntimeError("position did not enter redeem-pending state")
+            redeemed = strategy_repo.mark_position_redeemed(
+                str(linked["position_id"]), str(proof["transactionHash"])
+            )
+            repo.audit(
+                str(payload.get("actor") or "operator"),
+                "verified_unknown_redeemed_entry_recovery", "ok",
+                "REMOTE_TRADE_AND_PUBLIC_REDEMPTION_VERIFIED",
+                {
+                    "intent_id": intent_id,
+                    "position_id": linked["position_id"],
+                    "remote_trade_id": remote_trade_id,
+                    "remote_order_id": remote_order_id,
+                    "entry_transaction_hash": trade.get("transaction_hash"),
+                    "redemption_transaction_hash": proof.get("transactionHash"),
+                    "shares": str(shares),
+                    "price": str(price),
+                    "authoritative_balance": "0",
+                },
+            )
+            reconciliation_result = await reconciliation_coordinator().request(
+                actor="operator:unknown_redeemed_entry_recovery",
+                evidence_changed=True,
+                force=True,
+            )
+            return sanitize({
+                "ok": reconciliation_result.get("status") == "ok",
+                "intent": strategy_repo.intent(intent_id),
+                "position": redeemed,
                 "reconciliation": reconciliation_result,
             })
         if command == "RESOLVE_REDEEMED_POSITION":
