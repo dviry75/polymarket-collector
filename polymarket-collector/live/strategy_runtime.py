@@ -27,6 +27,7 @@ from .strategy import (
     simulate_sell_fak,
 )
 from .strategy_repository import StrategyRepository, stable_id
+from .stop_forensics import StopForensicRecord, StopForensicWriter
 
 
 EVENT_WINDOW_PATTERN = re.compile(r"-(\d+)m-(\d+)$")
@@ -129,6 +130,16 @@ class LiveStrategyRuntime:
             logger=logging.getLogger(f"{__name__}.exit_evidence"),
         )
         self._exit_evidence_task: asyncio.Task[Any] | None = None
+        forensic_path = (
+            config.stop_forensic_db_path
+            or f"{config.live_db_path}.stop-forensics.sqlite3"
+        )
+        self._stop_forensics = StopForensicWriter(
+            forensic_path,
+            queue_capacity=config.stop_forensic_queue_capacity,
+            batch_size=config.stop_forensic_batch_size,
+        )
+        self._stop_forensic_episode_ids: dict[str, str] = {}
         # Entry-liquidity instrumentation: write-only telemetry, drained off the
         # hot path. Every note_* call is a synchronous dict update + deque
         # append; nothing here touches the DB or the BUY submission.
@@ -672,6 +683,59 @@ class LiveStrategyRuntime:
             frame.get("message_hash") or item.get("message_hash") or "",
         )
 
+    def _capture_stop_forensic(
+        self,
+        stage: str,
+        position: dict[str, Any],
+        update: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Bounded best-effort capture; it must never affect the SELL path."""
+        if not getattr(
+            getattr(self, "config", None),
+            "stop_forensic_capture_enabled",
+            False,
+        ):
+            return
+        writer = getattr(self, "_stop_forensics", None)
+        if writer is None:
+            return
+        try:
+            position_id = str(position.get("position_id") or "")
+            trigger_id = str(update.get("_critical_trigger_id") or "")
+            episode_id = trigger_id and f"{trigger_id}:{position_id}"
+            if not episode_id:
+                episode_id = self._stop_forensic_episode_ids.get(position_id, "")
+            if not episode_id:
+                episode_id = stable_id(
+                    "stop-episode",
+                    ":".join((
+                        position_id,
+                        str(position.get("updated_at") or ""),
+                        str(update.get("exchange_timestamp_ms") or ""),
+                    )),
+                )
+            self._stop_forensic_episode_ids[position_id] = episode_id
+            timing = kwargs.pop("timing", None)
+            if not isinstance(timing, dict):
+                timing = update.get("_stop_forensic_timing")
+            record = StopForensicRecord.capture(
+                stage=stage,
+                episode_id=episode_id,
+                position=position,
+                update=update,
+                timing=timing if isinstance(timing, dict) else None,
+                stop_queue_depth=writer.queue_depth(),
+                ladder_buffer_multiple=(
+                    self.config.stop_forensic_ladder_buffer_multiple
+                ),
+                max_ladder_levels=self.config.stop_forensic_max_ladder_levels,
+                **kwargs,
+            )
+            writer.publish(record)
+        except Exception:
+            return
+
     def schedule_frame(self, context: dict[str, Any]) -> None:
         if not hasattr(self, "_critical_observed_price_state"):
             # Compatibility for focused unit fixtures constructed via __new__.
@@ -950,6 +1014,36 @@ class LiveStrategyRuntime:
                             )),
                         )
                     )
+                    if stop_now and item.get("_critical_stop_latched"):
+                        item["_stop_forensic_timing"] = dict(
+                            context.get("_latency_timing") or {}
+                        )
+                        item["_stop_forensic_event_ready"] = bool(
+                            readiness.get("ready")
+                        )
+                        item["_stop_forensic_integrity_status"] = str(
+                            readiness.get("reason") or "READY"
+                        )
+                        for position in (
+                            self._positions_from_ram(asset_id)
+                            if getattr(self, "_hot_state", None)
+                            else ()
+                        ):
+                            self._capture_stop_forensic(
+                                "STOP_FIRST_SEEN",
+                                position,
+                                item,
+                                timing=context.get("_latency_timing"),
+                                frame_hash=str(context.get("message_hash") or ""),
+                                event_ready=readiness.get("ready"),
+                                integrity_status=readiness.get("reason"),
+                                reconciliation_readiness=str(
+                                    self._hot_state.get(
+                                        "reconciliation_readiness", "NOT_READY"
+                                    )
+                                ),
+                                critical_queue_depth=len(self._critical_frames),
+                            )
                     self._trace_critical(
                         "TRIGGER_DETECTED", update=item, context=context
                     )
@@ -3790,6 +3884,24 @@ class LiveStrategyRuntime:
                         source="frame_worker", liquidity_hash=exit_book_hash,
                         latched_at=position.get("updated_at"),
                     )
+                    self._capture_stop_forensic(
+                        "STOP_LATCHED",
+                        position,
+                        update,
+                        frame_hash=frame_hash,
+                        book_hash=exit_book_hash,
+                        event_ready=event_ready,
+                        integrity_status=update.get(
+                            "_stop_forensic_integrity_status", ""
+                        ),
+                        reconciliation_readiness=str(
+                            self._hot_state.get(
+                                "reconciliation_readiness", "NOT_READY"
+                            )
+                        ),
+                        critical_queue_depth=len(self._critical_frames),
+                        min_price=initial_stop_floor,
+                    )
                 await self._refresh_hot_state_once()
 
                 position = (
@@ -4361,6 +4473,21 @@ class LiveStrategyRuntime:
                 )
             ),
         )
+        self._capture_stop_forensic(
+            "EXIT_PRE_SUBMIT",
+            position,
+            update,
+            intent_id=str(intent["intent_id"]),
+            purpose=purpose,
+            frame_hash=frame_hash,
+            book_hash=self._exit_liquidity_hash(update),
+            reconciliation_readiness=str(
+                self._hot_state.get("reconciliation_readiness", "NOT_READY")
+            ),
+            critical_queue_depth=len(self._critical_frames),
+            requested_shares=shares,
+            min_price=min_price,
+        )
         if self.paper_mode():
             fill = simulate_sell_fak(
                 update.get("bids") or [], shares=shares, min_price=min_price,
@@ -4403,6 +4530,20 @@ class LiveStrategyRuntime:
                     else "FILLED" if updated["state"] == "CLOSED" else "PARTIAL"
                 ),
             )
+            self._capture_stop_forensic(
+                "EXIT_RESPONSE_RETURNED",
+                position,
+                update,
+                intent_id=str(intent["intent_id"]),
+                purpose=purpose,
+                frame_hash=frame_hash,
+                requested_shares=shares,
+                min_price=min_price,
+                result_status=(
+                    "ZERO_FILL" if fill.filled_shares == 0
+                    else "FILLED" if updated["state"] == "CLOSED" else "PARTIAL"
+                ),
+            )
             return
 
         response = await self.adapter.create_order({
@@ -4427,6 +4568,20 @@ class LiveStrategyRuntime:
                 response.get("status") or response.get("failure_reason")
             ),
             remote_order_id=response.get("polymarket_order_id"),
+        )
+        self._capture_stop_forensic(
+            "EXIT_RESPONSE_RETURNED",
+            position,
+            update,
+            intent_id=str(intent["intent_id"]),
+            purpose=purpose,
+            frame_hash=frame_hash,
+            requested_shares=shares,
+            min_price=min_price,
+            result_status=str(
+                response.get("status") or response.get("failure_reason") or ""
+            ),
+            remote_order_id=str(response.get("polymarket_order_id") or ""),
         )
         if self._is_waiting_sellable_response(response):
             self.repo.mark_waiting_sellable(
@@ -4567,6 +4722,8 @@ class LiveStrategyRuntime:
             return
 
         self._stop.clear()
+        if self.config.stop_forensic_capture_enabled:
+            self._stop_forensics.start()
 
         # Refresh once before workers begin consuming market frames.
         await self._refresh_hot_state_once()
@@ -4631,6 +4788,8 @@ class LiveStrategyRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
+        if self.config.stop_forensic_capture_enabled:
+            await asyncio.to_thread(self._stop_forensics.stop, 2.0)
 
         if self._exit_task:
             self._exit_wakeup.set()
@@ -4771,6 +4930,7 @@ class LiveStrategyRuntime:
             ),
             "exit_supervision": self._exit_tracker.health(),
             "exit_evidence": self._exit_evidence.stats(),
+            "stop_forensics": self._stop_forensics.stats(),
             "entry_liquidity": self._entry_liquidity.stats(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,

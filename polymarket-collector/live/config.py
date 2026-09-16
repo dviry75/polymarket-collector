@@ -128,6 +128,14 @@ class LiveConfig:
     # behind seconds of stale frames. The cap only ever evicts non-STOP frames.
     critical_frame_coalesce_enabled: bool = True
     critical_frame_max_depth: int = 24
+    # Evidence-only STOP capture: a bounded hot-path queue feeding a dedicated
+    # writer and a SQLite database separate from live state.
+    stop_forensic_capture_enabled: bool = True
+    stop_forensic_db_path: str = ""
+    stop_forensic_queue_capacity: int = 512
+    stop_forensic_batch_size: int = 64
+    stop_forensic_max_ladder_levels: int = 32
+    stop_forensic_ladder_buffer_multiple: Decimal = Decimal("1.25")
     # Stop-loss exit forensics. Full order-book depth at cross/latch/submit is
     # only persisted when the exit was pathological: fill VWAP below
     # deep_capture_max_vwap, or a zero-fill / reject. The acceptable cutoff only
@@ -290,6 +298,22 @@ class LiveConfig:
             ),
             critical_frame_max_depth=int(
                 _env("LIVE_CRITICAL_FRAME_MAX_DEPTH", "24") or "24"
+            ),
+            stop_forensic_capture_enabled=_bool_env(
+                "LIVE_STOP_FORENSIC_CAPTURE_ENABLED", True
+            ),
+            stop_forensic_db_path=_env("LIVE_STOP_FORENSIC_DB_PATH", ""),
+            stop_forensic_queue_capacity=int(
+                _env("LIVE_STOP_FORENSIC_QUEUE_CAPACITY", "512") or "512"
+            ),
+            stop_forensic_batch_size=int(
+                _env("LIVE_STOP_FORENSIC_BATCH_SIZE", "64") or "64"
+            ),
+            stop_forensic_max_ladder_levels=int(
+                _env("LIVE_STOP_FORENSIC_MAX_LADDER_LEVELS", "32") or "32"
+            ),
+            stop_forensic_ladder_buffer_multiple=_decimal_env(
+                "LIVE_STOP_FORENSIC_LADDER_BUFFER_MULTIPLE", "1.25"
             ),
             exit_forensic_deep_capture_max_vwap=_decimal_env(
                 "LIVE_EXIT_FORENSIC_DEEP_CAPTURE_MAX_VWAP", "0.55"
@@ -528,6 +552,24 @@ class LiveConfig:
             errors.append(
                 "LIVE_CRITICAL_FRAME_MAX_DEPTH must be between 4 and 1024"
             )
+        if not 8 <= self.stop_forensic_queue_capacity <= 65536:
+            errors.append(
+                "LIVE_STOP_FORENSIC_QUEUE_CAPACITY must be between 8 and 65536"
+            )
+        if not 1 <= self.stop_forensic_batch_size <= 1024:
+            errors.append(
+                "LIVE_STOP_FORENSIC_BATCH_SIZE must be between 1 and 1024"
+            )
+        if not 1 <= self.stop_forensic_max_ladder_levels <= 256:
+            errors.append(
+                "LIVE_STOP_FORENSIC_MAX_LADDER_LEVELS must be between 1 and 256"
+            )
+        if not (
+            Decimal("1") <= self.stop_forensic_ladder_buffer_multiple <= Decimal("10")
+        ):
+            errors.append(
+                "LIVE_STOP_FORENSIC_LADDER_BUFFER_MULTIPLE must be between 1 and 10"
+            )
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -626,6 +668,13 @@ class LiveConfig:
                 self.critical_frame_coalesce_enabled
             ),
             "critical_frame_max_depth": self.critical_frame_max_depth,
+            "stop_forensic_capture_enabled": self.stop_forensic_capture_enabled,
+            "stop_forensic_queue_capacity": self.stop_forensic_queue_capacity,
+            "stop_forensic_batch_size": self.stop_forensic_batch_size,
+            "stop_forensic_max_ladder_levels": self.stop_forensic_max_ladder_levels,
+            "stop_forensic_ladder_buffer_multiple": str(
+                self.stop_forensic_ladder_buffer_multiple
+            ),
             "exit_forensic_deep_capture_max_vwap": str(
                 self.exit_forensic_deep_capture_max_vwap
             ),
