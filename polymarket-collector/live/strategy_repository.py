@@ -3116,10 +3116,12 @@ class StrategyRepository:
     def latch_stop_exit(
         self,
         position_id: str,
+        *,
+        busy_timeout_seconds: float = 30.0,
     ) -> dict[str, Any]:
         """Durably latch the one-way 0.66 exit before any remote action."""
         ts = now_iso()
-        with self.base.connect() as conn:
+        with self.base.connect(timeout_seconds=busy_timeout_seconds) as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
                 "SELECT * FROM live_strategy_positions WHERE position_id=?",

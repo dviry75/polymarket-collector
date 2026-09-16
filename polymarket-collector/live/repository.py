@@ -35,7 +35,7 @@ class LiveRepository:
         self.db_path = Path(db_path)
         self.query_only = bool(query_only)
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self, *, timeout_seconds: float = 30.0) -> sqlite3.Connection:
         class ClosingConnection(sqlite3.Connection):
             def __exit__(self, exc_type, exc_value, traceback) -> bool:
                 result = super().__exit__(exc_type, exc_value, traceback)
@@ -48,14 +48,16 @@ class LiveRepository:
             else str(self.db_path)
         )
         conn = sqlite3.connect(
-            target, factory=ClosingConnection, timeout=30.0,
+            target, factory=ClosingConnection, timeout=max(0.0, timeout_seconds),
             uri=self.query_only,
         )
         conn.row_factory = sqlite3.Row
         # A bounded wait avoids transient writer contention surfacing as an
         # application error. NORMAL is durable with WAL while avoiding one
         # filesystem sync for every high-frequency market-data transaction.
-        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute(
+            f"PRAGMA busy_timeout = {max(0, int(timeout_seconds * 1000))}"
+        )
         if self.query_only:
             conn.execute("PRAGMA query_only = ON")
         else:

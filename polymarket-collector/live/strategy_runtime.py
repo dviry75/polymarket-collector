@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
@@ -28,6 +29,7 @@ from .strategy import (
 )
 from .strategy_repository import StrategyRepository, stable_id
 from .stop_forensics import StopForensicRecord, StopForensicWriter
+from .stop_obligations import StopObligation
 
 
 EVENT_WINDOW_PATTERN = re.compile(r"-(\d+)m-(\d+)$")
@@ -203,6 +205,22 @@ class LiveStrategyRuntime:
         ] = {}
 
         self._stop = asyncio.Event()
+        self._stop_obligation_event = asyncio.Event()
+        self._stop_obligations: OrderedDict[str, StopObligation] = OrderedDict()
+        self._stop_obligation_task: asyncio.Task[Any] | None = None
+        self._stop_latch_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="stop-obligation-latch",
+        )
+        self._stop_owned_positions: set[str] = set()
+        self._stop_generation_watermarks: dict[str, tuple[int, int]] = {}
+        self.stop_obligations_queued = 0
+        self.stop_obligations_coalesced = 0
+        self.stop_obligations_rejected = 0
+        self.stop_obligations_latched = 0
+        self.stop_obligation_failures = 0
+        self.stop_obligation_max_depth = 0
+        self.stop_obligation_worst_latch_ms = 0.0
         self.frames_processed = 0
         self.last_error = ""
         self._market_freshness: Callable[[str], dict[str, Any]] | None = None
@@ -736,6 +754,173 @@ class LiveStrategyRuntime:
         except Exception:
             return
 
+    def _enqueue_stop_obligation(
+        self,
+        position: dict[str, Any],
+        update: dict[str, Any],
+        readiness: dict[str, Any],
+        *,
+        frame_hash: str,
+    ) -> bool:
+        """Publish one per-position STOP obligation without awaiting anything."""
+        mailbox = getattr(self, "_stop_obligations", None)
+        wakeup = getattr(self, "_stop_obligation_event", None)
+        if mailbox is None or wakeup is None:
+            return False
+        obligation = StopObligation.create(
+            position=position,
+            update=update,
+            readiness=readiness,
+            frame_hash=frame_hash,
+            stop_price=self.policy.stop_price,
+        )
+        if obligation is None:
+            self.stop_obligations_rejected += 1
+            return False
+        position_id = obligation.position_id
+        existing = mailbox.get(position_id)
+        if existing is not None:
+            existing_version = (existing.generation, existing.update_number)
+            incoming_version = (obligation.generation, obligation.update_number)
+            if incoming_version < existing_version:
+                self.stop_obligations_rejected += 1
+                return False
+            mailbox[position_id] = obligation
+            self.stop_obligations_coalesced += 1
+        else:
+            mailbox[position_id] = obligation
+        self._stop_owned_positions.add(position_id)
+        self.stop_obligations_queued += 1
+        self.stop_obligation_max_depth = max(
+            self.stop_obligation_max_depth, len(mailbox)
+        )
+        wakeup.set()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        task = getattr(self, "_stop_obligation_task", None)
+        if task is None or task.done():
+            self._stop_obligation_task = loop.create_task(
+                self._stop_obligation_worker(),
+                name="strategy-stop-obligation",
+            )
+        return True
+
+    def _latch_stop_obligation_sync(
+        self, obligation: StopObligation
+    ) -> dict[str, Any]:
+        latched = self.repo.latch_stop_exit(
+            obligation.position_id,
+            busy_timeout_seconds=0.25,
+        )
+        if latched.get("_newly_latched"):
+            self.repo.timeline(
+                severity="WARNING",
+                category="EXIT",
+                component="stop_obligation",
+                source="deterministic_book",
+                event_id=obligation.event_id,
+                condition_id=obligation.condition_id,
+                token_id=obligation.token_id,
+                side="SELL",
+                deal_id=stable_id("deal", obligation.event_id),
+                requested_action="LATCH_MARKET_EXIT",
+                reason_code="STOP_066_MAILBOX_LATCHED",
+                result_status="LATCHED",
+                remaining_shares_text=latched.get("remaining_shares_text"),
+                parameters_json={
+                    "trigger_bid": obligation.best_bid,
+                    "generation": obligation.generation,
+                    "update_number": obligation.update_number,
+                    "frame_hash": obligation.frame_hash,
+                },
+            )
+        return latched
+
+    async def _process_stop_obligation(
+        self, obligation: StopObligation
+    ) -> None:
+        version = (obligation.generation, obligation.update_number)
+        watermark = self._stop_generation_watermarks.get(obligation.token_id)
+        if watermark is not None and version < watermark:
+            self.stop_obligations_rejected += 1
+            self._stop_owned_positions.discard(obligation.position_id)
+            return
+        position = self._position_by_id_from_ram(obligation.position_id)
+        if position is None:
+            self.stop_obligations_rejected += 1
+            self._stop_owned_positions.discard(obligation.position_id)
+            return
+        if (
+            str(position.get("event_id") or "") != obligation.event_id
+            or str(position.get("condition_id") or "") != obligation.condition_id
+            or str(position.get("token_id") or "") != obligation.token_id
+        ):
+            self.stop_obligations_rejected += 1
+            self._stop_owned_positions.discard(obligation.position_id)
+            return
+        started = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        try:
+            latched = await loop.run_in_executor(
+                self._stop_latch_executor,
+                self._latch_stop_obligation_sync,
+                obligation,
+            )
+        except Exception as exc:
+            self.stop_obligation_failures += 1
+            self.last_error = (
+                f"STOP_OBLIGATION:{type(exc).__name__}:{exc}"
+            )[:500]
+            current = self._stop_obligations.get(obligation.position_id)
+            if current is None or (
+                current.generation,
+                current.update_number,
+            ) < version:
+                self._stop_obligations[obligation.position_id] = obligation
+            self._stop_obligation_event.set()
+            await asyncio.sleep(0.05)
+            return
+        self.stop_obligation_worst_latch_ms = max(
+            self.stop_obligation_worst_latch_ms,
+            (time.perf_counter() - started) * 1000,
+        )
+        self._stop_generation_watermarks[obligation.token_id] = version
+        self.stop_obligations_latched += 1
+        update = obligation.as_update()
+        self._capture_stop_forensic(
+            "STOP_LATCHED",
+            latched,
+            update,
+            frame_hash=obligation.frame_hash,
+            event_ready=True,
+            integrity_status=obligation.readiness_reason,
+            reconciliation_readiness=str(
+                self._hot_state.get("reconciliation_readiness", "NOT_READY")
+            ),
+            critical_queue_depth=len(self._critical_frames),
+            min_price=self.policy.stop_min_price,
+        )
+        await self._refresh_hot_state_once()
+        self._stop_owned_positions.discard(obligation.position_id)
+        self._exit_tracker.mark_stop_latched(obligation.position_id)
+        self._exit_wakeup.set()
+
+    async def _stop_obligation_worker(self) -> None:
+        while not self._stop.is_set():
+            if not self._stop_obligations:
+                self._stop_obligation_event.clear()
+                try:
+                    await self._stop_obligation_event.wait()
+                except asyncio.CancelledError:
+                    break
+            while self._stop_obligations and not self._stop.is_set():
+                _position_id, obligation = self._stop_obligations.popitem(
+                    last=False
+                )
+                await self._process_stop_obligation(obligation)
+
     def schedule_frame(self, context: dict[str, Any]) -> None:
         if not hasattr(self, "_critical_observed_price_state"):
             # Compatibility for focused unit fixtures constructed via __new__.
@@ -1043,6 +1228,12 @@ class LiveStrategyRuntime:
                                     )
                                 ),
                                 critical_queue_depth=len(self._critical_frames),
+                            )
+                            self._enqueue_stop_obligation(
+                                position,
+                                item,
+                                readiness,
+                                frame_hash=str(context.get("message_hash") or ""),
                             )
                     self._trace_critical(
                         "TRIGGER_DETECTED", update=item, context=context
@@ -3844,6 +4035,9 @@ class LiveStrategyRuntime:
                 and bid is not None
                 and bid <= self.policy.stop_price
             ):
+                if str(position["position_id"]) in self._stop_owned_positions:
+                    self._exit_wakeup.set()
+                    continue
                 position = self.repo.latch_stop_exit(
                     str(position["position_id"])
                 )
@@ -4761,6 +4955,14 @@ class LiveStrategyRuntime:
             self._frame_task = asyncio.create_task(
                 self._frame_worker(), name="strategy-frame-worker"
             )
+        if (
+            self._stop_obligation_task is None
+            or self._stop_obligation_task.done()
+        ):
+            self._stop_obligation_task = asyncio.create_task(
+                self._stop_obligation_worker(),
+                name="strategy-stop-obligation",
+            )
         if self._exit_task is None or self._exit_task.done():
             self._exit_task = asyncio.create_task(
                 self._exit_supervisor_loop(),
@@ -4790,6 +4992,16 @@ class LiveStrategyRuntime:
         self._stop.set()
         if self.config.stop_forensic_capture_enabled:
             await asyncio.to_thread(self._stop_forensics.stop, 2.0)
+
+        if self._stop_obligation_task:
+            self._stop_obligation_event.set()
+            self._stop_obligation_task.cancel()
+            try:
+                await self._stop_obligation_task
+            except asyncio.CancelledError:
+                pass
+            self._stop_obligation_task = None
+        self._stop_latch_executor.shutdown(wait=False, cancel_futures=False)
 
         if self._exit_task:
             self._exit_wakeup.set()
@@ -4931,6 +5143,22 @@ class LiveStrategyRuntime:
             "exit_supervision": self._exit_tracker.health(),
             "exit_evidence": self._exit_evidence.stats(),
             "stop_forensics": self._stop_forensics.stats(),
+            "stop_obligations": {
+                "queue_depth": len(self._stop_obligations),
+                "queued": self.stop_obligations_queued,
+                "coalesced": self.stop_obligations_coalesced,
+                "rejected": self.stop_obligations_rejected,
+                "latched": self.stop_obligations_latched,
+                "failures": self.stop_obligation_failures,
+                "max_depth": self.stop_obligation_max_depth,
+                "worst_latch_ms": round(
+                    self.stop_obligation_worst_latch_ms, 3
+                ),
+                "worker_running": bool(
+                    self._stop_obligation_task
+                    and not self._stop_obligation_task.done()
+                ),
+            },
             "entry_liquidity": self._entry_liquidity.stats(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
