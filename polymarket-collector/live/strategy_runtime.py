@@ -221,6 +221,14 @@ class LiveStrategyRuntime:
         self.stop_obligation_failures = 0
         self.stop_obligation_max_depth = 0
         self.stop_obligation_worst_latch_ms = 0.0
+        self._entry_frame_event = asyncio.Event()
+        self._entry_frames: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._entry_task: asyncio.Task[Any] | None = None
+        self.entry_frames_queued = 0
+        self.entry_frames_coalesced = 0
+        self.entry_frames_processed = 0
+        self.entry_queue_max_depth = 0
+        self.entry_phase_samples: deque[dict[str, float]] = deque(maxlen=256)
         self.frames_processed = 0
         self.last_error = ""
         self._market_freshness: Callable[[str], dict[str, Any]] | None = None
@@ -921,6 +929,110 @@ class LiveStrategyRuntime:
                 )
                 await self._process_stop_obligation(obligation)
 
+    def _enqueue_entry_frame(self, context: dict[str, Any]) -> bool:
+        mailbox = getattr(self, "_entry_frames", None)
+        wakeup = getattr(self, "_entry_frame_event", None)
+        if mailbox is None or wakeup is None:
+            return False
+        key = str(context.get("_critical_trigger_id") or "")
+        if not key:
+            return False
+        if key in mailbox:
+            mailbox[key] = context
+            self.entry_frames_coalesced += 1
+        else:
+            mailbox[key] = context
+        self.entry_frames_queued += 1
+        self.entry_queue_max_depth = max(
+            self.entry_queue_max_depth, len(mailbox)
+        )
+        wakeup.set()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        task = getattr(self, "_entry_task", None)
+        if task is None or task.done():
+            self._entry_task = loop.create_task(
+                self._entry_worker(), name="strategy-entry-worker"
+            )
+        return True
+
+    async def _entry_worker(self) -> None:
+        while not self._stop.is_set() or self._entry_frames:
+            if not self._entry_frames:
+                self._entry_frame_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._entry_frame_event.wait(), 0.25
+                    )
+                except asyncio.TimeoutError:
+                    continue
+            if not self._entry_frames:
+                continue
+            _key, context = self._entry_frames.popitem(last=False)
+            timing = context.setdefault("_entry_phase_timing", {})
+            timing["dequeued_monotonic"] = time.perf_counter()
+            enqueued = timing.get("enqueued_monotonic")
+            if enqueued is not None:
+                timing["queue_wait_ms"] = (
+                    timing["dequeued_monotonic"] - enqueued
+                ) * 1000
+            context["_entry_only"] = True
+            context["_skip_entry_evaluation"] = False
+            await self.process_atomic_frame(context)
+            timing["finished_monotonic"] = time.perf_counter()
+            self.entry_frames_processed += 1
+            def elapsed_ms(start: str, end: str) -> float | None:
+                left = timing.get(start)
+                right = timing.get(end)
+                if not isinstance(left, (int, float)) or not isinstance(
+                    right, (int, float)
+                ):
+                    return None
+                return round((right - left) * 1000, 3)
+
+            sample = {
+                "queue_wait_ms": round(
+                    float(timing.get("queue_wait_ms") or 0), 3
+                ),
+                "decision_ms": elapsed_ms(
+                    "decision_started_monotonic",
+                    "decision_finished_monotonic",
+                ),
+                "intent_reserve_ms": elapsed_ms(
+                    "intent_reserve_started_monotonic",
+                    "intent_reserved_monotonic",
+                ),
+                "initial_revalidation_ms": elapsed_ms(
+                    "initial_revalidation_started_monotonic",
+                    "initial_revalidation_finished_monotonic",
+                ),
+                "final_revalidation_ms": elapsed_ms(
+                    "final_guard_started_monotonic",
+                    "final_revalidation_finished_monotonic",
+                ),
+                "submit_ms": elapsed_ms(
+                    "submit_started_monotonic",
+                    "submit_returned_monotonic",
+                ),
+                "total_ms": elapsed_ms(
+                    "enqueued_monotonic", "finished_monotonic"
+                ),
+            }
+            self.entry_phase_samples.append({
+                key: value for key, value in sample.items() if value is not None
+            })
+            self._logger.info(
+                "ENTRY_PHASE_TIMING trigger=%s queue_wait_ms=%.3f total_ms=%.3f",
+                context.get("_critical_trigger_id") or "",
+                float(timing.get("queue_wait_ms") or 0),
+                (
+                    timing["finished_monotonic"]
+                    - float(timing.get("enqueued_monotonic") or timing["finished_monotonic"])
+                ) * 1000,
+            )
+
     def schedule_frame(self, context: dict[str, Any]) -> None:
         if not hasattr(self, "_critical_observed_price_state"):
             # Compatibility for focused unit fixtures constructed via __new__.
@@ -1315,6 +1427,21 @@ class LiveStrategyRuntime:
                         condition_id: readiness
                     },
                 }
+                critical["_skip_entry_evaluation"] = True
+                if (
+                    "ENTRY_074" in critical_trigger_types
+                    and bool(readiness.get("ready"))
+                ):
+                    entry_context = {
+                        **critical,
+                        "_entry_only": True,
+                        "_skip_entry_evaluation": False,
+                        "_entry_phase_timing": {
+                            "detected_monotonic": time.perf_counter(),
+                            "enqueued_monotonic": time.perf_counter(),
+                        },
+                    }
+                    self._enqueue_entry_frame(entry_context)
 
                 # A volatile book fires the same critical edge (same market,
                 # same trigger type) many times per second. The STOP obligation
@@ -1371,6 +1498,7 @@ class LiveStrategyRuntime:
 
             isolated = {
                 **context,
+                "_skip_entry_evaluation": True,
                 "updates": updates,
                 "event_readiness": {
                     condition_id: readiness
@@ -1553,6 +1681,9 @@ class LiveStrategyRuntime:
 
     async def process_atomic_frame(self, context: dict[str, Any]) -> None:
         self.frames_processed += 1
+        entry_only = bool(context.get("_entry_only"))
+        evaluate_entry = not bool(context.get("_skip_entry_evaluation"))
+        entry_timing = context.get("_entry_phase_timing")
         updates = [item for item in context.get("updates") or [] if isinstance(item, dict)]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for update in updates:
@@ -1564,6 +1695,32 @@ class LiveStrategyRuntime:
             if not market:
                 continue
             event_id = str(market.get("event_id") or "")
+            if entry_only:
+                try:
+                    await self._process_event(
+                        market=market,
+                        updates=condition_updates,
+                        event_ready=bool(
+                            (context.get("event_readiness") or {})
+                            .get(condition_id, {}).get("ready")
+                        ),
+                        readiness_reason=str(
+                            (context.get("event_readiness") or {})
+                            .get(condition_id, {}).get("reason") or "NOT_READY"
+                        ),
+                        received_at=str(context.get("received_at") or now_iso()),
+                        frame_hash=str(context.get("message_hash") or ""),
+                        manage_positions=False,
+                        evaluate_entry=True,
+                        entry_timing=(
+                            entry_timing if isinstance(entry_timing, dict) else None
+                        ),
+                    )
+                except Exception as exc:
+                    self.last_error = (
+                        f"ENTRY_WORKER:{type(exc).__name__}: {exc}"
+                    )[:500]
+                continue
             lock = self._event_locks.setdefault(event_id, asyncio.Lock())
             async with lock:
                 try:
@@ -1579,6 +1736,8 @@ class LiveStrategyRuntime:
                         ),
                         received_at=str(context.get("received_at") or now_iso()),
                         frame_hash=str(context.get("message_hash") or ""),
+                        manage_positions=True,
+                        evaluate_entry=evaluate_entry,
                     )
                 except Exception as exc:
                     self.last_error = f"{type(exc).__name__}: {exc}"[:500]
@@ -1607,12 +1766,17 @@ class LiveStrategyRuntime:
         readiness_reason: str,
         received_at: str,
         frame_hash: str,
+        manage_positions: bool = True,
+        evaluate_entry: bool = True,
+        entry_timing: dict[str, float] | None = None,
     ) -> None:
         event_id = str(market.get("event_id") or "")
         condition_id = str(market.get("condition_id") or "")
         yes_token = str(market.get("yes_token_id") or "")
         no_token = str(market.get("no_token_id") or "")
         if not self._eligible_market(market):
+            if not evaluate_entry:
+                return
             if any(exact_trigger(update.get("best_ask"), self.policy.entry_price) for update in updates):
                 self.repo.timeline(
                     severity="WARNING", category="DECISION", component="strategy",
@@ -1622,15 +1786,21 @@ class LiveStrategyRuntime:
                 )
             return
 
-        for update in updates:
-            await self._manage_position(
-                market=market, update=update, event_ready=event_ready,
-                frame_hash=frame_hash, received_at=received_at,
-            )
+        if manage_positions:
+            for update in updates:
+                await self._manage_position(
+                    market=market, update=update, event_ready=event_ready,
+                    frame_hash=frame_hash, received_at=received_at,
+                )
 
         if market.get("market_resolved"):
-            await self._handle_resolution(market)
+            if manage_positions:
+                await self._handle_resolution(market)
             return
+        if not evaluate_entry:
+            return
+        if entry_timing is not None:
+            entry_timing["decision_started_monotonic"] = time.perf_counter()
 
         try:
             observed_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
@@ -1675,6 +1845,8 @@ class LiveStrategyRuntime:
             event_id=event_id,
             policy=self.policy,
         )
+        if entry_timing is not None:
+            entry_timing["decision_finished_monotonic"] = time.perf_counter()
         trigger_update = next((
             item for item in updates
             if item.get("_critical_entry_latched")
@@ -1807,6 +1979,8 @@ class LiveStrategyRuntime:
                 )
                 return
 
+        if entry_timing is not None:
+            entry_timing["intent_reserve_started_monotonic"] = time.perf_counter()
         reservation = self.repo.reserve_event_entry(
             event_id=event_id, condition_id=condition_id,
             token_id=decision.token_id, side=decision.side,
@@ -1853,6 +2027,9 @@ class LiveStrategyRuntime:
                 )
             return
 
+        if entry_timing is not None:
+            entry_timing["intent_reserved_monotonic"] = time.perf_counter()
+
         self._mark_event_locked_ram(event_id)
 
         intent_id = str(reservation["entry_intent_id"])
@@ -1878,7 +2055,7 @@ class LiveStrategyRuntime:
         )
         await self._submit_entry(
             market=market, update=selected_update, side=str(decision.side),
-            intent_id=intent_id, fee_rate=fee_rate,
+            intent_id=intent_id, fee_rate=fee_rate, entry_timing=entry_timing,
         )
 
     def _daily_loss_blocked(self) -> bool:
@@ -2355,10 +2532,13 @@ class LiveStrategyRuntime:
         side: str,
         intent_id: str,
         fee_rate: Decimal,
+        entry_timing: dict[str, float] | None = None,
     ) -> None:
         event_id = str(market["event_id"])
         condition_id = str(market["condition_id"])
         token_id = str(update.get("asset_id") or "")
+        if entry_timing is not None:
+            entry_timing["submit_pipeline_started_monotonic"] = time.perf_counter()
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         signal_observed_ms = update.get("_critical_latched_at_ms")
         try:
@@ -2421,7 +2601,15 @@ class LiveStrategyRuntime:
         # this after signing, immediately before post_order.
         revalidation_book: dict[str, Any] | None = None
         if not self.paper_mode() and self._exit_book_provider is not None:
+            if entry_timing is not None:
+                entry_timing["initial_revalidation_started_monotonic"] = (
+                    time.perf_counter()
+                )
             reval = self._revalidate_entry_signal(market, update, token_id)
+            if entry_timing is not None:
+                entry_timing["initial_revalidation_finished_monotonic"] = (
+                    time.perf_counter()
+                )
             revalidation_book = reval.pop("book", None)
             self.repo.record_entry_audit(
                 intent_id, event_id=event_id,
@@ -2500,6 +2688,8 @@ class LiveStrategyRuntime:
             )
             return
         if self.paper_mode():
+            if entry_timing is not None:
+                entry_timing["submit_started_monotonic"] = time.perf_counter()
             self._note_entry_liquidity(
                 "note_submit", intent_id, update=update,
                 requested_shares=self.policy.max_shares,
@@ -2511,6 +2701,8 @@ class LiveStrategyRuntime:
                 fee_rate=fee_rate,
                 max_shares=self.policy.max_shares,
             )
+            if entry_timing is not None:
+                entry_timing["submit_returned_monotonic"] = time.perf_counter()
             if fill.filled_shares <= 0:
                 self.repo.mark_zero_fill(
                     event_id, "FAK_ZERO_FILL", intent_id=intent_id
@@ -2631,6 +2823,8 @@ class LiveStrategyRuntime:
         )
 
         def final_pre_post_guard() -> dict[str, Any]:
+            if entry_timing is not None:
+                entry_timing["final_guard_started_monotonic"] = time.perf_counter()
             guard_now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             if signal_observed_ms is None:
                 return {
@@ -2646,6 +2840,10 @@ class LiveStrategyRuntime:
                     "signal_age_ms": signal_age_ms,
                 }
             final_reval = self._revalidate_entry_signal(market, update, token_id)
+            if entry_timing is not None:
+                entry_timing["final_revalidation_finished_monotonic"] = (
+                    time.perf_counter()
+                )
             final_reval.pop("book", None)
             reason_map = {
                 "ENTRY_REVALIDATION_BOOK_NOT_READY": "ENTRY_FINAL_REVALIDATION_NOT_READY",
@@ -2686,6 +2884,8 @@ class LiveStrategyRuntime:
                 "generation": final_reval.get("generation"),
             }
 
+        if entry_timing is not None:
+            entry_timing["submit_started_monotonic"] = time.perf_counter()
         response = await self.adapter.create_order({
             "idempotency_key": intent_id,
             "durable_intent_reserved": True,
@@ -2702,6 +2902,8 @@ class LiveStrategyRuntime:
             "max_tokens": canonical_decimal(self.policy.max_shares),
             "max_price": "0.76",
         }, pre_post_guard=final_pre_post_guard)
+        if entry_timing is not None:
+            entry_timing["submit_returned_monotonic"] = time.perf_counter()
         status = str(response.get("status") or "unknown").lower()
         remote_id = response.get("polymarket_order_id")
         self._trace_critical(
@@ -4963,6 +5165,10 @@ class LiveStrategyRuntime:
                 self._stop_obligation_worker(),
                 name="strategy-stop-obligation",
             )
+        if self._entry_task is None or self._entry_task.done():
+            self._entry_task = asyncio.create_task(
+                self._entry_worker(), name="strategy-entry-worker"
+            )
         if self._exit_task is None or self._exit_task.done():
             self._exit_task = asyncio.create_task(
                 self._exit_supervisor_loop(),
@@ -5002,6 +5208,15 @@ class LiveStrategyRuntime:
                 pass
             self._stop_obligation_task = None
         self._stop_latch_executor.shutdown(wait=False, cancel_futures=False)
+
+        if self._entry_task:
+            self._entry_frame_event.set()
+            self._entry_task.cancel()
+            try:
+                await self._entry_task
+            except asyncio.CancelledError:
+                pass
+            self._entry_task = None
 
         if self._exit_task:
             self._exit_wakeup.set()
@@ -5157,6 +5372,20 @@ class LiveStrategyRuntime:
                 "worker_running": bool(
                     self._stop_obligation_task
                     and not self._stop_obligation_task.done()
+                ),
+            },
+            "entry_worker": {
+                "queue_depth": len(self._entry_frames),
+                "queued": self.entry_frames_queued,
+                "coalesced": self.entry_frames_coalesced,
+                "processed": self.entry_frames_processed,
+                "max_depth": self.entry_queue_max_depth,
+                "running": bool(
+                    self._entry_task and not self._entry_task.done()
+                ),
+                "last_phase_sample": (
+                    dict(self.entry_phase_samples[-1])
+                    if self.entry_phase_samples else {}
                 ),
             },
             "entry_liquidity": self._entry_liquidity.stats(),

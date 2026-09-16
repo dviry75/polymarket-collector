@@ -249,3 +249,47 @@ def test_sqlite_writer_contention_retries_without_blocking_event_loop(tmp_path) 
         await runtime.stop()
 
     asyncio.run(scenario())
+
+
+def test_slow_entry_worker_cannot_delay_stop_latch(tmp_path) -> None:
+    repo, runtime, position = _runtime(tmp_path)
+
+    async def scenario() -> None:
+        await runtime._refresh_hot_state_once()
+        entry_started = asyncio.Event()
+        release_entry = asyncio.Event()
+
+        async def slow_entry(_context: dict) -> None:
+            entry_started.set()
+            await release_entry.wait()
+
+        runtime.process_atomic_frame = slow_entry
+        assert runtime._enqueue_entry_frame({
+            "_critical_trigger_id": "slow-entry",
+            "_entry_phase_timing": {
+                "enqueued_monotonic": __import__("time").perf_counter(),
+            },
+        })
+        await asyncio.wait_for(entry_started.wait(), timeout=1)
+        started = asyncio.get_running_loop().time()
+        assert runtime._enqueue_stop_obligation(
+            position,
+            _update(position),
+            {"ready": True, "reason": "READY"},
+            frame_hash="stop-during-slow-entry",
+        )
+        for _ in range(100):
+            if runtime.stop_obligations_latched == 1:
+                break
+            await asyncio.sleep(0.01)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert runtime.stop_obligations_latched == 1
+        assert elapsed < 0.5
+        assert not release_entry.is_set()
+        assert int(
+            repo.position_for_token(position["token_id"])["stop_stage"]
+        ) == 1
+        release_entry.set()
+        await runtime.stop()
+
+    asyncio.run(scenario())
