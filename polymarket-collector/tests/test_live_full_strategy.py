@@ -186,12 +186,19 @@ def test_zero_fill_allows_new_unique_entry_attempt_and_preserves_history():
                     "PRAGMA index_list('live_strategy_intents')"
                 ).fetchall()
             }
+            position_indexes = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA index_list('live_strategy_positions')"
+                ).fetchall()
+            }
         assert [(row["intent_id"], row["state"]) for row in intents] == [
             (first["entry_intent_id"], "ZERO_FILL"),
             (second["entry_intent_id"], "RESERVED"),
         ]
         assert "idx_live_strategy_one_entry" not in indexes
         assert "idx_live_strategy_one_unresolved_entry" in indexes
+        assert "idx_live_strategy_intents_event_action_state" in indexes
+        assert "idx_live_strategy_positions_token_created" in position_indexes
     finally:
         temp.cleanup()
 

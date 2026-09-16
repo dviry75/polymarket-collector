@@ -125,6 +125,8 @@ class StrategyRepository:
                 ON live_strategy_intents(position_id)
                 WHERE action = 'EXIT'
                   AND state NOT IN ('FILLED','ZERO_FILL','CANCELED','REJECTED','FAILED','SETTLED');
+                CREATE INDEX IF NOT EXISTS idx_live_strategy_intents_event_action_state
+                ON live_strategy_intents(event_id, action, state);
 
                 CREATE TABLE IF NOT EXISTS live_order_attempts (
                     record_id TEXT PRIMARY KEY,
@@ -382,6 +384,9 @@ class StrategyRepository:
                     updated_at TEXT NOT NULL,
                     closed_at TEXT
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_live_strategy_positions_token_created
+                ON live_strategy_positions(token_id, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS live_quarantines (
                     quarantine_id TEXT PRIMARY KEY,

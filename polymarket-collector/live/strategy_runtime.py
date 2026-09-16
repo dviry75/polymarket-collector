@@ -226,6 +226,8 @@ class LiveStrategyRuntime:
         self.stop_obligations_rejected = 0
         self.stop_obligations_latched = 0
         self.stop_obligation_failures = 0
+        self.stop_obligation_generation_retries = 0
+        self.stop_obligation_stale_generation_rejections = 0
         self.stop_obligation_max_depth = 0
         self.stop_obligation_worst_latch_ms = 0.0
         self._entry_frame_event = asyncio.Event()
@@ -809,6 +811,12 @@ class LiveStrategyRuntime:
         self.stop_obligation_max_depth = max(
             self.stop_obligation_max_depth, len(mailbox)
         )
+        self._capture_stop_forensic(
+            "STOP_OBLIGATION_PUBLISHED", position, update,
+            frame_hash=frame_hash, event_ready=True,
+            integrity_status=obligation.readiness_reason,
+            critical_queue_depth=len(self._critical_frames),
+        )
         wakeup.set()
         try:
             loop = asyncio.get_running_loop()
@@ -862,6 +870,30 @@ class LiveStrategyRuntime:
             self.stop_obligations_rejected += 1
             self._stop_owned_positions.discard(obligation.position_id)
             return
+        if self._exit_book_provider is not None:
+            current_book = self._current_top_of_book(obligation.token_id)
+            if current_book is None:
+                self.stop_obligation_generation_retries += 1
+                current = self._stop_obligations.get(obligation.position_id)
+                if current is None or (
+                    current.generation, current.update_number
+                ) < version:
+                    self._stop_obligations[obligation.position_id] = obligation
+                self._stop_obligation_event.set()
+                await asyncio.sleep(0.05)
+                return
+            current_generation = int(current_book.get("generation") or 0)
+            if current_generation > obligation.generation:
+                self.stop_obligation_stale_generation_rejections += 1
+                self.stop_obligations_rejected += 1
+                self._stop_owned_positions.discard(obligation.position_id)
+                return
+            if current_generation < obligation.generation:
+                self.stop_obligation_generation_retries += 1
+                self._stop_obligations[obligation.position_id] = obligation
+                self._stop_obligation_event.set()
+                await asyncio.sleep(0.05)
+                return
         position = self._position_by_id_from_ram(obligation.position_id)
         if position is None:
             self.stop_obligations_rejected += 1
@@ -875,6 +907,12 @@ class LiveStrategyRuntime:
             self.stop_obligations_rejected += 1
             self._stop_owned_positions.discard(obligation.position_id)
             return
+        self._capture_stop_forensic(
+            "STOP_CONSUMER_STARTED", position, obligation.as_update(),
+            frame_hash=obligation.frame_hash, event_ready=True,
+            integrity_status=obligation.readiness_reason,
+            critical_queue_depth=len(self._critical_frames),
+        )
         started = time.perf_counter()
         loop = asyncio.get_running_loop()
         try:
@@ -5422,6 +5460,12 @@ class LiveStrategyRuntime:
                 "rejected": self.stop_obligations_rejected,
                 "latched": self.stop_obligations_latched,
                 "failures": self.stop_obligation_failures,
+                "generation_retries": (
+                    self.stop_obligation_generation_retries
+                ),
+                "stale_generation_rejections": (
+                    self.stop_obligation_stale_generation_rejections
+                ),
                 "max_depth": self.stop_obligation_max_depth,
                 "worst_latch_ms": round(
                     self.stop_obligation_worst_latch_ms, 3

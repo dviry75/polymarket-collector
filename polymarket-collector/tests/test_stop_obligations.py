@@ -293,3 +293,106 @@ def test_slow_entry_worker_cannot_delay_stop_latch(tmp_path) -> None:
         await runtime.stop()
 
     asyncio.run(scenario())
+
+
+def test_stale_generation_obligation_cannot_latch_after_resync(tmp_path) -> None:
+    repo, runtime, position = _runtime(tmp_path)
+
+    async def scenario() -> None:
+        await runtime._refresh_hot_state_once()
+        runtime.set_exit_book_provider(lambda _token: {
+            "book_ready": True, "generation": 5, "update_number": 1,
+            "best_bid": "0.65", "exchange_age_ms": 0,
+        })
+        runtime._stop_obligation_task = asyncio.current_task()
+        assert runtime._enqueue_stop_obligation(
+            position, _update(position, generation=4, number=99),
+            {"ready": True, "reason": "READY"}, frame_hash="pre-resync-stop",
+        )
+        runtime._stop_obligation_task = asyncio.create_task(
+            runtime._stop_obligation_worker()
+        )
+        await asyncio.sleep(0.1)
+        assert int(repo.position_for_token(position["token_id"])["stop_stage"]) == 0
+
+        assert runtime._enqueue_stop_obligation(
+            position, _update(position, generation=5, number=1),
+            {"ready": True, "reason": "READY"}, frame_hash="post-resync-stop",
+        )
+        for _ in range(100):
+            if runtime.stop_obligations_latched == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.stop_obligations_latched == 1
+        assert int(repo.position_for_token(position["token_id"])["stop_stage"]) == 1
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_eight_second_reconciliation_cannot_delay_stop_latch(tmp_path) -> None:
+    repo, runtime, position = _runtime(tmp_path)
+
+    async def scenario() -> None:
+        await runtime._refresh_hot_state_once()
+        reconciliation_started = asyncio.Event()
+
+        async def slow_reconciliation() -> None:
+            reconciliation_started.set()
+            await asyncio.sleep(8.0)
+
+        task = asyncio.create_task(slow_reconciliation())
+        await reconciliation_started.wait()
+        started = asyncio.get_running_loop().time()
+        assert runtime._enqueue_stop_obligation(
+            position, _update(position),
+            {"ready": True, "reason": "READY"}, frame_hash="slow-reconcile",
+        )
+        for _ in range(100):
+            if runtime.stop_obligations_latched == 1:
+                break
+            await asyncio.sleep(0.01)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert runtime.stop_obligations_latched == 1
+        assert elapsed < 0.5
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_market_burst_coalesces_newest_stop_without_duplicate_latch(tmp_path) -> None:
+    repo, runtime, position = _runtime(tmp_path)
+
+    async def scenario() -> None:
+        await runtime._refresh_hot_state_once()
+        runtime._stop_obligation_task = asyncio.current_task()
+        for number in range(1, 101):
+            assert runtime._enqueue_stop_obligation(
+                position, _update(position, number=number),
+                {"ready": True, "reason": "READY"},
+                frame_hash=f"burst-{number}",
+            )
+        assert len(runtime._stop_obligations) == 1
+        assert runtime.stop_obligations_coalesced == 99
+        runtime._stop_obligation_task = asyncio.create_task(
+            runtime._stop_obligation_worker()
+        )
+        for _ in range(100):
+            if runtime.stop_obligations_latched == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert runtime.stop_obligations_latched == 1
+        assert repo.latch_stop_exit(position["position_id"])["_newly_latched"] is False
+        assert runtime._enqueue_stop_obligation(
+            position, _update(position, number=50),
+            {"ready": True, "reason": "READY"}, frame_hash="stale-burst",
+        )
+        await asyncio.sleep(0.1)
+        assert runtime.stop_obligations_latched == 1
+        assert runtime.stop_obligations_rejected >= 1
+        await runtime.stop()
+
+    asyncio.run(scenario())
