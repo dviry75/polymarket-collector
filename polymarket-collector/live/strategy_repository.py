@@ -5158,6 +5158,8 @@ class StrategyRepository:
         ts = now_iso()
         position_id = stable_id("position", event_id)
         changed = False
+        before: dict[str, Any] = {}
+        change_kind = ""
         with self.base.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
@@ -5166,6 +5168,7 @@ class StrategyRepository:
             ).fetchone()
             if existing is None:
                 changed = True
+                change_kind = "REMOTE_POSITION_CREATED"
                 conn.execute(
                     """
                     INSERT INTO live_event_states(
@@ -5206,6 +5209,7 @@ class StrategyRepository:
                 )
             else:
                 position_id = str(existing["position_id"])
+                before = row_to_dict(existing) or {}
                 local = decimal_value(existing["remaining_shares_text"]) or Decimal("0")
                 local_sellable = (
                     decimal_value(existing["sellable_shares_text"])
@@ -5214,6 +5218,7 @@ class StrategyRepository:
 
                 if local != remote_shares:
                     changed = True
+                    change_kind = "REMAINING_AND_SELLABLE_CHANGED"
                     acquired = max(
                         decimal_value(existing["acquired_shares_text"]) or Decimal("0"),
                         remote_shares,
@@ -5238,6 +5243,8 @@ class StrategyRepository:
                         ),
                     )
                 elif local_sellable != remote_shares:
+                    changed = True
+                    change_kind = "SELLABLE_VISIBILITY_CHANGED"
                     # Same financial position, but remote account truth now
                     # confirms that the tokens are visible for SELL.
                     conn.execute(
@@ -5257,6 +5264,7 @@ class StrategyRepository:
                 "SELECT * FROM live_strategy_positions WHERE position_id=?", (position_id,)
             ).fetchone()
             conn.commit()
+        after = row_to_dict(row) or {}
         if changed:
             self.timeline(
                 severity="CRITICAL", category="RECONCILIATION", component="reconciliation",
@@ -5266,6 +5274,54 @@ class StrategyRepository:
                 reason_code="REMOTE_POSITION_CORRECTION", result_status="CORRECTED",
                 remaining_shares_text=canonical_decimal(remote_shares),
                 average_price_text=canonical_decimal(average_price),
+                parameters_json={
+                    "change_kind": change_kind,
+                    "source": source,
+                    "before": {
+                        "state": before.get("state"),
+                        "remaining_shares_text": before.get(
+                            "remaining_shares_text"
+                        ),
+                        "sellable_shares_text": before.get(
+                            "sellable_shares_text"
+                        ),
+                        "average_entry_price_text": before.get(
+                            "average_entry_price_text"
+                        ),
+                        "updated_at": before.get("updated_at"),
+                    },
+                    "remote": {
+                        "shares_text": canonical_decimal(remote_shares),
+                        "average_price_text": canonical_decimal(average_price),
+                    },
+                    "after": {
+                        "state": after.get("state"),
+                        "remaining_shares_text": after.get(
+                            "remaining_shares_text"
+                        ),
+                        "sellable_shares_text": after.get(
+                            "sellable_shares_text"
+                        ),
+                        "average_entry_price_text": after.get(
+                            "average_entry_price_text"
+                        ),
+                        "updated_at": after.get("updated_at"),
+                    },
+                    "remaining_delta_text": canonical_decimal(
+                        remote_shares
+                        - (
+                            decimal_value(before.get("remaining_shares_text"))
+                            or Decimal("0")
+                        )
+                    ),
+                    "sellable_delta_text": canonical_decimal(
+                        remote_shares
+                        - (
+                            decimal_value(before.get("sellable_shares_text"))
+                            or Decimal("0")
+                        )
+                    ),
+                },
             )
         return row_to_dict(row) or {}, changed
 

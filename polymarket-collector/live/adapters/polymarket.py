@@ -11,6 +11,7 @@ from eth_account import Account
 
 from .base import TradingAdapter
 from ..config import LiveConfig
+from ..api_observability import PriorityRequestObserver, RequestPriority
 from ..order_attempts import OrderAttemptRecorder, StartedAttempt
 from ..order_book import canonical_decimal, decimal_value
 from ..secrets import (
@@ -117,6 +118,7 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         self._public_client = public_client
         self.attempt_recorder = attempt_recorder
         self._client_lock = asyncio.Lock()
+        self._request_observer = PriorityRequestObserver()
         self.identity: dict[str, Any] = {
             "status": "NOT_INITIALIZED",
             "signer": None,
@@ -346,17 +348,28 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         return {**payload, "condition_id": condition_id, "source": "polymarket-client"}
 
     async def get_order_book(self, token_id: str) -> dict[str, Any]:
-        book = await (await self._public()).get_order_book(token_id=token_id)
+        public = await self._public()
+        book = await self._request_observer.call(
+            "book.order_book",
+            RequestPriority.MARKET_DATA,
+            lambda: public.get_order_book(token_id=token_id),
+        )
         payload = _dump(book)
         payload.setdefault("asset_id", token_id)
         payload["source"] = "polymarket-client"
         return payload
 
     async def _balance_allowance(
-        self, *, asset_type: str, token_id: str | None = None
+        self, *, asset_type: str, token_id: str | None = None,
+        priority: RequestPriority = RequestPriority.RECONCILIATION,
     ) -> dict[str, Any]:
-        result = await (await self._client()).get_balance_allowance(
-            asset_type=asset_type, token_id=token_id
+        client = await self._client()
+        result = await self._request_observer.call(
+            "collateral.balance_allowance",
+            priority,
+            lambda: client.get_balance_allowance(
+                asset_type=asset_type, token_id=token_id
+            ),
         )
         payload = _dump(result)
         balance_raw = int(payload.get("balance") or 0)
@@ -392,13 +405,48 @@ class RealPolymarketTradingAdapter(TradingAdapter):
             "allowances_raw": payload["allowances_raw"],
         }
 
+    async def get_collateral_snapshot(self) -> dict[str, Any]:
+        payload = await self._balance_allowance(asset_type="COLLATERAL")
+        return {
+            "balance": {
+                "status": payload["status"],
+                "balance_usd": payload["balance_text"],
+                "balance_raw": payload["balance_raw"],
+            },
+            "allowances": {
+                "status": payload["status"],
+                "allowance_usd": canonical_decimal(
+                    Decimal(payload["minimum_allowance_raw"]) / PUSD_SCALE
+                ),
+                "allowances_raw": payload["allowances_raw"],
+            },
+        }
+
+    def request_health(self) -> dict[str, Any]:
+        return self._request_observer.health()
+
     async def get_open_orders(self) -> list[dict[str, Any]]:
-        pages = (await self._client()).list_open_orders()
-        return [self._normalize_order(order) async for order in pages.iter_items()]
+        client = await self._client()
+
+        async def collect() -> list[dict[str, Any]]:
+            pages = client.list_open_orders()
+            return [
+                self._normalize_order(order)
+                async for order in pages.iter_items()
+            ]
+
+        return await self._request_observer.call(
+            "orders.open", RequestPriority.RECONCILIATION, collect
+        )
 
     async def get_order(self, order_id: str) -> dict[str, Any] | None:
         try:
-            result = await (await self._client()).get_order(order_id=order_id)
+            client = await self._client()
+            result = await self._request_observer.call(
+                "orders.status",
+                RequestPriority.ORDER_STATE,
+                lambda: client.get_order(order_id=order_id),
+            )
         except Exception as exc:
             if "404" in str(exc) or "not found" in str(exc).lower():
                 return None
@@ -412,8 +460,18 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         need the whole ledger. Reconciliation uses get_trades_page() so its
         cost tracks new activity instead of lifetime activity.
         """
-        pages = (await self._client()).list_account_trades()
-        return [self._normalize_trade(trade) async for trade in pages.iter_items()]
+        client = await self._client()
+
+        async def collect() -> list[dict[str, Any]]:
+            pages = client.list_account_trades()
+            return [
+                self._normalize_trade(trade)
+                async for trade in pages.iter_items()
+            ]
+
+        return await self._request_observer.call(
+            "trades.full_history", RequestPriority.RECONCILIATION, collect
+        )
 
     async def get_trades_page(
         self,
@@ -435,7 +493,11 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         )
         if cursor:
             paginator = paginator.from_cursor(cursor)
-        page = await paginator.first_page()
+        page = await self._request_observer.call(
+            "trades.page",
+            RequestPriority.RECONCILIATION,
+            paginator.first_page,
+        )
         return {
             "trades": [self._normalize_trade(trade) for trade in page.items],
             "has_more": bool(page.has_more),
@@ -443,12 +505,22 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         }
 
     async def get_positions(self) -> list[dict[str, Any]]:
-        pages = (await self._client()).list_positions(
-            user=self.config.funder_address or self.config.profile_address,
-            size_threshold=0,
-            page_size=100,
+        client = await self._client()
+
+        async def collect() -> list[dict[str, Any]]:
+            pages = client.list_positions(
+                user=self.config.funder_address or self.config.profile_address,
+                size_threshold=0,
+                page_size=100,
+            )
+            return [
+                self._normalize_position(position)
+                async for position in pages.iter_items()
+            ]
+
+        return await self._request_observer.call(
+            "positions.list", RequestPriority.RECONCILIATION, collect
         )
-        return [self._normalize_position(position) async for position in pages.iter_items()]
 
     async def _assert_allowance(
         self,
@@ -462,6 +534,9 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         payload = await self._balance_allowance(
             asset_type=asset_type,
             token_id=token_id if asset_type == "CONDITIONAL" else None,
+            priority=(
+                RequestPriority.ENTRY if side == "BUY" else RequestPriority.EXIT
+            ),
         )
         required = requested_amount if side == "BUY" else requested_shares
         required_raw = int((required * PUSD_SCALE).to_integral_value(rounding="ROUND_CEILING"))
@@ -610,7 +685,15 @@ class RealPolymarketTradingAdapter(TradingAdapter):
                     self._finish_attempt(attempt, result=result)
                     return result
             post_started = True
-            response = await client.post_order(signed)
+            response = await self._request_observer.call(
+                "orders.post",
+                (
+                    RequestPriority.EXIT
+                    if side == "SELL"
+                    else RequestPriority.ENTRY
+                ),
+                lambda: client.post_order(signed),
+            )
             normalized = self._normalize_response(response)
             normalized["submission_state"] = "RESPONSE_RECEIVED"
             if (

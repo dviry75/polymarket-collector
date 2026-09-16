@@ -101,6 +101,12 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         reconciliation=lambda reason: _reconciliation_coordinator.request(
             actor=f"strategy:{reason}", evidence_changed=True
         ),
+        targeted_reconciliation=lambda target: (
+            _reconciliation.run_targeted_position(
+                token_id=str(target.get("token_id") or ""),
+                actor=f"strategy:{target.get('reason') or 'targeted'}",
+            )
+        ),
     )
     _paper = PaperTradingEngine(
         _repo,

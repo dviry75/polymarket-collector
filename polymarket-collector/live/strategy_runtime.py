@@ -76,12 +76,19 @@ class LiveStrategyRuntime:
         adapter: TradingAdapter,
         *,
         reconciliation: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+        targeted_reconciliation: (
+            Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None,
     ):
         self.config = config
         self.base = base_repo
         self.repo = strategy_repo
         self.adapter = adapter
         self.reconciliation = reconciliation
+        self.targeted_reconciliation = targeted_reconciliation
+        self._targeted_reconciliation_tasks: set[asyncio.Task[Any]] = set()
+        self.targeted_reconciliation_scheduled = 0
+        self.targeted_reconciliation_fallbacks = 0
         self.policy = StrategyPolicy(
             entry_price=config.strategy_entry_price,
             entry_max_price=config.strategy_entry_max_price,
@@ -3336,6 +3343,9 @@ class LiveStrategyRuntime:
                 str(intent["intent_id"]),
                 reason="TAKE_PROFIT_WAITING_FOR_FULL_SELLABLE_BALANCE",
             )
+            self._schedule_targeted_reconciliation(
+                position, reason="take_profit_waiting_sellable"
+            )
             return
         if self.paper_mode():
             self.repo.update_intent(
@@ -3365,6 +3375,9 @@ class LiveStrategyRuntime:
                     or "INSUFFICIENT_BALANCE"
                 ),
                 normalized_error=response.get("message"),
+            )
+            self._schedule_targeted_reconciliation(
+                position, reason="take_profit_rejected_sellable"
             )
             return
 
@@ -4996,6 +5009,9 @@ class LiveStrategyRuntime:
                 str(intent["intent_id"]),
                 submitted_at=None,
             )
+            self._schedule_targeted_reconciliation(
+                position, reason="exit_rejected_sellable"
+            )
             return
 
         if self._finalize_known_no_remote_submission(
@@ -5062,6 +5078,40 @@ class LiveStrategyRuntime:
     def _min_order(self, condition_id: str) -> Decimal:
         market = self._market(condition_id) or {}
         return decimal_value(market.get("min_order_size")) or Decimal("0.000001")
+
+    def _schedule_targeted_reconciliation(
+        self, position: dict[str, Any], *, reason: str
+    ) -> None:
+        callback = self.targeted_reconciliation
+        token_id = str(position.get("token_id") or "")
+        if callback is None or not token_id:
+            return
+
+        async def run() -> None:
+            try:
+                result = await callback({
+                    "token_id": token_id,
+                    "position_id": str(position.get("position_id") or ""),
+                    "condition_id": str(position.get("condition_id") or ""),
+                    "reason": reason,
+                })
+                if result.get("status") == "ok":
+                    await self._refresh_hot_state_once()
+                    self._exit_wakeup.set()
+                elif result.get("status") == "requires_full":
+                    self.targeted_reconciliation_fallbacks += 1
+                    await self._reconcile(f"{reason}_targeted_fallback")
+            except Exception as exc:
+                self.last_error = (
+                    f"TARGETED_RECONCILIATION:{type(exc).__name__}:{exc}"
+                )[:500]
+
+        task = asyncio.create_task(
+            run(), name=f"targeted-reconciliation-{token_id[:12]}"
+        )
+        self.targeted_reconciliation_scheduled += 1
+        self._targeted_reconciliation_tasks.add(task)
+        task.add_done_callback(self._targeted_reconciliation_tasks.discard)
 
     async def _reconcile(self, reason: str) -> dict[str, Any]:
         if self.reconciliation is None:
@@ -5217,6 +5267,13 @@ class LiveStrategyRuntime:
             except asyncio.CancelledError:
                 pass
             self._entry_task = None
+
+        if self._targeted_reconciliation_tasks:
+            tasks = list(self._targeted_reconciliation_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._targeted_reconciliation_tasks.clear()
 
         if self._exit_task:
             self._exit_wakeup.set()
@@ -5387,6 +5444,11 @@ class LiveStrategyRuntime:
                     dict(self.entry_phase_samples[-1])
                     if self.entry_phase_samples else {}
                 ),
+            },
+            "targeted_reconciliation": {
+                "scheduled": self.targeted_reconciliation_scheduled,
+                "fallbacks": self.targeted_reconciliation_fallbacks,
+                "inflight": len(self._targeted_reconciliation_tasks),
             },
             "entry_liquidity": self._entry_liquidity.stats(),
             "frame_queue_depth": len(self._pending_frames),
