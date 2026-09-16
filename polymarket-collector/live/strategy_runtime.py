@@ -31,6 +31,15 @@ from .strategy_repository import StrategyRepository, stable_id
 from .stop_forensics import StopForensicRecord, StopForensicWriter
 from .stop_obligations import StopObligation
 
+EXIT_SUPERVISION_POSITION_STATES = frozenset({
+    "OPEN",
+    "TP_OPEN",
+    "EXITING",
+    "EXIT_RECONCILIATION_REQUIRED",
+    "QUARANTINED",
+})
+
+
 
 EVENT_WINDOW_PATTERN = re.compile(r"-(\d+)m-(\d+)$")
 
@@ -455,7 +464,7 @@ class LiveStrategyRuntime:
                     or Decimal("0")
                 ) > 0
                 and str(position.get("state") or "").upper()
-                not in {"CLOSED", "RESOLVED_LOSER", "REDEEMED"}
+                in EXIT_SUPERVISION_POSITION_STATES
             )
 
         current_ids = {
@@ -4019,7 +4028,7 @@ class LiveStrategyRuntime:
                 or Decimal("0")
             ) > 0
             and str(position.get("state") or "").upper()
-            != "CLOSED"
+            in EXIT_SUPERVISION_POSITION_STATES
         ]
 
         if self._stop_exhausted_positions:
@@ -4068,7 +4077,8 @@ class LiveStrategyRuntime:
                     decimal_value(position.get("remaining_shares_text"))
                     or Decimal("0")
                 ) > 0
-                and str(position.get("state") or "").upper() != "CLOSED"
+                and str(position.get("state") or "").upper()
+                in EXIT_SUPERVISION_POSITION_STATES
             ]
 
         # P0-E: strict priority ordering + bounded concurrency + tick budget.
