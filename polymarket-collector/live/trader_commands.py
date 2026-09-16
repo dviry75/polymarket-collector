@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -144,8 +145,9 @@ class TraderCommandHandler:
             strategy_repo.set_pause_entries(True, "operator", "OPERATOR_PAUSE")
             return {"ok": True, "pause_entries": True}
         if command == "RESUME_ENTRIES":
-            result = request_manual_resume(
-                config, repo, strategy_repo, market_ws, user_ws
+            result = await asyncio.to_thread(
+                request_manual_resume,
+                config, repo, strategy_repo, market_ws, user_ws,
             )
             if not result.get("ok"):
                 strategy_repo.timeline(
