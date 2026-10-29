@@ -1,0 +1,39 @@
+# DEMO V2 — Decision Log
+
+- D-001: V1 catalog = BTC/ETH/SOL/XRP/DOGE/HYPE/BNB x 5m/15m/1h.
+- D-002: Exclude hourly “above X” markets.
+- D-003: Entry requires exact observed best ask equality.
+- D-004: Either UP/DOWN may trigger.
+- D-005: Entry frequency is shared per rule+market-instance across both sides; default 1.
+- D-006: Concurrent positions are allowed.
+- D-007: Unchanged trigger price does not retrigger until price leaves and returns.
+- D-008: Trade size in shares; minimum 5.
+- D-009: Use actual applicable fee behavior when available; do not substitute fixed average.
+- D-010: Missing/unreliable required fee data blocks new entries.
+- D-011: Global wallet starts at $0 and may become arbitrarily negative.
+- D-012: Each rule has its own wallet view.
+- D-013: TP/SL exits use observed best bid and actual observed jump price.
+- D-014: Resolution settles winner 1.00, loser 0.00.
+- D-015: Timezone Asia/Jerusalem.
+- D-016: Multiple schedule ranges/day and cross-midnight allowed; none=24/7.
+- D-017: Multiple in-market windows allowed; none=full market.
+- D-018: Schedules/windows block entries only; existing positions continue.
+- D-019: Rule edits affect new entries only; open positions keep snapshot.
+- D-020: Disable/delete stops new entries only and preserves history.
+- D-021: Open positions live in trade model; no separate product surface required.
+- D-022: KPI scope follows trade filters: wallet, success rate, positive, negative, total trades, fees.
+- D-023: Break-even excluded from positive/negative and success-rate denominator.
+- D-024: Store underlying price at market open, entry and exit with provenance.
+- D-025: Rules may filter entry by underlying movement.
+- D-026: Do not listen when no rule can currently enter and no open position needs monitoring.
+- D-027: First fresh resubscribe snapshot exactly at trigger may enter.
+- D-028: No entry/TP/SL backfill after gaps.
+- D-029: Rules are fully independent.
+- D-030: Health states READY/DEGRADED/NOT_READY with automatic recovery.
+- D-031: Critical faults stop new entries; resume automatically after recovery/stability.
+- D-032: Reset Trading Data keeps rules; Factory Reset resets rules too; never affect LIVE.
+- D-033: Same username/password as LIVE, separate DEMO session.
+- D-034: UI/frontend out of scope for Codex/backend.
+- D-035: DEMO V2 implemented inside polymarket-collector repo but isolated from LIVE.
+- D-036: Audit/reuse existing working code before replacements.
+- D-037: No automatic research-history deletion at this stage.
