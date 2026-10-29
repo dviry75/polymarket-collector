@@ -11,7 +11,7 @@ Audit `239d6bd`, Phase 1 `ce76b60`; remote base `d26dda4`.
 | 5/6 | Exact entry/rearm/shared quota/concurrency, schedules/windows, observed-bid TP/SL, official settlement/accounting | 212cbbc | 111 passed |
 | 7 | Granular health, freshness, stable recovery/retry, provider orchestration and shutdown | 150e4ba | 116 passed |
 | 8 | Independent auth/sessions/CSRF, versioned REST/OpenAPI, cohorts/KPI and confirmed resets | 62fa3a4 | 124 passed |
-| Final validation | Cross-layer regressions, independent research workers, full fake-WS authenticated ASGI path and current docs | phase commit containing this entry | 141 passed, zero failed/skipped |
+| Final validation | Cross-layer regressions, independent research workers, full fake-WS authenticated ASGI path and current docs | 1729146 | 141 passed, zero failed/skipped |
 
 ## Important decisions
 
@@ -48,7 +48,10 @@ rounding evidence. Future production review/provisioning/deployment is outside s
 
 ## Git delivery
 
-All phase commits are local and restricted to demo_v2/. Exactly one push attempt
-is reserved for the end; no credential changes/reset/rebase/clean are permitted.
+All phase commits are local and restricted to demo_v2/. Exactly one final
+`git push origin main` attempt was made. It failed with missing HTTPS authentication:
+`could not read Username for 'https://github.com': terminal prompts disabled`.
+No credentials were changed and no retry/reset/rebase/clean was performed.
 Static import audit, cumulative diff and every local commit passed the demo_v2-only
-check. The final delivery report records the one push attempt and final SHA.
+check. This final documentation-only commit records that failed attempt; it is
+also local. The checkout and delivered Git bundle retain all completed work.
