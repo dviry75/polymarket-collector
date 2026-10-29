@@ -1,9 +1,30 @@
 #!/usr/bin/env python3
-"""Ingest Polymarket's own fill history for our proxy wallet into ``external_fills``.
+"""Ingest Polymarket's own record of our proxy wallet's fills AND redemptions.
 
-Dashboard-only, analytics-only. Read-only against Polymarket (HTTP GET only) and
-write-only against the two ``external_fills*`` tables -- it never touches the
-trader's tables, never signs an order, and never loads the L1 private key.
+Dashboard-only, analytics-only, and deliberately 100% Polymarket-sourced --
+no dependency on the trader's own bookkeeping. Three public Polymarket facts
+feed this, all read-only, all HTTP GET:
+
+  1. ``clob.polymarket.com/data/trades`` (L2 HMAC) -- the fills themselves.
+  2. ``clob.polymarket.com/markets/{condition_id}`` (public, no auth) -- each
+     market's REAL fee schedule. The per-trade ``fee_rate_bps`` on (1) is
+     frequently 0/absent even when a real fee applies ("crypto fee-enabled
+     markets compute the taker fee from a formula rather than a flat bps on
+     the trade message" -- this is Polymarket's own documented behaviour, see
+     ``live/fee_accounting.py`` for the trader's independent implementation
+     of the same fallback). The market's own published rate is the reliable
+     source, so that's what we use when the per-trade field is empty. As a
+     read-only optimisation this first checks the trader's ``live_markets``
+     cache (itself populated from this exact public endpoint, so no request
+     avoided is no accuracy lost) before making a live HTTP call.
+  3. ``data-api.polymarket.com/activity?type=REDEEM`` (public, no auth) --
+     the actual USD payout for a resolved position (win = $1/share, loss =
+     $0). Without this, a position bought and held to resolution (never
+     manually sold) looks like a pure loss forever, even if it won.
+
+Write-only against ``external_fills*``, ``external_redemptions``, and
+``external_market_fees``. Never writes to any trader-owned table, never signs
+an order, and never loads the L1 private key.
 
 Auth is **L2 HMAC only** (``POLYMARKET_API_SECRET`` from the environment /
 ``trader.env``); it does not use ``py-clob-client``, the SDK, or GCP Secret
@@ -223,6 +244,149 @@ def fetch_data_trades(config: dict[str, str]) -> list[dict[str, Any]]:
     return rows
 
 
+def fetch_redemptions(config: dict[str, str]) -> list[dict[str, Any]]:
+    """Public, unauthenticated: every REDEEM activity event for this account.
+
+    Modest volume (one event per resolved position) -- a full walk every run
+    is cheap and simple; no watermark needed, mirrors fetch_data_trades.
+    """
+    rows: list[dict[str, Any]] = []
+    offset, size = 0, 500
+    with httpx.Client(timeout=45) as client:
+        while True:
+            response = client.get(
+                config["data_host"] + "/activity",
+                params={
+                    "user": config["proxy_wallet"], "type": "REDEEM",
+                    "limit": size, "offset": offset,
+                    "sortBy": "TIMESTAMP", "sortDirection": "DESC",
+                },
+            )
+            response.raise_for_status()
+            page = response.json()
+            if not isinstance(page, list):
+                break
+            rows.extend(page)
+            if len(page) < size:
+                break
+            offset += len(page)
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# market fee schedule -- cache-first, public-fetch fallback
+# --------------------------------------------------------------------------- #
+def _num_or_none(value: Any) -> float | None:
+    parsed = dec(value)
+    return float(parsed) if parsed is not None else None
+
+
+def _fee_details_json(raw: Any) -> str | None:
+    if isinstance(raw, dict):
+        return json.dumps(raw, sort_keys=True)
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
+
+
+def _fetch_market_fee_live(client: httpx.Client, host: str, condition_id: str) -> dict[str, Any] | None:
+    try:
+        response = client.get(f"{host}/markets/{condition_id}")
+        if response.status_code == 404:
+            response = client.get(f"{host}/market", params={"condition_id": condition_id})
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPError as exc:
+        log.warning("market fee fetch failed for %s: %s", condition_id, exc)
+        return None
+    return {
+        "taker_base_fee": _num_or_none(payload.get("taker_base_fee")),
+        "maker_base_fee": _num_or_none(payload.get("maker_base_fee")),
+        "fee_details": _fee_details_json(payload.get("fee_details")),
+    }
+
+
+def get_or_fetch_market_fees(
+    repo: LiveRepository, condition_ids: set[str], config: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """{condition_id: {taker_base_fee, maker_base_fee, fee_details}} for every id.
+
+    Priority: external_market_fees cache -> the trader's live_markets cache
+    (same public endpoint, already fetched -- reading it costs nothing and
+    avoids hammering Polymarket) -> one live public fetch per still-missing
+    id. All network I/O happens with no sqlite connection open; the freshly
+    fetched rows are cached in one short write at the end.
+    """
+    if not condition_ids:
+        return {}
+    ids = list(condition_ids)
+    fees: dict[str, dict[str, Any]] = {}
+    with repo.connect() as conn:
+        placeholders = ",".join("?" * len(ids))
+        for row in conn.execute(
+            f"SELECT condition_id, taker_base_fee, maker_base_fee, fee_details "
+            f"FROM external_market_fees WHERE condition_id IN ({placeholders})",
+            ids,
+        ).fetchall():
+            fees[row["condition_id"]] = dict(row)
+        missing = [cid for cid in ids if cid not in fees]
+        if missing:
+            for row in conn.execute(
+                f"SELECT condition_id, taker_base_fee, maker_base_fee, fee_details "
+                f"FROM live_markets WHERE condition_id IN ({','.join('?' * len(missing))})",
+                missing,
+            ).fetchall():
+                if row["taker_base_fee"] is not None or row["fee_details"]:
+                    fees[row["condition_id"]] = dict(row)
+
+    still_missing = [cid for cid in ids if cid not in fees]
+    fetched: dict[str, dict[str, Any]] = {}
+    if still_missing:
+        log.info("fetching market fee schedule live for %d market(s)", len(still_missing))
+        with httpx.Client(timeout=20) as client:
+            for condition_id in still_missing:
+                data = _fetch_market_fee_live(client, config["clob_host"], condition_id)
+                if data:
+                    fees[condition_id] = data
+                    fetched[condition_id] = data
+
+    if fetched:
+        now = datetime.now(timezone.utc).isoformat()
+        with repo.connect() as conn:
+            conn.executemany(
+                "INSERT INTO external_market_fees"
+                "(condition_id,taker_base_fee,maker_base_fee,fee_details,source,fetched_at) "
+                "VALUES (:condition_id,:taker_base_fee,:maker_base_fee,:fee_details,'public_api',:fetched_at) "
+                "ON CONFLICT(condition_id) DO UPDATE SET "
+                "taker_base_fee=excluded.taker_base_fee, maker_base_fee=excluded.maker_base_fee, "
+                "fee_details=excluded.fee_details, source=excluded.source, fetched_at=excluded.fetched_at",
+                [{**data, "condition_id": cid, "fetched_at": now} for cid, data in fetched.items()],
+            )
+            conn.commit()
+    return fees
+
+
+def _rate_from_market_fee(market_fee: dict[str, Any] | None, *, is_taker: bool) -> Decimal | None:
+    """Mirrors live/fee_accounting.py's _market_taker_rate, extended symmetrically
+    to the maker side (fee_details carries one rate that applies to both in the
+    crypto_fees_v2 markets this bot trades)."""
+    if not market_fee:
+        return None
+    details = market_fee.get("fee_details")
+    if isinstance(details, str):
+        try:
+            details = json.loads(details or "{}")
+        except (TypeError, ValueError):
+            details = {}
+    details = details if isinstance(details, dict) else {}
+    rate = dec(details.get("rate") or details.get("r"))
+    if rate is not None and rate > 0:
+        return rate
+    field = "taker_base_fee" if is_taker else "maker_base_fee"
+    direct = dec(market_fee.get(field))
+    return direct if direct is not None and direct > 0 else None
+
+
 # --------------------------------------------------------------------------- #
 # row building -- account perspective + calculated fee
 # (adapted from tools/export_trade_history_simple.py:149-231)
@@ -231,6 +395,7 @@ def build_fill_rows(
     clob: list[dict[str, Any]],
     data: list[dict[str, Any]],
     proxy: str,
+    market_fees: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     by_tx: dict[str, list[dict[str, Any]]] = {}
     for row in data:
@@ -268,15 +433,23 @@ def build_fill_rows(
             log.warning("skipping trade %s: unresolved side/price/size", trade_id)
             continue
 
+        condition_id = str(trade.get("market") or "")
         rate_bps = dec(trade.get("fee_rate_bps"))
-        if rate_bps is None:
-            fee_usd = None
-        elif rate_bps == 0:
-            fee_usd = 0.0
-        else:
+        if rate_bps is not None and rate_bps > 0:
+            # Authoritative: a positive rate was carried on the trade message itself.
             fee_usd = float(
                 (size * price * (Decimal(1) - price) * rate_bps / Decimal(10000)).quantize(Decimal("0.000001"))
             )
+        else:
+            # The trade message didn't carry a usable rate -- fall back to the
+            # market's own published fee schedule (see module docstring).
+            rate = _rate_from_market_fee(market_fees.get(condition_id), is_taker=trader_side == "TAKER")
+            if rate is not None:
+                fee_usd = float((size * price * (Decimal(1) - price) * rate).quantize(Decimal("0.000001")))
+            elif trader_side == "MAKER":
+                fee_usd = 0.0  # no evidence of a maker fee on this market -> a real, not missing, zero
+            else:
+                fee_usd = None  # genuinely unresolved
 
         tx_hash = str(trade.get("transaction_hash") or "")
         candidates = by_tx.get(tx_hash.lower(), [])
@@ -290,7 +463,7 @@ def build_fill_rows(
 
         rows.append({
             "trade_id": str(trade_id),
-            "condition_id": str(trade.get("market") or ""),
+            "condition_id": condition_id,
             "token_id": str(trade.get("asset_id") or "") or None,
             "event_slug": (match.get("eventSlug") if match else None) or None,
             "market_title": (match.get("title") if match else None) or None,
@@ -336,6 +509,46 @@ ON CONFLICT(trade_id) DO UPDATE SET
     ingested_at  = excluded.ingested_at
 """
 
+_REDEMPTION_UPSERT = """
+INSERT INTO external_redemptions (
+    redemption_id, condition_id, token_id, outcome, size, payout_usd,
+    matched_at, transaction_hash, raw_json, ingested_at
+) VALUES (
+    :redemption_id, :condition_id, :token_id, :outcome, :size, :payout_usd,
+    :matched_at, :transaction_hash, :raw_json, :ingested_at
+)
+ON CONFLICT(redemption_id) DO UPDATE SET
+    payout_usd  = excluded.payout_usd,
+    raw_json    = excluded.raw_json,
+    ingested_at = excluded.ingested_at
+"""
+
+
+def build_redemption_rows(redemptions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ingested_at = datetime.now(timezone.utc).isoformat()
+    rows: list[dict[str, Any]] = []
+    for item in redemptions:
+        tx_hash = str(item.get("transactionHash") or "")
+        condition_id = str(item.get("conditionId") or "")
+        matched_at = to_iso_utc(item.get("timestamp"))
+        size = dec(item.get("size"))
+        payout = dec(item.get("usdcSize"))
+        if not tx_hash or not condition_id or not matched_at or size is None or payout is None:
+            continue
+        rows.append({
+            "redemption_id": tx_hash,
+            "condition_id": condition_id,
+            "token_id": str(item.get("asset") or "") or None,
+            "outcome": str(item.get("outcome") or "") or None,
+            "size": float(size),
+            "payout_usd": float(payout),
+            "matched_at": matched_at,
+            "transaction_hash": tx_hash,
+            "raw_json": json.dumps(item, sort_keys=True, ensure_ascii=False),
+            "ingested_at": ingested_at,
+        })
+    return rows
+
 
 def read_watermark(repo: LiveRepository) -> str | None:
     with repo.connect() as conn:
@@ -345,9 +558,14 @@ def read_watermark(repo: LiveRepository) -> str | None:
     return row["value"] if row and row["value"] else None
 
 
-def persist(repo: LiveRepository, rows: list[dict[str, Any]], sync: dict[str, str]) -> tuple[int, int]:
-    """One short RW transaction. Returns (rows_seen, rows_new_estimate)."""
-    if not rows and not sync:
+def persist(
+    repo: LiveRepository,
+    rows: list[dict[str, Any]],
+    redemption_rows: list[dict[str, Any]],
+    sync: dict[str, str],
+) -> tuple[int, int]:
+    """One short RW transaction. Returns (rows_seen, rows_new_estimate) for fills."""
+    if not rows and not redemption_rows and not sync:
         return 0, 0
     with repo.connect() as conn:
         existing: set[str] = set()
@@ -361,6 +579,8 @@ def persist(repo: LiveRepository, rows: list[dict[str, Any]], sync: dict[str, st
                 ).fetchall()
             }
             conn.executemany(_UPSERT, rows)
+        if redemption_rows:
+            conn.executemany(_REDEMPTION_UPSERT, redemption_rows)
         if sync:
             conn.executemany(
                 "INSERT INTO external_fills_sync(key,value) VALUES(?,?) "
@@ -412,13 +632,23 @@ def run(args: argparse.Namespace) -> int:
             log.warning("public enrichment feed unavailable (%s); continuing without event slugs", exc)
             data, enriched_available = [], 0
 
-        rows = build_fill_rows(clob, data, config["proxy_wallet"].lower())
+        condition_ids = {str(t.get("market") or "") for t in clob if t.get("market")}
+        market_fees = get_or_fetch_market_fees(repo, condition_ids, config)
+        rows = build_fill_rows(clob, data, config["proxy_wallet"].lower(), market_fees)
         max_matched = max((r["matched_at"] for r in rows), default=None)
+
+        try:
+            redemptions = fetch_redemptions(config)
+            redemption_rows = build_redemption_rows(redemptions)
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("redemption feed unavailable (%s); continuing without it this run", exc)
+            redemption_rows = []
 
         sync: dict[str, str] = {
             "last_run_at": run_at,
             "last_run_status": "ok",
             "last_run_rows": str(len(rows)),
+            "last_redemption_rows": str(len(redemption_rows)),
             "last_error": "",
         }
         # advance the watermark only on a clean (non-truncated) run
@@ -428,21 +658,22 @@ def run(args: argparse.Namespace) -> int:
         if args.backfill and not truncated:
             sync["backfill_completed_at"] = run_at
 
-        seen, new = persist(repo, rows, sync)
+        seen, new = persist(repo, rows, redemption_rows, sync)
         log.info(
-            "done fetched=%d new=%d updated=%d clob_trades=%d enrichment_rows=%d truncated=%s watermark=%s",
-            seen, new, seen - new, len(clob), enriched_available, truncated,
-            sync.get("last_matched_at", watermark),
+            "done fetched=%d new=%d updated=%d clob_trades=%d enrichment_rows=%d redemptions=%d "
+            "market_fees_cached=%d truncated=%s watermark=%s",
+            seen, new, seen - new, len(clob), enriched_available, len(redemption_rows),
+            len(market_fees), truncated, sync.get("last_matched_at", watermark),
         )
         return 0
     except httpx.HTTPStatusError as exc:
         log.error("HTTP %s from %s: %s", exc.response.status_code, exc.request.url, exc.response.text[:300])
-        persist(repo, [], {"last_run_at": run_at, "last_run_status": "error", "last_error": f"http {exc.response.status_code}"})
+        persist(repo, [], [], {"last_run_at": run_at, "last_run_status": "error", "last_error": f"http {exc.response.status_code}"})
         return 1
     except Exception as exc:  # noqa: BLE001 -- top-level guard, re-raised as exit code
         log.exception("ingestion failed: %s", exc)
         try:
-            persist(repo, [], {"last_run_at": run_at, "last_run_status": "error", "last_error": str(exc)[:300]})
+            persist(repo, [], [], {"last_run_at": run_at, "last_run_status": "error", "last_error": str(exc)[:300]})
         except Exception:  # noqa: BLE001
             pass
         return 1

@@ -58,6 +58,36 @@ CREATE TABLE IF NOT EXISTS external_fills_sync (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- Public redemption evidence (data-api.polymarket.com/activity?type=REDEEM):
+-- the real USD payout for a resolved position, win ($1/share) or loss ($0).
+-- Without this a held-to-resolution deal looks like a pure loss forever.
+CREATE TABLE IF NOT EXISTS external_redemptions (
+    redemption_id     TEXT PRIMARY KEY,
+    condition_id      TEXT NOT NULL,
+    token_id          TEXT,
+    outcome           TEXT,
+    size              REAL NOT NULL,
+    payout_usd        REAL NOT NULL,
+    matched_at        TEXT NOT NULL,
+    transaction_hash  TEXT,
+    raw_json          TEXT NOT NULL,
+    ingested_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_external_redemptions_matched_at ON external_redemptions(matched_at);
+CREATE INDEX IF NOT EXISTS idx_external_redemptions_condition  ON external_redemptions(condition_id);
+
+-- Cache of each market's real fee schedule (clob.polymarket.com/markets/{condition_id},
+-- public). The per-trade fee_rate_bps on /data/trades is frequently 0/absent even
+-- when a real fee applies -- the market's own published rate is the reliable source.
+CREATE TABLE IF NOT EXISTS external_market_fees (
+    condition_id    TEXT PRIMARY KEY,
+    taker_base_fee  REAL,
+    maker_base_fee  REAL,
+    fee_details     TEXT,
+    source          TEXT NOT NULL,
+    fetched_at      TEXT NOT NULL
+);
 """
 
 
@@ -80,7 +110,7 @@ def main() -> int:
         tables = [
             row["name"]
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'external_fills%' ORDER BY name"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'external_%' ORDER BY name"
             ).fetchall()
         ]
 

@@ -755,6 +755,11 @@ class DashboardReadModel:
                    FROM external_fills
                    WHERE matched_at>=?
                    GROUP BY condition_id
+               ),
+               redemptions AS (
+                   SELECT condition_id, SUM(payout_usd) AS redeemed_usd, COUNT(*) AS redemption_count
+                   FROM external_redemptions
+                   GROUP BY condition_id
                )
                SELECT ef.condition_id AS condition_id,
                       dr.seq AS seq,
@@ -768,12 +773,15 @@ class DashboardReadModel:
                       SUM(CASE WHEN ef.side='BUY'  THEN ef.notional_usd ELSE 0 END) AS buy_notional,
                       SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE 0 END) AS sell_notional,
                       SUM(COALESCE(ef.fee_usd,0)) AS fees_usd,
+                      COALESCE(MAX(red.redeemed_usd),0)     AS redeemed_usd,
+                      COALESCE(MAX(red.redemption_count),0) AS redemption_count,
                       SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE -ef.notional_usd END)
-                          - SUM(COALESCE(ef.fee_usd,0)) AS cash_flow_usd,
+                          - SUM(COALESCE(ef.fee_usd,0)) + COALESCE(MAX(red.redeemed_usd),0) AS cash_flow_usd,
                       GROUP_CONCAT(DISTINCT ef.outcome) AS outcomes,
                       SUM(CASE WHEN ef.fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
                FROM external_fills ef
                JOIN deal_rank dr ON dr.condition_id = ef.condition_id
+               LEFT JOIN redemptions red ON red.condition_id = ef.condition_id
                WHERE ef.matched_at>=? AND ef.matched_at<?
                GROUP BY ef.condition_id, dr.seq
                ORDER BY MAX(ef.matched_at) DESC
@@ -791,6 +799,8 @@ class DashboardReadModel:
             sell_size = float(row.get("sell_size") or 0.0)
             net_size = buy_size - sell_size
             fee_gaps = int(row.get("fee_gaps") or 0)
+            redemption_count = int(row.get("redemption_count") or 0)
+            state = "REDEEMED" if redemption_count > 0 else ("CLOSED" if abs(net_size) < 1e-6 else "OPEN")
             item = {
                 "seq": int(row.get("seq") or 0),
                 "deal_key": masked(row.get("condition_id")),
@@ -806,8 +816,9 @@ class DashboardReadModel:
                 "buy_notional_usd": number_value(row.get("buy_notional")),
                 "sell_notional_usd": number_value(row.get("sell_notional")),
                 "fees_usd": number_value(row.get("fees_usd")),
+                "redeemed_usd": number_value(row.get("redeemed_usd")),
                 "cash_flow_usd": number_value(row.get("cash_flow_usd")),
-                "state": "CLOSED" if abs(net_size) < 1e-6 else "OPEN",
+                "state": state,
                 "quality": "REAL" if fee_gaps == 0 else "PARTIAL",
                 "verified": True,
             }
@@ -828,15 +839,20 @@ class DashboardReadModel:
         if floor:
             start = max(start, floor)
         row = self._one(
-            """WITH deals AS (
-                   SELECT condition_id,
-                          SUM(CASE WHEN side='SELL' THEN notional_usd ELSE -notional_usd END)
-                              - SUM(COALESCE(fee_usd,0)) AS cash_flow_usd,
-                          SUM(COALESCE(fee_usd,0))       AS fees_usd,
-                          SUM(CASE WHEN fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
-                   FROM external_fills
-                   WHERE matched_at>=? AND matched_at<?
-                   GROUP BY condition_id)
+            """WITH redemptions AS (
+                   SELECT condition_id, SUM(payout_usd) AS redeemed_usd
+                   FROM external_redemptions GROUP BY condition_id
+               ),
+               deals AS (
+                   SELECT ef.condition_id,
+                          SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE -ef.notional_usd END)
+                              - SUM(COALESCE(ef.fee_usd,0)) + COALESCE(MAX(red.redeemed_usd),0) AS cash_flow_usd,
+                          SUM(COALESCE(ef.fee_usd,0))       AS fees_usd,
+                          SUM(CASE WHEN ef.fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
+                   FROM external_fills ef
+                   LEFT JOIN redemptions red ON red.condition_id = ef.condition_id
+                   WHERE ef.matched_at>=? AND ef.matched_at<?
+                   GROUP BY ef.condition_id)
                SELECT COUNT(*) AS deal_count,
                       SUM(CASE WHEN cash_flow_usd>0 THEN 1 ELSE 0 END) AS wins,
                       SUM(CASE WHEN cash_flow_usd<0 THEN 1 ELSE 0 END) AS losses,
