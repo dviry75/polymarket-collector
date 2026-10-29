@@ -74,6 +74,8 @@ def test_public_worker_fake_pipeline_and_recovery(repository,market,rule):
             await self.stop.wait()
         async def close(self):
             self.stop.set()
+        async def resync(self,reason):
+            self.latest.clear()
     discovery,data=Discovery(),Data()
     worker=runtime(repository,Providers(discovery=discovery,fees=Fees(),underlying=Underlying(),resolution=Resolution(),market_data=data))
     async def run():

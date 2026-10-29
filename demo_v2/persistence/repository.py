@@ -22,6 +22,9 @@ def identifier() -> str:
 
 
 def json_value(value):
+    from pydantic import BaseModel
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
     if isinstance(value, Decimal):
         return text(value)
     if isinstance(value, datetime):

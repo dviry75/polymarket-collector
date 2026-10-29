@@ -41,11 +41,12 @@ def test_app_starts_and_stops_with_only_temp_config_db(tmp_path):
             response = await client.get("/ready")
             assert response.status_code == 503
             assert response.json() == {"state": "NOT_READY", "entries_allowed": False}
-            assert (await client.get("/api/health")).status_code == 503
+            assert (await client.get("/demo/api/v1/health")).status_code == 503
             assert (await client.post("/api/rules", json={})).status_code == 404
             assert (await client.get("/live/health")).status_code == 404
             schema = (await client.get("/openapi.json")).json()
-            assert set(schema["paths"]) == {"/health", "/ready", "/api/health"}
+            assert {"/health","/ready","/demo/api/v1/rules","/demo/api/v1/health"} <= set(schema["paths"])
+            assert all(path in ("/health","/ready") or path.startswith("/demo/api/v1/") for path in schema["paths"])
     asyncio.run(run())
     assert next(c for c in app.state.health.snapshot().components if c.component == "database").reason == "STOPPED"
 
@@ -59,8 +60,8 @@ def test_live_cookie_and_injected_provider_do_not_grant_readiness_or_auth(tmp_pa
     async def run():
         async with running_client(app) as client:
             client.cookies.set("live_session", "fake-unused-live-cookie")
-            response = await client.get("/api/health")
-            assert response.json()["detail"]["code"] == "DEMO_AUTH_NOT_IMPLEMENTED"
+            response = await client.get("/demo/api/v1/health")
+            assert response.json()["detail"]["code"] == "DEMO_AUTH_NOT_CONFIGURED"
             assert (await client.get("/ready")).json()["entries_allowed"] is False
     asyncio.run(run())
 

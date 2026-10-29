@@ -32,6 +32,8 @@ class MarketData(Protocol):
 
     def token_ready(self, token_id: str) -> bool: ...
 
+    async def resync(self, reason: str) -> None: ...
+
 
 class MarketResolution(Protocol):
     async def resolve(self, instance: MarketInstance) -> OfficialResolution | None:

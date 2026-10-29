@@ -129,8 +129,9 @@ class GammaResolution:
     async def resolve(self, instance: MarketInstance) -> OfficialResolution | None:
         if not instance.verified or not instance.slug:
             return None
-        event = await self.http.get("/events/slug/"+quote(instance.slug, safe=""))
-        markets = [m for m in event.get("markets",[]) if str(m.get("id")) == instance.external_id
+        response = await self.http.get("/markets/"+quote(instance.external_id, safe=""))
+        # Read exact market ID; a market slug need not equal its parent event slug.
+        markets = [m for m in [response] if str(m.get("id")) == instance.external_id
                    and str(m.get("conditionId")) == instance.condition_id]
         if len(markets) != 1:
             raise ValueError("official resolution market identity mismatch")

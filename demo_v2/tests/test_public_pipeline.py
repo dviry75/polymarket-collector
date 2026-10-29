@@ -209,7 +209,9 @@ def test_official_resolution_requires_verified_status_and_matching_ids():
     definition=market_definitions()[0];event=event_for(definition)
     instance,_=parse_instance(event,definition,definition.key,NOW)
     class FakeHTTP:
-        async def get(self,path,params=None): return event
+        async def get(self,path,params=None):
+            assert path == "/markets/"+instance.external_id
+            return event["markets"][0]
     provider=GammaResolution(FakeHTTP(),clock=lambda:NOW)
     assert asyncio.run(provider.resolve(instance)) is None
     event["markets"][0].update(closed=True,umaResolutionStatus="resolved",outcomePrices='["0","1"]')

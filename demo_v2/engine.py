@@ -56,6 +56,12 @@ class DemoEngine:
         effects = []
         repo = self.repository
         with repo.database.transaction() as conn:
+            now=self.clock()
+            if any(not 0 <= (now-at).total_seconds() <= self.max_age for at in (obs.observed_at,obs.received_at)):
+                self.invalidate("OBSERVATION_AGED_WHILE_WAITING_FOR_DATABASE")
+                return []
+            applicable=applicable.current(now) if applicable else None
+            reference=reference if reference and reference.valid(instance,now,self.max_age) else None
             # Reject actions racing an explicit reset or newer transport generation.
             durable_generation = int(conn.execute("SELECT value FROM demo_v2_meta WHERE key='generation'").fetchone()[0])
             if durable_generation != obs.generation:
@@ -69,6 +75,8 @@ class DemoEngine:
             for row in conn.execute("SELECT * FROM demo_v2_positions WHERE status='OPEN' AND instance_id=? AND token_id=?",
                                     (instance.instance_id,obs.token_id)).fetchall():
                 bid = obs.best_bid
+                if obs.observed_at < datetime.fromisoformat(row["entry_at"]):
+                    continue
                 reason = None
                 if bid is not None and row["tp_text"] is not None and bid >= decimal(row["tp_text"]):
                     reason = ExitReason.TAKE_PROFIT

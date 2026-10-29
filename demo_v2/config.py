@@ -58,8 +58,8 @@ class DemoConfig:
         return cls(
             data_dir=root,
             db_path=Path(path) if path else None,
-            login_username=env.get("DEMO_LOGIN_USERNAME", ""),
-            login_password_hash=env.get("DEMO_LOGIN_PASSWORD_HASH", ""),
+            login_username=env.get("DEMO_AUTH_USERNAME", env.get("DEMO_LOGIN_USERNAME", "")),
+            login_password_hash=env.get("DEMO_AUTH_PASSWORD_HASH", env.get("DEMO_LOGIN_PASSWORD_HASH", "")),
             session_secret=env.get("DEMO_SESSION_SECRET", ""),
             session_ttl_seconds=int(env.get("DEMO_SESSION_TTL_SECONDS", "86400")),
             observation_max_age_seconds=float(env.get("DEMO_OBSERVATION_MAX_AGE_SECONDS", "5")),

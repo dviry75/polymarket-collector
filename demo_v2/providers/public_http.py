@@ -1,7 +1,7 @@
 """Unauthenticated public GET transport, with no trading/write API surface."""
 
 from decimal import Decimal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 
 import httpx
 
@@ -21,7 +21,9 @@ class PublicHTTP:
         self._owned = client is None
 
     async def get(self, path: str, *, params=None):
-        if not path.startswith("/") or path.startswith("//") or urlsplit(path).scheme:
+        parsed=urlsplit(path)
+        if (not path.startswith("/") or path.startswith("//") or parsed.scheme or parsed.path!=path
+                or any(part in (".","..") for part in unquote(path).split("/")) or "\\" in unquote(path)):
             raise ValueError("public path must be relative to the approved origin")
         allowed = {
             "https://gamma-api.polymarket.com": ("/series", "/events", "/markets"),

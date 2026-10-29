@@ -196,3 +196,9 @@ class PublicMarketWS:
         self.decisions.invalidate("MARKET_WS_STOPPED")
         if self._ws is not None:
             await self._ws.close()
+
+    async def resync(self,reason):
+        self.decisions.invalidate(reason)
+        self.latest.clear()
+        if self._ws is not None:
+            await self._ws.close()

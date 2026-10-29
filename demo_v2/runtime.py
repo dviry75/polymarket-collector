@@ -127,7 +127,8 @@ class DemoRuntime:
                     self.references.pop(instance_id,None)
             except Exception:
                 self.references.pop(instance_id,None)
-        self.record("underlying_provider",bool(wanted) and wanted <= self.references.keys(),"REFERENCE_PARTIAL_OR_UNAVAILABLE",critical=False)
+        ready=bool(wanted) and wanted <= self.references.keys()
+        self.record("underlying_provider",ready,"" if ready else "REFERENCE_PARTIAL_OR_UNAVAILABLE",critical=False)
 
     async def resolution_once(self):
         provider = self.providers.resolution
@@ -220,9 +221,9 @@ class DemoRuntime:
                 self.issue("engine_worker",type(exc).__name__)
                 # Require new snapshots; do not replay a failed decision.
                 data=self.providers.market_data
-                if data is not None and data._ws is not None:
+                if data is not None:
                     with suppress(Exception):
-                        await data._ws.close()
+                        await data.resync("ENGINE_FAILURE")
                 await asyncio.sleep(0.05)
 
     async def start(self):
@@ -265,7 +266,7 @@ class DemoRuntime:
         self.repository.reset(factory=factory)
         data=self.providers.market_data
         if data is not None:
-            data.latest.clear()
+            await data.resync("EXPLICIT_SIMULATION_RESET")
             await data.set_subscriptions(())
         self.references.clear()
         return {"reset":"FACTORY" if factory else "TRADING_DATA","rules_preserved":not factory}

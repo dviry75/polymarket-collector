@@ -81,3 +81,19 @@ Public provider availability/fee/reference contracts will be verified explicitly
   failure/retry, connected-without-books, stability, reset/generation and shutdown.
 - Public limitations unchanged. Next: wire independent auth and REST application.
 - Local commit: phase commit containing this entry (SHA recorded next phase).
+## Phase 8 — authenticated backend API complete
+
+- Phase 7 local commit: `150e4ba`.
+- Versioned `/demo/api/v1`: independent auth/current/logout; rule CRUD, CAS versions,
+  enable/disable/duplicate/archive; trades/detail/pagination; shared-filter KPI;
+  market/health views; confirmed trading and factory reset. No UI/streaming needed.
+- DEMO-only Argon2id or explicit legacy SHA256 validation; host-only HttpOnly/Secure
+  SameSite cookie and CSRF; durable global session revocation and credential
+  rotation; bounded rate limit. Missing config fails closed. No plaintext hash mode.
+- Tests: 124 passed, zero failed/skipped, including real ASGI requests with fake
+  credentials/temp DB, reset with open positions, schema and decimal-safe filters.
+- Public smoke: actual BTC current+next discovery, two native WS book snapshots,
+  Gamma fee schedule and fresh Binance BTC research reference succeeded. Fee
+  schedule intentionally remains UNSUPPORTED because debit/tie policy unverified.
+  Latest closed resolution was still pending; older final sample check in progress.
+- Local commit: phase commit containing this entry (SHA in final validation entry).
