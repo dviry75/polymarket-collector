@@ -6,7 +6,7 @@ from ..config import DemoConfig
 
 
 class DemoDatabase:
-    """Connection lifecycle only. Phase 1 creates no tables or migrations."""
+    """Dedicated DEMO connections; migrations and transactions are explicit."""
 
     def __init__(self, config: DemoConfig):
         self.config = config
@@ -32,3 +32,18 @@ class DemoDatabase:
     def probe(self) -> bool:
         with self.connect() as conn:
             return conn.execute("SELECT 1").fetchone()[0] == 1
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def migrate(self) -> None:
+        from .migrations import migrate
+        migrate(self)

@@ -33,6 +33,17 @@ def require_aware(value: datetime) -> None:
 class MarketDefinition:
     asset: Asset
     timeframe: Timeframe
+    family_id: str = ""
+    enabled: bool = True
+    provenance: str = "SOURCE_OF_TRUTH"
+
+    @property
+    def key(self) -> str:
+        return f"{self.asset.value}-{self.timeframe.value}"
+
+    @property
+    def expected_duration(self) -> int:
+        return self.timeframe.seconds
 
 
 def market_definitions() -> tuple[MarketDefinition, ...]:
@@ -49,6 +60,15 @@ class MarketInstance:
     down_token_id: str
     starts_at: datetime
     ends_at: datetime
+    external_id: str = ""
+    slug: str = ""
+    discovered_at: datetime | None = None
+    metadata_source: str = ""
+    verified: bool = False
+    status: str = "OPEN"
+    resolution_status: str = "PENDING"
+    winner_token_id: str | None = None
+    resolution_provenance: str = ""
 
     def __post_init__(self) -> None:
         require_aware(self.starts_at)
