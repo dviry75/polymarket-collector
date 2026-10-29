@@ -20,6 +20,9 @@ class DemoConfig:
     observation_max_age_seconds: float = 5.0
     decision_queue_capacity: int = 1024
     telemetry_capacity: int = 64
+    public_data_enabled: bool = False
+    recovery_stability_seconds: float = 2.0
+    session_cookie_secure: bool = True
 
     def __post_init__(self) -> None:
         root = Path(self.data_dir).expanduser().resolve()
@@ -41,6 +44,8 @@ class DemoConfig:
             raise ValueError("DEMO_OBSERVATION_MAX_AGE_SECONDS must be finite and positive")
         if self.decision_queue_capacity <= 0 or self.telemetry_capacity <= 0:
             raise ValueError("DEMO queue capacities must be positive")
+        if not math.isfinite(self.recovery_stability_seconds) or self.recovery_stability_seconds < 0:
+            raise ValueError("recovery stability must be finite and nonnegative")
         object.__setattr__(self, "data_dir", root)
         object.__setattr__(self, "db_path", target)
 
@@ -60,4 +65,7 @@ class DemoConfig:
             observation_max_age_seconds=float(env.get("DEMO_OBSERVATION_MAX_AGE_SECONDS", "5")),
             decision_queue_capacity=int(env.get("DEMO_DECISION_QUEUE_CAPACITY", "1024")),
             telemetry_capacity=int(env.get("DEMO_TELEMETRY_CAPACITY", "64")),
+            public_data_enabled=env.get("DEMO_PUBLIC_DATA_ENABLED", "false").lower() == "true",
+            recovery_stability_seconds=float(env.get("DEMO_RECOVERY_STABILITY_SECONDS", "2")),
+            session_cookie_secure=env.get("DEMO_COOKIE_SECURE", "true").lower() != "false",
         )

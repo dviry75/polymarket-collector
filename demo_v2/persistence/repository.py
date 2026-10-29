@@ -73,6 +73,8 @@ class DemoRepository:
                     "PENDING", None, "{}", dump(metadata or {}),
                 ))
             conn.execute("UPDATE demo_v2_instances SET metadata_json=? WHERE id=?", (dump(metadata or {}), instance.instance_id))
+            conn.execute("UPDATE demo_v2_instances SET status=?,discovered_at=? WHERE id=? AND resolution_status='PENDING'",
+                         (instance.status,utc(instance.discovered_at),instance.instance_id))
 
     def instances(self) -> list[dict]:
         with self.database.connect() as conn:
@@ -286,3 +288,13 @@ class DemoRepository:
     def incident(self, component: str, code: str, details: dict | None = None) -> None:
         with self.database.transaction() as conn:
             conn.execute("INSERT INTO demo_v2_incidents VALUES (?,?,?,?,?)", (identifier(), now_iso(), component, code, dump(details or {})))
+
+
+def instance_model(row):
+    from ..domain.models import Asset, Timeframe, MarketDefinition
+    asset, timeframe = row["definition_id"].split("-")
+    return MarketInstance(row["id"],MarketDefinition(Asset(asset),Timeframe(timeframe)),row["condition_id"],
+        row["up_token_id"],row["down_token_id"],datetime.fromisoformat(row["starts_at"]),datetime.fromisoformat(row["ends_at"]),
+        external_id=row["external_id"],slug=row["slug"],discovered_at=datetime.fromisoformat(row["discovered_at"]),
+        metadata_source=row["metadata_source"],verified=bool(row["verified"]),status=row["status"],
+        resolution_status=row["resolution_status"],winner_token_id=row["winner_token_id"],resolution_provenance=row["resolution_json"])

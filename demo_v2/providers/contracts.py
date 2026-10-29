@@ -5,6 +5,8 @@ from ..domain.models import (
     Asset, FeeParameters, MarketDefinition, MarketInstance, MarketObservation,
     OfficialResolution, Principal, ReferencePrice,
 )
+from .fees import FeeEvidence
+from .underlying import ReferenceContext
 
 
 class MarketDiscovery(Protocol):
@@ -26,6 +28,10 @@ class MarketData(Protocol):
 
     async def close(self) -> None: ...
 
+    async def run(self) -> None: ...
+
+    def token_ready(self, token_id: str) -> bool: ...
+
 
 class MarketResolution(Protocol):
     async def resolve(self, instance: MarketInstance) -> OfficialResolution | None:
@@ -34,15 +40,13 @@ class MarketResolution(Protocol):
 
 
 class FeeProvider(Protocol):
-    async def parameters(self, instance: MarketInstance) -> FeeParameters | None:
+    async def parameters(self, instance: MarketInstance) -> FeeEvidence | None:
         """None means unavailable/unreliable and must block affected entries."""
         ...
 
 
 class UnderlyingPriceProvider(Protocol):
-    async def market_open(self, instance: MarketInstance) -> ReferencePrice | None: ...
-
-    async def latest(self, asset: Asset) -> ReferencePrice | None: ...
+    async def context(self, instance: MarketInstance, metadata: dict) -> ReferenceContext | None: ...
 
 
 class CredentialValidator(Protocol):

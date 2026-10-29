@@ -67,3 +67,17 @@ Public provider availability/fee/reference contracts will be verified explicitly
   stale/mismatched reference, gap/no-backfill, rearm, schedules and all timeframes.
 - No new product blockers. Public fee policy restriction remains as Phase 4.
 - Local commit: phase commit containing this entry (SHA recorded next phase).
+## Phase 7 — health and recovery complete
+
+- Phases 5/6 local commit: `212cbbc`.
+- DEMO-owned discovery/fee/research/resolution retry workers, demand-driven public
+  WS, independent ordered decision consumer, graceful cancellation and persisted
+  incidents. Public transports disabled unless explicitly configured.
+- Per-rule dependencies gate entries, actual token freshness is distinct from
+  socket connection, and recovery requires two continuous healthy seconds.
+  Discovery expires after 30s; fees 300s; observations/reference 5s. Unaffected
+  families can work while other families are unavailable. Resolution is separate.
+- Tests: 116 passed, zero failed/skipped. Fake end-to-end provider/consumer path,
+  failure/retry, connected-without-books, stability, reset/generation and shutdown.
+- Public limitations unchanged. Next: wire independent auth and REST application.
+- Local commit: phase commit containing this entry (SHA recorded next phase).

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import StrEnum
+import time
 
 
 class HealthState(StrEnum):
@@ -42,3 +43,20 @@ class HealthRegistry:
         else:
             state = HealthState.READY
         return HealthSnapshot(state, components)
+
+
+class StabilityGate:
+    """A healthy interval must be continuous; every failed sample clears it."""
+
+    def __init__(self, seconds=2.0, *, clock=time.monotonic):
+        self.seconds, self.clock, self.since = seconds, clock, {}
+
+    def ready(self, key, healthy):
+        if not healthy:
+            self.since.pop(key,None)
+            return False
+        started = self.since.setdefault(key,self.clock())
+        return self.clock()-started >= self.seconds
+
+    def clear(self):
+        self.since.clear()
