@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 from ..domain.trading import EntryAmounts, FeeState, decimal
+from ..domain.models import require_aware
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,15 @@ class FeeEvidence:
     method: str = "UNVERIFIED"
     reason: str = ""
     max_age_seconds: int = 300
+
+    def __post_init__(self):
+        require_aware(self.observed_at)
+        if not self.instance_id or not self.source or self.max_age_seconds<=0:
+            raise ValueError("fee identity, source and freshness bound are required")
+        if self.rate is not None and (not isinstance(self.rate,Decimal) or not self.rate.is_finite() or not 0<=self.rate<=1):
+            raise ValueError("fee rate must be a finite Decimal fraction")
+        if not isinstance(self.quantum,Decimal) or not self.quantum.is_finite() or self.quantum<=0:
+            raise ValueError("fee quantum must be a positive Decimal")
 
     def current(self, now: datetime):
         age = (now-self.observed_at).total_seconds()

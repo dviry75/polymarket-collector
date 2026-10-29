@@ -1,74 +1,86 @@
 # Public integration contracts
 
-Verified read-only on 2026-10-29. No account/trading authentication was used.
+Checked 2026-10-29 using unauthenticated read-only requests. No account API or
+production state was accessed. Tests remain completely offline.
 
-## Discovery and resolution
+| Integration | Public verification | Limits |
+| --- | --- | --- |
+| Gamma discovery | PARTIAL: 20/21 candidate series; BTC current+next verified through implemented discovery | SOL hourly missing; not all 21 current instances verified |
+| Native Market WS | VERIFIED: subscribed to BTC UP/DOWN and received two book snapshots | Not a sustained-load/soak test |
+| Fee metadata | PARTIAL: current Gamma schedule and official formula/precision verified | Fee-enabled entries blocked: debit units and tie rounding unverified |
+| Binance research | PARTIAL: BTC symbol, exact open candle and fresh current trade verified | Other pairs verified only when fetched; availability not assumed |
+| Official resolution | VERIFIED: older BTC market closed, UMA resolved, exact labeled 1/0 winner | Recent closed market correctly remained pending; no inference |
 
-[Gamma discovery](https://docs.polymarket.com/market-data/discover-markets) is the
-authority for series membership, explicit outcome labels/token IDs and instance
-`eventStartTime`/`endDate`. Creation `startDate` is not the trading-window start.
-Candidate family names are accepted only when returned series metadata confirms
-the exact slug/recurrence, duration, unique condition/market ID and UP/DOWN labels.
-Threshold/hourly-above markets and ambiguous matches fail closed.
+## Discovery and official settlement
 
-A public `/series` lookup returned 20 of the 21 requested candidate families;
-`SOL-1h` was not returned and remains unavailable until verified, not fabricated.
-Search also returned historical events despite an active search filter, so local
-metadata/status/time validation is mandatory. Hourly event slugs differ from
-5m/15m slugs; no generic epoch-slug construction is used in discovery.
+[Gamma discovery](https://docs.polymarket.com/market-data/discover-markets) supplies
+verified recurring series, explicit labels/token IDs and `eventStartTime`/`endDate`.
+Creation `startDate` is not the trading start. Candidate family names require exact
+returned series slug/recurrence, duration and identity. Duplicate series/overlapping
+current instances fail closed; no last-row or first-token guessing. Verified series
+identity/provenance is stored with the definition/instance. Time buckets/slugs are
+not rollover authority. Discovery evidence expires after 30 seconds.
 
-Official settlement requires exact stored market/condition/token matching,
-`closed=true`, `umaResolutionStatus=resolved`, and one 1/0 winner. WS resolution
-messages are not turned into bids or simulated sells. Public CLOB `/markets/...`
-returned 403 in this environment; no bypass or authenticated fallback is attempted.
+Resolution reads the exact market ID via `/markets/{id}` (market/event slugs can
+differ), matches stored condition/token identities, and requires `closed=true`,
+`umaResolutionStatus=resolved`, and one exact 1/0 winner. The final sample ended
+2026-10-29 15:10 UTC. Pending/ambiguous evidence does nothing. Settlement is atomic,
+idempotent net-shares × 1/0; no fabricated bid, sell fee, redemption or account API.
+A public CLOB market GET returned HTTP 403; no bypass/authenticated fallback used.
 
-## Public Market WS
+## Ordered public market data
 
-[Native public protocol](https://docs.polymarket.com/market-data/realtime-data):
-market subscription, subscribe/unsubscribe updates and PING/PONG. DEMO uses only
-the public market endpoint. The connection has bounded buffering; decision
-overflow invalidates pending observations and reconnects. Demand changes issue
-dynamic updates followed by a conservative complete resync/new generation.
-Old held-instance tokens remain in the wanted set through rollover.
+[Public protocol](https://docs.polymarket.com/market-data/realtime-data): native
+`wss://ws-subscriptions-clob.polymarket.com/ws/market`, public token subscriptions,
+dynamic updates and PING/PONG. Demand updates conservatively request a complete
+resync/new generation, retaining old held tokens. Connection/backoff/heartbeat and
+bounded buffering are DEMO-owned; there is no User WS or authenticated PolyBolt.
 
-Exchange timestamps and local receipt times must both be fresh (default 5s).
-Initial stale snapshots may load structural books but never authorize actions.
-Ordered intermediate top transitions are sorted by raw wire change index and
-delivered before telemetry sampling. Missing/misaligned books fail closed.
+Both exchange timestamp and local receipt must be fresh (default 5s), checked again
+at decision delivery and after acquiring the DB write transaction. Structural stale
+snapshots cannot authorize actions. Intermediate top transitions are emitted in
+wire order before lossy telemetry, with local contiguous ordinals per generation.
+JSON numeric prices parse as Decimal. Duplicated wire messages are ignored; loss,
+reorder, overflow or stale delivery invalidates decisions and requires fresh data.
+Two continuous healthy seconds are required after recovery. No historical replay.
 
-## Fees and underlying — verification in progress
+## Applicable fees
 
-Current [fee documentation](https://docs.polymarket.com/trading/fees) specifies a
-price-dependent formula and five-decimal fee precision. Current Gamma BTC metadata
-exposes `feesEnabled`, `feeType=crypto_fees_v2`, and `feeSchedule` rate/exponent/
-takerOnly parameters. No historical constant is a fallback. Buy deduction units
-and exact rounding still require independent verification before fee-enabled
-entries can be marked VALID.
+Authority: [official fees](https://docs.polymarket.com/trading/fees) and Gamma's exact
+market `feesEnabled`/`feeSchedule`. Documented fee is shares × rate × p × (1-p),
+with five-decimal precision. The observed BTC rate is metadata, never a fallback.
+There is no runtime category/default rate. Evidence expires after 300 seconds.
 
-Current 5m/15m descriptions reference Chainlink **TWAP** streams; observed hourly
-BTC/ETH/XRP/BNB descriptions reference Binance USDT 1-hour candles. These are not
-interchangeable. The [current price stream](https://docs.polymarket.com/market-data/realtime-data)
-uses authenticated PolyBolt; it is outside the allowed public-only boundary.
-A research proxy must be labeled as a proxy, never an authoritative TWAP oracle.
-## Fee and reference contracts (Phase 4)
+Current public docs do not sufficiently establish debit units and tie rounding
+for this gross-to-net model. All fee-enabled public schedules, including numeric
+zero, remain UNSUPPORTED. Missing schedule is UNKNOWN. Only explicit
+`feesEnabled=false` supplies VALID zero. An evidence-backed code change is required
+before enabling fee-bearing public entries; no configuration bypass is provided.
 
-Official authority: https://docs.polymarket.com/trading/fees and Gamma per-market
-`feesEnabled` / `feeSchedule`. Formula: shares × applicable rate × p × (1-p),
-documented to five decimals. No category rate is a runtime fallback. Current
-documentation does not establish debit units and tie rounding sufficiently for
-this gross-to-net simulation. Fee-enabled public evidence is therefore
-UNSUPPORTED, including numeric zero schedules; explicit `feesEnabled=false` is
-VALID zero. Evidence expires after 300 seconds. Explicit fake contracts test share
-and cash debit units, sell net shares, HALF_UP/DOWN and exact Decimal arithmetic.
-Enabling fee-bearing public entries requires an evidence-backed code change.
+Explicit fake contracts verify share-deducted/cash buy fees, net-share sells,
+HALF_UP/DOWN rounding and ledger reconciliation. A share buy fee is recorded at
+its cash equivalent but is not charged to cash twice. Missing current exit fees
+also block a fabricated book exit; official fee-free settlement is independent.
 
-Market rules inspected on 2026-10-29 distinguish short Chainlink BTC/USD TWAP-60s
-families from hourly Binance ASSET/USDT one-hour candles. Source mapping verifies
-each instance description; unknown descriptions fail closed. Binance public
-exchangeInfo verifies base/quote/status, klines verifies exact market-open time,
-and recent trades provides exchange timestamps for entry/exit research context.
-https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints
-is the endpoint authority. The Binance source is always labelled SPOT_USDT_RESEARCH,
-not the Chainlink USD TWAP oracle, and current data must be <=5 seconds old.
-The migrated PolyBolt reference stream requires trading API credentials and is
-excluded. Missing pair, blocked HTTP or unmatched candle returns no usable context.
+## Reference sources and research proxy
+
+Inspected short descriptions reference Chainlink USD TWAP-60s; inspected hourly
+BTC/ETH/XRP/BNB rules reference Binance ASSET/USDT one-hour candles. Mapping is
+verified per instance description; unknown mapping fails closed. Exact Chainlink
+TWAP is not approximated as an authoritative oracle. The migrated PolyBolt stream
+requires trading API credentials and is outside this work package.
+
+[Binance public endpoints](https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints)
+verify base/quote/status using exchangeInfo, exact market-open klines, and fresh
+exchange-timestamped recent trades. Reference is explicitly `SPOT_USDT_RESEARCH`,
+including for hourly families, and always labelled a research proxy. It is not a
+Chainlink USD TWAP. Open/current source, pair and reference type must agree; the
+baseline timestamp must equal the verified market start. Current data expires at
+5s. Missing pair/candle, blocked HTTP or stale data cannot satisfy a movement rule.
+
+Per-instance research workers retry independently. Observations share a symbol
+lock and a two-second public trade-fetch cache across timeframes, preserving
+exchange timestamps without multiplying requests. Available open/entry/exit values,
+source IDs, timestamps and movement calculations are persisted with the
+position. Official resolution, not the proxy, determines the winner. No provider
+limitation is replaced by guessed identifiers, historical rates or fake prices.

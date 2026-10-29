@@ -81,6 +81,14 @@ def trade_view(row):
         else:
             result[key]=value
     result["total_fees"]=text(decimal(row["buy_fee_text"])+decimal(row["sell_fee_text"] or "0"))
+    entry=result["entry_provenance"].get("underlying")
+    exit=(result.get("exit_provenance") or {}).get("underlying")
+    during=None
+    if entry and exit and entry["current"]["reference_id"]==exit["current"]["reference_id"]:
+        first,last=decimal(entry["current"]["price"]),decimal(exit["current"]["price"])
+        during={"absolute":text(last-first),"percent":text((last-first)/first*100)}
+    result["underlying_movements"]={"open_to_entry":entry.get("movement") if entry else None,
+        "open_to_exit":exit.get("movement") if exit else None,"during_trade":during}
     return result
 
 

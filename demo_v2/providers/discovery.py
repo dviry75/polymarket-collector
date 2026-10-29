@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import re
+from dataclasses import replace
 from urllib.parse import quote
 
 from ..domain.models import MarketDefinition, MarketInstance, OfficialResolution
@@ -57,7 +58,8 @@ def parse_instance(event: dict, definition: MarketDefinition, series_id: str, no
                 continue
             status = "OPEN" if (market.get("active") is True and market.get("closed") is False
                 and market.get("acceptingOrders") is True and market.get("enableOrderBook") is True) else "UNAVAILABLE"
-            instance = MarketInstance(condition, definition, condition, up, down, start, end,
+            verified_definition=replace(definition,family_id=str(series_id),provenance="GAMMA_PUBLIC_SERIES")
+            instance = MarketInstance(condition, verified_definition, condition, up, down, start, end,
                 external_id=str(market["id"]), slug=str(market.get("slug") or event.get("slug") or ""),
                 discovered_at=now, metadata_source="GAMMA_PUBLIC", verified=True, status=status)
             candidates.append((instance, market))
@@ -82,7 +84,10 @@ class GammaDiscovery:
             response = await self.http.get("/series", params=[("slug",candidate_family(d)) for d in definitions]+[("limit","50")])
             if not isinstance(response, list):
                 raise ValueError("invalid series response")
-            self._series = {str(row.get("slug")):row for row in response}
+            grouped={}
+            for row in response:
+                grouped.setdefault(str(row.get("slug")),[]).append(row)
+            self._series = {slug:rows[0] for slug,rows in grouped.items() if len(rows)==1}
             self._series_at = now
         semaphore = asyncio.Semaphore(3)
         self.issues = {}

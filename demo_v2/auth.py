@@ -7,6 +7,7 @@ import hmac
 import json
 import secrets
 import time
+import re
 
 from .domain.models import Principal
 
@@ -19,7 +20,7 @@ class DemoAuth:
     def configured(self):
         return bool(self.config.login_username and len(self.config.session_secret)>=32 and
             (self.config.login_password_hash.startswith("$argon2id$") or
-             (self.config.login_password_hash.startswith("sha256:") and len(self.config.login_password_hash)==71)))
+             re.fullmatch(r"sha256:[0-9a-f]{64}",self.config.login_password_hash)))
 
     def _fingerprint(self):
         value=self.config.login_username+"\0"+self.config.login_password_hash
@@ -101,4 +102,4 @@ class DemoAuth:
         return hmac.new(self.config.session_secret.encode(),("demo-csrf:"+token).encode(),hashlib.sha256).hexdigest()
 
     def verify_csrf(self, token, supplied):
-        return bool(token and supplied and hmac.compare_digest(self.csrf(token),supplied))
+        return bool(token and supplied and hmac.compare_digest(self.csrf(token).encode(),supplied.encode()))

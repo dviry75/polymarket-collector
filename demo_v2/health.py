@@ -34,6 +34,9 @@ class HealthRegistry:
     def record(self, component: ComponentHealth) -> None:
         self._components[component.component] = component
 
+    def forget(self, component: str) -> None:
+        self._components.pop(component,None)
+
     def snapshot(self) -> HealthSnapshot:
         components = tuple(self._components.values())
         if not components or any(c.critical and c.state != HealthState.READY for c in components):

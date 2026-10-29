@@ -84,6 +84,7 @@ def test_public_worker_fake_pipeline_and_recovery(repository,market,rule):
             await worker.discover_once()
             await worker.fees_once()
             await worker.references_once()
+            await worker.reference_once(market.instance_id)
             await worker.demand_once()
             assert data.wanted==(market,)
             assert not worker.entry_gate(rule,market)  # Socket is not fresh books.

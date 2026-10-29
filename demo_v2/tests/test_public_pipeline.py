@@ -226,6 +226,21 @@ def test_public_transport_has_no_write_surface_and_rejects_account_endpoints():
             public=PublicHTTP("https://clob.polymarket.com",client=client)
             assert not hasattr(public,"post")
             assert await public.get("/book",params={"token_id":"123"}) == {"ok":True}
-            for path in ("//attacker/", "/auth/api-key", "/orders", "https://attacker/"):
+            for path in ("//attacker/", "/auth/api-key", "/orders", "https://attacker/",
+                         "/book/../orders","/book/%2e%2e/orders","/book?token_id=1","/book\\..\\orders"):
                 with pytest.raises(ValueError): await public.get(path)
     asyncio.run(run())
+
+
+def test_json_numeric_prices_keep_all_decimal_digits(market):
+    manager,stream=manager_for(market)
+    raw=json.dumps(snapshot(market,market.up_token_id,ask="NUMERIC"))
+    raw=raw.replace('"NUMERIC"','0.74000000000000001')
+    class WS:
+        async def recv(self):
+            manager._stop.set()
+            return raw
+    asyncio.run(manager._receive(WS()))
+    observed=asyncio.run(stream.next_observation())
+    assert observed.best_ask==Decimal("0.74000000000000001")
+    assert observed.best_ask!=Decimal("0.74")

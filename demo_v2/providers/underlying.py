@@ -3,8 +3,10 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+import asyncio
 
 from ..domain.trading import Comparison, Direction, Measurement, decimal
+from ..domain.models import require_aware
 
 
 @dataclass(frozen=True)
@@ -14,6 +16,13 @@ class ReferencePoint:
     source: str
     reference_id: str
     reference_type: str
+
+    def __post_init__(self):
+        require_aware(self.observed_at)
+        if not isinstance(self.price,Decimal) or not self.price.is_finite() or self.price<=0:
+            raise ValueError("reference price must be a positive finite Decimal")
+        if not all((self.source,self.reference_id,self.reference_type)):
+            raise ValueError("reference provenance is required")
 
 
 @dataclass(frozen=True)
@@ -70,11 +79,16 @@ class BinanceResearchProvider:
     def __init__(self, http, *, clock=lambda: datetime.now(timezone.utc)):
         self.http, self.clock = http, clock
         self.symbols, self.baselines, self.latest_points = {}, {}, {}
+        self._locks,self._latest_fetched={},{}
 
     async def context(self, instance, metadata):
         mapping = source_mapping(instance, metadata)
         if mapping is None:
             return None
+        async with self._locks.setdefault(mapping[0],asyncio.Lock()):
+            return await self._context(instance,mapping)
+
+    async def _context(self,instance,mapping):
         symbol, authority = mapping
         if symbol not in self.symbols:
             response = await self.http.get("/api/v3/exchangeInfo", params={"symbol":symbol})
@@ -94,12 +108,14 @@ class BinanceResearchProvider:
                 "BINANCE_PUBLIC", reference_id, "SPOT_USDT_RESEARCH")
         now = self.clock()
         point = self.latest_points.get(symbol)
-        if point is None or (now-point.observed_at).total_seconds() > 1:
+        fetched=self._latest_fetched.get(symbol)
+        if point is None or fetched is None or (now-fetched).total_seconds() >= 2:
             trades = await self.http.get("/api/v3/trades", params={"symbol":symbol,"limit":1})
             if len(trades) != 1:
                 return None
             point = ReferencePoint(decimal(trades[0]["price"]), datetime.fromtimestamp(int(trades[0]["time"])/1000, timezone.utc),
                 "BINANCE_PUBLIC", reference_id, "SPOT_USDT_RESEARCH")
             self.latest_points[symbol] = point
+            self._latest_fetched[symbol] = self.clock()
         return ReferenceContext(instance.instance_id, instance.definition.asset.value,
             self.baselines[instance.instance_id], point, authority)

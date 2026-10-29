@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import random
+from decimal import Decimal
 
 from ..domain.models import MarketObservation
 from ..streams import ObservationRejected
@@ -139,7 +140,7 @@ class PublicMarketWS:
                 if self._connected_at and (self.clock()-self._connected_at).total_seconds() >= self.stale_seconds and any(not self.token_ready(token) for token in self.token_map):
                     raise ObservationRejected("MARKET_DATA_STALE")
                 continue
-            messages = json.loads(raw)
+            messages = json.loads(raw,parse_float=Decimal)
             for message in messages if isinstance(messages,list) else [messages]:
                 if not isinstance(message,dict):
                     raise ValueError("invalid public WS frame")

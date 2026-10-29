@@ -57,7 +57,12 @@ class DemoRepository:
     def upsert_instance(self, instance: MarketInstance, metadata: dict | None = None) -> None:
         if not instance.verified or not instance.external_id or not instance.metadata_source or instance.discovered_at is None:
             raise ValueError("market instance requires verified identity and provenance")
+        metadata={**(metadata or {}),"_verified_definition":{"family_id":instance.definition.family_id,
+            "provenance":instance.definition.provenance}}
         with self.database.transaction() as conn:
+            if instance.definition.family_id:
+                conn.execute("UPDATE demo_v2_definitions SET family_id=?,provenance_json=? WHERE id=?",(
+                    instance.definition.family_id,dump({"source":instance.definition.provenance,"provider_verified":True}),instance.definition.key))
             existing = conn.execute("SELECT * FROM demo_v2_instances WHERE id=?", (instance.instance_id,)).fetchone()
             identities = (instance.definition.key, instance.external_id, instance.condition_id, instance.up_token_id,
                           instance.down_token_id, utc(instance.starts_at), utc(instance.ends_at))
@@ -240,7 +245,7 @@ class DemoRepository:
         self._ledger(conn, position_id, row["rule_id"], "SETTLEMENT" if reason == ExitReason.MARKET_RESOLUTION else "EXIT", net, timestamp, provenance)
         return dict(conn.execute("SELECT * FROM demo_v2_positions WHERE id=?", (position_id,)).fetchone())
 
-    def resolve(self, resolution: OfficialResolution) -> int:
+    def resolve(self, resolution: OfficialResolution, *, reference=None) -> int:
         with self.database.transaction() as conn:
             market = conn.execute("SELECT * FROM demo_v2_instances WHERE id=?", (resolution.instance_id,)).fetchone()
             if not market or resolution.winner_token_id not in (market["up_token_id"], market["down_token_id"]) or not resolution.source:
@@ -249,7 +254,8 @@ class DemoRepository:
                 if market["winner_token_id"] != resolution.winner_token_id:
                     raise ValueError("conflicting official resolution")
                 return 0
-            provenance = asdict(resolution)
+            reference=reference if reference and reference.valid(instance_model(dict(market)),datetime.now(timezone.utc)) else None
+            provenance = {**asdict(resolution),"underlying":reference.evidence() if reference else None}
             conn.execute("UPDATE demo_v2_instances SET status='CLOSED',resolution_status='RESOLVED',winner_token_id=?,resolution_json=? WHERE id=?", (
                 resolution.winner_token_id, dump(provenance), resolution.instance_id,
             ))
@@ -258,6 +264,11 @@ class DemoRepository:
                 self.close_position(row["id"], price=Decimal(int(row["token_id"] == resolution.winner_token_id)),
                     sell_fee=Decimal(0), reason=ExitReason.MARKET_RESOLUTION,
                     occurred_at=resolution.resolved_at, provenance=provenance, conn=conn)
+                if reference is not None:
+                    point=reference.current
+                    conn.execute("INSERT INTO demo_v2_underlying VALUES (?,?,?,?,?,?,?,?,?,?)",(
+                        identifier(),resolution.instance_id,row["id"],"EXIT",reference.asset,text(point.price),
+                        utc(point.observed_at),point.source,point.reference_id,dump(reference.evidence())))
             return len(positions)
 
     def positions(self, *, rule_id=None, instance_id=None, status=None) -> list[dict]:
@@ -296,7 +307,8 @@ class DemoRepository:
 def instance_model(row):
     from ..domain.models import Asset, Timeframe, MarketDefinition
     asset, timeframe = row["definition_id"].split("-")
-    return MarketInstance(row["id"],MarketDefinition(Asset(asset),Timeframe(timeframe)),row["condition_id"],
+    definition=json.loads(row["metadata_json"]).get("_verified_definition",{})
+    return MarketInstance(row["id"],MarketDefinition(Asset(asset),Timeframe(timeframe),**definition),row["condition_id"],
         row["up_token_id"],row["down_token_id"],datetime.fromisoformat(row["starts_at"]),datetime.fromisoformat(row["ends_at"]),
         external_id=row["external_id"],slug=row["slug"],discovered_at=datetime.fromisoformat(row["discovered_at"]),
         metadata_source=row["metadata_source"],verified=bool(row["verified"]),status=row["status"],

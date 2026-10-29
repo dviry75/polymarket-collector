@@ -1,99 +1,75 @@
-# DEMO V2 — Phase 1 Architecture
+# DEMO V2 architecture
 
-Option C + narrow Option A. All DEMO ownership stays in this subtree. No LIVE
-files, configuration, schema, services or extraction are changed. The latest
-user-approved authentication decision supersedes the audit's provisioning question.
-
-## Package and ownership
+Option C + narrow Option A: own configuration, DB, domain, providers, runtime,
+sessions and REST API. No LIVE files or runtime resources are changed.
 
 ```text
 demo_v2/
-  app.py                   independent FastAPI factory, no module-level app/startup
-  config.py                DEMO_* only; secret fields excluded from repr
-  domain/models.py         seven assets, three timeframes, identity/provenance DTOs
-  providers/contracts.py   discovery, observations, resolution, fees, underlying, credentials
-  providers/book_primitives.py  the complete approved direct LIVE import surface
-  persistence/             dedicated SQLite connection boundary + future repository/session ports
-  streams.py               ordered fresh decision ingress; separate lossy telemetry buffer
-  health.py                READY / DEGRADED / NOT_READY and typed component reasons
-  api/                     independent router and fail-closed session placeholder
-  tests/                   temporary databases, fake observations, import/I/O guards
-  deploy/                  inert env/resource examples; no installed units or proxy changes
+  app.py, config.py, auth.py     independent factory and DEMO-only settings/sessions
+  domain/                      catalog/identity, immutable rules, entry eligibility
+  persistence/                 dedicated SQLite, checksummed migrations, atomic repository
+  providers/                   public GET/discovery/WS/resolution/fee/research contracts
+  engine.py                    ordered exact entry, rearm/quota and purchased-token exits
+  streams.py                   decision FIFO and independent lossy telemetry buffer
+  runtime.py, health.py         public workers, demand, freshness, recovery and lifecycle
+  api/                         versioned auth/rules/trades/KPI/markets/health/reset
+  tests/                       temporary DB, fake providers, isolation and ASGI verification
+  deploy/                      inert examples only
 ```
 
-`DemoConfig.from_env()` reads only explicitly named `DEMO_*` keys, never a dotenv
-file or LIVE fallback. DB must resolve to `DEMO_DATA_DIR/demo_v2.sqlite3`; symlink
-escapes, hard-link aliases and foreign table namespaces are rejected. Configuration
-and app imports do not create files. Lifespan probes only this dedicated database;
-Phase 1 creates no business tables and executes no migrations. The connection
-skeleton is not yet a transactional domain repository.
-
-Credentials will be provisioned into DEMO configuration separately with the same
-username/password values as LIVE. No values are copied/read in development.
-The session signing secret, `demo_v2_session` cookie scoped to `/demo/`, and future
-`SessionStateStore` belong to DEMO. There is no LIVE DB/session lookup. Credential
-validation is a port only: login, session signing and revocation storage are not
-implemented yet, so `/api/*` denies access with `DEMO_AUTH_NOT_IMPLEMENTED`.
-
-## Imports and provider flow
-
-Only `providers/book_primitives.py` may directly import `live.order_book` helpers
-and `live.strategy.exact_trigger`. Their stdlib-only dependency closure is tested
-in a fresh process. The legacy source directory is added by the explicit launch
-environment, not by application code mutating `sys.path`. No LIVE config/repository,
-router, entrypoint, WebSocket manager, strategy runtime, adapter, account
-reconciliation or IPC command dependency is allowed. SDKs/private keys are absent.
+Only `providers/book_primitives.py` imports `live.order_book` and
+`live.strategy.exact_trigger`. The launch environment supplies their source path;
+application code never changes sys.path. LIVE configuration, repositories, router,
+entrypoints, adapter, account/User WS, reconciliation, order submission, keys and
+IPC are forbidden. PublicHTTP has only allowlisted unauthenticated GET endpoints;
+PublicMarketWS uses only the public market endpoint. No trading SDK is installed.
 
 ```text
-DEMO config -> factory -> DEMO database probe / health / API boundary
-future public providers -> verified instance/token metadata + ordered observations
-                        -> DecisionStream -> future rule engine
-                        -> optional TelemetryBuffer -> future telemetry writer
-future official resolution -> independent settlement path (not synthetic bid/sell)
-future credential validator -> DEMO session/revocation store -> DEMO API
+DEMO config -> app lifespan -> dedicated migrations/repository + independent auth
+public Gamma -> verified families/instances -> entry/held-position demand -> public WS
+WS snapshots + ordered delta transitions -> DecisionStream -> DemoEngine -> atomic DB
+                                       -> TelemetryBuffer -> optional diagnostics only
+public fee/research workers -> timestamped evidence cache -> entry/exit provenance
+public official resolution -> independent atomic 1/0 settlement + immutable cash ledger
+REST -> same repositories/read-model cohorts; reset -> invalidate generation + atomic delete
 ```
 
-Catalog definitions cover 7 x 3 families without network discovery. Instance start
-and end are explicit metadata; no BTC slug parsing or fixed five-minute rollover.
-Provider objects are injected and never started by the skeleton. Absent fee or
-reference evidence is represented by `None`, not a fabricated zero/default.
+The engine never awaits network I/O. Run one ASGI worker/decision owner per DEMO
+database; separate workers must not share this DB/runtime. A single event-loop
+consumer handles contiguous ordinals after expanding wire transitions. Connection generation,
+identity and exchange/receipt freshness are checked at ingress, delivery and
+transaction time (including time spent waiting for SQLite). Loss, stale/reordered
+observations or overflow invalidates queued actions and requires new snapshots.
+First fresh data in a new generation may act if dependencies are eligible/stable;
+there is no missed-event replay. Telemetry coalescing cannot select decision prices.
 
-## Decisions and telemetry
+Entry checks the current immutable rule version, schedule/window, fresh applicable
+fee/research evidence and per-family data health. Shared rule+instance counters,
+side rearm, independent position, snapshot/research and ledger commit together.
+Current-rule edits never change existing TP/SL. Disable/archive/schedules stop
+entries; purchased-token fresh bids still manage exits. Official settlement uses
+net shares at 1/0 and no invented sell fee/bid. Unavailable exit fee evidence blocks
+a simulated book sale; verified official resolution remains independent.
 
-One `DecisionStream` belongs to one ordered provider connection on one event loop.
-Providers assign local contiguous observation ordinals after expanding ordered
-frame transitions; these are not invented exchange sequence numbers. Every accepted
-observation reaches the FIFO independently of telemetry sampling/coalescing.
-Publish and delivery check readiness, generation, exchange-observation age and
-local receipt age. Bounds are DEMO settings, not inherited LIVE thresholds.
+SQLite ownership is enforced by exact path, namespace, alias checks, WAL/FK and
+checksummed schema. Money is Decimal TEXT; no SQL REAL sums. Global/per-rule/cohort
+wallets are signed immutable ledger sums without a balance floor. No automatic
+research/history pruning occurs. Explicit reset semantics are in README.
 
-Providers call `invalidate(reason)` immediately on disconnect or detected loss.
-Sequence loss/reorder, stale/future data or overflow rejects the observation,
-invalidates pending decisions and requires a strictly newer generation. Beginning
-a generation discards old queued observations. The first fresh ready observation
-can be delivered immediately. No historical entry/exit replay is provided.
-`TelemetryBuffer` may coalesce or evict values and has no reference back to the
-decision stream; persistence never authorizes or selects prices for decisions.
-No provider pump, rule evaluator, retry worker or trade engine is implemented.
+Runtime retries providers independently; per-instance research workers prevent a
+blocked asset from starving other fresh research. Demand retains old held tokens
+through rollover and can unsubscribe exhausted/ineligible rules without positions.
+Actual book freshness is separate from socket connectivity. Stability defaults to
+2 seconds; discovery expires at 30s, fee evidence at 300s, prices at 5s. Affected
+rules fail closed; other healthy families can continue. Global readiness is a
+conservative all-components summary: DEGRADED is not a promise that every rule is
+blocked; individual rule/market dependencies are authoritative. `/health` is shallow
+public liveness, `/ready` is the bounded global summary; authenticated health gives
+the component detail. Disabled/unverified public integrations remain explicit.
 
-`/health` is public process liveness only. `/ready` is a bounded public readiness
-summary and returns 503 while dependencies are unimplemented. The registry models
-all three states but does not yet poll providers or perform automatic recovery.
-The skeleton remains NOT_READY even after its DB probe succeeds. No trading is enabled.
-
-## Local validation and future launch
-
-Python 3.11+; dependencies are separate from the LIVE requirements. From repo root,
-using an isolated virtual environment:
-
-```bash
-python -m pip install -r demo_v2/requirements-test.txt
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -c demo_v2/pytest.ini demo_v2/tests -q
-# Optional local launch only; do not run this against production resources.
-PYTHONPATH="$PWD/polymarket-collector" python -m uvicorn demo_v2.app:create_app --factory --host 127.0.0.1 --port 8010
-```
-
-The launch example does not load an env file. A future operator provisions only
-DEMO settings. Resource examples are placeholders: ports/paths/route installation
-and secret provisioning are not deployed in this phase. Business schema, real
-providers, full health recovery/auth, rule engine/exits and accounting remain later work.
+Auth reads only DEMO credentials with an independent signing secret, host-only
+cookie and durable session version/fingerprint. Logout revokes all DEMO sessions.
+No LIVE credential lookup/copy occurs. All writes require CSRF after login.
+REST financial values are strings, polling is supported, and generated OpenAPI
+plus README define the frontend contract. Public fee-enabled entries remain
+UNSUPPORTED until the missing current fee-unit/rounding policy is verified.

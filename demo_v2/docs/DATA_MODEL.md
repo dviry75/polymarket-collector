@@ -8,6 +8,7 @@ busy timeout and lifecycle indexes. No migration touches a LIVE file.
   duration, provenance. A catalog definition does not assert provider availability.
 - Instances: immutable verified external/condition/token identities and metadata
   start/end; independent discovery and official-resolution provenance.
+  Verified provider family identity is retained on definitions and in instance metadata.
 - Rules: mutable lifecycle/current-version pointer; immutable version JSON holds
   Decimal prices/shares, selected markets, schedules/windows and movement filters.
   Versions cannot be updated or deleted except during an explicit factory reset.
@@ -22,6 +23,8 @@ busy timeout and lifecycle indexes. No migration touches a LIVE file.
   exact Decimal sum starting at zero without a balance floor.
 - Underlying/fee evidence/incidents: research observations, source IDs, timestamps,
   context, readiness and provenance. Raw telemetry is not decision input.
+  Available official-settlement research context commits with the settlement;
+  missing research never invents an underlying price or alters the official winner.
 
 All financial SQL columns use canonical decimal TEXT. No SQL SUM/REAL arithmetic
 is used for money. If a buy fee is deducted in shares, cash debit is gross notional;

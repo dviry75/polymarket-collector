@@ -106,3 +106,29 @@ def test_public_research_provider_validates_pair_candle_time_and_mapping(market)
         assert sample.valid(market,now)
         assert sample.is_research_proxy and sample.settlement_reference == "BINANCE_1H_CANDLE"
     asyncio.run(run())
+
+
+def test_three_timeframe_consumers_share_timestamped_symbol_fetch(market):
+    now=[datetime.now(timezone.utc)]
+    calls=[]
+    class HTTP:
+        async def get(self,path,params):
+            calls.append(path)
+            await asyncio.sleep(0)
+            if path.endswith("exchangeInfo"):
+                return {"symbols":[dict(symbol="ETHUSDT",baseAsset="ETH",quoteAsset="USDT",status="TRADING")]}
+            if path.endswith("klines"):
+                return [[int(market.starts_at.timestamp()*1000),"100"]]
+            return [{"price":"101","time":int(now[0].timestamp()*1000)}]
+    async def run():
+        provider=BinanceResearchProvider(HTTP(),clock=lambda:now[0])
+        instances=[replace(market,instance_id=str(index)) for index in range(3)]
+        metadata={"description":"Binance 1 hour candle"}
+        samples=await asyncio.gather(*(provider.context(instance,metadata) for instance in instances))
+        assert calls.count("/api/v3/trades")==1
+        assert calls.count("/api/v3/exchangeInfo")==1
+        assert all(sample.current.reference_id=="BINANCE_SPOT:ETHUSDT" for sample in samples)
+        now[0]+=timedelta(seconds=2)
+        await asyncio.gather(*(provider.context(instance,metadata) for instance in instances))
+        assert calls.count("/api/v3/trades")==2
+    asyncio.run(run())

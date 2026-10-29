@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Annotated
 
@@ -14,7 +14,10 @@ from .models import market_definitions
 def decimal(value) -> Decimal:
     if isinstance(value, (float, bool)):
         raise ValueError("financial values must be decimal strings or integers")
-    result = Decimal(str(value))
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation,TypeError) as exc:
+        raise ValueError("invalid decimal encoding") from exc
     if not result.is_finite():
         raise ValueError("financial values must be finite")
     return result

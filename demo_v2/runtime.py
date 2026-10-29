@@ -28,6 +28,7 @@ class DemoRuntime:
         self.clock, self.telemetry = clock, telemetry
         self.providers = providers or Providers()
         self.clients, self.tasks = [], []
+        self.reference_tasks={}
         self.instances, self.metadata, self.current, self.fees, self.references = {}, {}, {}, {}, {}
         self.discovery_at = None
         self.database_ok = self.engine_ok = False
@@ -112,23 +113,40 @@ class DemoRuntime:
         self.record("fee_provider",ready,"" if ready else "VALID_FEE_EVIDENCE_UNAVAILABLE",critical=False)
 
     async def references_once(self):
-        provider = self.providers.underlying
-        if provider is None:
+        if self.providers.underlying is None:
             raise RuntimeError("UNDERLYING_NOT_CONFIGURED")
         # Research snapshots are best effort for every active/held instance;
         # only a rule explicitly requiring them is gated by their availability.
         wanted = set(self.current.values()) | {p["instance_id"] for p in self.repository.positions(status="OPEN")}
-        for instance_id in wanted:
-            try:
-                sample = await provider.context(self.instances[instance_id],self.metadata.get(instance_id,{}))
-                if sample is not None and sample.valid(self.instances[instance_id],self.clock(),self.config.observation_max_age_seconds):
-                    self.references[instance_id] = sample
-                else:
-                    self.references.pop(instance_id,None)
-            except Exception:
+        for instance_id,task in tuple(self.reference_tasks.items()):
+            if instance_id not in wanted or task.done():
+                task.cancel()
+                await asyncio.gather(task,return_exceptions=True)
+                self.reference_tasks.pop(instance_id)
                 self.references.pop(instance_id,None)
-        ready=bool(wanted) and wanted <= self.references.keys()
+                self.health.forget("underlying:"+instance_id)
+        for instance_id in wanted-self.reference_tasks.keys():
+            self.reference_tasks[instance_id]=asyncio.create_task(self._worker("underlying:"+instance_id,
+                lambda key=instance_id:self.reference_once(key),1),name="demo-reference-"+instance_id)
+        ready=bool(wanted) and all(i in self.references and self.references[i].valid(
+            self.instances[i],self.clock(),self.config.observation_max_age_seconds) for i in wanted)
         self.record("underlying_provider",ready,"" if ready else "REFERENCE_PARTIAL_OR_UNAVAILABLE",critical=False)
+
+    async def reference_once(self, instance_id):
+        try:
+            sample=await self.providers.underlying.context(self.instances[instance_id],self.metadata.get(instance_id,{}))
+            valid=sample is not None and sample.valid(self.instances[instance_id],self.clock(),self.config.observation_max_age_seconds)
+            if valid:
+                self.references[instance_id]=sample
+            else:
+                self.references.pop(instance_id,None)
+            self.record("underlying:"+instance_id,valid,"" if valid else "REFERENCE_UNAVAILABLE",critical=False)
+        except Exception:
+            self.references.pop(instance_id,None)
+            self.record("underlying:"+instance_id,False,"REFERENCE_UNAVAILABLE",critical=False)
+
+    def all_tasks(self):
+        return (*self.tasks,*self.reference_tasks.values())
 
     async def resolution_once(self):
         provider = self.providers.resolution
@@ -142,7 +160,7 @@ class DemoRuntime:
             try:
                 evidence = await provider.resolve(instance)
                 if evidence is not None:
-                    self.repository.resolve(evidence)
+                    self.repository.resolve(evidence,reference=self.references.get(instance_id))
                     self.instances[instance_id] = instance_model(self.repository.instance(instance_id))
             except Exception:
                 failed = True
@@ -157,7 +175,8 @@ class DemoRuntime:
         instances = [self.instances[i] for i in set(self.current.values()) | {
             p["instance_id"] for p in self.repository.positions(status="OPEN")} if i in self.instances]
         demand = subscription_demand(instances,rules,self.repository.positions(status="OPEN"),now,
-            lambda rule,instance,at:entry_eligible(rule["spec"],instance,at) and self.dependencies(rule,instance))
+            lambda rule,instance,at:entry_eligible(rule["spec"],instance,at) and self.dependencies(rule,instance)
+                and self.repository.entry_count(rule["id"],instance.instance_id)<rule["spec"].entry_frequency)
         await data.set_subscriptions(demand)
         # Sample unhealthy states continuously even when no actionable tick arrives.
         for rule in rules:
@@ -206,6 +225,11 @@ class DemoRuntime:
                 if instance is None:
                     raise ValueError("UNKNOWN_INSTANCE")
                 self.engine.process(observation,instance,self.fees.get(instance.instance_id),self.references.get(instance.instance_id))
+                if self.engine.reason:
+                    self.decisions.invalidate(self.engine.reason)
+                    if self.providers.market_data is not None:
+                        await self.providers.market_data.resync(self.engine.reason)
+                    raise ObservationRejected(self.engine.reason)
                 self.engine_ok=True
                 self.record("engine_worker",True)
             except asyncio.CancelledError:
@@ -275,9 +299,9 @@ class DemoRuntime:
         self._stop.set()
         if self.providers.market_data is not None:
             await self.providers.market_data.close()
-        for task in self.tasks:
+        for task in self.all_tasks():
             task.cancel()
-        await asyncio.gather(*self.tasks,return_exceptions=True)
+        await asyncio.gather(*self.all_tasks(),return_exceptions=True)
         for client in self.clients:
             await client.close()
         self.record("engine_worker",False,"STOPPED")

@@ -210,7 +210,7 @@ async def health(request: Request):
         "market_data":data.health() if data and hasattr(data,"health") else None,
         "discovery_at":runtime.discovery_at,"recovery_stability_seconds":str(runtime.config.recovery_stability_seconds),
         "engine_generation":runtime.engine.generation,"engine_reason":runtime.engine.reason,
-        "workers":{task.get_name():"STOPPED" if task.done() else "RUNNING" for task in runtime.tasks}})
+        "workers":{task.get_name():"STOPPED" if task.done() else "RUNNING" for task in runtime.all_tasks()}})
 
 
 @router.post("/maintenance/reset-trading-data",tags=["Maintenance"])
