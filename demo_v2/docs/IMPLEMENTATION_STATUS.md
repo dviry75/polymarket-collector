@@ -40,3 +40,16 @@ Local commit: phase commit containing this entry; next update records its SHA.
 4: verified fees and reference prices;
 5/6: rule/position engine; 7: health/recovery; 8: authenticated REST API.
 Public provider availability/fee/reference contracts will be verified explicitly.
+## Phase 4 — complete offline, external fee policy fail-closed
+
+- Phase 3 local commit: `f843715`.
+- Completed: typed fee evidence/freshness, exact gross/net share and cash arithmetic;
+  explicit Binance research mapping, verified symbol/open candle and timestamped
+  current reference; movement percent/absolute/sign/between predicates.
+- Tests: 88 passed, zero failed/skipped (all offline temporary/fake dependencies).
+- Important decision: current fee-enabled public markets remain UNSUPPORTED until
+  debit units and tie rounding are verified. No remembered/default rate. Research
+  proxy is explicitly distinct from settlement authority.
+- Remaining external limitations: SOL hourly family unverified, CLOB HTTP 403;
+  public fee debit/rounding contract incomplete. Independent work continues.
+- Local commit: `feat: add DEMO V2 fee and underlying providers` (SHA in next phase).

@@ -50,3 +50,25 @@ BTC/ETH/XRP/BNB descriptions reference Binance USDT 1-hour candles. These are no
 interchangeable. The [current price stream](https://docs.polymarket.com/market-data/realtime-data)
 uses authenticated PolyBolt; it is outside the allowed public-only boundary.
 A research proxy must be labeled as a proxy, never an authoritative TWAP oracle.
+## Fee and reference contracts (Phase 4)
+
+Official authority: https://docs.polymarket.com/trading/fees and Gamma per-market
+`feesEnabled` / `feeSchedule`. Formula: shares × applicable rate × p × (1-p),
+documented to five decimals. No category rate is a runtime fallback. Current
+documentation does not establish debit units and tie rounding sufficiently for
+this gross-to-net simulation. Fee-enabled public evidence is therefore
+UNSUPPORTED, including numeric zero schedules; explicit `feesEnabled=false` is
+VALID zero. Evidence expires after 300 seconds. Explicit fake contracts test share
+and cash debit units, sell net shares, HALF_UP/DOWN and exact Decimal arithmetic.
+Enabling fee-bearing public entries requires an evidence-backed code change.
+
+Market rules inspected on 2026-10-29 distinguish short Chainlink BTC/USD TWAP-60s
+families from hourly Binance ASSET/USDT one-hour candles. Source mapping verifies
+each instance description; unknown descriptions fail closed. Binance public
+exchangeInfo verifies base/quote/status, klines verifies exact market-open time,
+and recent trades provides exchange timestamps for entry/exit research context.
+https://developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints
+is the endpoint authority. The Binance source is always labelled SPOT_USDT_RESEARCH,
+not the Chainlink USD TWAP oracle, and current data must be <=5 seconds old.
+The migrated PolyBolt reference stream requires trading API credentials and is
+excluded. Missing pair, blocked HTTP or unmatched candle returns no usable context.

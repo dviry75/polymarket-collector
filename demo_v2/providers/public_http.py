@@ -26,8 +26,8 @@ class PublicHTTP:
         allowed = {
             "https://gamma-api.polymarket.com": ("/series", "/events", "/markets"),
             "https://clob.polymarket.com": ("/book", "/markets/", "/fee-rate", "/tick-size"),
-            "https://api.binance.com": ("/api/v3/klines", "/api/v3/ticker/price"),
-            "https://data-api.binance.vision": ("/api/v3/klines", "/api/v3/ticker/price"),
+            "https://api.binance.com": ("/api/v3/klines", "/api/v3/ticker/price", "/api/v3/trades", "/api/v3/exchangeInfo"),
+            "https://data-api.binance.vision": ("/api/v3/klines", "/api/v3/ticker/price", "/api/v3/trades", "/api/v3/exchangeInfo"),
         }[self.origin]
         if not any(path == prefix or path.startswith(prefix.rstrip("/")+"/") for prefix in allowed):
             raise ValueError("endpoint is outside the public data allowlist")
