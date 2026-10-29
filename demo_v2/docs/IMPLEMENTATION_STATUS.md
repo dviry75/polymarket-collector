@@ -17,8 +17,26 @@ book/trigger helper surface; no production resources accessed.
 Local commit: the phase commit containing this entry (`git log`, recorded by SHA
 in the next phase update to avoid a self-referential commit hash).
 
+Phase 2 commit: `7b5405e`.
+
+## Phase 3 — public market pipeline (completed offline; public verification partial)
+
+Implemented read-only GET allowlist; series-verified 21-family discovery with
+strict explicit labels, time/condition matching and ambiguous/unavailable status;
+metadata-driven rollover/demand including held older tokens; DEMO public WS with
+bounded ingress, reconnect/backoff, heartbeat, dynamic subscriptions, fresh
+generations and ordered intermediate book transitions independent of telemetry.
+Official Gamma resolution verifies exact identities and finalized 1/0 outcomes.
+**73 tests passed**, including fake socket lifecycle, all 21 fake families,
+ambiguous/missing family fail-closed and exact-edge preservation.
+
+Public checks: Gamma series/market metadata succeeded; only 20 candidate series
+were returned (`SOL-1h` unavailable). CLOB market GET returned 403; no bypass.
+Public WS smoke remains pending. See INTEGRATION_CONTRACTS.md for source evidence.
+Local commit: phase commit containing this entry; next update records its SHA.
+
 ## Remaining phases
 
-3: public discovery/rollover/WS; 4: verified fees and reference prices;
+4: verified fees and reference prices;
 5/6: rule/position engine; 7: health/recovery; 8: authenticated REST API.
 Public provider availability/fee/reference contracts will be verified explicitly.
