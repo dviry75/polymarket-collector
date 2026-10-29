@@ -53,3 +53,17 @@ Public provider availability/fee/reference contracts will be verified explicitly
 - Remaining external limitations: SOL hourly family unverified, CLOB HTTP 403;
   public fee debit/rounding contract incomplete. Independent work continues.
 - Local commit: `feat: add DEMO V2 fee and underlying providers` (SHA in next phase).
+## Phases 5/6 — rule and position engine complete
+
+- Phase 4 commit: `6d7dcad`.
+- Ordered exact ask equality, side rearm/shared quota, independent concurrent
+  rules/positions; Jerusalem schedules/DST and start-relative windows; fresh
+  movement filtering and persisted research evidence; immutable entry snapshots.
+- Purchased-token observed bid TP/SL, current valid fee evidence, atomic cash
+  accounting; official 1/0 idempotent settlement remains an independent path.
+- Fresh-generation checks include durable generation, so reset/restart cannot
+  replay queued decisions. Entry gates do not stop reliable exits.
+- Tests: 111 passed, zero failed/skipped; jump prices, archive/edit preservation,
+  stale/mismatched reference, gap/no-backfill, rearm, schedules and all timeframes.
+- No new product blockers. Public fee policy restriction remains as Phase 4.
+- Local commit: phase commit containing this entry (SHA recorded next phase).
