@@ -1,0 +1,13 @@
+# Planning placeholders only: nothing is installed, deployed or started.
+[demo]
+asgi_factory = "demo_v2.app:create_app"
+host = "127.0.0.1"
+port = 8010
+service_name = "polymarket-demo-v2"
+environment_namespace = "DEMO_"
+data_directory = "/var/lib/polymarket-demo-v2"
+log_directory = "/var/log/polymarket-demo-v2"
+runtime_directory = "/run/polymarket-demo-v2"
+route = "/demo/"
+session_cookie_name = "demo_v2_session"
+session_cookie_path = "/demo/"
