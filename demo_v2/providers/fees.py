@@ -67,8 +67,8 @@ class FeeEvidence:
 class GammaFeeProvider:
     """Gamma parameters are authoritative; incomplete current unit policy blocks entries.
 
-    Current public docs establish formula and five decimals, but not debit units
-    and tie rounding. Historical LIVE assumptions are deliberately not promoted.
+    CTF Exchange V2 source establishes cash debit units. Current public docs
+    establish formula and five decimals, but not tie/per-fill rounding policy.
     """
 
     def __init__(self, http, *, clock=lambda: datetime.now(timezone.utc)):
@@ -95,5 +95,9 @@ class GammaFeeProvider:
                 raise ValueError("bad schedule")
         except (ValueError, KeyError, TypeError):
             return FeeEvidence(**common, state=FeeState.UNKNOWN, reason="INVALID_FEE_SCHEDULE")
-        return FeeEvidence(**common, state=FeeState.UNSUPPORTED, rate=rate, exponent=exponent,
-            method="GAMMA_SCHEDULE_DOCUMENTED_CURVE", reason="CURRENT_DEBIT_UNITS_AND_TIE_ROUNDING_UNVERIFIED")
+        ctf=market.get("version")=="v1"
+        reason=("UNSUPPORTED_FEE_EXPONENT" if exponent!=1 else "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED"
+                if ctf else "MARKET_PROTOCOL_FEE_UNITS_UNVERIFIED")
+        return FeeEvidence(**common,state=FeeState.UNSUPPORTED,rate=rate,exponent=exponent,
+            buy_units="CASH" if ctf else "UNKNOWN",sell_units="CASH" if ctf else "UNKNOWN",
+            method="GAMMA_CTF_V2_CASH_UNITS_CCC0596" if ctf else "GAMMA_SCHEDULE_DOCUMENTED_CURVE",reason=reason)

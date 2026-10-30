@@ -1,0 +1,4020 @@
+{
+  "api": {
+    "checks": {
+      "DELETE /rules/4ad330c4a27b44f084086275a7ea72d1": 200,
+      "GET /auth/current": 401,
+      "GET /health": 200,
+      "GET /kpi": 200,
+      "GET /markets": 200,
+      "GET /rules": 200,
+      "GET /rules/4ad330c4a27b44f084086275a7ea72d1": 200,
+      "GET /rules/4ad330c4a27b44f084086275a7ea72d1/versions": 200,
+      "GET /trades": 200,
+      "GET /trades/8602bc8190ee4c9c809dd0690140f2c1": 200,
+      "GET /trades?limit=1&offset=0": 200,
+      "POST /auth/login": 200,
+      "POST /auth/logout": 200,
+      "POST /maintenance/factory-reset": 200,
+      "POST /maintenance/reset-trading-data": 200,
+      "POST /rules": 201,
+      "POST /rules/4ad330c4a27b44f084086275a7ea72d1/disable": 200,
+      "POST /rules/4ad330c4a27b44f084086275a7ea72d1/duplicate": 201,
+      "POST /rules/4ad330c4a27b44f084086275a7ea72d1/enable": 200,
+      "PUT /rules/4ad330c4a27b44f084086275a7ea72d1": 200
+    },
+    "decimal_strings": true,
+    "fake_position_only": true,
+    "mode": "LOOPBACK_TEMP_DB_FAKE_CREDENTIALS",
+    "openapi_routes": [
+      "/demo/api/v1/auth/login",
+      "/demo/api/v1/auth/current",
+      "/demo/api/v1/auth/logout",
+      "/demo/api/v1/rules",
+      "/demo/api/v1/rules/{rule_id}",
+      "/demo/api/v1/rules/{rule_id}/versions",
+      "/demo/api/v1/rules/{rule_id}/{action}",
+      "/demo/api/v1/trades",
+      "/demo/api/v1/trades/{position_id}",
+      "/demo/api/v1/kpi",
+      "/demo/api/v1/markets",
+      "/demo/api/v1/health",
+      "/demo/api/v1/maintenance/reset-trading-data",
+      "/demo/api/v1/maintenance/factory-reset",
+      "/health",
+      "/ready"
+    ],
+    "public_provider_calls": 0,
+    "real_trading_routes": false,
+    "result": "PASS",
+    "server_stopped": true
+  },
+  "fee_contract": {
+    "buy_shares_deducted": false,
+    "buy_units": "CASH",
+    "cash_example": {
+      "buy_cash_debit": "51.75",
+      "buy_net_shares": "100",
+      "fee": "1.75",
+      "price": "0.5",
+      "sell_net_cash": "48.25",
+      "shares": "100"
+    },
+    "contract_sections": [
+      "_settleComplementaryTaker",
+      "_matchBuyOrders",
+      "_settleTakerOrder",
+      "_performOrderChecks"
+    ],
+    "contract_source": "https://github.com/Polymarket/ctf-exchange-v2/blob/ccc0596074f4dfd62c944fbca4de252893b82b4b/src/exchange/mixins/Trading.sol",
+    "current_fee_endpoint": "/clob-markets/{condition_id}: fd.r / fd.e / fd.to; /fee-rate base_fee is not the curve rate",
+    "docs": "https://docs.polymarket.com/trading/fees",
+    "enabled_entry_state": "UNSUPPORTED",
+    "formula": "C * rate * (p * (1-p)) ** exponent",
+    "metadata_docs": "https://docs.polymarket.com/market-data/market-details",
+    "no_fallback_rate": true,
+    "non_boundary_examples": [
+      {
+        "fee": "0.63000",
+        "price": "0.10",
+        "rate": "0.07",
+        "shares": "100"
+      },
+      {
+        "fee": "1.12000",
+        "price": "0.20",
+        "rate": "0.07",
+        "shares": "100"
+      },
+      {
+        "fee": "1.47000",
+        "price": "0.30",
+        "rate": "0.07",
+        "shares": "100"
+      },
+      {
+        "fee": "1.75000",
+        "price": "0.50",
+        "rate": "0.07",
+        "shares": "100"
+      },
+      {
+        "fee": "0.63000",
+        "price": "0.90",
+        "rate": "0.07",
+        "shares": "100"
+      }
+    ],
+    "observed_exponent": 1,
+    "per_match_vs_aggregate_rounding": "UNVERIFIED",
+    "precision_decimal_places": 5,
+    "rounding_blocker": "Operator supplies per-fill fee amounts; contract validates bounds rather than the off-chain curve/tie policy. SDK computes unrounded budget estimates, not authoritative charged-fee rounding.",
+    "rounding_counterexample": {
+      "down_5dp": "0.00346",
+      "half_up_5dp": "0.00347",
+      "price": "0.01",
+      "rate": "0.07",
+      "raw_fee": "0.003465",
+      "shares": "5",
+      "two_2.5_share_matches_half_up_total": "0.00346",
+      "verdict": "UNSUPPORTED until authoritative tie and per-match aggregation policy is established"
+    },
+    "sdk_source": "https://github.com/Polymarket/py-sdk/blob/d26958d68a054edb01787825ff63c8c0d175d127/src/polymarket/_internal/actions/orders/market.py#L409",
+    "sell_units": "CASH",
+    "settlement": "Official winner=1, loser=0; no exchange SELL, no artificial exchange taker fee.",
+    "status": "PARTIAL",
+    "tie_rounding": "UNVERIFIED"
+  },
+  "matrix": {
+    "clob": [
+      {
+        "body_excerpt": "{\"enable_order_book\":true,\"active\":true,\"closed\":false,\"archived\":false,\"accepting_orders\":true,\"accepting_order_timestamp\":\"2026-10-29T09:12:38Z\",\"minimum_order_size\":5,\"minimum_tick_size\":0.001,\"condition_id\":\"0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d\",\"question_id\":\"0x2608c7a52c65db2f534c58ec1d73922279a00a7ae476b542b698def815f393e7\",\"question\":\"Bitcoin Up or Down - October 30, 5:05AM-5:10AM ET\",\"description\":\"This market will resolve to \\\"Up\\\" if the time-weighted ave",
+        "cf_ray": "a52947fd7c7158a1-TLV",
+        "content_type": "application/json",
+        "params": null,
+        "path": "/markets/0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+        "server": "cloudflare",
+        "status": 200
+      },
+      {
+        "body_excerpt": "{\"market\":\"0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d\",\"asset_id\":\"70434976029388517764119536033940355724188322125272212103719029462599134625605\",\"timestamp\":\"1793351367360\",\"hash\":\"dfeeace59c650b7b5bd8fd16a2e64b9a683a8584\",\"bids\":[],\"asks\":[{\"price\":\"0.999\",\"size\":\"1130\"},{\"price\":\"0.99\",\"size\":\"2220.12\"},{\"price\":\"0.98\",\"size\":\"660.52\"},{\"price\":\"0.97\",\"size\":\"726.29\"},{\"price\":\"0.96\",\"size\":\"1148\"},{\"price\":\"0.95\",\"size\":\"1026\"},{\"price\":\"0.94\",\"size\":\"558.7\"},{\"price\"",
+        "cf_ray": "a52947fe0d2b58a1-TLV",
+        "content_type": "application/json",
+        "params": {
+          "token_id": "70434976029388517764119536033940355724188322125272212103719029462599134625605"
+        },
+        "path": "/book",
+        "server": "cloudflare",
+        "status": 200
+      },
+      {
+        "body_excerpt": "{\"base_fee\":1000}\n",
+        "cf_ray": "a52947fe8dd958a1-TLV",
+        "content_type": "application/json",
+        "params": {
+          "token_id": "70434976029388517764119536033940355724188322125272212103719029462599134625605"
+        },
+        "path": "/fee-rate",
+        "server": "cloudflare",
+        "status": 200
+      },
+      {
+        "body_excerpt": "{\"r\":{\"mi\":50,\"ma\":4.5,\"moas\":30},\"t\":[{\"t\":\"70434976029388517764119536033940355724188322125272212103719029462599134625605\",\"o\":\"Up\"},{\"t\":\"42369824501083052164789997953437548993159383596511021587836365659815549676210\",\"o\":\"Down\"}],\"c\":\"0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d\",\"mos\":5,\"mts\":0.001,\"mbf\":1000,\"tbf\":1000,\"aot\":\"2026-10-29T09:12:38Z\",\"itode\":true,\"fd\":{\"r\":0.07,\"e\":1,\"to\":true},\"v\":\"v1\"}\n",
+        "checked_at": "2026-10-30T09:13:55.750518+00:00",
+        "condition_id": "0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+        "content_type": "application/json",
+        "fee_parameters": {
+          "e": 1,
+          "r": 0.07,
+          "to": true
+        },
+        "path": "/clob-markets/0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+        "server": "cloudflare",
+        "status": 200
+      }
+    ],
+    "markets": [
+      {
+        "candidate_series": "btc-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+            "definition": {
+              "asset": "BTC",
+              "enabled": true,
+              "family_id": "10684",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "42369824501083052164789997953437548993159383596511021587836365659815549676210",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382438",
+            "instance_id": "0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "btc-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "70434976029388517764119536033940355724188322125272212103719029462599134625605",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "BTC-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.453807+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x0f5372d37f60e1aa85271eee2a4c37c8ca1c4d95ec073553d464c3ccfe389436",
+              "definition": {
+                "asset": "BTC",
+                "enabled": true,
+                "family_id": "10684",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "14110353635923459603808964826167812807653744680361061233947281521026558318029",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380484",
+              "instance_id": "0x0f5372d37f60e1aa85271eee2a4c37c8ca1c4d95ec073553d464c3ccfe389436",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "btc-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "26584869748238657047633054445788325668889067228715610107185107754014880772817",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0x0f5372d37f60e1aa85271eee2a4c37c8ca1c4d95ec073553d464c3ccfe389436",
+              "resolved_at": "2026-10-30T09:09:16.944808+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "26584869748238657047633054445788325668889067228715610107185107754014880772817"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"70434976029388517764119536033940355724188322125272212103719029462599134625605\", \"42369824501083052164789997953437548993159383596511021587836365659815549676210\"]",
+          "closed": false,
+          "conditionId": "0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Bitcoin, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the BTC/USD TWAP data stream available at https://data.chain.link/streams/btc-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair BTC/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382438",
+          "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xff39c170340122a99afb83e3bb1426538e0e1ab6656e8ecec55704e819400339",
+            "definition": {
+              "asset": "BTC",
+              "enabled": true,
+              "family_id": "10684",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "1046105103544525012689240572098524422369612298982214079268517719802492980926",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382465",
+            "instance_id": "0xff39c170340122a99afb83e3bb1426538e0e1ab6656e8ecec55704e819400339",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "btc-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "86536631812986952337041755227957329493632629091697391511892282774135405612763",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "BTCUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "btc-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+            "definition": {
+              "asset": "BTC",
+              "enabled": true,
+              "family_id": "10192",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "5455036208480405539215005745754792943218931474336688441952384888402567183092",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382435",
+            "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "btc-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "46245614482306753023334524930090183680027350335446347916532371721630954483758",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "BTC-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.455595+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x346a97a208a090bf82069982dd8b8e88b99448bb0c7f7b20d88a186c7e6328f2",
+              "definition": {
+                "asset": "BTC",
+                "enabled": true,
+                "family_id": "10192",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "29302794855710454460111747561639947065569363203060251789523723328199323177569",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379957",
+              "instance_id": "0x346a97a208a090bf82069982dd8b8e88b99448bb0c7f7b20d88a186c7e6328f2",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "btc-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "536784069885657677409666189548583346373959743792199190035709706491078809786",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x346a97a208a090bf82069982dd8b8e88b99448bb0c7f7b20d88a186c7e6328f2",
+              "resolved_at": "2026-10-30T09:09:16.950771+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "29302794855710454460111747561639947065569363203060251789523723328199323177569"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"46245614482306753023334524930090183680027350335446347916532371721630954483758\", \"5455036208480405539215005745754792943218931474336688441952384888402567183092\"]",
+          "closed": false,
+          "conditionId": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Bitcoin, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the BTC/USD TWAP data stream available at https://data.chain.link/streams/btc-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair BTC/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382435",
+          "outcomePrices": "[\"0.035\", \"0.965\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xeb399765a15ee88f1018bb976faae2b7a05074b689486871f5ccfcf71075e7d7",
+            "definition": {
+              "asset": "BTC",
+              "enabled": true,
+              "family_id": "10192",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "59397124986791493646687660240184537947365087905539826051677704685785062576360",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382477",
+            "instance_id": "0xeb399765a15ee88f1018bb976faae2b7a05074b689486871f5ccfcf71075e7d7",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "btc-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "50185674121025347762234203505849333031839041181525036215870078424634918684651",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "BTCUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "btc-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0x472c3ea50ff85da18aa979af791f934754052b8d4dbfb8bf291a21bf42fb5655",
+            "definition": {
+              "asset": "BTC",
+              "enabled": true,
+              "family_id": "10114",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "9489441696452033537445715974877235147729571379607005249645769341486570280326",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337334",
+            "instance_id": "0x472c3ea50ff85da18aa979af791f934754052b8d4dbfb8bf291a21bf42fb5655",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bitcoin-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "55061003711790336737817170463611241659276839192976662873695153737594349024518",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "BTC-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x472c3ea50ff85da18aa979af791f934754052b8d4dbfb8bf291a21bf42fb5655",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.457243+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x475770790bed8900ff94760a3e0f19ac212f21be3d1c5dc88427a39f9fce9ecb",
+              "definition": {
+                "asset": "BTC",
+                "enabled": true,
+                "family_id": "10114",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "5892990313644640243779123982670595595591154565331745626676969729771579055866",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332767",
+              "instance_id": "0x475770790bed8900ff94760a3e0f19ac212f21be3d1c5dc88427a39f9fce9ecb",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "bitcoin-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "31467063756945018024337130835165846019882717402529404828265404723030921632407",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0x475770790bed8900ff94760a3e0f19ac212f21be3d1c5dc88427a39f9fce9ecb",
+              "resolved_at": "2026-10-30T09:09:16.984674+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "31467063756945018024337130835165846019882717402529404828265404723030921632407"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"55061003711790336737817170463611241659276839192976662873695153737594349024518\", \"9489441696452033537445715974877235147729571379607005249645769341486570280326\"]",
+          "closed": false,
+          "conditionId": "0x472c3ea50ff85da18aa979af791f934754052b8d4dbfb8bf291a21bf42fb5655",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the BTC/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the BTC/USDT pair (https://www.binance.com/en/trade/BTC_USDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance BTC/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337334",
+          "outcomePrices": "[\"0.205\", \"0.795\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/trade/BTC_USDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xd91c4d466081c9131fd69b569dc362feb6314fcc5945d69f30cef2e286613ce9",
+            "definition": {
+              "asset": "BTC",
+              "enabled": true,
+              "family_id": "10114",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "16906795029290392181827004977144444476521830120804300525468514232254980945706",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337936",
+            "instance_id": "0xd91c4d466081c9131fd69b569dc362feb6314fcc5945d69f30cef2e286613ce9",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bitcoin-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "38533520922953734701147776578381665542123294218977549133366167952647499577774",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "BTCUSDT",
+          "BINANCE_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "eth-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0x024bcaf9d978174415eb50267a890795849c716b1f01a2eb96b7b65c104ac7d3",
+            "definition": {
+              "asset": "ETH",
+              "enabled": true,
+              "family_id": "10683",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "106340933647580362331760122097689983450489434547760114195019226467479168823884",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382445",
+            "instance_id": "0x024bcaf9d978174415eb50267a890795849c716b1f01a2eb96b7b65c104ac7d3",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "eth-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "74729508717847091860219598440942954894658231349916847663676238952366950940274",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "ETH-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x024bcaf9d978174415eb50267a890795849c716b1f01a2eb96b7b65c104ac7d3",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.475811+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xd0fa27a5b464c32e7a6b30a1a729f0ce5c700f8459efcb24e4a8e42fc352090e",
+              "definition": {
+                "asset": "ETH",
+                "enabled": true,
+                "family_id": "10683",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "62721934102786707893743656270976030863314616881647362452931758950601768359281",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380480",
+              "instance_id": "0xd0fa27a5b464c32e7a6b30a1a729f0ce5c700f8459efcb24e4a8e42fc352090e",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "eth-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "18986433955887504281843233771401841582960289461481272267544017089445176600409",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0xd0fa27a5b464c32e7a6b30a1a729f0ce5c700f8459efcb24e4a8e42fc352090e",
+              "resolved_at": "2026-10-30T09:09:16.961485+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "18986433955887504281843233771401841582960289461481272267544017089445176600409"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"74729508717847091860219598440942954894658231349916847663676238952366950940274\", \"106340933647580362331760122097689983450489434547760114195019226467479168823884\"]",
+          "closed": false,
+          "conditionId": "0x024bcaf9d978174415eb50267a890795849c716b1f01a2eb96b7b65c104ac7d3",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Ethereum, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the ETH/USD TWAP data stream available at https://data.chain.link/streams/eth-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair ETH/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382445",
+          "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/eth-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x17518a7e8fb1110c60e932413cc6613cbe887644bef191e1ba3f92295832a1d7",
+            "definition": {
+              "asset": "ETH",
+              "enabled": true,
+              "family_id": "10683",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "25164876304495214428855098519909475699250330751638791783336278096854219406941",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382461",
+            "instance_id": "0x17518a7e8fb1110c60e932413cc6613cbe887644bef191e1ba3f92295832a1d7",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "eth-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "32486041093886896186943947978465749343249276798800641636397759304820337756004",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "ETHUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "eth-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0x64dd59a6cd17c76a1f1601a0a3944742878ad87e4ac0054e065f44fd544c1b3f",
+            "definition": {
+              "asset": "ETH",
+              "enabled": true,
+              "family_id": "10191",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "88842284375261138009692922523204376535882832809829924903055024582449013061258",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382423",
+            "instance_id": "0x64dd59a6cd17c76a1f1601a0a3944742878ad87e4ac0054e065f44fd544c1b3f",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "eth-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "18513156156133973539023846858762532887449965878820835531998421150822912564148",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "ETH-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x64dd59a6cd17c76a1f1601a0a3944742878ad87e4ac0054e065f44fd544c1b3f",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.480834+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x2b94025c0b3b06a58ae0d957be81a07f3a386c9dade5e154b0566726116c0e62",
+              "definition": {
+                "asset": "ETH",
+                "enabled": true,
+                "family_id": "10191",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "46039271411358471881428198491766334190324918442019244846627758982770239753543",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379964",
+              "instance_id": "0x2b94025c0b3b06a58ae0d957be81a07f3a386c9dade5e154b0566726116c0e62",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "eth-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "6772693208781377162037730586777468959680073004214907299285799211660596150709",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x2b94025c0b3b06a58ae0d957be81a07f3a386c9dade5e154b0566726116c0e62",
+              "resolved_at": "2026-10-30T09:09:16.967436+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "46039271411358471881428198491766334190324918442019244846627758982770239753543"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"18513156156133973539023846858762532887449965878820835531998421150822912564148\", \"88842284375261138009692922523204376535882832809829924903055024582449013061258\"]",
+          "closed": false,
+          "conditionId": "0x64dd59a6cd17c76a1f1601a0a3944742878ad87e4ac0054e065f44fd544c1b3f",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Ethereum, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the ETH/USD TWAP data stream available at https://data.chain.link/streams/eth-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair ETH/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382423",
+          "outcomePrices": "[\"0.055\", \"0.945\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/eth-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x01856e35a27c243fdd08ea1b50040076a1d0310549cce81c50d21c39c3bbb4d6",
+            "definition": {
+              "asset": "ETH",
+              "enabled": true,
+              "family_id": "10191",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "95727999367156317203890096391064927659412507717497409429493573463588464440948",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382478",
+            "instance_id": "0x01856e35a27c243fdd08ea1b50040076a1d0310549cce81c50d21c39c3bbb4d6",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "eth-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "20536567403430805689065496663769350710862637137886246727680779126450790279573",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "ETHUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "eth-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0x6a7bc0dfe157d6698ce45fda2ccb3e335609d97bf5e4a479ea07baa7f48c1da7",
+            "definition": {
+              "asset": "ETH",
+              "enabled": true,
+              "family_id": "10117",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "100543593983632345186100136559098450856044100542306524770333565722303095864966",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337335",
+            "instance_id": "0x6a7bc0dfe157d6698ce45fda2ccb3e335609d97bf5e4a479ea07baa7f48c1da7",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "ethereum-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "43868479775566582519551498709996452955668832464177005555846173797742322862804",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "ETH-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x6a7bc0dfe157d6698ce45fda2ccb3e335609d97bf5e4a479ea07baa7f48c1da7",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.503495+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x4b28e5c17a9e2da11e0e473d07041dcb0dd1b41c0e3366414d8765f8e1aaac85",
+              "definition": {
+                "asset": "ETH",
+                "enabled": true,
+                "family_id": "10117",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "17664546139091101583971719323371179175717251695708758407405252167594630351589",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332768",
+              "instance_id": "0x4b28e5c17a9e2da11e0e473d07041dcb0dd1b41c0e3366414d8765f8e1aaac85",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "ethereum-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "96188094987937756984409370554193127454965828933970791217781302393723184122556",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x4b28e5c17a9e2da11e0e473d07041dcb0dd1b41c0e3366414d8765f8e1aaac85",
+              "resolved_at": "2026-10-30T09:09:16.988720+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "17664546139091101583971719323371179175717251695708758407405252167594630351589"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"43868479775566582519551498709996452955668832464177005555846173797742322862804\", \"100543593983632345186100136559098450856044100542306524770333565722303095864966\"]",
+          "closed": false,
+          "conditionId": "0x6a7bc0dfe157d6698ce45fda2ccb3e335609d97bf5e4a479ea07baa7f48c1da7",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the ETH/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the ETH/USDT pair (https://www.binance.com/en/trade/ETH_USDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance ETH/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337335",
+          "outcomePrices": "[\"0.315\", \"0.685\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/trade/ETH_USDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x461d7168292c909fc3c76382c2e1396dba8bfd8bd16dadd1d74bbb2cbcbcbe53",
+            "definition": {
+              "asset": "ETH",
+              "enabled": true,
+              "family_id": "10117",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "57181955098446746935323493815505309603495898336069098108094312988007049651800",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337937",
+            "instance_id": "0x461d7168292c909fc3c76382c2e1396dba8bfd8bd16dadd1d74bbb2cbcbcbe53",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "ethereum-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "8603987155886207118333455923821286487405937900693145886502518905694277840192",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "ETHUSDT",
+          "BINANCE_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "sol-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0xd5160cfdb8a1befd3f817b468779a53242160ccf5e5a24d8e3ec378196a994a9",
+            "definition": {
+              "asset": "SOL",
+              "enabled": true,
+              "family_id": "10686",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "4482392506851587843302169800570748026798584679250426624269694752293877995049",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382443",
+            "instance_id": "0xd5160cfdb8a1befd3f817b468779a53242160ccf5e5a24d8e3ec378196a994a9",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "sol-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "51604214709523052100828639511983740342408245461882185227619407236652813415658",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "SOL-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xd5160cfdb8a1befd3f817b468779a53242160ccf5e5a24d8e3ec378196a994a9",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.506343+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x44bf4f099a7835feb7e0fb3946146df9bb49700e377b30a05faf18b909064f93",
+              "definition": {
+                "asset": "SOL",
+                "enabled": true,
+                "family_id": "10686",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "106710416544956465229301274434859501519930524470961513301135557935893045021934",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380483",
+              "instance_id": "0x44bf4f099a7835feb7e0fb3946146df9bb49700e377b30a05faf18b909064f93",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "sol-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "98267391216940485034775755077405679123883094452028419971058328618307678151674",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x44bf4f099a7835feb7e0fb3946146df9bb49700e377b30a05faf18b909064f93",
+              "resolved_at": "2026-10-30T09:09:16.999356+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "106710416544956465229301274434859501519930524470961513301135557935893045021934"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"51604214709523052100828639511983740342408245461882185227619407236652813415658\", \"4482392506851587843302169800570748026798584679250426624269694752293877995049\"]",
+          "closed": false,
+          "conditionId": "0xd5160cfdb8a1befd3f817b468779a53242160ccf5e5a24d8e3ec378196a994a9",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Solana, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the SOL/USD TWAP data stream available at https://data.chain.link/streams/sol-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair SOL/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382443",
+          "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/sol-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xce4f8a9b63c6e9fdbbb24cbcbea8b7602de40d7e30046670cd8159d8531deec7",
+            "definition": {
+              "asset": "SOL",
+              "enabled": true,
+              "family_id": "10686",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "29648331413034042980541182275304400348042667881874415249192052750683223194345",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382462",
+            "instance_id": "0xce4f8a9b63c6e9fdbbb24cbcbea8b7602de40d7e30046670cd8159d8531deec7",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "sol-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "75869275808718479741792320214858244150832290177102387221251613391973371226498",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "SOLUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "sol-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0xf3e23cfeef08cb5c6cabafe6aae93832667bb99b610d3699ef2f507640e2c65f",
+            "definition": {
+              "asset": "SOL",
+              "enabled": true,
+              "family_id": "10423",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "17964633202103498983933643064394311233336600117878893998804533641849556709944",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382431",
+            "instance_id": "0xf3e23cfeef08cb5c6cabafe6aae93832667bb99b610d3699ef2f507640e2c65f",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "sol-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "28331713212815071034912464876122427929391370358391048478212597706187162474680",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "SOL-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xf3e23cfeef08cb5c6cabafe6aae93832667bb99b610d3699ef2f507640e2c65f",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.507388+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x0c678466e5745377986eb6d8049f0702d583557c2bb7df8ddc8ef6f8a4f88aa5",
+              "definition": {
+                "asset": "SOL",
+                "enabled": true,
+                "family_id": "10423",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "93249163585305450694048182042916004660520563263650638309377945784744404141463",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379960",
+              "instance_id": "0x0c678466e5745377986eb6d8049f0702d583557c2bb7df8ddc8ef6f8a4f88aa5",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "sol-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "4983657548752562221434078882925787462162759849610085316590896780500859852390",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x0c678466e5745377986eb6d8049f0702d583557c2bb7df8ddc8ef6f8a4f88aa5",
+              "resolved_at": "2026-10-30T09:09:17.001867+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "93249163585305450694048182042916004660520563263650638309377945784744404141463"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"28331713212815071034912464876122427929391370358391048478212597706187162474680\", \"17964633202103498983933643064394311233336600117878893998804533641849556709944\"]",
+          "closed": false,
+          "conditionId": "0xf3e23cfeef08cb5c6cabafe6aae93832667bb99b610d3699ef2f507640e2c65f",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Solana, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the SOL/USD TWAP data stream available at https://data.chain.link/streams/sol-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair SOL/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382431",
+          "outcomePrices": "[\"0.13\", \"0.87\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/sol-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x3e39ef6b1626f43e6c7a9e186ae6008ff2421aa906c2956277c339084d3c9a10",
+            "definition": {
+              "asset": "SOL",
+              "enabled": true,
+              "family_id": "10423",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "3135379944234018839622525765089971031512289199195787221585934463553333017841",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382481",
+            "instance_id": "0x3e39ef6b1626f43e6c7a9e186ae6008ff2421aa906c2956277c339084d3c9a10",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "sol-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "53120716617483213139384909244236885702879282242849827102499240035941751814670",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "SOLUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "solana-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0x01542cf657dad8322f25ee9677628b363364777d27c8a43d115fc09111ac20a1",
+            "definition": {
+              "asset": "SOL",
+              "enabled": true,
+              "family_id": "10122",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "46850666514009230329517392628575270079850850647117118689549592045788501763027",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337336",
+            "instance_id": "0x01542cf657dad8322f25ee9677628b363364777d27c8a43d115fc09111ac20a1",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "solana-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "95521595524104803844151477578154257928673448255441658974741346991738268072698",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "SOL-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x01542cf657dad8322f25ee9677628b363364777d27c8a43d115fc09111ac20a1",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.529782+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x8c7031ab93d387a3ecd03756f51f4abd1f2346dae91d8f004b531594fedaa778",
+              "definition": {
+                "asset": "SOL",
+                "enabled": true,
+                "family_id": "10122",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "88981321560013771884678598975817090106310624114567085512375722063272171166292",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332769",
+              "instance_id": "0x8c7031ab93d387a3ecd03756f51f4abd1f2346dae91d8f004b531594fedaa778",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "solana-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "61654474766448880497926492811477753933535515487180409119882811818730856920743",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0x8c7031ab93d387a3ecd03756f51f4abd1f2346dae91d8f004b531594fedaa778",
+              "resolved_at": "2026-10-30T09:09:17.100793+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "61654474766448880497926492811477753933535515487180409119882811818730856920743"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"95521595524104803844151477578154257928673448255441658974741346991738268072698\", \"46850666514009230329517392628575270079850850647117118689549592045788501763027\"]",
+          "closed": false,
+          "conditionId": "0x01542cf657dad8322f25ee9677628b363364777d27c8a43d115fc09111ac20a1",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the SOL/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the SOL/USDT pair (https://www.binance.com/en/trade/SOL_USDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance SOL/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337336",
+          "outcomePrices": "[\"0.295\", \"0.705\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/trade/SOL_USDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x146516115f74033e40e2bbeffac05e8a4c31f34ba1f4a33c595db2993486f790",
+            "definition": {
+              "asset": "SOL",
+              "enabled": true,
+              "family_id": "10122",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "78382073296640520980451502965340953012753347207767001797758731057964516021753",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337938",
+            "instance_id": "0x146516115f74033e40e2bbeffac05e8a4c31f34ba1f4a33c595db2993486f790",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "solana-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "53532530584419807319202724238161338458685293821405205201143330430270434677320",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "SOLUSDT",
+          "BINANCE_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "xrp-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0xedeffe168911fd57c55f575b799cfb6d9c0ff1be7392c00ff1f0d40bdeebc5c3",
+            "definition": {
+              "asset": "XRP",
+              "enabled": true,
+              "family_id": "10685",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "86736423710032385772186930583578936030852512075707422409226416552353997377312",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382444",
+            "instance_id": "0xedeffe168911fd57c55f575b799cfb6d9c0ff1be7392c00ff1f0d40bdeebc5c3",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "xrp-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "49461051999060647867931742907224362553507484508160394291818059925131690658760",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "XRP-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xedeffe168911fd57c55f575b799cfb6d9c0ff1be7392c00ff1f0d40bdeebc5c3",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.532566+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xdd8925f3f87d7601fd2ff31ef6e81b01014a9fde31a905ab9648412d276de725",
+              "definition": {
+                "asset": "XRP",
+                "enabled": true,
+                "family_id": "10685",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "56733146941013951223365734140377213781956775283998841366014786260935746045536",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380492",
+              "instance_id": "0xdd8925f3f87d7601fd2ff31ef6e81b01014a9fde31a905ab9648412d276de725",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "xrp-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "84498226628773300237559187024116941759208629558869267520270339058947885971929",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0xdd8925f3f87d7601fd2ff31ef6e81b01014a9fde31a905ab9648412d276de725",
+              "resolved_at": "2026-10-30T09:09:17.009880+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "56733146941013951223365734140377213781956775283998841366014786260935746045536"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"49461051999060647867931742907224362553507484508160394291818059925131690658760\", \"86736423710032385772186930583578936030852512075707422409226416552353997377312\"]",
+          "closed": false,
+          "conditionId": "0xedeffe168911fd57c55f575b799cfb6d9c0ff1be7392c00ff1f0d40bdeebc5c3",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of XRP, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the XRP/USD TWAP data stream available at https://data.chain.link/streams/xrp-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair XRP/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382444",
+          "outcomePrices": "[\"0.009\", \"0.991\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/xrp-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xe2bc319bb0e6c6183bfcd58a3a9490bd516f371dbf20a6157f74f7ad3a75c1bd",
+            "definition": {
+              "asset": "XRP",
+              "enabled": true,
+              "family_id": "10685",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "55613072924315290909524678529840365909380364768104527102672759063060747077561",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382466",
+            "instance_id": "0xe2bc319bb0e6c6183bfcd58a3a9490bd516f371dbf20a6157f74f7ad3a75c1bd",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "xrp-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "111607409334270702067314336874291672698867707525935840766128082935427502602257",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "XRPUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "xrp-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0xbcdbddeec0e1be38f00e878428b695516022c63c156e518eb4590968b05319ce",
+            "definition": {
+              "asset": "XRP",
+              "enabled": true,
+              "family_id": "10422",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "106253957743989374032025755719716077116175175316597197111246650593237064793541",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382427",
+            "instance_id": "0xbcdbddeec0e1be38f00e878428b695516022c63c156e518eb4590968b05319ce",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "xrp-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "65534204686977029793958416797557310745456478007236477978962742610931845047348",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "XRP-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xbcdbddeec0e1be38f00e878428b695516022c63c156e518eb4590968b05319ce",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.533596+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xc526a002e1d3804722193563b0c8a5aaa331d950dcb20928845a428784bc82a5",
+              "definition": {
+                "asset": "XRP",
+                "enabled": true,
+                "family_id": "10422",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "103890705634758675878682054741542973267711860686535688632182060867372451528273",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379965",
+              "instance_id": "0xc526a002e1d3804722193563b0c8a5aaa331d950dcb20928845a428784bc82a5",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "xrp-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "1241964879311993711990075456672964576290591820342225069322142136353317876548",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0xc526a002e1d3804722193563b0c8a5aaa331d950dcb20928845a428784bc82a5",
+              "resolved_at": "2026-10-30T09:09:17.012449+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "103890705634758675878682054741542973267711860686535688632182060867372451528273"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"65534204686977029793958416797557310745456478007236477978962742610931845047348\", \"106253957743989374032025755719716077116175175316597197111246650593237064793541\"]",
+          "closed": false,
+          "conditionId": "0xbcdbddeec0e1be38f00e878428b695516022c63c156e518eb4590968b05319ce",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of XRP, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the XRP/USD TWAP data stream available at https://data.chain.link/streams/xrp-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair XRP/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382427",
+          "outcomePrices": "[\"0.935\", \"0.065\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/xrp-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x0dc8674d4fd0cc5ea3aba787aa103d19124845462a71b55832a86ee17eca4a10",
+            "definition": {
+              "asset": "XRP",
+              "enabled": true,
+              "family_id": "10422",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "105259910266776609821418120619951088986579123886112451044159010580765426565116",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382475",
+            "instance_id": "0x0dc8674d4fd0cc5ea3aba787aa103d19124845462a71b55832a86ee17eca4a10",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "xrp-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "40968147589036515344800017026064467534759051789424409343086488737106548627357",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "XRPUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "xrp-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0xd2c671db2ebcd1d185e10b4ef3cd777274ed50e640606b4892877f539006bd69",
+            "definition": {
+              "asset": "XRP",
+              "enabled": true,
+              "family_id": "10123",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "56445469116516932188653402981339232822776080845955568858277350381921238741890",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337344",
+            "instance_id": "0xd2c671db2ebcd1d185e10b4ef3cd777274ed50e640606b4892877f539006bd69",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "xrp-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "106185168877511507490023272615013421365575058274918719375808622172645436886208",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "XRP-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xd2c671db2ebcd1d185e10b4ef3cd777274ed50e640606b4892877f539006bd69",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.550302+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x95fc23b677d92d128d38dfa78002ac9bdcae6ce66a7667d7970c05020060bf13",
+              "definition": {
+                "asset": "XRP",
+                "enabled": true,
+                "family_id": "10123",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "94880802088421670320618803483056748594521649756910333671465123029268863562770",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332770",
+              "instance_id": "0x95fc23b677d92d128d38dfa78002ac9bdcae6ce66a7667d7970c05020060bf13",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "xrp-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "20897592511432512136416771779664282507806136796060214299499790871160625725521",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0x95fc23b677d92d128d38dfa78002ac9bdcae6ce66a7667d7970c05020060bf13",
+              "resolved_at": "2026-10-30T09:09:17.044040+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "20897592511432512136416771779664282507806136796060214299499790871160625725521"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"106185168877511507490023272615013421365575058274918719375808622172645436886208\", \"56445469116516932188653402981339232822776080845955568858277350381921238741890\"]",
+          "closed": false,
+          "conditionId": "0xd2c671db2ebcd1d185e10b4ef3cd777274ed50e640606b4892877f539006bd69",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the XRP/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the XRP/USDT pair (https://www.binance.com/en/trade/XRP_USDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance XRP/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337344",
+          "outcomePrices": "[\"0.615\", \"0.385\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/trade/XRP_USDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x7069653324d23534d09d3dd5b70c9fe28a9a63393bd7c193428f895fbf21b195",
+            "definition": {
+              "asset": "XRP",
+              "enabled": true,
+              "family_id": "10123",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "104021071188685178072015517152688271794215239748790019410108550678307860672933",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337939",
+            "instance_id": "0x7069653324d23534d09d3dd5b70c9fe28a9a63393bd7c193428f895fbf21b195",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "xrp-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "12679193669909241115454983234279857351364128113695587289778853290476323107993",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "XRPUSDT",
+          "BINANCE_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "doge-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0xbf605275e478fb96d173d6f0b9ca3e782a31bc59b7d958cdb8d9ed7f7d415625",
+            "definition": {
+              "asset": "DOGE",
+              "enabled": true,
+              "family_id": "11325",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "22998046113041345089350671491684163459152293523548074305981522445012635258828",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382442",
+            "instance_id": "0xbf605275e478fb96d173d6f0b9ca3e782a31bc59b7d958cdb8d9ed7f7d415625",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "doge-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "41231768547855927978388228700961327797047155867248111347792995086301702959229",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "DOGE-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xbf605275e478fb96d173d6f0b9ca3e782a31bc59b7d958cdb8d9ed7f7d415625",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.554655+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xf40ac2c8516167134f9dc4b6262e9e205d9893b9c8f1ed76325679a1d5fb5a6e",
+              "definition": {
+                "asset": "DOGE",
+                "enabled": true,
+                "family_id": "11325",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "18256868654618893322661718157148420849102504015793942559199892597358614266334",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380495",
+              "instance_id": "0xf40ac2c8516167134f9dc4b6262e9e205d9893b9c8f1ed76325679a1d5fb5a6e",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "doge-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "29040931998995379092268630863274710185447610751904568319779507149285626306044",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0xf40ac2c8516167134f9dc4b6262e9e205d9893b9c8f1ed76325679a1d5fb5a6e",
+              "resolved_at": "2026-10-30T09:09:17.038383+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "29040931998995379092268630863274710185447610751904568319779507149285626306044"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"41231768547855927978388228700961327797047155867248111347792995086301702959229\", \"22998046113041345089350671491684163459152293523548074305981522445012635258828\"]",
+          "closed": false,
+          "conditionId": "0xbf605275e478fb96d173d6f0b9ca3e782a31bc59b7d958cdb8d9ed7f7d415625",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Dogecoin, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the DOGE/USD TWAP data stream available at https://data.chain.link/streams/doge-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair DOGE/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382442",
+          "outcomePrices": "[\"0.005\", \"0.995\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/doge-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x7dcc9209008e2ea9a7c7e35cf6407ac3a96c1cfdf613aeeaf0f0167eaf522894",
+            "definition": {
+              "asset": "DOGE",
+              "enabled": true,
+              "family_id": "11325",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "99720657408843273739556752634296682156088948441443550153745772246575571635905",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382464",
+            "instance_id": "0x7dcc9209008e2ea9a7c7e35cf6407ac3a96c1cfdf613aeeaf0f0167eaf522894",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "doge-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "115458083827597645374031100060080410308785325718823199181946127830363434957530",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "DOGEUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "doge-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0x99080742aeaccf1fe58bdf17f225a8285fbf1405bf16f76466099975accef217",
+            "definition": {
+              "asset": "DOGE",
+              "enabled": true,
+              "family_id": "11328",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "34273479642730058564734090941035803793583601932416533705472819777560002828897",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382430",
+            "instance_id": "0x99080742aeaccf1fe58bdf17f225a8285fbf1405bf16f76466099975accef217",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "doge-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "44606264175708031644357574210009686732364513828379952785437398547573868464196",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "DOGE-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x99080742aeaccf1fe58bdf17f225a8285fbf1405bf16f76466099975accef217",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.568862+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x37cdc2ce318e839fc0299b67d7229173a41fbc5537c9ec30117b61e54b76f421",
+              "definition": {
+                "asset": "DOGE",
+                "enabled": true,
+                "family_id": "11328",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "40138556184695567468960157335216012877574605366501029588475648657984866254228",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379969",
+              "instance_id": "0x37cdc2ce318e839fc0299b67d7229173a41fbc5537c9ec30117b61e54b76f421",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "doge-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "72488052164708614339928544269614602711863493371314117762592590668793100821864",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x37cdc2ce318e839fc0299b67d7229173a41fbc5537c9ec30117b61e54b76f421",
+              "resolved_at": "2026-10-30T09:09:17.023874+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "40138556184695567468960157335216012877574605366501029588475648657984866254228"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"44606264175708031644357574210009686732364513828379952785437398547573868464196\", \"34273479642730058564734090941035803793583601932416533705472819777560002828897\"]",
+          "closed": false,
+          "conditionId": "0x99080742aeaccf1fe58bdf17f225a8285fbf1405bf16f76466099975accef217",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Dogecoin, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the DOGE/USD TWAP data stream available at https://data.chain.link/streams/doge-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair DOGE/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382430",
+          "outcomePrices": "[\"0.36\", \"0.64\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/doge-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xbbd2c4d182cef4de4ab2e21499dccb011d2dffd1652baf2c3d5f1e3af0386d39",
+            "definition": {
+              "asset": "DOGE",
+              "enabled": true,
+              "family_id": "11328",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "8142488540326968859537759001597902316825894733846359094727146231913145725816",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382473",
+            "instance_id": "0xbbd2c4d182cef4de4ab2e21499dccb011d2dffd1652baf2c3d5f1e3af0386d39",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "doge-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "94860342991306072213402096721131709298145506893157261052340949735872810528226",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "DOGEUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "doge-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0x776a79dabbc9fc8cdc5a6f4148bc391d405651fc0e3590587ead6e1d70295d8e",
+            "definition": {
+              "asset": "DOGE",
+              "enabled": true,
+              "family_id": "11287",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "16609244561960910537703394826086166384589365315249918767188563293586956673428",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337355",
+            "instance_id": "0x776a79dabbc9fc8cdc5a6f4148bc391d405651fc0e3590587ead6e1d70295d8e",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "dogecoin-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "79934840383834615732460483580465102789958226126476734514952895303270077512545",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "DOGE-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x776a79dabbc9fc8cdc5a6f4148bc391d405651fc0e3590587ead6e1d70295d8e",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.582141+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x7990a7c4f853e1f45d1411efe9fc53c3f8a5feba1cadaa9f9e39265cfc8e66b7",
+              "definition": {
+                "asset": "DOGE",
+                "enabled": true,
+                "family_id": "11287",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "106946418857334420302500518749260245696048942082333966928603299538654145657153",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332771",
+              "instance_id": "0x7990a7c4f853e1f45d1411efe9fc53c3f8a5feba1cadaa9f9e39265cfc8e66b7",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "dogecoin-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "13293722046869109144520492153135780254259958639436567830680659515667813422546",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0x7990a7c4f853e1f45d1411efe9fc53c3f8a5feba1cadaa9f9e39265cfc8e66b7",
+              "resolved_at": "2026-10-30T09:09:17.051671+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "13293722046869109144520492153135780254259958639436567830680659515667813422546"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"79934840383834615732460483580465102789958226126476734514952895303270077512545\", \"16609244561960910537703394826086166384589365315249918767188563293586956673428\"]",
+          "closed": false,
+          "conditionId": "0x776a79dabbc9fc8cdc5a6f4148bc391d405651fc0e3590587ead6e1d70295d8e",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the DOGE/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the DOGE/USDT pair (https://www.binance.com/en/trade/DOGE_USDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance DOGE/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337355",
+          "outcomePrices": "[\"0.41\", \"0.59\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/trade/DOGE_USDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x7ef85c6df43d8cb14c9088af1a58d1ac5e16898eb8e0475e24f5522a38fbcedd",
+            "definition": {
+              "asset": "DOGE",
+              "enabled": true,
+              "family_id": "11287",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "100724300654536126207419702187110568689949995585524889162354598773651042380966",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337940",
+            "instance_id": "0x7ef85c6df43d8cb14c9088af1a58d1ac5e16898eb8e0475e24f5522a38fbcedd",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "dogecoin-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "98444130913776571634358703005776990786319856582320833877638612626887272303056",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "DOGEUSDT",
+          "BINANCE_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "hype-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0x283873546da307eef749299b3b4e3ca54ce972e0e3fb58d5aaf9830aec14f8af",
+            "definition": {
+              "asset": "HYPE",
+              "enabled": true,
+              "family_id": "11327",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "78032707522950574160369450940531410597173786363120674400508354640429951269406",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382439",
+            "instance_id": "0x283873546da307eef749299b3b4e3ca54ce972e0e3fb58d5aaf9830aec14f8af",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "hype-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "75645229599870357319549931489801768138643547697516721096482748207000721575430",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "HYPE-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x283873546da307eef749299b3b4e3ca54ce972e0e3fb58d5aaf9830aec14f8af",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.608431+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xc4cc8ac4b90e02d41441f2ed35cefe0881c03b23a07127f77a14bb0a210f20dc",
+              "definition": {
+                "asset": "HYPE",
+                "enabled": true,
+                "family_id": "11327",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "49311255396005583126057737528053288365803628360543713971593167423541421726317",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380491",
+              "instance_id": "0xc4cc8ac4b90e02d41441f2ed35cefe0881c03b23a07127f77a14bb0a210f20dc",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "hype-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "41224395762408083482135496815001682986263573872933842757358115622778262112935",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0xc4cc8ac4b90e02d41441f2ed35cefe0881c03b23a07127f77a14bb0a210f20dc",
+              "resolved_at": "2026-10-30T09:09:17.026037+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "41224395762408083482135496815001682986263573872933842757358115622778262112935"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"75645229599870357319549931489801768138643547697516721096482748207000721575430\", \"78032707522950574160369450940531410597173786363120674400508354640429951269406\"]",
+          "closed": false,
+          "conditionId": "0x283873546da307eef749299b3b4e3ca54ce972e0e3fb58d5aaf9830aec14f8af",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Hyperliquid, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the HYPE/USD TWAP data stream available at https://data.chain.link/streams/hype-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair HYPE/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382439",
+          "outcomePrices": "[\"0.0015\", \"0.9985\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/hype-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xd31ba69866f681d2dcf61de8bba49f251eb21e884683ded40776f7d87e15b18a",
+            "definition": {
+              "asset": "HYPE",
+              "enabled": true,
+              "family_id": "11327",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "59955035756907446691047023796154664467934136046929610223822177734461520991977",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382460",
+            "instance_id": "0xd31ba69866f681d2dcf61de8bba49f251eb21e884683ded40776f7d87e15b18a",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "hype-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "91748952621242663935462612800545042282206157462105484516557268884651676849409",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "HYPEUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "hype-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0x70fe6469e4d8a8aab9dc6a200303d6adff8b7c9b88bcc31d2e970a6c071b84d4",
+            "definition": {
+              "asset": "HYPE",
+              "enabled": true,
+              "family_id": "11329",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "101657994256958928283921027934922869010284387549657500313180981341206491920628",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382416",
+            "instance_id": "0x70fe6469e4d8a8aab9dc6a200303d6adff8b7c9b88bcc31d2e970a6c071b84d4",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "hype-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "50266514704713973480025106010045558828742711667591971674413944752530737442363",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "HYPE-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x70fe6469e4d8a8aab9dc6a200303d6adff8b7c9b88bcc31d2e970a6c071b84d4",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.626737+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xbecc20dd5bf3262eb36074f0cd9dad71080c40e25325950cc80d00d73cf272dc",
+              "definition": {
+                "asset": "HYPE",
+                "enabled": true,
+                "family_id": "11329",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "93301557287329280372661762071099674552975609746542650989703554093427775228970",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379958",
+              "instance_id": "0xbecc20dd5bf3262eb36074f0cd9dad71080c40e25325950cc80d00d73cf272dc",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "hype-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "32801881861307821769814901568078594130419230825155636436033746153442908398782",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0xbecc20dd5bf3262eb36074f0cd9dad71080c40e25325950cc80d00d73cf272dc",
+              "resolved_at": "2026-10-30T09:09:17.115682+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "93301557287329280372661762071099674552975609746542650989703554093427775228970"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"50266514704713973480025106010045558828742711667591971674413944752530737442363\", \"101657994256958928283921027934922869010284387549657500313180981341206491920628\"]",
+          "closed": false,
+          "conditionId": "0x70fe6469e4d8a8aab9dc6a200303d6adff8b7c9b88bcc31d2e970a6c071b84d4",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of Hyperliquid, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the HYPE/USD TWAP data stream available at https://data.chain.link/streams/hype-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair HYPE/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382416",
+          "outcomePrices": "[\"0.43\", \"0.57\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/hype-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x3d8e14a3de5764e592ea5d3e12d4897e8dcc724df9b95b1d123d1e0700ffa5c6",
+            "definition": {
+              "asset": "HYPE",
+              "enabled": true,
+              "family_id": "11329",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "21386712219105485649481007431856202214385313834254060939563643004406349757828",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382476",
+            "instance_id": "0x3d8e14a3de5764e592ea5d3e12d4897e8dcc724df9b95b1d123d1e0700ffa5c6",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "hype-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "49203671054828207877062838060919362985045020335417734907617081051879558296697",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "HYPEUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "hype-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0x95eab5bb7d1c5582d2c49eab4056a48db172d470f1564e2c51952c4a5ac025c8",
+            "definition": {
+              "asset": "HYPE",
+              "enabled": true,
+              "family_id": "11289",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "101205735952648769760600325680143408530503203531178165872212574478450419328556",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337365",
+            "instance_id": "0x95eab5bb7d1c5582d2c49eab4056a48db172d470f1564e2c51952c4a5ac025c8",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "hype-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "114741521306804676442685238470944444385455711619207105891595553171834122010048",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "HYPE-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x95eab5bb7d1c5582d2c49eab4056a48db172d470f1564e2c51952c4a5ac025c8",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.631965+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0xe91c942145f1853570a36738bffbe205157caafd7f7200b450e700c3862d0bbb",
+              "definition": {
+                "asset": "HYPE",
+                "enabled": true,
+                "family_id": "11289",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "109036317845811288946549980556254412526994745244666410760802598184730539523733",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332772",
+              "instance_id": "0xe91c942145f1853570a36738bffbe205157caafd7f7200b450e700c3862d0bbb",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "hype-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "21091670956672578125421048006587689573708440921824868847240120291506790695538",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"1\", \"0\"]",
+            "resolution": {
+              "instance_id": "0xe91c942145f1853570a36738bffbe205157caafd7f7200b450e700c3862d0bbb",
+              "resolved_at": "2026-10-30T09:09:17.089061+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "21091670956672578125421048006587689573708440921824868847240120291506790695538"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"114741521306804676442685238470944444385455711619207105891595553171834122010048\", \"101205735952648769760600325680143408530503203531178165872212574478450419328556\"]",
+          "closed": false,
+          "conditionId": "0x95eab5bb7d1c5582d2c49eab4056a48db172d470f1564e2c51952c4a5ac025c8",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the HYPE/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the HYPE/USDT pair (https://www.binance.com/en/futures/HYPEUSDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance HYPE/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337365",
+          "outcomePrices": "[\"0.38\", \"0.62\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/futures/HYPEUSDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xd64eedac3fc80aa51e8df6bc4e90c757e5a251656c50e2249346a0ad181478dd",
+            "definition": {
+              "asset": "HYPE",
+              "enabled": true,
+              "family_id": "11289",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "89226069851908520322732290361317477141376312112404615274775371998888902154777",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337941",
+            "instance_id": "0xd64eedac3fc80aa51e8df6bc4e90c757e5a251656c50e2249346a0ad181478dd",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "hype-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "105240891194181878470907525612069911715720998067982598887604195701575449634659",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "HYPEUSDT",
+          "BINANCE_USDM_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "bnb-up-or-down-5m",
+        "current": [
+          {
+            "condition_id": "0xbfabe88e659e5fd46936984ed6d3929571f6a6a4d6baa72843632a29d153b583",
+            "definition": {
+              "asset": "BNB",
+              "enabled": true,
+              "family_id": "11326",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "109892620675000308132757375834681578283437561380214400974311390889522747097525",
+            "ends_at": "2026-10-30T09:10:00+00:00",
+            "external_id": "6382440",
+            "instance_id": "0xbfabe88e659e5fd46936984ed6d3929571f6a6a4d6baa72843632a29d153b583",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bnb-updown-5m-1793351100",
+            "starts_at": "2026-10-30T09:05:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "63945060091250197072811441465499235420251390118660059002019348307899462307848",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "BNB-5m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0xbfabe88e659e5fd46936984ed6d3929571f6a6a4d6baa72843632a29d153b583",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.647794+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x266ab6125e14c7a81bc9ce5d15368f1b93853bbffbefa3817fe4355e4f490999",
+              "definition": {
+                "asset": "BNB",
+                "enabled": true,
+                "family_id": "11326",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "5m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "41044444810603264045446241473262578294045112603607848337253791319915422804281",
+              "ends_at": "2026-10-30T06:05:00+00:00",
+              "external_id": "6380490",
+              "instance_id": "0x266ab6125e14c7a81bc9ce5d15368f1b93853bbffbefa3817fe4355e4f490999",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "bnb-updown-5m-1793340000",
+              "starts_at": "2026-10-30T06:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "96149830536455551689423050819705657879777325356020131262555215904096936786720",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x266ab6125e14c7a81bc9ce5d15368f1b93853bbffbefa3817fe4355e4f490999",
+              "resolved_at": "2026-10-30T09:09:17.063998+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "41044444810603264045446241473262578294045112603607848337253791319915422804281"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"63945060091250197072811441465499235420251390118660059002019348307899462307848\", \"109892620675000308132757375834681578283437561380214400974311390889522747097525\"]",
+          "closed": false,
+          "conditionId": "0xbfabe88e659e5fd46936984ed6d3929571f6a6a4d6baa72843632a29d153b583",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of BNB, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the BNB/USD TWAP data stream available at https://data.chain.link/streams/bnb-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair BNB/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:10:00Z",
+          "eventStartTime": "2026-10-30T09:05:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382440",
+          "outcomePrices": "[\"0.0005\", \"0.9995\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/bnb-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xa19ada3fbbc6552d04ad41a931b024ad28ab09279a1978fed0a74c3b6bdf712b",
+            "definition": {
+              "asset": "BNB",
+              "enabled": true,
+              "family_id": "11326",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "5m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "112050744158994770432159055009595791110216395312416633688527356941531977481775",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382459",
+            "instance_id": "0xa19ada3fbbc6552d04ad41a931b024ad28ab09279a1978fed0a74c3b6bdf712b",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bnb-updown-5m-1793351400",
+            "starts_at": "2026-10-30T09:10:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "54049590948533282590572513428357012366541780133276213293805250213915422164623",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "BNBUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "bnb-up-or-down-15m",
+        "current": [
+          {
+            "condition_id": "0x4fea6a131bab4c06d161e03b7475104d69ac488446561cf0c8898828f6c256b0",
+            "definition": {
+              "asset": "BNB",
+              "enabled": true,
+              "family_id": "11330",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "92099889094851918471844487147247769312271180257672551387248868691976247504613",
+            "ends_at": "2026-10-30T09:15:00+00:00",
+            "external_id": "6382420",
+            "instance_id": "0x4fea6a131bab4c06d161e03b7475104d69ac488446561cf0c8898828f6c256b0",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bnb-updown-15m-1793350800",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "12234324952785373210321162913153198068914490175597169024329069585223884650225",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "BNB-15m",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x4fea6a131bab4c06d161e03b7475104d69ac488446561cf0c8898828f6c256b0",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.656588+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x4306d5157f22da83d7386782020618da9c791a906554295e7d27df0bb430e113",
+              "definition": {
+                "asset": "BNB",
+                "enabled": true,
+                "family_id": "11330",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "15m"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "16042901103181301270642361644994802088425255957121603353915474957589087899158",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6379966",
+              "instance_id": "0x4306d5157f22da83d7386782020618da9c791a906554295e7d27df0bb430e113",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "bnb-updown-15m-1793339100",
+              "starts_at": "2026-10-30T05:45:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "113738269253452156054921244483427703183584165486393920939000060864167391487221",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x4306d5157f22da83d7386782020618da9c791a906554295e7d27df0bb430e113",
+              "resolved_at": "2026-10-30T09:09:17.076701+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "16042901103181301270642361644994802088425255957121603353915474957589087899158"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"12234324952785373210321162913153198068914490175597169024329069585223884650225\", \"92099889094851918471844487147247769312271180257672551387248868691976247504613\"]",
+          "closed": false,
+          "conditionId": "0x4fea6a131bab4c06d161e03b7475104d69ac488446561cf0c8898828f6c256b0",
+          "description": "This market will resolve to \"Up\" if the time-weighted average price (TWAP) of BNB, generated by Chainlink, of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the BNB/USD TWAP data stream available at https://data.chain.link/streams/bnb-usd-twap-60s-streams.\nPlease note that this market is about the price according to the TWAP Chainlink data stream for the asset pair BNB/USD, not according to any other sources or spot markets.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T09:15:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6382420",
+          "outcomePrices": "[\"0.075\", \"0.925\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://data.chain.link/streams/bnb-usd-twap-60s-streams",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0xa8230865d0bcfe098cd8b92850a6121bf10fbb90fd38fd2b981852b1750c8683",
+            "definition": {
+              "asset": "BNB",
+              "enabled": true,
+              "family_id": "11330",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "15m"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "55824754391416063217269728126068928141354805834310320834530516070665078330977",
+            "ends_at": "2026-10-30T09:30:00+00:00",
+            "external_id": "6382472",
+            "instance_id": "0xa8230865d0bcfe098cd8b92850a6121bf10fbb90fd38fd2b981852b1750c8683",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bnb-updown-15m-1793351700",
+            "starts_at": "2026-10-30T09:15:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "1972596125291484798620408301074566694757191219843228404676336033750206747731",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "BNBUSDT",
+          "CHAINLINK_TWAP_60S"
+        ],
+        "status": "VERIFIED"
+      },
+      {
+        "candidate_series": "bnb-up-or-down-hourly",
+        "current": [
+          {
+            "condition_id": "0x10b6751da1c591a5dbbba2f931b072dee676e0b4c452b94c22c4d6767d41fcb3",
+            "definition": {
+              "asset": "BNB",
+              "enabled": true,
+              "family_id": "11291",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "51606975822133839612726342829132782149100700104240640076009013678305624149388",
+            "ends_at": "2026-10-30T10:00:00+00:00",
+            "external_id": "6337374",
+            "instance_id": "0x10b6751da1c591a5dbbba2f931b072dee676e0b4c452b94c22c4d6767d41fcb3",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bnb-up-or-down-october-30-2026-5am-et",
+            "starts_at": "2026-10-30T09:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "110355644444961456216057797769719797253030038900348545738624449834920347906528",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "family": "BNB-1h",
+        "fee_evidence": {
+          "buy_units": "CASH",
+          "exponent": 1,
+          "instance_id": "0x10b6751da1c591a5dbbba2f931b072dee676e0b4c452b94c22c4d6767d41fcb3",
+          "max_age_seconds": 300,
+          "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+          "observed_at": "2026-10-30T09:09:15.662675+00:00",
+          "quantum": "0.00001",
+          "rate": "0.07",
+          "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+          "rounding": "UNKNOWN",
+          "sell_units": "CASH",
+          "source": "GAMMA_PUBLIC",
+          "state": "UNSUPPORTED"
+        },
+        "historical_resolution": [
+          {
+            "closed": true,
+            "instance": {
+              "condition_id": "0x24ea0d4e9fb58973450a63636e8ce1c5679b66c522fb9a5ea1852921695f9f6e",
+              "definition": {
+                "asset": "BNB",
+                "enabled": true,
+                "family_id": "11291",
+                "provenance": "GAMMA_PUBLIC_SERIES",
+                "timeframe": "1h"
+              },
+              "discovered_at": "2026-10-30T09:09:15.442796+00:00",
+              "down_token_id": "1509869141081952710811649475321491278428092838200226203487470997983161057178",
+              "ends_at": "2026-10-30T06:00:00+00:00",
+              "external_id": "6332773",
+              "instance_id": "0x24ea0d4e9fb58973450a63636e8ce1c5679b66c522fb9a5ea1852921695f9f6e",
+              "metadata_source": "GAMMA_PUBLIC",
+              "resolution_provenance": "",
+              "resolution_status": "PENDING",
+              "slug": "bnb-up-or-down-october-30-2026-1am-et",
+              "starts_at": "2026-10-30T05:00:00+00:00",
+              "status": "UNAVAILABLE",
+              "up_token_id": "23529425724515998206995520716364824965886638445118655357546327586718293446466",
+              "verified": true,
+              "winner_token_id": null
+            },
+            "outcome_prices": "[\"0\", \"1\"]",
+            "resolution": {
+              "instance_id": "0x24ea0d4e9fb58973450a63636e8ce1c5679b66c522fb9a5ea1852921695f9f6e",
+              "resolved_at": "2026-10-30T09:09:17.106579+00:00",
+              "source": "GAMMA_PUBLIC_CLOSED_UMA_RESOLVED",
+              "winner_token_id": "1509869141081952710811649475321491278428092838200226203487470997983161057178"
+            },
+            "uma_status": "resolved"
+          }
+        ],
+        "issue": null,
+        "market_metadata": {
+          "acceptingOrders": true,
+          "active": true,
+          "clobTokenIds": "[\"110355644444961456216057797769719797253030038900348545738624449834920347906528\", \"51606975822133839612726342829132782149100700104240640076009013678305624149388\"]",
+          "closed": false,
+          "conditionId": "0x10b6751da1c591a5dbbba2f931b072dee676e0b4c452b94c22c4d6767d41fcb3",
+          "description": "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the BNB/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the BNB/USDT pair (https://www.binance.com/en/trade/BNB_USDT). The close \u00ab C \u00bb and open \u00ab O \u00bb displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance BNB/USDT, not according to other exchanges or trading pairs.",
+          "enableOrderBook": true,
+          "endDate": "2026-10-30T10:00:00Z",
+          "eventStartTime": "2026-10-30T09:00:00Z",
+          "feeSchedule": {
+            "exponent": 1,
+            "rate": "0.07",
+            "rebateRate": "0.2",
+            "takerOnly": true
+          },
+          "feeType": "crypto_fees_v2",
+          "feesEnabled": true,
+          "id": "6337374",
+          "outcomePrices": "[\"0.29\", \"0.71\"]",
+          "outcomes": "[\"Up\", \"Down\"]",
+          "positionIds": null,
+          "resolutionSource": "https://www.binance.com/en/trade/BNB_USDT",
+          "umaResolutionStatus": null,
+          "version": "v1"
+        },
+        "next": [
+          {
+            "condition_id": "0x3ab2b23d0e67afcafe82796ff44735fbe4d2ada251bccf51ebd47cd6acc5b291",
+            "definition": {
+              "asset": "BNB",
+              "enabled": true,
+              "family_id": "11291",
+              "provenance": "GAMMA_PUBLIC_SERIES",
+              "timeframe": "1h"
+            },
+            "discovered_at": "2026-10-30T09:09:14.146148+00:00",
+            "down_token_id": "88843607567817242302036680097581383962613068396179777023357852522639544872587",
+            "ends_at": "2026-10-30T11:00:00+00:00",
+            "external_id": "6337942",
+            "instance_id": "0x3ab2b23d0e67afcafe82796ff44735fbe4d2ada251bccf51ebd47cd6acc5b291",
+            "metadata_source": "GAMMA_PUBLIC",
+            "resolution_provenance": "",
+            "resolution_status": "PENDING",
+            "slug": "bnb-up-or-down-october-30-2026-6am-et",
+            "starts_at": "2026-10-30T10:00:00+00:00",
+            "status": "OPEN",
+            "up_token_id": "105107946744031409640002944257093598919626621019495686891777124719814592617406",
+            "verified": true,
+            "winner_token_id": null
+          }
+        ],
+        "next_contiguous": true,
+        "source_mapping": [
+          "BNBUSDT",
+          "BINANCE_1H_CANDLE"
+        ],
+        "status": "VERIFIED"
+      }
+    ],
+    "mode": "PUBLIC_READ_ONLY",
+    "observed_at": "2026-10-30T09:09:14.146105+00:00",
+    "previous_clob_failure_recheck": {
+      "cause": "UNDETERMINED: original URL/client reproduces 403, current HTTPX requests return 200. No UA spoof, proxy, credentials or bypass was attempted.",
+      "client": "urllib default User-Agent and TLS stack; explicit ProxyHandler({})",
+      "error": "urllib.error.HTTPError: HTTP Error 403: Forbidden",
+      "response_headers_captured": false,
+      "status": 403,
+      "url": "https://clob.polymarket.com/markets/0x5b24c35e819c2541a231a3365b5adcfb396dd21f71fda1f03d607b44e221e56d"
+    },
+    "underlying": [
+      {
+        "asset": "BTC",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "BTC",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "78029.84",
+                "reference_id": "BINANCE_SPOT:BTCUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:17.700000+00:00",
+                "price": "77833.71",
+                "reference_id": "BINANCE_SPOT:BTCUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xaa2d146cafa869d53f7df710bab5c321c5436ac2fb74fce249e4f860402bbc2d",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-196.13",
+                "percent": "-0.2513525594823723847184615527"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "BTC-5m",
+            "fresh": true,
+            "mapping": [
+              "BTCUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "BTC",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "78030.94",
+                "reference_id": "BINANCE_SPOT:BTCUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:17.700000+00:00",
+                "price": "77833.71",
+                "reference_id": "BINANCE_SPOT:BTCUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-197.23",
+                "percent": "-0.2527587134026579713124050537"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "BTC-15m",
+            "fresh": true,
+            "mapping": [
+              "BTCUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "BTC",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "78030.94",
+                "reference_id": "BINANCE_SPOT:BTCUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:17.700000+00:00",
+                "price": "77833.71",
+                "reference_id": "BINANCE_SPOT:BTCUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x472c3ea50ff85da18aa979af791f934754052b8d4dbfb8bf291a21bf42fb5655",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-197.23",
+                "percent": "-0.2527587134026579713124050537"
+              },
+              "settlement_reference": "BINANCE_1H_CANDLE"
+            },
+            "family": "BTC-1h",
+            "fresh": true,
+            "mapping": [
+              "BTCUSDT",
+              "BINANCE_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "BTCUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      },
+      {
+        "asset": "ETH",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "ETH",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "2230.06",
+                "reference_id": "BINANCE_SPOT:ETHUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:17.047000+00:00",
+                "price": "2224.8",
+                "reference_id": "BINANCE_SPOT:ETHUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x024bcaf9d978174415eb50267a890795849c716b1f01a2eb96b7b65c104ac7d3",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-5.26",
+                "percent": "-0.2358680932351595921185977059"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "ETH-5m",
+            "fresh": true,
+            "mapping": [
+              "ETHUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "ETH",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "2228.85",
+                "reference_id": "BINANCE_SPOT:ETHUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:17.047000+00:00",
+                "price": "2224.8",
+                "reference_id": "BINANCE_SPOT:ETHUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x64dd59a6cd17c76a1f1601a0a3944742878ad87e4ac0054e065f44fd544c1b3f",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-4.05",
+                "percent": "-0.1817080557238037552998182919"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "ETH-15m",
+            "fresh": true,
+            "mapping": [
+              "ETHUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "ETH",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "2228.85",
+                "reference_id": "BINANCE_SPOT:ETHUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:17.047000+00:00",
+                "price": "2224.8",
+                "reference_id": "BINANCE_SPOT:ETHUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x6a7bc0dfe157d6698ce45fda2ccb3e335609d97bf5e4a479ea07baa7f48c1da7",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-4.05",
+                "percent": "-0.1817080557238037552998182919"
+              },
+              "settlement_reference": "BINANCE_1H_CANDLE"
+            },
+            "family": "ETH-1h",
+            "fresh": true,
+            "mapping": [
+              "ETHUSDT",
+              "BINANCE_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "ETHUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      },
+      {
+        "asset": "SOL",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "SOL",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "97.47",
+                "reference_id": "BINANCE_SPOT:SOLUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:20.553000+00:00",
+                "price": "97.23",
+                "reference_id": "BINANCE_SPOT:SOLUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xd5160cfdb8a1befd3f817b468779a53242160ccf5e5a24d8e3ec378196a994a9",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.24",
+                "percent": "-0.2462296091104955370883348723"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "SOL-5m",
+            "fresh": true,
+            "mapping": [
+              "SOLUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "SOL",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "97.41",
+                "reference_id": "BINANCE_SPOT:SOLUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:20.553000+00:00",
+                "price": "97.23",
+                "reference_id": "BINANCE_SPOT:SOLUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xf3e23cfeef08cb5c6cabafe6aae93832667bb99b610d3699ef2f507640e2c65f",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.18",
+                "percent": "-0.1847859562673236834000615953"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "SOL-15m",
+            "fresh": true,
+            "mapping": [
+              "SOLUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "SOL",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "97.41",
+                "reference_id": "BINANCE_SPOT:SOLUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:20.553000+00:00",
+                "price": "97.23",
+                "reference_id": "BINANCE_SPOT:SOLUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x01542cf657dad8322f25ee9677628b363364777d27c8a43d115fc09111ac20a1",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.18",
+                "percent": "-0.1847859562673236834000615953"
+              },
+              "settlement_reference": "BINANCE_1H_CANDLE"
+            },
+            "family": "SOL-1h",
+            "fresh": true,
+            "mapping": [
+              "SOLUSDT",
+              "BINANCE_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "SOLUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      },
+      {
+        "asset": "XRP",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "XRP",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "1.2626",
+                "reference_id": "BINANCE_SPOT:XRPUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:22.171000+00:00",
+                "price": "1.2608",
+                "reference_id": "BINANCE_SPOT:XRPUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xedeffe168911fd57c55f575b799cfb6d9c0ff1be7392c00ff1f0d40bdeebc5c3",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.0018",
+                "percent": "-0.1425629653096784413115792808"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "XRP-5m",
+            "fresh": true,
+            "mapping": [
+              "XRPUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "XRP",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "1.2569",
+                "reference_id": "BINANCE_SPOT:XRPUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:22.171000+00:00",
+                "price": "1.2608",
+                "reference_id": "BINANCE_SPOT:XRPUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xbcdbddeec0e1be38f00e878428b695516022c63c156e518eb4590968b05319ce",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "0.0039",
+                "percent": "0.3102872145755430026255072003"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "XRP-15m",
+            "fresh": true,
+            "mapping": [
+              "XRPUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "XRP",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "1.2569",
+                "reference_id": "BINANCE_SPOT:XRPUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:22.171000+00:00",
+                "price": "1.2608",
+                "reference_id": "BINANCE_SPOT:XRPUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xd2c671db2ebcd1d185e10b4ef3cd777274ed50e640606b4892877f539006bd69",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "0.0039",
+                "percent": "0.3102872145755430026255072003"
+              },
+              "settlement_reference": "BINANCE_1H_CANDLE"
+            },
+            "family": "XRP-1h",
+            "fresh": true,
+            "mapping": [
+              "XRPUSDT",
+              "BINANCE_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "XRPUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      },
+      {
+        "asset": "DOGE",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "DOGE",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "0.07579",
+                "reference_id": "BINANCE_SPOT:DOGEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:23.205000+00:00",
+                "price": "0.07562",
+                "reference_id": "BINANCE_SPOT:DOGEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xbf605275e478fb96d173d6f0b9ca3e782a31bc59b7d958cdb8d9ed7f7d415625",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.00017",
+                "percent": "-0.2243039978889035492809077715"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "DOGE-5m",
+            "fresh": true,
+            "mapping": [
+              "DOGEUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "DOGE",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "0.07566",
+                "reference_id": "BINANCE_SPOT:DOGEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:23.205000+00:00",
+                "price": "0.07562",
+                "reference_id": "BINANCE_SPOT:DOGEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x99080742aeaccf1fe58bdf17f225a8285fbf1405bf16f76466099975accef217",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.00004",
+                "percent": "-0.05286809410520750726936293947"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "DOGE-15m",
+            "fresh": true,
+            "mapping": [
+              "DOGEUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "DOGE",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "0.07566",
+                "reference_id": "BINANCE_SPOT:DOGEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:23.205000+00:00",
+                "price": "0.07562",
+                "reference_id": "BINANCE_SPOT:DOGEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x776a79dabbc9fc8cdc5a6f4148bc391d405651fc0e3590587ead6e1d70295d8e",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.00004",
+                "percent": "-0.05286809410520750726936293947"
+              },
+              "settlement_reference": "BINANCE_1H_CANDLE"
+            },
+            "family": "DOGE-1h",
+            "fresh": true,
+            "mapping": [
+              "DOGEUSDT",
+              "BINANCE_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "DOGEUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      },
+      {
+        "asset": "HYPE",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "HYPE",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "92.06",
+                "reference_id": "BINANCE_SPOT:HYPEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:23.518000+00:00",
+                "price": "91.9",
+                "reference_id": "BINANCE_SPOT:HYPEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x283873546da307eef749299b3b4e3ca54ce972e0e3fb58d5aaf9830aec14f8af",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-0.16",
+                "percent": "-0.1737996958505322615685422551"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "HYPE-5m",
+            "fresh": true,
+            "mapping": [
+              "HYPEUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "HYPE",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "91.87",
+                "reference_id": "BINANCE_SPOT:HYPEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:23.518000+00:00",
+                "price": "91.9",
+                "reference_id": "BINANCE_SPOT:HYPEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x70fe6469e4d8a8aab9dc6a200303d6adff8b7c9b88bcc31d2e970a6c071b84d4",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "0.03",
+                "percent": "0.03265483835855012517688037444"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "HYPE-15m",
+            "fresh": true,
+            "mapping": [
+              "HYPEUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "HYPE",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "91.87",
+                "reference_id": "BINANCE_SPOT:HYPEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:23.518000+00:00",
+                "price": "91.9",
+                "reference_id": "BINANCE_SPOT:HYPEUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x95eab5bb7d1c5582d2c49eab4056a48db172d470f1564e2c51952c4a5ac025c8",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "0.03",
+                "percent": "0.03265483835855012517688037444"
+              },
+              "settlement_reference": "BINANCE_USDM_1H_CANDLE"
+            },
+            "family": "HYPE-1h",
+            "fresh": true,
+            "mapping": [
+              "HYPEUSDT",
+              "BINANCE_USDM_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "HYPEUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      },
+      {
+        "asset": "BNB",
+        "contexts": [
+          {
+            "available": true,
+            "evidence": {
+              "asset": "BNB",
+              "baseline": {
+                "observed_at": "2026-10-30T09:05:00+00:00",
+                "price": "705.79",
+                "reference_id": "BINANCE_SPOT:BNBUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:25.701000+00:00",
+                "price": "704.28",
+                "reference_id": "BINANCE_SPOT:BNBUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0xbfabe88e659e5fd46936984ed6d3929571f6a6a4d6baa72843632a29d153b583",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-1.51",
+                "percent": "-0.2139446577593901868827838309"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "BNB-5m",
+            "fresh": true,
+            "mapping": [
+              "BNBUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "BNB",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "705.79",
+                "reference_id": "BINANCE_SPOT:BNBUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:25.701000+00:00",
+                "price": "704.28",
+                "reference_id": "BINANCE_SPOT:BNBUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x4fea6a131bab4c06d161e03b7475104d69ac488446561cf0c8898828f6c256b0",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-1.51",
+                "percent": "-0.2139446577593901868827838309"
+              },
+              "settlement_reference": "CHAINLINK_TWAP_60S"
+            },
+            "family": "BNB-15m",
+            "fresh": true,
+            "mapping": [
+              "BNBUSDT",
+              "CHAINLINK_TWAP_60S"
+            ]
+          },
+          {
+            "available": true,
+            "evidence": {
+              "asset": "BNB",
+              "baseline": {
+                "observed_at": "2026-10-30T09:00:00+00:00",
+                "price": "705.79",
+                "reference_id": "BINANCE_SPOT:BNBUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "current": {
+                "observed_at": "2026-10-30T09:09:25.701000+00:00",
+                "price": "704.28",
+                "reference_id": "BINANCE_SPOT:BNBUSDT",
+                "reference_type": "SPOT_USDT_RESEARCH",
+                "source": "BINANCE_PUBLIC"
+              },
+              "instance_id": "0x10b6751da1c591a5dbbba2f931b072dee676e0b4c452b94c22c4d6767d41fcb3",
+              "is_research_proxy": true,
+              "movement": {
+                "absolute": "-1.51",
+                "percent": "-0.2139446577593901868827838309"
+              },
+              "settlement_reference": "BINANCE_1H_CANDLE"
+            },
+            "family": "BNB-1h",
+            "fresh": true,
+            "mapping": [
+              "BNBUSDT",
+              "BINANCE_1H_CANDLE"
+            ]
+          }
+        ],
+        "pair": "BNBUSDT",
+        "provider": "BINANCE_PUBLIC",
+        "research_proxy": true,
+        "status": "VERIFIED"
+      }
+    ]
+  },
+  "public_e2e": {
+    "expected_entry_blocker": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+    "fee": {
+      "buy_units": "CASH",
+      "exponent": 1,
+      "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+      "max_age_seconds": 300,
+      "method": "GAMMA_CTF_V2_CASH_UNITS_CCC0596",
+      "observed_at": "2026-10-30T09:10:55.241731+00:00",
+      "quantum": "0.00001",
+      "rate": "0.07",
+      "reason": "CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",
+      "rounding": "UNKNOWN",
+      "sell_units": "CASH",
+      "source": "GAMMA_PUBLIC",
+      "state": "UNSUPPORTED"
+    },
+    "generation_advanced": true,
+    "health": [
+      "NOT_READY",
+      "READY",
+      "NOT_READY",
+      "READY"
+    ],
+    "instance": {
+      "condition_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+      "definition": {
+        "asset": "BTC",
+        "enabled": true,
+        "family_id": "10192",
+        "provenance": "GAMMA_PUBLIC_SERIES",
+        "timeframe": "15m"
+      },
+      "discovered_at": "2026-10-30T09:10:54.905428+00:00",
+      "down_token_id": "5455036208480405539215005745754792943218931474336688441952384888402567183092",
+      "ends_at": "2026-10-30T09:15:00+00:00",
+      "external_id": "6382435",
+      "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+      "metadata_source": "GAMMA_PUBLIC",
+      "resolution_provenance": "",
+      "resolution_status": "PENDING",
+      "slug": "btc-updown-15m-1793350800",
+      "starts_at": "2026-10-30T09:00:00+00:00",
+      "status": "OPEN",
+      "up_token_id": "46245614482306753023334524930090183680027350335446347916532371721630954483758",
+      "verified": true,
+      "winner_token_id": null
+    },
+    "mode": "PUBLIC_OBSERVATIONS_NO_TRADING",
+    "no_old_generation_replay": true,
+    "observations": [
+      {
+        "best_ask": "0.99",
+        "best_bid": "0.98",
+        "book_ready": true,
+        "generation": 1,
+        "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+        "observed_at": "2026-10-30T09:10:55.637000+00:00",
+        "received_at": "2026-10-30T09:10:55.695115+00:00",
+        "sequence": 1,
+        "source": "POLYMARKET_PUBLIC_WS",
+        "token_id": "5455036208480405539215005745754792943218931474336688441952384888402567183092"
+      },
+      {
+        "best_ask": "0.01",
+        "best_bid": null,
+        "book_ready": true,
+        "generation": 2,
+        "instance_id": "0x6d0af72e47a97eebd8c552c8109d430210390214516930183aa9b158019b2303",
+        "observed_at": "2026-10-30T09:10:59.343000+00:00",
+        "received_at": "2026-10-30T09:10:59.394504+00:00",
+        "sequence": 1,
+        "source": "POLYMARKET_PUBLIC_WS",
+        "token_id": "46245614482306753023334524930090183680027350335446347916532371721630954483758"
+      }
+    ],
+    "observed_at": "2026-10-30T09:10:54.880051+00:00",
+    "persisted_rule_runtime_rows": 1,
+    "positions": 0,
+    "result": "PASS",
+    "sent": [
+      {
+        "assets_ids": [
+          "46245614482306753023334524930090183680027350335446347916532371721630954483758",
+          "5455036208480405539215005745754792943218931474336688441952384888402567183092"
+        ],
+        "custom_feature_enabled": true,
+        "type": "market"
+      },
+      {
+        "assets_ids": [
+          "46245614482306753023334524930090183680027350335446347916532371721630954483758",
+          "5455036208480405539215005745754792943218931474336688441952384888402567183092"
+        ],
+        "custom_feature_enabled": true,
+        "type": "market"
+      },
+      {
+        "assets_ids": [
+          "46245614482306753023334524930090183680027350335446347916532371721630954483758",
+          "5455036208480405539215005745754792943218931474336688441952384888402567183092"
+        ],
+        "operation": "unsubscribe"
+      }
+    ],
+    "unsubscribed": true
+  },
+  "validation": {
+    "command": "PYTHONDONTWRITEBYTECODE=1 python -m pytest -c demo_v2/pytest.ini demo_v2/tests -q",
+    "failed": 0,
+    "passed": 199,
+    "skipped": 0
+  }
+}

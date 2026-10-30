@@ -72,4 +72,4 @@ cookie and durable session version/fingerprint. Logout revokes all DEMO sessions
 No LIVE credential lookup/copy occurs. All writes require CSRF after login.
 REST financial values are strings, polling is supported, and generated OpenAPI
 plus README define the frontend contract. Public fee-enabled entries remain
-UNSUPPORTED until the missing current fee-unit/rounding policy is verified.
+UNSUPPORTED until the missing operator tie/per-match rounding policy is verified.

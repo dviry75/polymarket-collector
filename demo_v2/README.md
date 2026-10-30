@@ -112,8 +112,9 @@ generation. No public-provider integration can submit an order.
 
 See `docs/INTEGRATION_CONTRACTS.md`: BTC public discovery, native Market WS,
 Binance research and an older official resolution were smoke-tested read-only.
-20/21 candidate series were found; SOL hourly is not verified. This does not claim
-that all 21 current instances or all reference pairs were network-verified.
-Fee-enabled public markets intentionally block entries until current debit units
-and tie rounding are verified. An explicit fees-disabled market can supply valid
+Phase 9 verified all 21 current/next families and all seven spot research pairs.
+Exact identities/timestamps and the HYPE futures-versus-spot distinction are recorded
+in the integration evidence. These are point-in-time checks, not sustained-load results.
+Fee-enabled public markets intentionally block entries until current tie/per-match
+rounding is verified. An explicit fees-disabled market can supply valid
 zero evidence. Production provisioning/review and deployment are separate work.

@@ -69,7 +69,10 @@ def source_mapping(instance, metadata):
     description = str(metadata.get("description", "")).lower()
     pair = instance.definition.asset.value+"USDT"
     if instance.definition.timeframe.value == "1h" and "binance" in description and "1 hour" in description:
-        return pair, "BINANCE_1H_CANDLE"
+        authority=str(metadata.get("resolutionSource","")).lower()+" "+description
+        # HYPE hourly explicitly names a futures candle. The research provider
+        # still returns labelled spot data, never an authoritative futures price.
+        return pair,"BINANCE_USDM_1H_CANDLE" if "/futures/" in authority else "BINANCE_1H_CANDLE"
     if instance.definition.timeframe.value in ("5m", "15m") and "chainlink" in description and "twap" in description:
         return pair, "CHAINLINK_TWAP_60S"
     return None

@@ -27,10 +27,16 @@ def array(value) -> list:
 
 def candidate_family(definition: MarketDefinition) -> str:
     suffix = "hourly" if definition.timeframe.value == "1h" else definition.timeframe.value
-    return f"{definition.asset.value.lower()}-up-or-down-{suffix}"
+    # Gamma's verified hourly SOL series uses the full asset name (series 10122).
+    asset="solana" if definition.asset.value=="SOL" and suffix=="hourly" else definition.asset.value.lower()
+    return f"{asset}-up-or-down-{suffix}"
 
 
 def labeled_tokens(market: dict) -> tuple[str, str]:
+    if market.get("version") not in (None,"v1"):
+        # Protocol-v2 Position IDs are outside this CTF integration; never select
+        # legacy token IDs merely because both fields happen to be populated.
+        raise ValueError("unsupported public market protocol")
     labels, tokens = array(market.get("outcomes")), array(market.get("clobTokenIds"))
     if len(labels) != 2 or len(tokens) != 2 or len(set(map(str, tokens))) != 2:
         raise ValueError("ambiguous binary outcomes/tokens")
