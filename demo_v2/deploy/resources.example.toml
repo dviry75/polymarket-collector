@@ -1,13 +1,19 @@
-# Planning placeholders only: nothing is installed, deployed or started.
+# Deployment proposal only; nothing is installed, deployed or started.
+# See DEPLOYMENT.md for inspected host evidence and required provisioning.
 [demo]
 asgi_factory = "demo_v2.app:create_app"
 host = "127.0.0.1"
 port = 8010
-service_name = "polymarket-demo-v2"
+service_name = "polymarket-demo-v2.service"
 environment_namespace = "DEMO_"
 data_directory = "/var/lib/polymarket-demo-v2"
-log_directory = "/var/log/polymarket-demo-v2"
+logging = "journald:polymarket-demo-v2.service"
 runtime_directory = "/run/polymarket-demo-v2"
 route = "/demo/"
 session_cookie_name = "demo_v2_session"
 session_cookie_path = "/demo/"
+workers = 1
+app_directory = "/opt/polymarket-demo-v2/app"
+venv_directory = "/opt/polymarket-demo-v2/venv"
+frontend_directory = "/opt/polymarket-demo-v2/frontend/demo"
+environment_file = "/etc/polymarket-demo-v2/demo.env"

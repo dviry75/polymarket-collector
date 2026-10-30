@@ -1,0 +1,12 @@
+# Optional NEW dedicated named tunnel; nothing is installed or created here.
+# Replace placeholders manually after approval. Never commit the credentials file.
+tunnel: REPLACE_WITH_DEDICATED_TUNNEL_UUID
+credentials-file: /etc/cloudflared/polymarket-demo-v2.json
+ingress:
+  - hostname: demo-poly.dvirtechnologies.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      httpHostHeader: demo-poly.dvirtechnologies.com
+  - service: http_status:404
+# Enforce HTTPS at the edge, disable caching for this hostname (especially API),
+# and verify the public hostname/certificate before normal browser use.

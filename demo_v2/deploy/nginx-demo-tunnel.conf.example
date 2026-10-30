@@ -1,0 +1,56 @@
+# PROPOSED standalone host; include in nginx's http context after review.
+# OPTIONAL Cloudflare Tunnel profile; choose instead of nginx-demo-poly.conf.
+# Requires managed hostname HTTPS/redirect at Cloudflare and local cloudflared.
+# No ingress except loopback. Browser TLS terminates at Cloudflare, not here.
+# Rate-limit zone names are DEMO-specific; preserve unrelated server blocks.
+limit_req_zone $binary_remote_addr zone=demo_v2_api:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=demo_v2_login:1m rate=5r/m;
+log_format demo_v2_safe '$remote_addr $request_method $uri $status $request_time';
+
+server {
+    listen 127.0.0.1:8080;
+    absolute_redirect off;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header CF-Connecting-IP;
+    server_name demo-poly.dvirtechnologies.com;
+    server_tokens off;
+    client_max_body_size 32k;
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+    send_timeout 30s;
+    access_log /var/log/nginx/polymarket-demo-v2.access.log demo_v2_safe;
+    error_log /var/log/nginx/polymarket-demo-v2.error.log warn;
+    # frontend/demo/ holds only the production build; never point root at the repo.
+    root /opt/polymarket-demo-v2/frontend;
+    index index.html;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy same-origin always;
+    add_header X-Frame-Options DENY always;
+
+    location = / { return 302 /demo/; }
+    location = /demo { return 308 /demo/; }
+    location = /demo/api { return 404; }
+    location = /demo/api/ { return 404; }
+    location = /demo/api/v1/auth/login {
+        limit_req zone=demo_v2_login burst=5 nodelay;
+        limit_req_status 429;
+        include /etc/nginx/snippets/polymarket-demo-v2-api.conf;
+    }
+    location ^~ /demo/api/v1/ {
+        limit_req zone=demo_v2_api burst=30 nodelay;
+        limit_req_status 429;
+        include /etc/nginx/snippets/polymarket-demo-v2-api.conf;
+    }
+    # Unknown API versions must never be turned into a successful HTML response.
+    location /demo/api/ { return 404; }
+    location /demo/ {
+        # Hash routing (#rules, #rule/edit/...) needs no SPA path rewrite.
+        # Missing modules/assets must remain 404 instead of receiving index.html.
+        try_files $uri $uri/ =404;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy same-origin always;
+        add_header X-Frame-Options DENY always;
+    }
+    location / { return 404; }
+}

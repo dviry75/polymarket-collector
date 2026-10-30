@@ -1,0 +1,19 @@
+# Production-only dependency closure verified on Python 3.14.4.
+# Top-level constraints remain owned by demo_v2/requirements.txt.
+-r ../requirements.txt
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+argon2-cffi-bindings==26.1.0
+certifi==2026.10.23
+cffi==2.1.1
+click==8.5.0
+h11==0.16.0
+httpcore==1.0.9
+idna==3.20
+pycparser==3.12
+pydantic==2.14.2
+pydantic_core==2.50.2
+starlette==1.10.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0

@@ -104,3 +104,11 @@ Supplied vanilla ES modules connected to existing auth, rules, trades/KPI, marke
 health and confirmed resets. Original CSS retained. Only backend runtime change:
 additive RuleView `net_pnl` read projection (all closed positions, Decimal string).
 Frontend README describes build/local verification; no LIVE or deployment changes.
+
+## Deployment Review & Preparation — 2026-10-30
+
+See `../deploy/REVIEW.md` and `../deploy/DEPLOYMENT.md`. Dedicated service,
+production env/venv, nginx profiles, private provisioning, WAL-aware backup and
+rollback were prepared and tested locally. No actual deployment, proxy/tunnel,
+DNS/TLS issuance, firewall or LIVE change. Infrastructure/secrets remain operator
+preconditions; fee-enabled entries intentionally remain UNSUPPORTED.

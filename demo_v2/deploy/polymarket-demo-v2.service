@@ -1,0 +1,61 @@
+[Unit]
+Description=Polymarket DEMO V2 (simulated trading only)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polymarket-demo-v2
+Group=polymarket-demo-v2
+WorkingDirectory=/opt/polymarket-demo-v2/app
+EnvironmentFile=/etc/polymarket-demo-v2/demo.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/polymarket-demo-v2/app:/opt/polymarket-demo-v2/app/polymarket-collector
+ExecStartPre=/opt/polymarket-demo-v2/venv/bin/python -m demo_v2.deploy.preflight
+ExecStart=/opt/polymarket-demo-v2/venv/bin/python -m uvicorn demo_v2.app:create_app --factory --host 127.0.0.1 --port 8010 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1 --timeout-graceful-shutdown 20 --no-access-log
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+UMask=0077
+StateDirectory=polymarket-demo-v2
+StateDirectoryMode=0700
+RuntimeDirectory=polymarket-demo-v2
+RuntimeDirectoryMode=0700
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-demo-v2
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/polymarket-demo-v2
+InaccessiblePaths=-/etc/polymarket-live -/opt/polymarket-btc-live -/run/polymarket
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=4096
+TasksMax=64
+MemoryAccounting=true
+MemoryHigh=256M
+MemoryMax=512M
+CPUWeight=20
+
+[Install]
+WantedBy=multi-user.target

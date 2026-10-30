@@ -124,3 +124,10 @@ in the integration evidence. These are point-in-time checks, not sustained-load 
 Fee-enabled public markets intentionally block entries until current tie/per-match
 rounding is verified. An explicit fees-disabled market can supply valid
 zero evidence. Production provisioning/review and deployment are separate work.
+
+## Deployment preparation
+
+`deploy/DEPLOYMENT.md` contains the reviewed installation/update/rollback plan;
+`deploy/REVIEW.md` records actual host evidence and outstanding conditions. Units,
+proxy profiles and operator helpers are preparation only. Nothing was installed
+or activated on the host. Fee-bearing entries remain fail-closed.
