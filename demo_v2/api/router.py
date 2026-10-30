@@ -1,5 +1,6 @@
 from dataclasses import asdict
 from datetime import datetime
+from decimal import Decimal
 import json
 from typing import Annotated, Literal
 
@@ -7,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import Field, SecretStr
 
-from ..domain.trading import FrozenModel, RuleSpec
+from ..domain.trading import FrozenModel, RuleSpec, decimal, text
 from ..persistence.repository import dump
 from .dependencies import require_demo_session
 from .read_model import TradeFilter, TradeQuery, cohort, kpi, trade_view
@@ -77,8 +78,10 @@ async def logout(request: Request):
 
 
 def rule_view(repository,row):
+    positions=repository.positions(rule_id=row["id"])
+    realized=sum((decimal(p["net_pnl_text"]) for p in positions if p["status"]=="CLOSED"),Decimal(0))
     return {key:value for key,value in row.items() if key!="snapshot_json"} | {
-        "trade_count":len(repository.positions(rule_id=row["id"])),"wallet":str(repository.wallet(row["id"]))}
+        "trade_count":len(positions),"wallet":str(repository.wallet(row["id"])),"net_pnl":text(realized)}
 
 
 @router.get("/rules",tags=["Rules"],response_model=RuleList)

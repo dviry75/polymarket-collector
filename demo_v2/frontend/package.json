@@ -1,0 +1,16 @@
+{
+  "name": "polymarket-demo-v2-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/*.test.mjs",
+    "typecheck": "tsc -p jsconfig.json && node --check src/app.js",
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/serve.mjs",
+    "preview": "node scripts/serve.mjs --built",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": { "@playwright/test": "1.64.1", "typescript": "7.0.2" }
+}

@@ -1,0 +1,14 @@
+/* Only adaptations required by real API data; original styles.css is unchanged. */
+.market-prices { gap: 8px; align-items: flex-start; }
+.market-prices .quote-side { flex: 1; min-width: 0; }
+.quote-side > small { display: block; font-size: 9px; line-height: 1.6; }
+.quote-book { margin: 6px 0 0; direction: ltr; font-family: 'SFMono-Regular', Consolas, monospace; font-variant-numeric: tabular-nums; }
+.quote-book > div { display: flex; justify-content: space-between; gap: 3px; line-height: 1.9; }
+.quote-book dt { font-size: 9px; font-weight: normal; }
+.quote-book dd { margin: 0; font-size: 11px; white-space: nowrap; }
+.rule-cell .trade-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 170px; direction: ltr; }
+@media (max-width: 1250px) and (min-width: 901px) {
+  .quote-book > div { flex-direction: column; gap: 0; }
+}
+
+.market-instance { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; margin-top: 6px; font-size: 9px; }

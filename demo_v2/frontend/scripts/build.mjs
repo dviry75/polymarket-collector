@@ -1,0 +1,13 @@
+import {cp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+const root=fileURLToPath(new URL('../',import.meta.url));
+const output=root+'build';
+const base=process.env.DEMO_API_BASE||'/demo/api/v1';
+const parsed=new URL(base,'http://relative.invalid');
+if(!['http:','https:'].includes(parsed.protocol)||parsed.username||parsed.password||parsed.search||parsed.hash||base.startsWith('//'))throw new Error('Invalid public DEMO_API_BASE');
+await rm(output,{recursive:true,force:true});
+await mkdir(output,{recursive:true});
+await cp(root+'src',output+'/src',{recursive:true});
+await writeFile(output+'/index.html',await readFile(root+'index.html','utf8'));
+await writeFile(output+'/src/config.js','export const API_BASE = '+JSON.stringify(base)+';\n');
+console.log('Production ES modules built (no runtime dependencies).');

@@ -1,7 +1,8 @@
-# Polymarket DEMO V2 backend
+# Polymarket DEMO V2
 
-Isolated simulated trading and research. Backend only: no frontend, account API,
-wallet key, real orders, service installation or deployment. Read `AGENTS.md` and
+Isolated simulated trading and research, with the integrated Hebrew RTL frontend
+under `frontend/` (see its README for local build/preview and browser tests).
+No account execution API, wallet key, real orders, service installation or deployment. Read `AGENTS.md` and
 its product context before changing behavior. Current instructions supersede the
 original bootstrap-only authorization in that file.
 
@@ -50,11 +51,11 @@ Nothing in this work package installs or runs this server. Deployment examples
 under `deploy/` are inert. SQLite migrations apply only to the selected DEMO DB on
 application lifespan. Never point this at existing production resources.
 
-## API contract for the external frontend
+## API contract for the frontend
 
 Base prefix: `/demo/api/v1`; generated schemas: `/openapi.json`. Polling is the V1
 frontend transport. JSON financial values are decimal **strings**; timestamps are
-aware UTC ISO-8601. There is no UI, account execution or real-trading endpoint.
+aware UTC ISO-8601. There is no account execution or real-trading endpoint.
 
 1. POST `/auth/login` with `{username,password}` sets the host-only HttpOnly,
    Secure, SameSite=Strict `demo_v2_session` cookie, scoped to `/demo/`.
@@ -83,7 +84,8 @@ version returns 409. Every lifecycle edit creates a version. Archive keeps histo
 and open-position management. Duplicate starts disabled. RuleSpec fields and
 schedule/filter enums are described by OpenAPI; weekdays use Monday=0,
 Asia/Jerusalem local intervals, `[start,end)`, including cross-midnight ranges.
-Entry windows use seconds from verified instance start. Empty schedules/windows
+Entry windows use seconds from verified instance start, shared across all selected
+market definitions. Empty schedules/windows
 mean all time/full market. Multiple underlying conditions are ANDed.
 
 Trade and KPI filters: `rule_id`, `instance_id`, `asset`, `timeframe`, `side`,
@@ -93,6 +95,10 @@ signed open-to-entry change). Missing underlying evidence cannot match a movemen
 filter. Trades also accept `limit=1..200` (default 50), `offset>=0`. Responses use
 `{items,total,limit,offset}`. The historical cohort is materialized in memory for
 Decimal-safe movement filtering; very large histories may need indexed projections.
+
+Rule responses also expose `net_pnl`, the Decimal string sum of all closed
+positions for that rule; it excludes open positions and is independent of trade
+pagination. This is a read-model enhancement only.
 
 KPI wallet is the complete signed ledger cash flow attributable to the filtered
 trade cohort, including outstanding entry debits. No implicit balance constraint.

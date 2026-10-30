@@ -25,6 +25,7 @@ class RuleView(ExtensibleView):
     updated_at: datetime
     trade_count: int
     wallet: str
+    net_pnl: str = Field(description="Realized net P&L over all closed positions of this rule; open positions excluded")
 
 
 class RuleList(BaseModel):

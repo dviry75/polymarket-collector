@@ -1,6 +1,6 @@
 # DEMO V2 implementation status
 
-Local main; backend Phases 2–8 completed 2026-10-29; Phase 9 verified 2026-10-30. No UI or deployment.
+Local main; backend Phases 2–8 completed 2026-10-29; Phase 9 verified 2026-10-30. Frontend integrated subsequently under `frontend/`; no deployment.
 Audit `239d6bd`, Phase 1 `ce76b60`; remote base `d26dda4`.
 
 | Phase | Completed | Local commit | Tests at phase boundary |
@@ -97,3 +97,10 @@ Phase 9 started from clean `a182d65`, with all ten earlier local commits present
 The completed verification is committed before exactly one final push attempt;
 no credential change/reset/rebase/clean or deployment is authorized. The final
 Phase 9 reply records the actual push result.
+
+## Frontend integration — 2026-10-30
+
+Supplied vanilla ES modules connected to existing auth, rules, trades/KPI, markets,
+health and confirmed resets. Original CSS retained. Only backend runtime change:
+additive RuleView `net_pnl` read projection (all closed positions, Decimal string).
+Frontend README describes build/local verification; no LIVE or deployment changes.

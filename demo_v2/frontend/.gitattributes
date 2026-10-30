@@ -1,0 +1,2 @@
+# Preserve the supplied design source's original mixed CRLF endings.
+src/styles.css -text whitespace=cr-at-eol
