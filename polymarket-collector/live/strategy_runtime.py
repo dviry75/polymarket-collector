@@ -13,6 +13,8 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters.base import TradingAdapter
+from .btc_reference_feed import BtcReferenceProvider
+from .btc_reference_recorder import BtcReferenceRecorder
 from .config import LiveConfig
 from .entry_liquidity import EntryLiquidityCollector
 from .exit_forensics import ExitEvidenceCollector
@@ -24,6 +26,7 @@ from .strategy import (
     StrategyPolicy,
     choose_entry,
     exact_trigger,
+    remaining_seconds,
     simulate_buy_fak,
     simulate_sell_fak,
 )
@@ -76,6 +79,9 @@ class LiveStrategyRuntime:
     # to the SQLite fallback instead of raising AttributeError on the hot path.
     _market_provider: Callable[[str], dict[str, Any] | None] | None = None
     _exit_book_provider: Callable[[str], dict[str, Any] | None] | None = None
+    _btc: BtcReferenceRecorder | None = None
+    _btc_feed_task: asyncio.Task[Any] | None = None
+    _btc_writer_task: asyncio.Task[Any] | None = None
 
     def __init__(
         self,
@@ -172,6 +178,16 @@ class LiveStrategyRuntime:
         self._entry_liquidity_enabled = bool(
             config.entry_liquidity_capture_enabled
         )
+        # BTC reference gate: in-memory evaluation on the entry path, persisted
+        # by a separate writer task. The provider is attached by the trader
+        # process (set_btc_reference_provider); without one the gate reads
+        # BTC_FEED_UNAVAILABLE and fails closed in enforce mode.
+        self._btc = BtcReferenceRecorder(
+            config, strategy_repo, base_repo,
+            logger=logging.getLogger(f"{__name__}.btc_reference"),
+        )
+        self._btc_feed_task = None
+        self._btc_writer_task = None
         # P0-C/D: positions already published into hot state, and those still
         # awaiting their first current-state exit evaluation.
         self._known_position_ids: set[str] = set()
@@ -317,6 +333,48 @@ class LiveStrategyRuntime:
         self._exit_book_provider = provider
         self._exit_evidence.set_book_provider(provider)
         self._entry_liquidity.set_book_provider(provider)
+
+    def set_btc_reference_provider(self, provider: BtcReferenceProvider) -> None:
+        if self._btc is not None:
+            self._btc.provider = provider
+
+    async def start_btc_reference(self) -> None:
+        """Start the BTC feed and its writer. Trader process only (network)."""
+        btc = self._btc
+        if btc is None:
+            return
+        if btc.provider is not None and (
+            self._btc_feed_task is None or self._btc_feed_task.done()
+        ):
+            self._btc_feed_task = asyncio.create_task(
+                btc.provider.run(self._stop), name="btc-reference-feed"
+            )
+        if self._btc_writer_task is None or self._btc_writer_task.done():
+            self._btc_writer_task = asyncio.create_task(
+                btc.run(self._stop), name="btc-reference-writer"
+            )
+
+    def _btc_trading_state(
+        self, schedule: dict[str, Any], ram_state: dict[str, Any]
+    ) -> str:
+        flags = []
+        if not self.enabled():
+            flags.append("DISABLED")
+        if ram_state.get("kill_switch"):
+            flags.append("KILL_SWITCH")
+        if ram_state.get("pause_entries"):
+            flags.append("PAUSED")
+        if ram_state.get("stale"):
+            flags.append("STATE_STALE")
+        if not schedule.get("allowed"):
+            flags.append("SCHEDULE_INACTIVE")
+        if (
+            self.config.execution_mode == "REAL_TRADING"
+            and not self.config.continuous_trading_enabled
+            and not ram_state.get("canary_armed")
+        ):
+            flags.append("CANARY_NOT_ARMED")
+        return "|".join([self.config.execution_mode, *(flags or ["ACTIVE"])])
 
     def _market(self, condition_id: str) -> dict[str, Any] | None:
         """Use the in-memory market cache on the hot path.
@@ -1682,6 +1740,49 @@ class LiveStrategyRuntime:
                     event_id, outcome, reason, update.get("outcome"),
                     readiness.get("reason") or "NOT_READY",
                 )
+            self._note_btc_shadow(
+                market=market, event_id=event_id, triggers=triggers,
+                schedule=schedule, ram_state=ram_state,
+            )
+
+    def _note_btc_shadow(
+        self,
+        *,
+        market: dict[str, Any],
+        event_id: str,
+        triggers: list[dict[str, Any]],
+        schedule: dict[str, Any],
+        ram_state: dict[str, Any],
+    ) -> None:
+        """Calibration-only gate evaluation of in-window 0.74 triggers.
+
+        Runs whatever the trading state is (pause, kill switch, schedule) and
+        never feeds back into any decision. Memory-only work.
+        """
+        btc = self._btc
+        if btc is None or btc.mode == "off":
+            return
+        try:
+            remaining = remaining_seconds(event_id, datetime.now(timezone.utc))
+            if remaining is None or not (
+                0 < remaining <= self.policy.entry_window_seconds
+            ):
+                return
+            trading_state = self._btc_trading_state(schedule, ram_state)
+            yes_token = str(market.get("yes_token_id") or "")
+            no_token = str(market.get("no_token_id") or "")
+            for update in triggers:
+                token_id = str(update.get("asset_id") or "")
+                side = "YES" if token_id == yes_token else "NO" if token_id == no_token else None
+                if side is None:
+                    continue
+                evaluation = btc.evaluate(market=market, side=side, token_id=token_id)
+                btc.note_evaluation(
+                    evaluation, source="SHADOW", trading_state=trading_state,
+                    remaining_seconds=remaining,
+                )
+        except Exception as exc:
+            self.last_error = f"BTC_SHADOW:{type(exc).__name__}: {exc}"[:500]
 
     async def _frame_worker(self) -> None:
         while (
@@ -2033,6 +2134,25 @@ class LiveStrategyRuntime:
                 )
                 return
 
+        btc = self._btc
+        btc_evaluation: dict[str, Any] | None = None
+        if btc is not None:
+            btc_evaluation = btc.evaluate(
+                market=market, side=decision.side, token_id=decision.token_id,
+            )
+            btc.note_evaluation(
+                btc_evaluation, source="DECISION",
+                trading_state=self._btc_trading_state(schedule, ram_state),
+                remaining_seconds=remaining_seconds(event_id, observed_at),
+            )
+            if btc.blocks(btc_evaluation):
+                # Not an event lock: the next 0.74 trigger re-evaluates.
+                await self._record_btc_gate_block(
+                    market=market, decision=decision, evaluation=btc_evaluation,
+                    trigger_update=trigger_update, frame_hash=frame_hash,
+                )
+                return
+
         if entry_timing is not None:
             entry_timing["intent_reserve_started_monotonic"] = time.perf_counter()
         reservation = self.repo.reserve_event_entry(
@@ -2087,6 +2207,9 @@ class LiveStrategyRuntime:
         self._mark_event_locked_ram(event_id)
 
         intent_id = str(reservation["entry_intent_id"])
+        if btc is not None and btc_evaluation is not None:
+            btc.attach_intent(btc_evaluation, intent_id)
+            btc.note_deal_entry(btc_evaluation, intent_id=intent_id)
         if trigger_update is not None:
             self._trace_critical(
                 "ENTRY_INTENT_RESERVED", update=trigger_update,
@@ -2111,6 +2234,52 @@ class LiveStrategyRuntime:
             market=market, update=selected_update, side=str(decision.side),
             intent_id=intent_id, fee_rate=fee_rate, entry_timing=entry_timing,
         )
+
+    async def _record_btc_gate_block(
+        self,
+        *,
+        market: dict[str, Any],
+        decision: Any,
+        evaluation: dict[str, Any],
+        trigger_update: dict[str, Any] | None,
+        frame_hash: str,
+    ) -> None:
+        gate = evaluation["decision"]
+        current = evaluation["current"]
+        open_tick = evaluation["open"]
+        if trigger_update is not None:
+            self._trace_critical(
+                "TERMINAL_RESULT", update=trigger_update,
+                reason=gate.reason, result="SKIPPED",
+            )
+        try:
+            await asyncio.to_thread(
+                self.repo.timeline,
+                severity="WARNING", category="DECISION", component="strategy",
+                source="btc_reference_gate", event_id=str(market.get("event_id") or ""),
+                condition_id=str(market.get("condition_id") or ""),
+                token_id=decision.token_id, side=decision.side,
+                requested_action="ENTRY", reason_code=gate.reason,
+                result_status="SKIPPED",
+                parameters_json={
+                    "mode": "enforce",
+                    "side_outcome": evaluation["side_outcome"],
+                    "open_price": canonical_decimal(open_tick.price) if open_tick else None,
+                    "current_price": canonical_decimal(current.price) if current else None,
+                    "current_age_ms": evaluation["age_ms"],
+                    "delta_usd": (
+                        canonical_decimal(gate.delta_usd)
+                        if gate.delta_usd is not None else None
+                    ),
+                    "directional_delta_usd": (
+                        canonical_decimal(gate.directional_delta_usd)
+                        if gate.directional_delta_usd is not None else None
+                    ),
+                    "frame_hash": frame_hash,
+                },
+            )
+        except Exception as exc:
+            self.last_error = f"BTC_GATE_TIMELINE:{type(exc).__name__}: {exc}"[:500]
 
     def _daily_loss_blocked(self) -> bool:
         try:
@@ -5294,6 +5463,15 @@ class LiveStrategyRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
+        for name in ("_btc_feed_task", "_btc_writer_task"):
+            task = getattr(self, name, None)
+            if task is None:
+                continue
+            try:
+                await asyncio.wait_for(task, 3)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                task.cancel()
+            setattr(self, name, None)
         if self.config.stop_forensic_capture_enabled:
             await asyncio.to_thread(self._stop_forensics.stop, 2.0)
 
@@ -5537,5 +5715,6 @@ class LiveStrategyRuntime:
             "hot_state_refresh_failures": self.hot_state_refresh_failures,
             "last_error": self.last_error,
             "entry_schedule": self.entry_schedule_status(),
+            "btc_reference": self._btc.health() if self._btc is not None else None,
             **self.repo.strategy_status(),
         }

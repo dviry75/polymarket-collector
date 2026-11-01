@@ -14,6 +14,7 @@ from .adapters import MockTradingAdapter, RealPolymarketTradingAdapter, TradingA
 from .account_identity import MockPublicAccountIdentityClient, PublicAccountIdentityClient
 from .auth import COOKIE_NAME, LiveAuthManager
 from .backup import LiveBackupManager
+from .btc_reference_feed import build_btc_reference_provider
 from .config import LiveConfig, redact_mapping
 from .dry_run import DryRunService
 from .market_websocket import MarketWebSocketManager, UserWebSocketManager
@@ -107,6 +108,9 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
                 actor=f"strategy:{target.get('reason') or 'targeted'}",
             )
         ),
+    )
+    _strategy_runtime.set_btc_reference_provider(
+        build_btc_reference_provider(_config)
     )
     _paper = PaperTradingEngine(
         _repo,
