@@ -241,6 +241,7 @@ def test_shadow_evaluation_while_paused(harness_factory, monkeypatch):
     assert shadow["side"] == "NO" and shadow["side_outcome"] == "DOWN"
     assert shadow["reason"] == "BTC_DELTA_BELOW_MIN"
     assert shadow["directional_delta_usd"] == "-12"
+    assert shadow["first_directional_delta_usd"] == "-12"
     assert "PAUSED" in shadow["trading_state"]
     assert shadow["remaining_seconds"] == "100"
     assert h.rows("SELECT * FROM live_strategy_intents") == []

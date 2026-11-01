@@ -192,43 +192,29 @@ class BtcReferenceRecorder:
             return
         decision: BtcGateDecision = evaluation["decision"]
         key = (evaluation["event_id"], evaluation["side"], source, decision.reason)
-        directional_delta = _text(decision.directional_delta_usd)
-        observed = _iso_from_ms(evaluation["observed_ms"])
+        directional_delta = decision.directional_delta_usd
         row = self._evaluations.get(key)
         if row is None:
+            # Raw values only; text formatting happens in the writer task.
             row = self._evaluations[key] = {
                 "event_id": key[0], "side": key[1], "source": source,
-                "reason": decision.reason, "first_seen_at": observed, "count": 0,
-                "max_directional_delta_usd": directional_delta,
-                "min_directional_delta_usd": directional_delta,
+                "reason": decision.reason, "first_ms": evaluation["observed_ms"],
+                "count": 0, "first_dir": directional_delta,
+                "max_dir": directional_delta, "min_dir": directional_delta,
+                "intent_id": None,
             }
-        current = evaluation["current"]
-        open_tick = evaluation["open"]
-        row.update({
-            "last_seen_at": observed,
-            "count": row["count"] + 1,
-            "trading_state": trading_state,
-            "side_outcome": evaluation["side_outcome"],
-            "token_id": evaluation["token_id"],
-            "mode": self.mode,
-            "open_price_text": _text(open_tick.price) if open_tick else None,
-            "current_price_text": _text(current.price) if current else None,
-            "current_payload_ts_ms": current.ts_ms if current else None,
-            "current_age_ms": evaluation["age_ms"],
-            "delta_usd": _text(decision.delta_usd),
-            "directional_delta_usd": directional_delta,
-            "remaining_seconds": _text(remaining_seconds),
-            "allowed": int(decision.allowed),
-            "would_block": int(not decision.allowed),
-            "intent_id": intent_id or row.get("intent_id"),
-        })
-        if decision.directional_delta_usd is not None:
-            for bound, pick in (("max_directional_delta_usd", max), ("min_directional_delta_usd", min)):
-                previous = decimal_value(row.get(bound))
-                row[bound] = _text(
-                    decision.directional_delta_usd if previous is None
-                    else pick(previous, decision.directional_delta_usd)
-                )
+        elif directional_delta is not None:
+            if row["max_dir"] is None or directional_delta > row["max_dir"]:
+                row["max_dir"] = directional_delta
+            if row["min_dir"] is None or directional_delta < row["min_dir"]:
+                row["min_dir"] = directional_delta
+        row["last_ms"] = evaluation["observed_ms"]
+        row["count"] += 1
+        row["trading_state"] = trading_state
+        row["evaluation"] = evaluation
+        row["remaining"] = remaining_seconds
+        if intent_id:
+            row["intent_id"] = intent_id
         self.evaluations_noted += 1
         if source == "DECISION" and not decision.allowed:
             if self.mode == "enforce":
@@ -312,13 +298,42 @@ class BtcReferenceRecorder:
         if not self._evaluations:
             return
         pending, self._evaluations = self._evaluations, {}
-        rows = list(pending.values())
+        rows = [self._evaluation_db_row(row) for row in pending.values()]
         try:
             self.rows_written += await asyncio.to_thread(self.repo.upsert_btc_gate_evaluations, rows)
         except Exception:
             for key, row in pending.items():
                 self._evaluations.setdefault(key, row)
             raise
+
+    def _evaluation_db_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        evaluation = row["evaluation"]
+        decision: BtcGateDecision = evaluation["decision"]
+        current = evaluation["current"]
+        open_tick = evaluation["open"]
+        return {
+            "event_id": row["event_id"], "side": row["side"], "source": row["source"],
+            "reason": row["reason"], "count": row["count"],
+            "first_seen_at": _iso_from_ms(row["first_ms"]),
+            "last_seen_at": _iso_from_ms(row["last_ms"]),
+            "trading_state": row["trading_state"],
+            "side_outcome": evaluation["side_outcome"],
+            "token_id": evaluation["token_id"],
+            "mode": self.mode,
+            "open_price_text": _text(open_tick.price) if open_tick else None,
+            "current_price_text": _text(current.price) if current else None,
+            "current_payload_ts_ms": current.ts_ms if current else None,
+            "current_age_ms": evaluation["age_ms"],
+            "delta_usd": _text(decision.delta_usd),
+            "directional_delta_usd": _text(decision.directional_delta_usd),
+            "first_directional_delta_usd": _text(row["first_dir"]),
+            "max_directional_delta_usd": _text(row["max_dir"]),
+            "min_directional_delta_usd": _text(row["min_dir"]),
+            "remaining_seconds": _text(row["remaining"]),
+            "allowed": int(decision.allowed),
+            "would_block": int(not decision.allowed),
+            "intent_id": row["intent_id"],
+        }
 
     async def _flush_deal_entries(self) -> None:
         while self._deal_entries:

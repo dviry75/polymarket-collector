@@ -717,6 +717,7 @@ class StrategyRepository:
                     current_age_ms INTEGER,
                     delta_usd TEXT,
                     directional_delta_usd TEXT,
+                    first_directional_delta_usd TEXT,
                     max_directional_delta_usd TEXT,
                     min_directional_delta_usd TEXT,
                     remaining_seconds TEXT,
@@ -6143,15 +6144,16 @@ class StrategyRepository:
                     event_id,side,source,reason,observed_at,first_seen_at,last_seen_at,
                     count,trading_state,side_outcome,token_id,mode,open_price_text,
                     current_price_text,current_payload_ts_ms,current_age_ms,delta_usd,
-                    directional_delta_usd,max_directional_delta_usd,
-                    min_directional_delta_usd,remaining_seconds,allowed,would_block,
+                    directional_delta_usd,first_directional_delta_usd,
+                    max_directional_delta_usd,min_directional_delta_usd,
+                    remaining_seconds,allowed,would_block,
                     intent_id,created_at,updated_at
                 ) VALUES(
                     :event_id,:side,:source,:reason,:first_seen_at,:first_seen_at,
                     :last_seen_at,:count,:trading_state,:side_outcome,:token_id,:mode,
                     :open_price_text,:current_price_text,:current_payload_ts_ms,
                     :current_age_ms,:delta_usd,:directional_delta_usd,
-                    :max_directional_delta_usd,:min_directional_delta_usd,
+                    :first_directional_delta_usd,:max_directional_delta_usd,:min_directional_delta_usd,
                     :remaining_seconds,:allowed,:would_block,:intent_id,:ts,:ts
                 )
                 ON CONFLICT(event_id,side,source,reason) DO UPDATE SET
