@@ -29,6 +29,17 @@ def _decimal_env(name: str, default: str) -> Decimal:
     return value if value.is_finite() else Decimal(default)
 
 
+def _optional_decimal_env(name: str) -> Decimal | None:
+    raw = _env(name, "")
+    if not raw:
+        return None
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return Decimal("NaN")
+    return value
+
+
 def _decimal_tuple_env(name: str, default_csv: str) -> tuple[Decimal, ...]:
     raw = _env(name, default_csv) or default_csv
 
@@ -154,6 +165,15 @@ class LiveConfig:
         Decimal("3"), Decimal("4"), Decimal("5"),
     )
     entry_liquidity_deep_capture_max_vwap: Decimal = Decimal("0.60")
+    # BTC reference gate (Chainlink BTC/USD via Polymarket RTDS). An extra
+    # pre-reservation entry check only; exits never read the BTC feed.
+    btc_feed_provider: str = "rtds"
+    btc_feed_stall_seconds: float = 10.0
+    btc_open_tick_max_offset_ms: int = 2000
+    btc_gate_mode: str = "observe"
+    btc_gate_min_delta_usd: Decimal = Decimal("10")
+    btc_gate_max_delta_usd: Decimal | None = None
+    btc_max_price_age_ms: int = 5000
     require_clean_runtime: bool = True
     approved_git_sha: str = ""
     approved_runtime_hash: str = ""
@@ -332,6 +352,19 @@ class LiveConfig:
             ),
             entry_liquidity_deep_capture_max_vwap=_decimal_env(
                 "LIVE_ENTRY_LIQUIDITY_DEEP_CAPTURE_MAX_VWAP", "0.60"
+            ),
+            btc_feed_provider=_env("LIVE_BTC_FEED_PROVIDER", "rtds").lower(),
+            btc_feed_stall_seconds=float(
+                _env("LIVE_BTC_FEED_STALL_SECONDS", "10") or "10"
+            ),
+            btc_open_tick_max_offset_ms=int(
+                _env("LIVE_BTC_OPEN_TICK_MAX_OFFSET_MS", "2000") or "2000"
+            ),
+            btc_gate_mode=_env("LIVE_BTC_GATE_MODE", "observe").lower(),
+            btc_gate_min_delta_usd=_decimal_env("LIVE_BTC_GATE_MIN_DELTA_USD", "10"),
+            btc_gate_max_delta_usd=_optional_decimal_env("LIVE_BTC_GATE_MAX_DELTA_USD"),
+            btc_max_price_age_ms=int(
+                _env("LIVE_BTC_MAX_PRICE_AGE_MS", "5000") or "5000"
             ),
             require_clean_runtime=_bool_env("LIVE_REQUIRE_CLEAN_RUNTIME", True),
             approved_git_sha=_env("LIVE_APPROVED_GIT_SHA", "").strip(),
@@ -570,6 +603,28 @@ class LiveConfig:
             errors.append(
                 "LIVE_STOP_FORENSIC_LADDER_BUFFER_MULTIPLE must be between 1 and 10"
             )
+        if self.btc_feed_provider not in {"rtds", "polybolt"}:
+            errors.append("LIVE_BTC_FEED_PROVIDER must be rtds or polybolt")
+        if not 2 <= self.btc_feed_stall_seconds <= 120:
+            errors.append("LIVE_BTC_FEED_STALL_SECONDS must be between 2 and 120")
+        if not 0 <= self.btc_open_tick_max_offset_ms <= 10000:
+            errors.append(
+                "LIVE_BTC_OPEN_TICK_MAX_OFFSET_MS must be between 0 and 10000"
+            )
+        if self.btc_gate_mode not in {"off", "observe", "enforce"}:
+            errors.append("LIVE_BTC_GATE_MODE must be off, observe or enforce")
+        if not self.btc_gate_min_delta_usd.is_finite() or self.btc_gate_min_delta_usd < 0:
+            errors.append("LIVE_BTC_GATE_MIN_DELTA_USD must be >= 0")
+        if self.btc_gate_max_delta_usd is not None and (
+            not self.btc_gate_max_delta_usd.is_finite()
+            or self.btc_gate_max_delta_usd <= self.btc_gate_min_delta_usd
+        ):
+            errors.append(
+                "LIVE_BTC_GATE_MAX_DELTA_USD must be greater than "
+                "LIVE_BTC_GATE_MIN_DELTA_USD"
+            )
+        if not 1000 <= self.btc_max_price_age_ms <= 30000:
+            errors.append("LIVE_BTC_MAX_PRICE_AGE_MS must be between 1000 and 30000")
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -693,6 +748,16 @@ class LiveConfig:
             "entry_liquidity_deep_capture_max_vwap": str(
                 self.entry_liquidity_deep_capture_max_vwap
             ),
+            "btc_feed_provider": self.btc_feed_provider,
+            "btc_feed_stall_seconds": self.btc_feed_stall_seconds,
+            "btc_open_tick_max_offset_ms": self.btc_open_tick_max_offset_ms,
+            "btc_gate_mode": self.btc_gate_mode,
+            "btc_gate_min_delta_usd": str(self.btc_gate_min_delta_usd),
+            "btc_gate_max_delta_usd": (
+                str(self.btc_gate_max_delta_usd)
+                if self.btc_gate_max_delta_usd is not None else None
+            ),
+            "btc_max_price_age_ms": self.btc_max_price_age_ms,
             "require_clean_runtime": self.require_clean_runtime,
             "approved_git_sha_configured": bool(self.approved_git_sha),
             "approved_runtime_hash_configured": bool(self.approved_runtime_hash),

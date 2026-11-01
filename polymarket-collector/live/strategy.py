@@ -186,6 +186,60 @@ def choose_entry(
     return EntryDecision(False, "TOKEN_EVENT_MISMATCH")
 
 
+BTC_GATE_MODES = ("off", "observe", "enforce")
+
+
+@dataclass(frozen=True)
+class BtcGateConfig:
+    mode: str = "observe"
+    min_delta_usd: Decimal = Decimal("10")
+    max_delta_usd: Decimal | None = None
+    max_price_age_ms: int = 5000
+
+
+@dataclass(frozen=True)
+class BtcGateDecision:
+    allowed: bool
+    reason: str
+    delta_usd: Decimal | None = None
+    directional_delta_usd: Decimal | None = None
+
+
+def btc_reference_gate(
+    side_outcome: str | None,
+    open_price: Decimal | None,
+    current_price: Decimal | None,
+    current_payload_age_ms: int | None,
+    cfg: BtcGateConfig,
+) -> BtcGateDecision:
+    """Require BTC to have moved toward the traded side since the window open.
+
+    ``side_outcome`` is ``UP`` or ``DOWN`` (the market's outcome label for the
+    token being bought). ``allowed`` is the gate verdict only; whether a
+    failing verdict blocks the entry is decided by ``cfg.mode``. Markets
+    resolve Up on a tie, so a Down entry never passes at zero movement.
+    """
+    delta = (
+        current_price - open_price
+        if current_price is not None and open_price is not None else None
+    )
+    if current_price is None:
+        return BtcGateDecision(False, "BTC_FEED_UNAVAILABLE")
+    if current_payload_age_ms is None or current_payload_age_ms > cfg.max_price_age_ms:
+        return BtcGateDecision(False, "BTC_PRICE_STALE")
+    if open_price is None or delta is None:
+        return BtcGateDecision(False, "BTC_OPEN_PRICE_UNKNOWN")
+    side = str(side_outcome or "").upper()
+    if side not in {"UP", "DOWN"}:
+        return BtcGateDecision(False, "BTC_SIDE_MAPPING_UNKNOWN", delta)
+    directional = delta if side == "UP" else -delta
+    if directional < cfg.min_delta_usd or (side == "DOWN" and directional == 0):
+        return BtcGateDecision(False, "BTC_DELTA_BELOW_MIN", delta, directional)
+    if cfg.max_delta_usd is not None and directional > cfg.max_delta_usd:
+        return BtcGateDecision(False, "BTC_DELTA_ABOVE_MAX", delta, directional)
+    return BtcGateDecision(True, "BTC_GATE_PASS", delta, directional)
+
+
 def fee_amount(
     shares: Decimal, price: Decimal, fee_rate: Decimal
 ) -> Decimal:
