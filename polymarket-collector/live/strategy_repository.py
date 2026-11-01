@@ -639,6 +639,100 @@ class StrategyRepository:
                         "ALTER TABLE live_strategy_entry_audit "
                         f"ADD COLUMN {column} {definition}"
                     )
+            # BTC reference (Chainlink) snapshots on the deal row: entry values
+            # written right after the reservation, exit values after the
+            # closing fill. Both are written off the trading hot path.
+            deal_btc_columns = {
+                "btc_open_price_text": "TEXT",
+                "btc_open_tick_ts_ms": "INTEGER",
+                "btc_entry_price_text": "TEXT",
+                "btc_entry_ts_ms": "INTEGER",
+                "btc_entry_age_ms": "INTEGER",
+                "btc_entry_directional_delta_usd": "TEXT",
+                "btc_gate_reason": "TEXT",
+                "btc_gate_mode": "TEXT",
+                "btc_entry_missing_reason": "TEXT",
+                "btc_exit_price_text": "TEXT",
+                "btc_exit_ts_ms": "INTEGER",
+                "btc_exit_age_ms": "INTEGER",
+                "btc_exit_directional_delta_usd": "TEXT",
+                "btc_exit_type": "TEXT",
+                "btc_exit_missing_reason": "TEXT",
+            }
+            existing_deal_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(live_strategy_deals)"
+                ).fetchall()
+            }
+            for column, definition in deal_btc_columns.items():
+                if column not in existing_deal_columns:
+                    conn.execute(
+                        "ALTER TABLE live_strategy_deals "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_btc_event_reference (
+                    event_id TEXT PRIMARY KEY,
+                    window_start INTEGER NOT NULL,
+                    open_price_text TEXT,
+                    open_tick_ts_ms INTEGER,
+                    open_received_at TEXT,
+                    close_price_text TEXT,
+                    close_tick_ts_ms INTEGER,
+                    derived_outcome TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    actual_outcome TEXT,
+                    outcome_match INTEGER,
+                    feed_gaps_in_window INTEGER NOT NULL DEFAULT 0,
+                    feed_stalls_in_window INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_btc_event_reference_window "
+                "ON live_btc_event_reference(window_start DESC)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_btc_gate_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    trading_state TEXT,
+                    side_outcome TEXT,
+                    token_id TEXT,
+                    mode TEXT NOT NULL,
+                    open_price_text TEXT,
+                    current_price_text TEXT,
+                    current_payload_ts_ms INTEGER,
+                    current_age_ms INTEGER,
+                    delta_usd TEXT,
+                    directional_delta_usd TEXT,
+                    max_directional_delta_usd TEXT,
+                    min_directional_delta_usd TEXT,
+                    remaining_seconds TEXT,
+                    allowed INTEGER NOT NULL,
+                    would_block INTEGER NOT NULL,
+                    intent_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(event_id, side, source, reason)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_btc_gate_eval_time "
+                "ON live_btc_gate_evaluations(last_seen_at DESC)"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_live_strategy_entry_audit_event "
                 "ON live_strategy_entry_audit(event_id, created_at DESC)"
@@ -6033,3 +6127,234 @@ class StrategyRepository:
             "attempt_count": 0,
             "last_attempt_at": None,
         }
+
+    # ------------------------------------------------------------------ #
+    # BTC reference (Chainlink) persistence. Called only from the runtime's
+    # background BTC writer via asyncio.to_thread, never from the hot path.
+    # ------------------------------------------------------------------ #
+    def upsert_btc_gate_evaluations(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO live_btc_gate_evaluations(
+                    event_id,side,source,reason,observed_at,first_seen_at,last_seen_at,
+                    count,trading_state,side_outcome,token_id,mode,open_price_text,
+                    current_price_text,current_payload_ts_ms,current_age_ms,delta_usd,
+                    directional_delta_usd,max_directional_delta_usd,
+                    min_directional_delta_usd,remaining_seconds,allowed,would_block,
+                    intent_id,created_at,updated_at
+                ) VALUES(
+                    :event_id,:side,:source,:reason,:first_seen_at,:first_seen_at,
+                    :last_seen_at,:count,:trading_state,:side_outcome,:token_id,:mode,
+                    :open_price_text,:current_price_text,:current_payload_ts_ms,
+                    :current_age_ms,:delta_usd,:directional_delta_usd,
+                    :max_directional_delta_usd,:min_directional_delta_usd,
+                    :remaining_seconds,:allowed,:would_block,:intent_id,:ts,:ts
+                )
+                ON CONFLICT(event_id,side,source,reason) DO UPDATE SET
+                    last_seen_at=excluded.last_seen_at,
+                    count=count+excluded.count,
+                    trading_state=excluded.trading_state,
+                    side_outcome=excluded.side_outcome,
+                    token_id=excluded.token_id,
+                    mode=excluded.mode,
+                    open_price_text=COALESCE(excluded.open_price_text,open_price_text),
+                    current_price_text=excluded.current_price_text,
+                    current_payload_ts_ms=excluded.current_payload_ts_ms,
+                    current_age_ms=excluded.current_age_ms,
+                    delta_usd=excluded.delta_usd,
+                    directional_delta_usd=excluded.directional_delta_usd,
+                    max_directional_delta_usd=CASE
+                        WHEN max_directional_delta_usd IS NULL
+                          OR CAST(excluded.max_directional_delta_usd AS REAL)
+                             > CAST(max_directional_delta_usd AS REAL)
+                        THEN COALESCE(excluded.max_directional_delta_usd,max_directional_delta_usd)
+                        ELSE max_directional_delta_usd END,
+                    min_directional_delta_usd=CASE
+                        WHEN min_directional_delta_usd IS NULL
+                          OR CAST(excluded.min_directional_delta_usd AS REAL)
+                             < CAST(min_directional_delta_usd AS REAL)
+                        THEN COALESCE(excluded.min_directional_delta_usd,min_directional_delta_usd)
+                        ELSE min_directional_delta_usd END,
+                    remaining_seconds=excluded.remaining_seconds,
+                    allowed=excluded.allowed,
+                    would_block=excluded.would_block,
+                    intent_id=COALESCE(excluded.intent_id,intent_id),
+                    updated_at=excluded.updated_at
+                """,
+                [{**row, "ts": ts} for row in rows],
+            )
+            conn.commit()
+        return len(rows)
+
+    def record_deal_btc_entry(
+        self, *, event_id: str, entry_intent_id: str, values: dict[str, Any]
+    ) -> bool:
+        columns = (
+            "btc_open_price_text", "btc_open_tick_ts_ms", "btc_entry_price_text",
+            "btc_entry_ts_ms", "btc_entry_age_ms", "btc_entry_directional_delta_usd",
+            "btc_gate_reason", "btc_gate_mode", "btc_entry_missing_reason",
+        )
+        with self.base.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE live_strategy_deals SET "
+                + ",".join(f"{column}=?" for column in columns)
+                + ",updated_at=? WHERE event_id=? AND entry_intent_id=?",
+                (*(values.get(column) for column in columns), now_iso(),
+                 event_id, entry_intent_id),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
+
+    def deals_pending_btc_exit(
+        self, *, since: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Terminal deals without a BTC exit snapshot, with their exit fills."""
+        with self.base.connect() as conn:
+            deals = [
+                row_to_dict(row) or {}
+                for row in conn.execute(
+                    """
+                    SELECT d.event_id,d.position_id,d.state,d.final_reason,d.outcome,
+                           d.closed_at,d.updated_at,d.btc_open_price_text,
+                           (SELECT m.raw_market_info FROM live_markets m
+                             WHERE m.event_id=d.event_id
+                             ORDER BY m.id DESC LIMIT 1) AS raw_market_info
+                    FROM live_strategy_deals d
+                    WHERE btc_exit_type IS NULL AND btc_exit_missing_reason IS NULL
+                      AND state IN ('CLOSED','DUST','RESOLVED_LOSER',
+                                    'RESOLVED_WINNER','REDEEM_PENDING')
+                      AND updated_at>=?
+                    ORDER BY updated_at LIMIT ?
+                    """,
+                    (since, int(limit)),
+                ).fetchall()
+            ]
+            for deal in deals:
+                position_id = deal.get("position_id")
+                deal["exit_fills"] = [
+                    row_to_dict(row) or {}
+                    for row in conn.execute(
+                        """
+                        SELECT i.purpose,f.matched_at,f.created_at
+                        FROM live_strategy_fills f
+                        JOIN live_strategy_intents i ON i.intent_id=f.intent_id
+                        WHERE i.position_id=? AND i.action IN ('EXIT','TP')
+                        """,
+                        (position_id,),
+                    ).fetchall()
+                ] if position_id else []
+                deal["exit_intents"] = [
+                    row_to_dict(row) or {}
+                    for row in conn.execute(
+                        """
+                        SELECT purpose,final_at,updated_at,filled_shares_text
+                        FROM live_strategy_intents
+                        WHERE position_id=? AND action IN ('EXIT','TP')
+                        """,
+                        (position_id,),
+                    ).fetchall()
+                ] if position_id else []
+        return deals
+
+    def record_deal_btc_exit(self, *, event_id: str, values: dict[str, Any]) -> bool:
+        columns = (
+            "btc_exit_price_text", "btc_exit_ts_ms", "btc_exit_age_ms",
+            "btc_exit_directional_delta_usd", "btc_exit_type",
+            "btc_exit_missing_reason",
+        )
+        with self.base.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE live_strategy_deals SET "
+                + ",".join(f"{column}=?" for column in columns)
+                + ",updated_at=? WHERE event_id=? AND btc_exit_type IS NULL "
+                "AND btc_exit_missing_reason IS NULL",
+                (*(values.get(column) for column in columns), now_iso(), event_id),
+            )
+            conn.commit()
+        return cursor.rowcount > 0
+
+    def upsert_btc_event_references(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        ts = now_iso()
+        with self.base.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO live_btc_event_reference(
+                    event_id,window_start,open_price_text,open_tick_ts_ms,
+                    open_received_at,close_price_text,close_tick_ts_ms,
+                    derived_outcome,feed_gaps_in_window,feed_stalls_in_window,
+                    created_at,updated_at
+                ) VALUES(
+                    :event_id,:window_start,:open_price_text,:open_tick_ts_ms,
+                    :open_received_at,:close_price_text,:close_tick_ts_ms,
+                    :derived_outcome,:feed_gaps_in_window,:feed_stalls_in_window,:ts,:ts
+                )
+                ON CONFLICT(event_id) DO UPDATE SET
+                    open_price_text=COALESCE(excluded.open_price_text,open_price_text),
+                    open_tick_ts_ms=COALESCE(excluded.open_tick_ts_ms,open_tick_ts_ms),
+                    open_received_at=COALESCE(excluded.open_received_at,open_received_at),
+                    close_price_text=COALESCE(excluded.close_price_text,close_price_text),
+                    close_tick_ts_ms=COALESCE(excluded.close_tick_ts_ms,close_tick_ts_ms),
+                    derived_outcome=CASE WHEN excluded.derived_outcome='UNKNOWN'
+                        THEN derived_outcome ELSE excluded.derived_outcome END,
+                    outcome_match=CASE
+                        WHEN actual_outcome IS NULL THEN outcome_match
+                        WHEN excluded.derived_outcome='UNKNOWN' THEN outcome_match
+                        WHEN actual_outcome=excluded.derived_outcome THEN 1 ELSE 0 END,
+                    feed_gaps_in_window=MAX(feed_gaps_in_window,excluded.feed_gaps_in_window),
+                    feed_stalls_in_window=MAX(feed_stalls_in_window,excluded.feed_stalls_in_window),
+                    updated_at=excluded.updated_at
+                """,
+                [{**row, "ts": ts} for row in rows],
+            )
+            conn.commit()
+        return len(rows)
+
+    def fill_btc_event_actual_outcomes(self, *, limit: int = 200) -> int:
+        """Copy authoritative market resolution onto the BTC reference rows."""
+        from .btc_reference_feed import side_outcome_map
+
+        with self.base.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT r.event_id,r.derived_outcome,m.winning_asset_id,
+                       m.winning_outcome,m.yes_token_id,m.no_token_id,m.raw_market_info
+                FROM live_btc_event_reference r
+                JOIN live_markets m ON m.event_id=r.event_id
+                WHERE r.actual_outcome IS NULL AND m.market_resolved=1
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            updated = 0
+            ts = now_iso()
+            for row in rows:
+                market = row_to_dict(row) or {}
+                actual = None
+                label = str(market.get("winning_outcome") or "").strip().upper()
+                if label in {"UP", "DOWN"}:
+                    actual = label
+                else:
+                    mapping = side_outcome_map(market) or {}
+                    winner = str(market.get("winning_asset_id") or "")
+                    if winner and winner == str(market.get("yes_token_id") or ""):
+                        actual = mapping.get("YES")
+                    elif winner and winner == str(market.get("no_token_id") or ""):
+                        actual = mapping.get("NO")
+                if actual is None:
+                    continue
+                derived = str(market.get("derived_outcome") or "UNKNOWN")
+                conn.execute(
+                    "UPDATE live_btc_event_reference SET actual_outcome=?,outcome_match=?,"
+                    "updated_at=? WHERE event_id=?",
+                    (actual, None if derived == "UNKNOWN" else int(derived == actual),
+                     ts, market["event_id"]),
+                )
+                updated += 1
+            conn.commit()
+        return updated

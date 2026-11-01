@@ -57,6 +57,27 @@ def window_start_from_event_id(event_id: str) -> int | None:
         return None
 
 
+def side_outcome_map(market: dict[str, Any]) -> dict[str, str] | None:
+    """{"YES": "UP"|"DOWN", "NO": ...} from the market's Gamma outcome labels.
+
+    Discovery stores the labels in ``raw_market_info``. Returns None when they
+    are missing or are not exactly one Up and one Down; callers fail closed.
+    """
+    info = market.get("raw_market_info")
+    if isinstance(info, str):
+        try:
+            info = json.loads(info)
+        except ValueError:
+            return None
+    if not isinstance(info, dict):
+        return None
+    yes = str(info.get("yes_outcome_label") or "").strip().upper()
+    no = str(info.get("no_outcome_label") or "").strip().upper()
+    if {yes, no} != {"UP", "DOWN"}:
+        return None
+    return {"YES": yes, "NO": no}
+
+
 def rtds_subscribe_message() -> str:
     # RTDS compares the ``filters`` string literally. ``{"symbol": "btc/usd"}``
     # (with a space) is accepted silently and yields one snapshot followed by
