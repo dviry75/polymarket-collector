@@ -49,7 +49,7 @@
 - **שורה אחת לכל event:** `event_id UNIQUE`. השורה נוצרת ב־`reserve_event_entry` ונסגרת ב־`apply_exit_fill`, `mark_position_resolved` או `mark_position_redeemed`.
 - **הדשבורד:** `live/dashboard_read_model.py` משתמש בה ב־`pnl_summary`, `pnl_timeseries` ו־`trade_history`, כלומר endpoint `/live/dashboard/v1/trades`.
 - **עמודה `outcome`:** מחזיקה את צד הטוקן (YES/NO). המיפוי ל־Up/Down מגיע מ־`live_markets.raw_market_info`.
-- **ייצוא ה־Excel** (`tools/export_trade_history_simple.py`) **לא** קורא את הטבלה הזאת. ראו סעיף 9.
+- **ייצוא ה־Excel** (`tools/export_trade_history_simple.py`) קורא ממנה את עמודות ה־BTC, read-only, לפי ה־slug. ראו סעיף 9.
 
 ## 4. קבצים ושורות
 
@@ -75,7 +75,8 @@
 | `live/dashboard_read_model.py:157-175`, `:502` | שדה `btc` בכל פריט של `/trades` |
 | `scripts/benchmark_btc_reference.py` (חדש) | benchmark |
 | `scripts/btc_gate_analysis.sql` (חדש) | שאילתות ניתוח |
-| `tests/test_btc_reference_feed.py`, `tests/test_btc_gate.py`, `tests/test_btc_reference_integration.py`, `tests/fixtures/rtds_chainlink_sample.jsonl` | טסטים ו־fixture אמיתי (31 הודעות מתוך הריצה של discovery) |
+| `tools/export_trade_history_simple.py`, `scripts/email_trade_export.py` | עמודות BTC וגיליון `BTC Deals` בייצוא ה־Excel |
+| `tests/test_btc_reference_feed.py`, `tests/test_btc_gate.py`, `tests/test_btc_reference_integration.py`, `tests/test_trade_export_btc.py`, `tests/fixtures/rtds_chainlink_sample.jsonl` | טסטים ו־fixture אמיתי (31 הודעות מתוך הריצה של discovery) |
 
 ## 5. הסכמה החדשה (migration מוסיף, בסגנון הקיים)
 
@@ -215,7 +216,7 @@
 
 ### טסטים (pytest, בלי רשת, DB זמני)
 
-- **סה"כ:** 659 עוברים (622 קיימים + 37 חדשים). ריצה מלאה על ה־branch.
+- **סה"כ:** 666 עוברים (622 קיימים + 44 חדשים). ריצה מלאה על ה־branch.
 - **טסטים חדשים:**
   - **השער:** כל קודי ההחלטה, Up ו־Down, בדיוק 10, max, תיקו, ולידציית config ו־env.
   - **מחירי פתיחה וסגירה:** טיק בדיוק על הגבול (מתוך ה־fixture האמיתי, 17:40:00), טיק מאוחר, טיק חסר, השלמה מ־snapshot.
@@ -260,13 +261,27 @@ uvloop לא נמדד: ה־uvloop שב־venv הבדיקה לא נטען תחת Py
 
 ## 9. ייצוא העסקאות (Excel)
 
-**לא הוספתי עמודות לייצוא.** הסיבות:
-- `tools/export_trade_history_simple.py` (שרץ דרך `scripts/email_trade_export.py`) מושך את ההיסטוריה מה־API של Polymarket (CLOB ו־Data API), שורה לכל fill, ובכוונה בלי DB ובלי אנליטיקה ("one row per executed fill, twelve columns").
-- הוספת BTC מחייבת שלושה דברים:
-  1. גישת קריאה ל־DB מתהליך הייצוא (תחת systemd, בהרשאות של `polymarket-trade-export`).
-  2. join של `Event Slug` ל־`live_strategy_deals.event_id`.
-  3. שתי עמודות לכל fill: BUY ⇐ `btc_entry_*`, SELL ⇐ `btc_exit_*`.
-- זה שינוי בעיצוב של כלי שתוכנן להיות "מראה" של ה־History באתר. צריך החלטה שלך.
+הייצוא (`tools/export_trade_history_simple.py`, שרץ גם דרך `scripts/email_trade_export.py`) עדיין מושך את ה־fills מה־API של Polymarket. נתוני ה־BTC מגיעים מה־DB החי:
+- **קריאה בלבד:** ה־DB נפתח ב־`mode=ro` ועם `PRAGMA query_only`. ה־unit של `polymarket-trade-export` כבר מגדיר את קובץ ה־DB כ־`ReadOnlyPaths`.
+- **ה־join:** `Event Slug` של ה־Data API ↔ `live_strategy_deals.event_id`. אומת מול ה־API הציבורי שה־`eventSlug` זהה ל־slug של Gamma (`btc-updown-5m-<ts>`).
+- **אם ה־DB חסר, לא קריא או לא עבר migration:** הייצוא יוצא כרגיל עם עמודות BTC ריקות, והסיבה נרשמת ב־log (`BTC_DB_NOT_FOUND`, `BTC_DB_UNAVAILABLE`, `BTC_COLUMNS_NOT_MIGRATED`).
+
+**גיליון `Trade History`:** 12 העמודות הקיימות לא השתנו. אחריהן 5 עמודות חדשות:
+
+| עמודה | בקנייה | במכירה |
+|---|---|---|
+| `BTC Open USD` | מחיר הפתיחה של החלון | אותו דבר |
+| `BTC At Trade USD` | מחיר ה־BTC בהחלטת הכניסה | מחיר ה־BTC ב־fill היציאה האחרון של העסקה |
+| `BTC Move For Side USD` | התנועה מהפתיחה לכיוון הצד שנקנה (+ = לטובתנו) | אותו דבר, ביציאה |
+| `BTC Gate / Exit` | סיבת השער ומצבו, למשל `PASS (observe)` | סוג היציאה: `TP` / `STOP` / `EMERGENCY` |
+| `BTC Note` | סיבה לערך חסר | סיבה לערך חסר |
+
+- **fills חלקיים:** כמה fills של אותה עסקה מקבלים את אותו ערך, כי ה־snapshot נשמר פעם אחת לכל עסקה.
+- **עסקאות מלפני הפיצ'ר:** העמודות ריקות.
+
+**גיליון `BTC Deals` (חדש):** שורה לכל עסקה שיש לה נתוני BTC, עם הכניסה, השער, סוג היציאה, מחיר היציאה וה־PnL. הגיליון נדרש כי יציאה ב־RESOLUTION היא redeem ולא fill, ולכן אין לה שורה ב־`Trade History`. מחיר הסגירה של חלון כזה מופיע רק כאן, ולא מוצג כ"מחיר במכירה". אם אין נתוני BTC, הגיליון לא נוצר.
+
+**⚠ פריסה:** ה־unit רץ מ־`/opt/polymarket-btc-live/repo/polymarket-collector`, כלומר מקוד `repo/` ולא מה־branch הזה. השינוי ייכנס לפעולה רק אחרי מיזוג ופריסה. לא בדקתי שהמשתמש `dvir` מורשה לקרוא את קובץ ה־DB, כי לי אין הרשאה לראות את התיקייה. אם אין לו הרשאה, הייצוא ייצא בלי BTC עם `BTC_DB_UNAVAILABLE` ב־log.
 
 **בדשבורד:** ה־API (`/live/dashboard/v1/trades`) מחזיר עכשיו שדה `btc` בכל עסקה. ה־frontend לא נמצא בריפו הזה, ולכן לא שיניתי את התצוגה.
 
@@ -280,5 +295,5 @@ uvloop לא נמדד: ה־uvloop שב־venv הבדיקה לא נטען תחת Py
    - Chainlink Data Streams ישירות.
 3. **בדיקה חוזרת אחרי חסימה:** כרגע רק על edge של 0.74 (סעיף 6).
 4. **DUST:** הסוג נקבע לפי ה־fill האחרון (סעיף 6).
-5. **ייצוא ה־Excel:** סעיף 9.
+5. **ייצוא ה־Excel:** בוצע (סעיף 9). נשאר לוודא בפריסה ש־`dvir` יכול לקרוא את ה־DB.
 6. **מיזוג:** ה־branch מבוסס על `14b02f9`, ושינויי ה־entry-gate-unification (על `0bdc38a`) לא נכללו בו.

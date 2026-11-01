@@ -7,8 +7,11 @@ slice with ``CPUQuota``/``MemoryMax``/``Nice=19`` so it cannot starve the trader
 latency does not matter (minutes is fine).
 
 - The Excel file is produced by ``tools/export_trade_history_simple.py`` **unchanged**
-  (single "Trade History" sheet, one row per fill, chronological, freeze + filters,
-  MAKER perspective reconstructed from ``maker_orders``). No date filter -- full history.
+  ("Trade History" sheet, one row per fill, chronological, freeze + filters,
+  MAKER perspective reconstructed from ``maker_orders``, BTC reference columns,
+  plus a "BTC Deals" sheet). No date filter -- full history.
+- The BTC values come from the live DB (``LIVE_DB_PATH``), opened read-only; the
+  unit mounts it read-only. Without it the export still goes out, BTC left empty.
 - SMTP config comes from ``/etc/polymarket-live/smtp.env`` (injected by systemd);
   it is never exposed to the public dashboard process.
 - Recipients are restricted to the configured report addresses
@@ -36,10 +39,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from live.reporting import SMTPSettings  # noqa: E402
 from live.trade_export_queue import RECIPIENTS_FILE, REQUEST_DIR  # noqa: E402
 from tools.export_trade_history_simple import (  # noqa: E402
+    DEFAULT_DB_PATH,
     assert_no_secrets,
+    attach_btc,
     build_rows,
     fetch_clob_trades,
     fetch_data_trades,
+    load_btc_deals,
     write_workbook,
 )
 
@@ -99,9 +105,11 @@ def build_workbook(config: dict[str, str]) -> Path:
     data = fetch_data_trades(config)
     log.info("fetched CLOB fills=%d data-api rows=%d", len(clob), len(data))
     rows = build_rows(clob, data, config["proxy_wallet"].lower())
+    btc_deals, btc_status = load_btc_deals(os.environ.get("LIVE_DB_PATH") or DEFAULT_DB_PATH)
+    log.info("BTC reference: %s, fills matched=%d", btc_status, attach_btc(rows, btc_deals))
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"polymarket_trade_history_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.xlsx"
-    write_workbook(rows, path)
+    write_workbook(rows, path, btc_deals)
     assert_no_secrets(path, config)
     log.info("wrote %s (%d fills)", path, len(rows))
     return path
