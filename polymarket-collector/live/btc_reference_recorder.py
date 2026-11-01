@@ -6,6 +6,12 @@ the caller's stack. A dedicated task (``run``) drains the pending state to
 SQLite through ``asyncio.to_thread`` once a second, and from there also
 writes the per-window reference rows and the BTC exit snapshot of closed
 deals. Exits never wait on, or read, anything in this module.
+
+Re-check measurement: every blocked (or would-block) evaluation starts an
+in-memory watch on its token. The watch records whether the gate would have
+passed while the ask stayed at 0.74, and ends when the ask leaves 0.74, the
+final-minute entry cutoff is reached, or the window ends; only then is its
+result written. It never feeds back into a decision.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ RESOLUTION_FINAL_REASONS = {"MARKET_RESOLUTION", "REDEEMED"}
 EXIT_SETTLE_MS = 5000
 EXIT_LOOKBACK = timedelta(hours=6)
 REFERENCE_WINDOWS_TRACKED = 3
+WATCH_LIMIT = 64
+WATCH_WRITE_ATTEMPTS = 10
 
 
 def _text(value: Decimal | None) -> str | None:
@@ -76,6 +84,13 @@ def exit_type_for_purpose(purpose: str | None) -> str:
     return name or "UNKNOWN"
 
 
+def outcome_from(close: Decimal | None, open_: Decimal | None) -> str:
+    """Gamma: Up when the end value is >= the start value (a tie is Up)."""
+    if close is None or open_ is None:
+        return "UNKNOWN"
+    return "UP" if close >= open_ else "DOWN"
+
+
 def directional(side_outcome: str | None, price: Decimal | None,
                 open_price: Decimal | None) -> Decimal | None:
     if price is None or open_price is None or side_outcome not in {"UP", "DOWN"}:
@@ -106,6 +121,12 @@ class BtcReferenceRecorder:
         self.open_tick_max_offset_ms = int(
             getattr(config, "btc_open_tick_max_offset_ms", 2000)
         )
+        self.entry_price = decimal_value(
+            getattr(config, "strategy_entry_price", Decimal("0.74"))
+        ) or Decimal("0.74")
+        self.entry_cutoff_seconds = int(
+            getattr(config, "strategy_entry_cutoff_seconds_before_close", 60)
+        )
         self._logger = logger or logging.getLogger(__name__)
         self._side_maps: dict[str, dict[str, str] | None] = {}
         self._evaluations: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -114,6 +135,11 @@ class BtcReferenceRecorder:
         self._last_exit_scan = 0.0
         self._last_outcome_fill = 0.0
         self._last_health_publish = 0.0
+        self._watches: dict[str, dict[tuple[str, str, str, str], dict[str, Any]]] = {}
+        self._watch_results: deque[dict[str, Any]] = deque()
+        self.watches_started = 0
+        self.watches_finished = 0
+        self.watches_dropped = 0
         self.evaluations_noted = 0
         self.decision_blocks = 0
         self.would_block = 0
@@ -155,6 +181,7 @@ class BtcReferenceRecorder:
             provider.open_price(window_start)
             if provider is not None and window_start is not None else None
         )
+        twap = provider.twap_current() if provider is not None else None
         age = (now - current.ts_ms) if current is not None else None
         decision = btc_reference_gate(
             side_outcome,
@@ -171,6 +198,7 @@ class BtcReferenceRecorder:
             "side_outcome": side_outcome,
             "open": open_tick,
             "current": current,
+            "twap": twap,
             "age_ms": age,
             "decision": decision,
             "observed_ms": now,
@@ -183,7 +211,7 @@ class BtcReferenceRecorder:
             "event_id": str(market.get("event_id") or ""),
             "window_start": None, "side": str(side or ""),
             "token_id": str(token_id or ""), "side_outcome": None,
-            "open": None, "current": None, "age_ms": None,
+            "open": None, "current": None, "twap": None, "age_ms": None,
             "decision": BtcGateDecision(False, "BTC_GATE_ERROR"),
             "observed_ms": self.now_ms(),
         }
@@ -233,6 +261,105 @@ class BtcReferenceRecorder:
                 self.decision_blocks += 1
             else:
                 self.would_block += 1
+        if not decision.allowed and source in {"DECISION", "SHADOW"}:
+            self._start_watch(key, evaluation, remaining_seconds)
+
+    # ------------------------------------------------ re-check watches
+    @property
+    def has_watches(self) -> bool:
+        return bool(self._watches)
+
+    def _start_watch(self, key: tuple[str, str, str, str], evaluation: dict[str, Any],
+                     remaining_seconds: Decimal | None) -> None:
+        token_id = evaluation["token_id"]
+        window_start = evaluation["window_start"]
+        if not token_id or window_start is None or remaining_seconds is None:
+            return
+        if remaining_seconds <= self.entry_cutoff_seconds:
+            return  # no entry could follow; nothing to measure
+        watches = self._watches.get(token_id)
+        if watches is not None and key in watches:
+            return
+        if sum(len(item) for item in self._watches.values()) >= WATCH_LIMIT:
+            self.watches_dropped += 1
+            return
+        self._watches.setdefault(token_id, {})[key] = {
+            "key": key,
+            "side_outcome": evaluation["side_outcome"],
+            "window_start": window_start,
+            "crossed_ms": None,
+            "cross_dir": None,
+        }
+        self.watches_started += 1
+
+    def _watch_crossed(self, watch: dict[str, Any], now: int) -> None:
+        if watch["crossed_ms"] is not None or self.provider is None:
+            return
+        current = self.provider.current()
+        open_tick = self.provider.open_price(watch["window_start"])
+        decision = btc_reference_gate(
+            watch["side_outcome"],
+            open_tick.price if open_tick else None,
+            current.price if current else None,
+            (now - current.ts_ms) if current is not None else None,
+            self.gate_config,
+        )
+        if decision.allowed:
+            watch["crossed_ms"] = now
+            watch["cross_dir"] = decision.directional_delta_usd
+
+    def _end_watch(self, token_id: str, watch: dict[str, Any], reason: str, now: int,
+                   *, ask_left: bool = False) -> None:
+        event_id, side, source, gate_reason = watch["key"]
+        self._watch_results.append({
+            "event_id": event_id, "side": side, "source": source, "reason": gate_reason,
+            "ask_left_074_at": _iso_from_ms(now) if ask_left else None,
+            "delta_crossed_min_while_at_074": int(watch["crossed_ms"] is not None),
+            "crossed_at": _iso_from_ms(watch["crossed_ms"]),
+            "directional_delta_at_cross": _text(watch["cross_dir"]),
+            "watch_end_reason": reason,
+            "watch_ended_at": _iso_from_ms(now),
+            "attempts": 0,
+        })
+        watches = self._watches.get(token_id)
+        if watches is not None:
+            watches.pop(watch["key"], None)
+            if not watches:
+                del self._watches[token_id]
+        self.watches_finished += 1
+
+    def observe_asks(self, updates: list[dict[str, Any]]) -> None:
+        """Book updates of watched tokens, in frame order. Memory only."""
+        if not self._watches:
+            return
+        now = self.now_ms()
+        for update in updates:
+            token_id = str(update.get("asset_id") or "")
+            watches = self._watches.get(token_id)
+            if not watches:
+                continue
+            ask = decimal_value(update.get("best_ask"))
+            if ask is None:
+                continue
+            for watch in list(watches.values()):
+                self._watch_crossed(watch, now)
+                if ask != self.entry_price:
+                    self._end_watch(token_id, watch, "ASK_LEFT_074", now, ask_left=True)
+
+    def check_watches(self, now_ms: int | None = None) -> None:
+        """Advance every watch on the BTC clock: crossing, cutoff, window end."""
+        if not self._watches:
+            return
+        now = self.now_ms() if now_ms is None else now_ms
+        for token_id, watches in list(self._watches.items()):
+            for watch in list(watches.values()):
+                remaining_ms = (watch["window_start"] + WINDOW_SECONDS) * 1000 - now
+                if remaining_ms <= 0:
+                    self._end_watch(token_id, watch, "WINDOW_ENDED", now)
+                elif remaining_ms <= self.entry_cutoff_seconds * 1000:
+                    self._end_watch(token_id, watch, "FINAL_MINUTE", now)
+                else:
+                    self._watch_crossed(watch, now)
 
     def attach_intent(self, evaluation: dict[str, Any], intent_id: str) -> None:
         decision: BtcGateDecision = evaluation["decision"]
@@ -261,6 +388,10 @@ class BtcReferenceRecorder:
         elif evaluation["side_outcome"] is None:
             missing = "BTC_SIDE_MAPPING_UNKNOWN"
         stale = missing in {"BTC_FEED_UNAVAILABLE", "BTC_PRICE_STALE"}
+        twap = evaluation.get("twap")
+        twap_fresh = twap is not None and (
+            evaluation["observed_ms"] - twap.ts_ms <= self.gate_config.max_price_age_ms
+        )
         self._deal_entries.append({
             "event_id": evaluation["event_id"],
             "entry_intent_id": intent_id,
@@ -274,6 +405,7 @@ class BtcReferenceRecorder:
                 "btc_gate_reason": None if self.mode == "off" else decision.reason,
                 "btc_gate_mode": self.mode,
                 "btc_entry_missing_reason": missing,
+                "btc_entry_twap_text": _text(twap.price) if twap_fresh else None,
             },
         })
 
@@ -285,11 +417,18 @@ class BtcReferenceRecorder:
             except asyncio.TimeoutError:
                 pass
             await self.flush()
+        now = self.now_ms()
+        for token_id, watches in list(self._watches.items()):
+            for watch in list(watches.values()):
+                self._end_watch(token_id, watch, "SHUTDOWN", now)
         await self.flush()  # final drain on shutdown
 
     async def flush(self, *, force_scans: bool = False) -> None:
         now = time.monotonic()
-        steps = [self._flush_evaluations, self._flush_deal_entries, self._flush_references]
+        steps = [
+            self._flush_evaluations, self._flush_watches,
+            self._flush_deal_entries, self._flush_references,
+        ]
         if force_scans or now - self._last_exit_scan >= 2.0:
             self._last_exit_scan = now
             steps.append(self._flush_deal_exits)
@@ -348,6 +487,23 @@ class BtcReferenceRecorder:
             "intent_id": row["intent_id"],
         }
 
+    async def _flush_watches(self) -> None:
+        self.check_watches()
+        if not self._watch_results:
+            return
+        pending = list(self._watch_results)
+        self._watch_results.clear()
+        try:
+            unmatched = await asyncio.to_thread(self.repo.record_btc_recheck_results, pending)
+        except Exception:
+            self._watch_results.extend(pending)
+            raise
+        # The evaluation row may not be written yet (its flush failed); retry.
+        for row in unmatched:
+            row["attempts"] += 1
+            if row["attempts"] < WATCH_WRITE_ATTEMPTS:
+                self._watch_results.append(row)
+
     async def _flush_deal_entries(self) -> None:
         while self._deal_entries:
             job = self._deal_entries[0]
@@ -371,11 +527,11 @@ class BtcReferenceRecorder:
             window_start = newest - index * WINDOW_SECONDS
             open_tick = provider.open_price(window_start)
             close_tick = provider.close_price(window_start + WINDOW_SECONDS)
+            open_twap = provider.twap_boundary(window_start)
+            close_twap = provider.twap_boundary(window_start + WINDOW_SECONDS)
             stats = provider.state.window_stats(window_start)
-            derived = "UNKNOWN"
-            if open_tick is not None and close_tick is not None:
-                # Gamma: Up when the end value is >= the value at the start.
-                derived = "UP" if close_tick.price >= open_tick.price else "DOWN"
+            open_price = open_tick.price if open_tick else None
+            close_twap_price = close_twap.price if close_twap else None
             row = {
                 "event_id": f"btc-updown-5m-{window_start}",
                 "window_start": window_start,
@@ -384,7 +540,17 @@ class BtcReferenceRecorder:
                 "open_received_at": _iso_from_ms(open_tick.received_ms) if open_tick else None,
                 "close_price_text": _text(close_tick.price) if close_tick else None,
                 "close_tick_ts_ms": close_tick.ts_ms if close_tick else None,
-                "derived_outcome": derived,
+                "open_twap_text": _text(open_twap.price) if open_twap else None,
+                "close_twap_text": _text(close_twap_price),
+                "close_twap_ts_ms": close_twap.ts_ms if close_twap else None,
+                # Resolution is on the TWAP stream: close TWAP vs the open.
+                "derived_outcome": outcome_from(close_twap_price, open_price),
+                "derived_outcome_spot": outcome_from(
+                    close_tick.price if close_tick else None, open_price,
+                ),
+                "derived_outcome_twap_open": outcome_from(
+                    close_twap_price, open_twap.price if open_twap else None,
+                ),
                 "feed_gaps_in_window": stats["gaps"],
                 "feed_stalls_in_window": stats["stalls"],
             }
@@ -434,7 +600,9 @@ class BtcReferenceRecorder:
         values: dict[str, Any] = {
             "btc_exit_price_text": None, "btc_exit_ts_ms": None, "btc_exit_age_ms": None,
             "btc_exit_directional_delta_usd": None, "btc_exit_type": None,
-            "btc_exit_missing_reason": None,
+            "btc_exit_missing_reason": None, "btc_exit_twap_text": None,
+            # The exit type is unchanged; this only flags a residual left behind.
+            "btc_exit_dust_residual": int(str(deal.get("state") or "") == "DUST"),
         }
         resolution = (
             str(deal.get("final_reason") or "").upper() in RESOLUTION_FINAL_REASONS
@@ -451,6 +619,8 @@ class BtcReferenceRecorder:
             if provider is None:
                 values["btc_exit_missing_reason"] = "BTC_FEED_UNAVAILABLE"
                 return values
+            close_twap = provider.twap_boundary(window_end)
+            values["btc_exit_twap_text"] = _text(close_twap.price) if close_twap else None
             tick, status = provider.state.boundary_status(window_end)
             if tick is None:
                 values["btc_exit_missing_reason"] = f"BTC_CLOSE_PRICE_{status}"
@@ -472,6 +642,9 @@ class BtcReferenceRecorder:
         if provider is None:
             values["btc_exit_missing_reason"] = "BTC_FEED_UNAVAILABLE"
             return values
+        twap = provider.twap_price_at(fill_ms)
+        if twap is not None and fill_ms - twap.ts_ms <= self.gate_config.max_price_age_ms:
+            values["btc_exit_twap_text"] = _text(twap.price)
         tick = provider.price_at(fill_ms)
         if tick is None:
             values["btc_exit_missing_reason"] = "BTC_TICK_NOT_IN_BUFFER"
@@ -535,6 +708,10 @@ class BtcReferenceRecorder:
             "rows_written": self.rows_written,
             "deal_entries_written": self.deal_entries_written,
             "deal_exits_written": self.deal_exits_written,
+            "watches_active": sum(len(item) for item in self._watches.values()),
+            "watches_started": self.watches_started,
+            "watches_finished": self.watches_finished,
+            "watches_dropped": self.watches_dropped,
             "writer_failures": self.writer_failures,
             "last_error": self.last_error,
         }

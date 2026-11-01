@@ -332,6 +332,10 @@ def test_resolution_records_window_close(harness_factory):
     h = harness_factory()
     h.tick(0, OPEN)
     h.tick(300_000, OPEN + 100)
+    # Spot closes up, but the 60s TWAP (the resolution source) closes below
+    # the spot open: the derived outcome follows the TWAP.
+    h.provider.twap_state.ingest(W * 1000, Decimal(OPEN + 5))
+    h.provider.twap_state.ingest((W + 300) * 1000, Decimal(OPEN - 1))
     position = _open_position(h)
     h.strategy.mark_position_resolved(position["position_id"], winner=True, redeem_pending=True)
     h.clock[0] = (W + 301) * 1000
@@ -345,16 +349,23 @@ def test_resolution_records_window_close(harness_factory):
     assert deal["btc_exit_ts_ms"] == (W + 300) * 1000
     assert deal["btc_exit_age_ms"] == 0
     assert deal["btc_exit_directional_delta_usd"] == "100"
+    assert deal["btc_exit_twap_text"] == "79999"
+    assert deal["btc_exit_dust_residual"] == 0
 
     reference = h.rows("SELECT * FROM live_btc_event_reference WHERE event_id=?", EVENT)[0]
     assert reference["open_price_text"] == "80000"
     assert reference["close_price_text"] == "80100"
-    assert reference["derived_outcome"] == "UP"
+    assert reference["open_twap_text"] == "80005"
+    assert reference["close_twap_text"] == "79999"
+    assert reference["close_twap_ts_ms"] == (W + 300) * 1000
+    assert reference["derived_outcome"] == "DOWN"
+    assert reference["derived_outcome_spot"] == "UP"
+    assert reference["derived_outcome_twap_open"] == "DOWN"
     assert reference["actual_outcome"] is None
-    h.base.mark_market_resolved_from_rest("condition", "yes", "Up")
+    h.base.mark_market_resolved_from_rest("condition", "no", "Down")
     h.flush()
     reference = h.rows("SELECT * FROM live_btc_event_reference WHERE event_id=?", EVENT)[0]
-    assert reference["actual_outcome"] == "UP"
+    assert reference["actual_outcome"] == "DOWN"
     assert reference["outcome_match"] == 1
 
 

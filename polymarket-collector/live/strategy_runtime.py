@@ -1678,6 +1678,12 @@ class LiveStrategyRuntime:
 
     def _observe_entry_trigger(self, context: dict[str, Any]) -> None:
         """Log the 0.74 decision path, including while execution is READ_ONLY."""
+        btc = self._btc
+        if btc is not None and btc.has_watches:
+            try:
+                btc.observe_asks(context.get("updates") or [])
+            except Exception as exc:
+                self.last_error = f"BTC_RECHECK_WATCH:{type(exc).__name__}: {exc}"[:500]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for update in context.get("updates") or []:
             if isinstance(update, dict) and update.get("condition_id"):

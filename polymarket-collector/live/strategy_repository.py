@@ -658,6 +658,11 @@ class StrategyRepository:
                 "btc_exit_directional_delta_usd": "TEXT",
                 "btc_exit_type": "TEXT",
                 "btc_exit_missing_reason": "TEXT",
+                # Chainlink 60s TWAP next to the spot values (calibration only).
+                "btc_entry_twap_text": "TEXT",
+                "btc_exit_twap_text": "TEXT",
+                # 1 when the exit left an unsellable residual (deal state DUST).
+                "btc_exit_dust_residual": "INTEGER",
             }
             existing_deal_columns = {
                 str(row[1])
@@ -734,6 +739,36 @@ class StrategyRepository:
                 "CREATE INDEX IF NOT EXISTS idx_live_btc_gate_eval_time "
                 "ON live_btc_gate_evaluations(last_seen_at DESC)"
             )
+            added_btc_columns = {
+                "live_btc_event_reference": {
+                    # derived_outcome = close TWAP >= open (spot), per the
+                    # TWAP resolution rule; the two variants below keep the
+                    # spot-only and TWAP-only readings for comparison.
+                    "open_twap_text": "TEXT",
+                    "close_twap_text": "TEXT",
+                    "close_twap_ts_ms": "INTEGER",
+                    "derived_outcome_spot": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                    "derived_outcome_twap_open": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                },
+                "live_btc_gate_evaluations": {
+                    # Re-check measurement: after a (would-)block, did the BTC
+                    # move cross the minimum while the ask stayed at 0.74?
+                    "ask_left_074_at": "TEXT",
+                    "delta_crossed_min_while_at_074": "INTEGER",
+                    "crossed_at": "TEXT",
+                    "directional_delta_at_cross": "TEXT",
+                    "watch_end_reason": "TEXT",
+                    "watch_ended_at": "TEXT",
+                },
+            }
+            for table, columns in added_btc_columns.items():
+                present = {
+                    str(row[1])
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, definition in columns.items():
+                    if column not in present:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_live_strategy_entry_audit_event "
                 "ON live_strategy_entry_audit(event_id, created_at DESC)"
@@ -6199,6 +6234,7 @@ class StrategyRepository:
             "btc_open_price_text", "btc_open_tick_ts_ms", "btc_entry_price_text",
             "btc_entry_ts_ms", "btc_entry_age_ms", "btc_entry_directional_delta_usd",
             "btc_gate_reason", "btc_gate_mode", "btc_entry_missing_reason",
+            "btc_entry_twap_text",
         )
         with self.base.connect() as conn:
             cursor = conn.execute(
@@ -6266,7 +6302,7 @@ class StrategyRepository:
         columns = (
             "btc_exit_price_text", "btc_exit_ts_ms", "btc_exit_age_ms",
             "btc_exit_directional_delta_usd", "btc_exit_type",
-            "btc_exit_missing_reason",
+            "btc_exit_missing_reason", "btc_exit_twap_text", "btc_exit_dust_residual",
         )
         with self.base.connect() as conn:
             cursor = conn.execute(
@@ -6279,6 +6315,48 @@ class StrategyRepository:
             conn.commit()
         return cursor.rowcount > 0
 
+    def record_btc_recheck_results(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Write finished re-check watches onto their evaluation rows.
+
+        A row can be watched once per 0.74 episode. The first result is kept,
+        except that a later episode in which the gate would have passed
+        replaces one in which it would not. Returns the rows whose evaluation
+        row does not exist yet.
+        """
+        if not rows:
+            return []
+        unmatched = []
+        ts = now_iso()
+        with self.base.connect() as conn:
+            for row in rows:
+                key = (row["event_id"], row["side"], row["source"], row["reason"])
+                if conn.execute(
+                    "SELECT 1 FROM live_btc_gate_evaluations "
+                    "WHERE event_id=? AND side=? AND source=? AND reason=?", key,
+                ).fetchone() is None:
+                    unmatched.append(row)
+                    continue
+                conn.execute(
+                    """
+                    UPDATE live_btc_gate_evaluations SET
+                        ask_left_074_at=:ask_left_074_at,
+                        delta_crossed_min_while_at_074=:delta_crossed_min_while_at_074,
+                        crossed_at=:crossed_at,
+                        directional_delta_at_cross=:directional_delta_at_cross,
+                        watch_end_reason=:watch_end_reason,
+                        watch_ended_at=:watch_ended_at,
+                        updated_at=:ts
+                    WHERE event_id=:event_id AND side=:side AND source=:source
+                      AND reason=:reason
+                      AND (watch_end_reason IS NULL
+                           OR (delta_crossed_min_while_at_074=0
+                               AND :delta_crossed_min_while_at_074=1))
+                    """,
+                    {**row, "ts": ts},
+                )
+            conn.commit()
+        return unmatched
+
     def upsert_btc_event_references(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
@@ -6289,12 +6367,16 @@ class StrategyRepository:
                 INSERT INTO live_btc_event_reference(
                     event_id,window_start,open_price_text,open_tick_ts_ms,
                     open_received_at,close_price_text,close_tick_ts_ms,
-                    derived_outcome,feed_gaps_in_window,feed_stalls_in_window,
+                    open_twap_text,close_twap_text,close_twap_ts_ms,
+                    derived_outcome,derived_outcome_spot,derived_outcome_twap_open,
+                    feed_gaps_in_window,feed_stalls_in_window,
                     created_at,updated_at
                 ) VALUES(
                     :event_id,:window_start,:open_price_text,:open_tick_ts_ms,
                     :open_received_at,:close_price_text,:close_tick_ts_ms,
-                    :derived_outcome,:feed_gaps_in_window,:feed_stalls_in_window,:ts,:ts
+                    :open_twap_text,:close_twap_text,:close_twap_ts_ms,
+                    :derived_outcome,:derived_outcome_spot,:derived_outcome_twap_open,
+                    :feed_gaps_in_window,:feed_stalls_in_window,:ts,:ts
                 )
                 ON CONFLICT(event_id) DO UPDATE SET
                     open_price_text=COALESCE(excluded.open_price_text,open_price_text),
@@ -6302,6 +6384,15 @@ class StrategyRepository:
                     open_received_at=COALESCE(excluded.open_received_at,open_received_at),
                     close_price_text=COALESCE(excluded.close_price_text,close_price_text),
                     close_tick_ts_ms=COALESCE(excluded.close_tick_ts_ms,close_tick_ts_ms),
+                    open_twap_text=COALESCE(excluded.open_twap_text,open_twap_text),
+                    close_twap_text=COALESCE(excluded.close_twap_text,close_twap_text),
+                    close_twap_ts_ms=COALESCE(excluded.close_twap_ts_ms,close_twap_ts_ms),
+                    derived_outcome_spot=CASE WHEN excluded.derived_outcome_spot='UNKNOWN'
+                        THEN derived_outcome_spot ELSE excluded.derived_outcome_spot END,
+                    derived_outcome_twap_open=CASE
+                        WHEN excluded.derived_outcome_twap_open='UNKNOWN'
+                        THEN derived_outcome_twap_open
+                        ELSE excluded.derived_outcome_twap_open END,
                     derived_outcome=CASE WHEN excluded.derived_outcome='UNKNOWN'
                         THEN derived_outcome ELSE excluded.derived_outcome END,
                     outcome_match=CASE
