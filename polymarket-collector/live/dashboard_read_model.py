@@ -153,6 +153,27 @@ def resolve_window(
     return DateWindow(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), normalized)
 
 
+DEAL_BTC_TEXT_FIELDS = (
+    "btc_open_price_text", "btc_entry_price_text", "btc_entry_directional_delta_usd",
+    "btc_exit_price_text", "btc_exit_directional_delta_usd",
+)
+DEAL_BTC_RAW_FIELDS = (
+    "btc_open_tick_ts_ms", "btc_entry_ts_ms", "btc_entry_age_ms", "btc_gate_reason",
+    "btc_gate_mode", "btc_entry_missing_reason", "btc_exit_ts_ms", "btc_exit_age_ms",
+    "btc_exit_type", "btc_exit_missing_reason",
+)
+
+
+def _deal_btc_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """BTC (Chainlink) reference snapshot of a deal; None-valued before migration."""
+    fields: dict[str, Any] = {
+        name.removesuffix("_text"): number_value(decimal_value(row.get(name)))
+        for name in DEAL_BTC_TEXT_FIELDS
+    }
+    fields.update({name: row.get(name) for name in DEAL_BTC_RAW_FIELDS})
+    return fields
+
+
 class DashboardReadModel:
     def __init__(
         self,
@@ -478,6 +499,7 @@ class DashboardReadModel:
             "fees_usd": number_value(decimal_value(row.get("total_fees_text"))), "final_reason": row.get("final_reason"),
             "quality": "REAL" if row.get("fee_verification_status") == "VERIFIED" else "PARTIAL", "verified": True,
             "fee_status": row.get("fee_verification_status"), "fee_source": row.get("fee_source"),
+            "btc": _deal_btc_fields(row),
         } for row in rows]
         return {"items": items, "page": page, "page_size": page_size, "total": int(count.get("total") or 0), "quality": "REAL"}
 

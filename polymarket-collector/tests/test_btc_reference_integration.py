@@ -410,3 +410,27 @@ def test_parse_time_ms_formats():
     assert parse_time_ms("1800000250123") == 1_800_000_250_123
     assert parse_time_ms("2027-01-15T08:00:00Z") == parse_time_ms("2027-01-15T08:00:00+00:00")
     assert parse_time_ms("") is None and parse_time_ms("nope") is None
+
+
+def test_dashboard_trade_history_exposes_deal_btc_fields():
+    from live.dashboard_read_model import DashboardReadModel, resolve_window
+    from test_dashboard_v1 import NOW, build_db, seed_verified_lifecycle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        with repo.connect() as conn:
+            conn.execute(
+                "UPDATE live_strategy_deals SET btc_open_price_text='80000',"
+                "btc_entry_price_text='80025.5',btc_entry_directional_delta_usd='25.5',"
+                "btc_gate_reason='BTC_GATE_PASS',btc_gate_mode='observe',"
+                "btc_exit_type='TP',btc_exit_price_text='80060'"
+            )
+            conn.commit()
+        model = DashboardReadModel(LiveRepository(repo.db_path, query_only=True))
+        item = model.trade_history(resolve_window("today", now=NOW))["items"][0]
+        assert item["btc"]["btc_entry_price"] == 80025.5
+        assert item["btc"]["btc_entry_directional_delta_usd"] == 25.5
+        assert item["btc"]["btc_gate_reason"] == "BTC_GATE_PASS"
+        assert item["btc"]["btc_exit_type"] == "TP"
+        assert item["btc"]["btc_exit_missing_reason"] is None
