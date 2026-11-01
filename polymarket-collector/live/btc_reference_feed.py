@@ -10,6 +10,10 @@ the window open price is the first tick whose payload timestamp is
 ``>= window_start`` and the close price is the first tick ``>= window_end``
 (``window_start + 300``). One boundary map serves both: the close of one
 window is the open of the next.
+
+The same connection also carries Chainlink's 60-second TWAP stream (the
+market's resolution source), kept in a separate state. The gate uses spot
+only; the TWAP values are recorded for calibration and outcome derivation.
 """
 
 from __future__ import annotations
@@ -35,6 +39,10 @@ WINDOW_STATS_RETENTION = 288
 
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 RTDS_TOPIC = "crypto_prices_chainlink"
+RTDS_TWAP_TOPIC = "crypto_prices_twap_sixty"
+# The spot snapshot arrives as topic "crypto_prices"; the TWAP snapshot keeps
+# its own topic and carries ``window_s`` in the payload.
+RTDS_SPOT_SNAPSHOT_TOPIC = "crypto_prices"
 RTDS_SYMBOL = "btc/usd"
 RTDS_PING_INTERVAL_SECONDS = 5.0
 # full_accuracy_value is an integer scaled by 1e18 (Chainlink Data Streams).
@@ -87,7 +95,8 @@ def rtds_subscribe_message() -> str:
         {
             "action": "subscribe",
             "subscriptions": [
-                {"topic": RTDS_TOPIC, "type": "*", "filters": filters}
+                {"topic": RTDS_TOPIC, "type": "*", "filters": filters},
+                {"topic": RTDS_TWAP_TOPIC, "type": "*", "filters": filters},
             ],
         },
         separators=(",", ":"),
@@ -127,11 +136,13 @@ def _tick_price(payload: dict[str, Any]) -> tuple[Decimal | None, bool]:
 def parse_rtds_message(raw: Any) -> dict[str, Any]:
     """Parse one RTDS frame.
 
-    Returns ``{"kind": "update"|"snapshot"|"ignore", "ticks": [(ts_ms, price)],
-    "precision_mismatch": int}``. Floats are parsed as Decimal so the
-    snapshot's float ``value`` keeps its printed digits.
+    Returns ``{"kind": "update"|"snapshot"|"ignore", "stream": "spot"|"twap",
+    "ticks": [(ts_ms, price)], "precision_mismatch": int}``. Floats are parsed
+    as Decimal so the snapshot's float ``value`` keeps its printed digits.
     """
-    result: dict[str, Any] = {"kind": "ignore", "ticks": [], "precision_mismatch": 0}
+    result: dict[str, Any] = {
+        "kind": "ignore", "stream": "spot", "ticks": [], "precision_mismatch": 0,
+    }
     if not raw or not isinstance(raw, (str, bytes)):
         return result
     try:
@@ -146,19 +157,29 @@ def parse_rtds_message(raw: Any) -> dict[str, Any]:
     symbol = str(payload.get("symbol") or "").lower()
     if symbol and symbol != RTDS_SYMBOL:
         return result
+    topic = message.get("topic")
+    if topic == RTDS_TWAP_TOPIC or "window_s" in payload:
+        stream = "twap"
+    elif topic in (RTDS_TOPIC, RTDS_SPOT_SNAPSHOT_TOPIC):
+        stream = "spot"
+    else:
+        return result
+    result["stream"] = stream
     if isinstance(payload.get("data"), list):
         ticks = []
+        mismatches = 0
         for item in payload["data"]:
             if not isinstance(item, dict):
                 continue
-            price = _decimal(item.get("value"))
+            price, mismatch = _tick_price(item)
             ts = item.get("timestamp")
             if price is None or not isinstance(ts, int):
                 continue
+            mismatches += int(mismatch)
             ticks.append((ts, price))
-        result.update(kind="snapshot", ticks=ticks)
+        result.update(kind="snapshot", ticks=ticks, precision_mismatch=mismatches)
         return result
-    if message.get("topic") != RTDS_TOPIC:
+    if topic not in (RTDS_TOPIC, RTDS_TWAP_TOPIC):
         return result
     ts = payload.get("timestamp")
     price, mismatch = _tick_price(payload)
@@ -309,6 +330,10 @@ class BtcReferenceProvider:
         self.state = BtcReferenceState(
             open_tick_max_offset_ms=open_tick_max_offset_ms, clock_ms=self._clock_ms,
         )
+        # Chainlink 60s TWAP (resolution source). Never read by the gate.
+        self.twap_state = BtcReferenceState(
+            open_tick_max_offset_ms=open_tick_max_offset_ms, clock_ms=self._clock_ms,
+        )
         self.connected = False
         self.reconnects = 0
         self.stalls = 0
@@ -333,9 +358,19 @@ class BtcReferenceProvider:
     def price_at(self, ts_ms: int) -> BtcTick | None:
         return self.state.price_at(ts_ms)
 
+    def twap_current(self) -> BtcTick | None:
+        return self.twap_state.current()
+
+    def twap_price_at(self, ts_ms: int) -> BtcTick | None:
+        return self.twap_state.price_at(ts_ms)
+
+    def twap_boundary(self, boundary_epoch_seconds: int) -> BtcTick | None:
+        return self.twap_state.boundary_status(boundary_epoch_seconds)[0]
+
     def health(self) -> dict[str, Any]:
         now = self.now_ms()
         latest = self.state.current()
+        twap = self.twap_state.current()
         return {
             "provider": self.name,
             "running": self.running,
@@ -352,12 +387,16 @@ class BtcReferenceProvider:
             "backfilled": self.state.backfilled,
             "precision_mismatches": self.state.precision_mismatches,
             "buffer_size": self.state.buffer_size(),
+            "twap_ticks_total": self.twap_state.ticks_total,
+            "twap_last_payload_age_ms": (now - twap.ts_ms) if twap else None,
+            "twap_gaps": self.twap_state.gaps,
             "last_error": self.last_error,
         }
 
 
 class RtdsChainlinkProvider(BtcReferenceProvider):
-    """Public Polymarket RTDS, topic crypto_prices_chainlink, btc/usd. No credentials."""
+    """Public Polymarket RTDS, topics crypto_prices_chainlink (spot) and
+    crypto_prices_twap_sixty (60s TWAP), btc/usd. No credentials."""
 
     name = "rtds"
 
@@ -392,17 +431,24 @@ class RtdsChainlinkProvider(BtcReferenceProvider):
         )
 
     def handle_raw(self, raw: Any) -> int:
-        """Apply one frame to state. Returns the number of new live ticks."""
+        """Apply one frame to state. Returns the number of new live spot ticks.
+
+        Only spot ticks count as progress for the stall watchdog: the gate
+        depends on spot, and a silent spot stream must reconnect even while
+        TWAP frames keep arriving.
+        """
         parsed = parse_rtds_message(raw)
         if parsed["kind"] == "ignore":
             return 0
         received = self.now_ms()
-        self.state.precision_mismatches += parsed["precision_mismatch"]
+        twap = parsed["stream"] == "twap"
+        state = self.twap_state if twap else self.state
+        state.precision_mismatches += parsed["precision_mismatch"]
         snapshot = parsed["kind"] == "snapshot"
         added = 0
         for ts_ms, price in parsed["ticks"]:
-            if self.state.ingest(ts_ms, price, received_ms=received, from_snapshot=snapshot):
-                added += 0 if snapshot else 1
+            if state.ingest(ts_ms, price, received_ms=received, from_snapshot=snapshot):
+                added += 0 if snapshot or twap else 1
         return added
 
     async def _session(self, stop: asyncio.Event) -> bool:

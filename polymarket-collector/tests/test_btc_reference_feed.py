@@ -30,6 +30,9 @@ def test_subscribe_message_is_compact():
     # The server compares this string literally; a space silences the stream.
     assert subscription["filters"] == '{"symbol":"btc/usd"}'
     assert subscription["topic"] == "crypto_prices_chainlink"
+    twap = json.loads(message)["subscriptions"][1]
+    assert twap["topic"] == "crypto_prices_twap_sixty"
+    assert twap["filters"] == '{"symbol":"btc/usd"}'
 
 
 def test_parse_real_update_uses_full_accuracy_value():
