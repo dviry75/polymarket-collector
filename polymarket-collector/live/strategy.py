@@ -39,6 +39,8 @@ class StrategyPolicy:
     max_exposure: Decimal = Decimal("8.00")
     max_shares: Decimal = Decimal("8.00")
     entry_window_seconds: int = 120
+    # No new entry once remaining <= this; exits are unaffected.
+    entry_cutoff_seconds_before_close: int = 60
 
     def validate(self) -> None:
         expected = StrategyPolicy()
@@ -130,8 +132,12 @@ def remaining_seconds(event_id: str, observed_at: datetime) -> Decimal | None:
 
 
 def entry_window_reason(
-    event_id: str, observed_at: datetime, window_seconds: int = 120
+    event_id: str,
+    observed_at: datetime,
+    window_seconds: int = 120,
+    cutoff_seconds: int = 0,
 ) -> str | None:
+    """None when an entry may open: cutoff < remaining <= window."""
     remaining = remaining_seconds(event_id, observed_at)
     if remaining is None:
         return "MISSING_EVENT_END_TIME"
@@ -139,7 +145,17 @@ def entry_window_reason(
         return "EVENT_ENDED"
     if remaining > Decimal(window_seconds):
         return "BEFORE_ENTRY_WINDOW"
+    if remaining <= Decimal(cutoff_seconds):
+        return "ENTRY_FINAL_MINUTE"
     return None
+
+
+def in_entry_final_minute(
+    event_id: str, observed_at: datetime, cutoff_seconds: int
+) -> bool:
+    """True once no new entry may be sent; unknown remaining fails closed."""
+    remaining = remaining_seconds(event_id, observed_at)
+    return remaining is None or remaining <= Decimal(cutoff_seconds)
 
 
 def choose_entry(
@@ -171,7 +187,10 @@ def choose_entry(
         return EntryDecision(
             False, "SKIPPED_SIMULTANEOUS_TRIGGER", simultaneous=True
         )
-    window = entry_window_reason(event_id, observed_at, policy.entry_window_seconds)
+    window = entry_window_reason(
+        event_id, observed_at, policy.entry_window_seconds,
+        policy.entry_cutoff_seconds_before_close,
+    )
     if window:
         return EntryDecision(False, window)
     if active_exposure >= policy.max_exposure:

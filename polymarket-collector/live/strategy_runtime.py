@@ -26,6 +26,7 @@ from .strategy import (
     StrategyPolicy,
     choose_entry,
     exact_trigger,
+    in_entry_final_minute,
     remaining_seconds,
     simulate_buy_fak,
     simulate_sell_fak,
@@ -116,6 +117,9 @@ class LiveStrategyRuntime:
             max_exposure=config.max_total_exposure_usd,
             max_shares=config.max_trade_tokens,
             entry_window_seconds=config.strategy_entry_window_seconds,
+            entry_cutoff_seconds_before_close=(
+                config.strategy_entry_cutoff_seconds_before_close
+            ),
         )
         self.policy.validate()
         self._event_locks: dict[str, asyncio.Lock] = {}
@@ -1768,7 +1772,13 @@ class LiveStrategyRuntime:
                 0 < remaining <= self.policy.entry_window_seconds
             ):
                 return
-            trading_state = self._btc_trading_state(schedule, ram_state)
+            # Entries are closed in the final minute; the gate is still
+            # evaluated there for calibration, tagged as such.
+            trading_state = (
+                "FINAL_MINUTE"
+                if remaining <= self.policy.entry_cutoff_seconds_before_close
+                else self._btc_trading_state(schedule, ram_state)
+            )
             yes_token = str(market.get("yes_token_id") or "")
             no_token = str(market.get("no_token_id") or "")
             for update in triggers:
@@ -2831,6 +2841,23 @@ class LiveStrategyRuntime:
                 )
                 return
 
+        # The final-minute cutoff, again on the same clock as choose_entry: a
+        # signal latched before the cutoff must not be sent after it.
+        if in_entry_final_minute(
+            event_id, datetime.now(timezone.utc),
+            self.policy.entry_cutoff_seconds_before_close,
+        ):
+            reason = "ENTRY_REVALIDATION_FINAL_MINUTE"
+            self._abort_entry(
+                intent_id, event_id, update, reason=reason, market=market,
+            )
+            self.repo.record_entry_audit(
+                intent_id, event_id=event_id, revalidation_result=reason,
+                entry_validity=f"ABORTED_{reason}",
+            )
+            self._note_entry_liquidity("note_abort", intent_id, reason=reason)
+            return
+
         # P0-A — initial revalidation against the current authoritative book
         # before entering the adapter's preflight. The final guard below repeats
         # this after signing, immediately before post_order.
@@ -3072,6 +3099,15 @@ class LiveStrategyRuntime:
                 return {
                     "ok": False,
                     "reason": "ENTRY_FINAL_REVALIDATION_STALE",
+                    "signal_age_ms": signal_age_ms,
+                }
+            if in_entry_final_minute(
+                event_id, datetime.now(timezone.utc),
+                self.policy.entry_cutoff_seconds_before_close,
+            ):
+                return {
+                    "ok": False,
+                    "reason": "ENTRY_FINAL_REVALIDATION_FINAL_MINUTE",
                     "signal_age_ms": signal_age_ms,
                 }
             final_reval = self._revalidate_entry_signal(market, update, token_id)

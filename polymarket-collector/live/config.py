@@ -116,6 +116,7 @@ class LiveConfig:
     strategy_stop_min_price: Decimal = Decimal("0.01")
     strategy_emergency_min_price: Decimal = Decimal("0.01")
     strategy_entry_window_seconds: int = 120
+    strategy_entry_cutoff_seconds_before_close: int = 60
     stop_loss_order_type: str = "FAK"
     # NOTE: max_exit_slippage bounds the *rules/dashboard* projection only; it
     # does NOT constrain STOP_066 / EMERGENCY execution (see strategy_stop_min_price).
@@ -274,6 +275,9 @@ class LiveConfig:
             strategy_stop_min_price=_decimal_env("LIVE_STRATEGY_STOP_MIN_PRICE", "0.01"),
             strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.01"),
             strategy_entry_window_seconds=int(_env("LIVE_STRATEGY_ENTRY_WINDOW_SECONDS", "120") or "120"),
+            strategy_entry_cutoff_seconds_before_close=int(
+                _env("LIVE_STRATEGY_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", "60") or "60"
+            ),
             stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "FAK").upper(),
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
             stop_loss_retry_delay_ms=int(_env("LIVE_STOP_LOSS_RETRY_DELAY_MS", "500") or "500"),
@@ -493,6 +497,8 @@ class LiveConfig:
             errors.append("strategy prices are immutable for this LIVE build")
         if self.strategy_entry_window_seconds != 120:
             errors.append("entry window must remain exactly 120 seconds")
+        if self.strategy_entry_cutoff_seconds_before_close != 60:
+            errors.append("entry cutoff must remain exactly 60 seconds before close")
         if self.order_heartbeat_interval_seconds != 5:
             errors.append("order heartbeat interval must remain exactly 5 seconds")
         if not 0 < self.recovery_stability_seconds <= 5:
