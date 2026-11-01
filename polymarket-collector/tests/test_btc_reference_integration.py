@@ -435,3 +435,35 @@ def test_dashboard_trade_history_exposes_deal_btc_fields():
         assert item["btc"]["btc_gate_reason"] == "BTC_GATE_PASS"
         assert item["btc"]["btc_exit_type"] == "TP"
         assert item["btc"]["btc_exit_missing_reason"] is None
+
+
+def test_gate_error_blocks_in_enforce_only(harness_factory):
+    def boom(**_kwargs):
+        raise RuntimeError("evaluation bug")
+
+    enforce = harness_factory(mode="enforce")
+    enforce.runtime._btc.evaluate = boom
+    enforce.trigger("enforce-error")
+    assert enforce.submits == []
+    skipped = enforce.rows(
+        "SELECT reason_code FROM live_audit_timeline WHERE source='btc_reference_gate'"
+    )
+    assert skipped == [{"reason_code": "BTC_GATE_ERROR"}]
+
+    observe = harness_factory(mode="observe")
+    observe.runtime._btc.evaluate = boom
+    observe.trigger("observe-error")
+    assert len(observe.submits) == 1
+
+
+def test_deal_entry_bookkeeping_error_still_submits(harness_factory):
+    h = harness_factory(mode="observe")
+    h.tick(0, OPEN)
+    h.tick(199_000, OPEN + 25)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("bookkeeping bug")
+
+    h.runtime._btc.note_deal_entry = boom
+    h.trigger("bookkeeping-error")
+    assert len(h.submits) == 1

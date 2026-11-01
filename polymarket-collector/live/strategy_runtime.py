@@ -2137,15 +2137,24 @@ class LiveStrategyRuntime:
         btc = self._btc
         btc_evaluation: dict[str, Any] | None = None
         if btc is not None:
-            btc_evaluation = btc.evaluate(
-                market=market, side=decision.side, token_id=decision.token_id,
-            )
-            btc.note_evaluation(
-                btc_evaluation, source="DECISION",
-                trading_state=self._btc_trading_state(schedule, ram_state),
-                remaining_seconds=remaining_seconds(event_id, observed_at),
-            )
-            if btc.blocks(btc_evaluation):
+            try:
+                btc_evaluation = btc.evaluate(
+                    market=market, side=decision.side, token_id=decision.token_id,
+                )
+                btc.note_evaluation(
+                    btc_evaluation, source="DECISION",
+                    trading_state=self._btc_trading_state(schedule, ram_state),
+                    remaining_seconds=remaining_seconds(event_id, observed_at),
+                )
+            except Exception as exc:
+                self.last_error = f"BTC_GATE:{type(exc).__name__}: {exc}"[:500]
+                btc_evaluation = None
+                if btc.mode == "enforce":
+                    # Fail closed, but never on observe/off telemetry bugs.
+                    btc_evaluation = btc.error_evaluation(
+                        market=market, side=decision.side, token_id=decision.token_id,
+                    )
+            if btc_evaluation is not None and btc.blocks(btc_evaluation):
                 # Not an event lock: the next 0.74 trigger re-evaluates.
                 await self._record_btc_gate_block(
                     market=market, decision=decision, evaluation=btc_evaluation,
@@ -2208,8 +2217,11 @@ class LiveStrategyRuntime:
 
         intent_id = str(reservation["entry_intent_id"])
         if btc is not None and btc_evaluation is not None:
-            btc.attach_intent(btc_evaluation, intent_id)
-            btc.note_deal_entry(btc_evaluation, intent_id=intent_id)
+            try:
+                btc.attach_intent(btc_evaluation, intent_id)
+                btc.note_deal_entry(btc_evaluation, intent_id=intent_id)
+            except Exception as exc:  # the reserved intent must still be submitted
+                self.last_error = f"BTC_DEAL_ENTRY:{type(exc).__name__}: {exc}"[:500]
         if trigger_update is not None:
             self._trace_critical(
                 "ENTRY_INTENT_RESERVED", update=trigger_update,
@@ -5463,15 +5475,6 @@ class LiveStrategyRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
-        for name in ("_btc_feed_task", "_btc_writer_task"):
-            task = getattr(self, name, None)
-            if task is None:
-                continue
-            try:
-                await asyncio.wait_for(task, 3)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                task.cancel()
-            setattr(self, name, None)
         if self.config.stop_forensic_capture_enabled:
             await asyncio.to_thread(self._stop_forensics.stop, 2.0)
 
@@ -5558,6 +5561,16 @@ class LiveStrategyRuntime:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._frame_task.cancel()
             self._frame_task = None
+        # Last: the BTC writer does a final flush once the feed has stopped.
+        for name in ("_btc_feed_task", "_btc_writer_task"):
+            task = getattr(self, name, None)
+            if task is None:
+                continue
+            try:
+                await asyncio.wait_for(task, 3)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                task.cancel()
+            setattr(self, name, None)
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():

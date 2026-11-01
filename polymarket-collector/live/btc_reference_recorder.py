@@ -176,6 +176,18 @@ class BtcReferenceRecorder:
             "observed_ms": now,
         }
 
+    def error_evaluation(self, *, market: dict[str, Any], side: str | None,
+                         token_id: str | None) -> dict[str, Any]:
+        """Fail-closed verdict used when evaluation itself raised."""
+        return {
+            "event_id": str(market.get("event_id") or ""),
+            "window_start": None, "side": str(side or ""),
+            "token_id": str(token_id or ""), "side_outcome": None,
+            "open": None, "current": None, "age_ms": None,
+            "decision": BtcGateDecision(False, "BTC_GATE_ERROR"),
+            "observed_ms": self.now_ms(),
+        }
+
     def blocks(self, evaluation: dict[str, Any]) -> bool:
         return self.mode == "enforce" and not evaluation["decision"].allowed
 
@@ -273,6 +285,7 @@ class BtcReferenceRecorder:
             except asyncio.TimeoutError:
                 pass
             await self.flush()
+        await self.flush()  # final drain on shutdown
 
     async def flush(self, *, force_scans: bool = False) -> None:
         now = time.monotonic()
@@ -475,7 +488,7 @@ class BtcReferenceRecorder:
         return values
 
     async def _flush_deal_exits(self) -> None:
-        since = (datetime.now(timezone.utc) - EXIT_LOOKBACK).isoformat().replace("+00:00", "Z")
+        since = (datetime.now(timezone.utc) - EXIT_LOOKBACK).isoformat()
         deals = await asyncio.to_thread(self.repo.deals_pending_btc_exit, since=since)
         for deal in deals:
             values = self.exit_values(deal)
