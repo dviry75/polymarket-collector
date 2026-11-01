@@ -62,11 +62,11 @@
 | `live/strategy_runtime.py:185` | יצירת ה־recorder ב־`__init__` |
 | `live/strategy_runtime.py:337-380` | `set_btc_reference_provider`, `start_btc_reference`, `_btc_trading_state` |
 | `live/strategy_runtime.py:1743-1790` | הערכת צל ב־`_observe_entry_trigger` (`_note_btc_shadow`) |
-| `live/strategy_runtime.py:2136-2155` | השער ב־`_process_event`, מיד לפני `reserve_event_entry` |
-| `live/strategy_runtime.py:2211` | שיוך `intent_id` ותזמון כתיבת עמודות הכניסה |
-| `live/strategy_runtime.py:2238` | `_record_btc_gate_block`: SKIPPED ב־timeline דרך `to_thread` |
-| `live/strategy_runtime.py:5466` | עצירת ה־tasks ב־`stop()` |
-| `live/strategy_runtime.py:5718` | `btc_reference` ב־`health()`, ומשם ל־STATUS ב־IPC |
+| `live/strategy_runtime.py:2136-2165` | השער ב־`_process_event`, מיד לפני `reserve_event_entry` |
+| `live/strategy_runtime.py:2221` | שיוך `intent_id` ותזמון כתיבת עמודות הכניסה |
+| `live/strategy_runtime.py:2250` | `_record_btc_gate_block`: SKIPPED ב־timeline דרך `to_thread` |
+| `live/strategy_runtime.py:5565` | עצירת ה־tasks ב־`stop()` |
+| `live/strategy_runtime.py:5731` | `btc_reference` ב־`health()`, ומשם ל־STATUS ב־IPC |
 | `live/strategy_repository.py:645-735` | migration: עמודות ב־deals ושתי טבלאות חדשות |
 | `live/strategy_repository.py:6136-6360` | upsert/record/scan/fill לנתוני BTC |
 | `live/router.py:112` | חיבור ה־provider ל־runtime (יצירת אובייקט בלבד, בלי רשת) |
