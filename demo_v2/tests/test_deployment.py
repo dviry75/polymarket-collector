@@ -142,6 +142,7 @@ def test_cold_service_restart_restores_positions_and_requires_fresh_generation_a
                 # No historical prices or cached generation can grant entry readiness.
                 assert not app.state.runtime.entry_gate(rule,market)
                 data.latest={market.up_token_id:True,market.down_token_id:True}
+                await app.state.runtime.demand_once()
                 assert not app.state.runtime.entry_gate(rule,market)
                 # A fresh post-restart recovered bid does not reconstruct a missed SL.
                 app.state.decisions.publish(quote(generation=data.generation,bid='0.72',ask='0.75'))

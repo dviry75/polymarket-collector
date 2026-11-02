@@ -94,6 +94,7 @@ class HealthView(ExtensibleView):
     components: list[dict]
     entries_allowed: bool
     blocker_codes: list[str]
+    fee_model: dict = Field(description="Configured empirical simulation policy; independent of exchange metadata")
     discovery_at: datetime | None
     engine_generation: int
     engine_reason: str

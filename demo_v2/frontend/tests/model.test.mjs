@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {freshRule,mapRule,rulePayload,validateRule,mapTrade,cohortQuery,jerusalemDayStart,formatDecimal,formatMoney,compareDecimal,marketState,healthState} from '../src/model.js';
+import {freshRule,mapRule,rulePayload,validateRule,mapTrade,cohortQuery,jerusalemDayStart,formatDecimal,formatMoney,formatFee,compareDecimal,marketState,healthState} from '../src/model.js';
 
 test('decimal display rounds exactly without losing huge values or raw precision',()=>{
   const raw='9007199254740993.739999999999';
@@ -57,4 +57,13 @@ test('backend market freshness can expire locally; no fresh/listening inference 
 test('health preserves all server states and missing state never becomes READY',()=>{
   for(const state of ['READY','DEGRADED','NOT_READY'])assert.equal(healthState({state}),state);
   assert.equal(healthState({status:200}),'UNKNOWN');assert.equal(healthState(null),'UNKNOWN');
+});
+
+test('empirical fees and historical fee amounts retain sub-cent precision',()=>{
+  assert.equal(formatFee('0.068'),'$0.068');
+  assert.equal(formatFee('0.136'),'$0.136');
+  assert.equal(formatFee('0.123456'),'$0.123456');
+  assert.equal(formatFee('0.00001'),'$0.00001');
+  assert.equal(formatFee('0'),'$0.000');
+  assert.equal(formatFee(null),'—');
 });

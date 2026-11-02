@@ -1,10 +1,13 @@
 """DEMO-only settings. No dotenv loader, trading credentials or LIVE fallback."""
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 import math
 import os
 from pathlib import Path
 from typing import Mapping
+
+from .domain.fees import DEFAULT_FLAT_FEE, FlatFeePolicy
 
 
 @dataclass(frozen=True)
@@ -23,8 +26,10 @@ class DemoConfig:
     public_data_enabled: bool = False
     recovery_stability_seconds: float = 2.0
     session_cookie_secure: bool = True
+    flat_fee_per_action: Decimal = DEFAULT_FLAT_FEE
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "flat_fee_per_action", FlatFeePolicy(self.flat_fee_per_action).per_action)
         root = Path(self.data_dir).expanduser().resolve()
         candidate = Path(self.db_path) if self.db_path else root / "demo_v2.sqlite3"
         target = candidate.expanduser().resolve()
@@ -68,4 +73,5 @@ class DemoConfig:
             public_data_enabled=env.get("DEMO_PUBLIC_DATA_ENABLED", "false").lower() == "true",
             recovery_stability_seconds=float(env.get("DEMO_RECOVERY_STABILITY_SECONDS", "2")),
             session_cookie_secure=env.get("DEMO_COOKIE_SECURE", "true").lower() != "false",
+            flat_fee_per_action=env.get("DEMO_FLAT_FEE_PER_ACTION", "0.068"),
         )

@@ -1,5 +1,75 @@
 # DEMO V2 implementation status
 
+## Current fee release — 2026-11-03
+
+**FEE BLOCKER: NONE. SIMULATED ENTRIES: ENABLED when other guards pass.**
+The source uses `EMPIRICAL_FLAT_AVERAGE`, default $0.068 per BUY/SELL,
+no fee on resolution. Decimal configuration, immutable action provenance,
+ledger/API fee reporting and sub-cent frontend fee display are implemented.
+The exact fee provider is retained for research and is not run by the app.
+Other freshness, WS/discovery, schedule, trigger, stability, underlying and
+critical dependency guards remain. See `FEE_MODEL_REVIEW.md`.
+
+Validation of the clean staged candidate (unrelated Rubik/forensic work excluded):
+**277 backend tests passed, 0 failed/skipped**, including 45 flat-fee cases and the
+native fake-WS authenticated rule → ordered observations → exact entry → TP sale
+pipeline with an injected exact-fee provider that raises if called (zero calls).
+**15 frontend unit/contract tests passed**; build, TypeScript and JS syntax passed.
+**4 real Chrome E2E workflows passed** with loopback fake providers/temp DB. The
+new workflow creates a rule through the UI on a fee-enabled fixture market,
+proves a fresh non-trigger creates no position, then an exact trigger creates
+one position with 5 shares, cash debit 3.768 and buy fee 0.068. No exact-fee
+provider is configured. Browser table and methodology show 0.068 accurately.
+Screenshots were visually checked. Other workflows cover auth, cohorts,
+maintenance, outage/mobile behavior and conflicting rule edits.
+
+The earlier exact-fee research fixtures/tests remain; no claim of exact fee
+rounding verification is made. Pre-existing uncommitted fonts and rounding
+forensics are preserved and excluded from this release.
+This task changes source only: **no deployment, restart, installed DB/env/config
+change or LIVE change**. The previously installed release does not acquire these
+changes until a separately authorized deployment. Earlier checks below are
+point-in-time historical records, not current host/readiness claims.
+
+## Files in the empirical fee release
+
+All 29 changed files are under `demo_v2/`; no LIVE file, migration, dependency
+lockfile, installed DB/env/config, service or deployment artifact is changed.
+Paths below are relative to `demo_v2/`:
+
+- `README.md`
+- `api/router.py`
+- `api/schemas.py`
+- `config.py`
+- `docs/ARCHITECTURE.md`
+- `docs/DECISIONS.md`
+- `docs/FEE_MODEL_REVIEW.md`
+- `docs/IMPLEMENTATION_STATUS.md`
+- `docs/INTEGRATION_CONTRACTS.md`
+- `docs/SOURCE_OF_TRUTH.md`
+- `docs/VALIDATION_MATRIX.md`
+- `engine.py`
+- `frontend/src/app.js`
+- `frontend/src/model.js`
+- `frontend/tests/e2e/backend_fixture.py`
+- `frontend/tests/e2e/integration.spec.js`
+- `frontend/tests/model.test.mjs`
+- `persistence/repository.py`
+- `providers/contracts.py`
+- `providers/fees.py`
+- `runtime.py`
+- `tests/test_backend_e2e.py`
+- `tests/test_deployment.py`
+- `tests/test_engine.py`
+- `tests/test_fee_evidence_reconciliation.py`
+- `tests/test_runtime.py`
+- `tests/test_validation_edges.py`
+- `domain/fees.py`
+- `tests/test_flat_fees.py`
+
+## Historical implementation and verification records
+
+
 Local main; backend Phases 2–8 completed 2026-10-29; Phase 9 verified 2026-10-30. Frontend integrated subsequently under `frontend/`; no deployment.
 Audit `239d6bd`, Phase 1 `ce76b60`; remote base `d26dda4`.
 

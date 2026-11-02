@@ -16,11 +16,14 @@ from test_fee_underlying import verified_fee,context
 
 def test_authenticated_backend_with_native_fake_ws_and_ordered_decisions(tmp_path,market,monkeypatch):
     class Discovery:
-        metadata={market.instance_id:{}}
+        metadata={market.instance_id:{"feesEnabled":True,"feeSchedule":{"rate":"0.07","exponent":1,"takerOnly":True}}}
         issues={}
         async def discover(self,definitions): return [market]
     class Fees:
-        async def parameters(self,instance): return verified_fee(instance.instance_id)
+        calls=0
+        async def parameters(self,instance):
+            self.calls+=1
+            raise RuntimeError("EXACT_FEE_API_UNAVAILABLE")
     class Underlying:
         async def context(self,instance,metadata): return context(instance)
     class Resolution:
@@ -68,6 +71,10 @@ def test_authenticated_backend_with_native_fake_ws_and_ordered_decisions(tmp_pat
                 if data.token_ready(market.down_token_id): break
                 await asyncio.sleep(0.001)
             assert data.token_ready(market.up_token_id)
+            for _ in range(1000):
+                if app.state.runtime.entry_gate(app.state.repository.rules()[0],market): break
+                await asyncio.sleep(0.001)
+            assert app.state.runtime.entry_gate(app.state.repository.rules()[0],market)
             # Telemetry capacity one cannot select which of these decisions survives.
             for ask in ("0.74","0.73","0.74"):
                 socket.snapshot(market.up_token_id,"0.72",ask)
@@ -83,6 +90,11 @@ def test_authenticated_backend_with_native_fake_ws_and_ordered_decisions(tmp_pat
             stats=KPIView.model_validate((await client.get(PREFIX+"/kpi")).json())
             assert trades.total==2 and all(row.exit_price=="0.97" for row in trades.items)
             assert stats.positive==2 and stats.open==0
+            assert app.state.runtime.providers.fees.calls == 0
+            assert all(row.buy_fee == row.sell_fee == "0.068" and row.total_fees == "0.136"
+                and row.net_shares == "5" and row.net_pnl == "1.014"
+                and row.fee_evidence["method"] == "EMPIRICAL_FLAT_AVERAGE" for row in trades.items)
+            assert stats.total_fees == "0.272"
             assert Decimal(stats.wallet)==sum(Decimal(row.net_pnl) for row in trades.items)
             HealthView.model_validate((await client.get(PREFIX+"/health")).json())
             MarketList.model_validate((await client.get(PREFIX+"/markets")).json())

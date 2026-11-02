@@ -1,4 +1,8 @@
-"""Applicable evidence and exact simulation arithmetic. No remembered fee rate."""
+"""Exact exchange-fee research, retained independently from DEMO execution.
+
+The application does not construct or poll this provider. Its UNKNOWN/UNSUPPORTED
+states describe exchange research only, never empirical simulation readiness.
+"""
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone

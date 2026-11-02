@@ -8,8 +8,8 @@
 - D-006: Concurrent positions are allowed.
 - D-007: Unchanged trigger price does not retrigger until price leaves and returns.
 - D-008: Trade size in shares; minimum 5.
-- D-009: Use actual applicable fee behavior when available; do not substitute fixed average.
-- D-010: Missing/unreliable required fee data blocks new entries.
+- D-009 (superseded by D-038): Use actual applicable fee behavior when available; do not substitute fixed average.
+- D-010 (superseded by D-038): Missing/unreliable required fee data blocks new entries.
 - D-011: Global wallet starts at $0 and may become arbitrarily negative.
 - D-012: Each rule has its own wallet view.
 - D-013: TP/SL exits use observed best bid and actual observed jump price.
@@ -37,3 +37,10 @@
 - D-035: DEMO V2 implemented inside polymarket-collector repo but isolated from LIVE.
 - D-036: Audit/reuse existing working code before replacements.
 - D-037: No automatic research-history deletion at this stage.
+
+- D-038 (2026-11-03, explicit product decision): Use EMPIRICAL_FLAT_AVERAGE,
+  default Decimal("0.068") per virtual BUY/SELL, optional DEMO_FLAT_FEE_PER_ACTION
+  configuration. CASH only, unchanged shares, no resolution fee. Basis: operator
+  summary of 1,644 historical operations/$111.81. Exact Polymarket rounding stays
+  unknown/research-only; no fee-specific entry/readiness dependency. Preserve
+  previous research, historical charges and all other trading guards.

@@ -73,11 +73,11 @@ def test_schedule_close_blocks_entry_but_not_exit(repository,market,rule):
     assert repository.positions()[0]["exit_reason"]=="TAKE_PROFIT"
 
 
-def test_unknown_exit_fees_never_fabricate_exit_but_official_resolution_can_settle(repository,market,rule):
+def test_unavailable_exchange_fee_does_not_block_official_resolution(repository,market,rule):
     worker=engine(repository,market)
     worker.process(quote(),market,verified_fee())
     position=repository.positions()[0]
-    worker.process(quote(2,bid="0.97",ask="0.98"),market,verified_fee(state=FeeState.UNKNOWN,rate=Decimal(0)))
+    worker.process(quote(2,bid="0.95",ask="0.98"),market,verified_fee(state=FeeState.UNKNOWN,rate=Decimal(0)))
     assert repository.positions()[0]["status"]=="OPEN"
     sample=context(market,"102")
     evidence=OfficialResolution(market.instance_id,market.up_token_id,datetime.now(timezone.utc),"fake-official")
@@ -90,14 +90,14 @@ def test_unknown_exit_fees_never_fabricate_exit_but_official_resolution_can_sett
         assert conn.execute("SELECT COUNT(*) FROM demo_v2_underlying WHERE context='EXIT'").fetchone()[0]==1
 
 
-def test_share_fee_ledger_not_double_counted_and_movement_cohort(repository,market,rule):
+def test_flat_cash_fee_ledger_not_double_counted_and_movement_cohort(repository,market,rule):
     worker=engine(repository,market)
     worker.process(quote(),market,verified_fee(),context(market,"101.5"))
     worker.process(quote(2,bid="0.97",ask="0.98"),market,verified_fee(),context(market,"103"))
     rows=cohort(repository,TradeFilter(movement_min="1",movement_max="2"))
     assert len(rows)==1
     row=rows[0]
-    assert Decimal(row["cash_debit_text"])==Decimal(row["entry_notional_text"])
+    assert Decimal(row["cash_debit_text"])==Decimal(row["entry_notional_text"])+Decimal("0.068")
     assert Decimal(row["net_proceeds_text"])-Decimal(row["cash_debit_text"])==repository.wallet()==Decimal(row["net_pnl_text"])
     stats=kpi(repository,rows)
     assert Decimal(stats["wallet"])==repository.wallet()
@@ -158,7 +158,6 @@ def test_exhausted_rule_unsubscribes_after_last_position_closes(repository,marke
     worker.instances[market.instance_id]=market
     worker.current[market.definition.key]=market.instance_id
     worker.discovery_at=datetime.now(timezone.utc)
-    worker.fees[market.instance_id]=verified_fee()
     asyncio.run(worker.demand_once())
     assert data.wanted==(market,)
     position=open_position(repository,rule)

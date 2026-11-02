@@ -20,10 +20,10 @@ Dynamic listening: no eligible rule + no open position => no listening required;
 
 Underlying filter: percentage/absolute movement; >/< /between; direction modes; stale required data blocks entry; observations/provenance persisted.
 
-Fees/accounting: min 5 shares; gross vs net shares preserved; buy/sell fees correct; resolution does not invent sell fee; global wallet starts zero and may go negative; per-rule ledger correct; P&L reconciles.
+Fees/accounting: min 5 shares; gross vs net shares preserved; buy/sell flat cash fees=0.068 each; shares unchanged; signed sale credit may be negative; resolution does not invent sell fee; global wallet starts zero and may go negative; per-rule ledger correct; P&L reconciles.
 
 KPI: positive/negative based on closed net P&L; break-even excluded; filters align table/KPI; total fees reconcile.
 
-Health: socket open but stale data != READY; missing fee data blocks entries; stale required underlying blocks affected entries; reconnect/re-subscribe; return READY only when healthy; no backfill.
+Health: socket open but stale data != READY; missing exact exchange fee data does not block entries; invalid flat configuration fails startup; stale required underlying blocks affected entries; reconnect/re-subscribe; return READY only when healthy; no backfill.
 
 Isolation: separate DEMO DB/config/service; no path to real adapter write methods; tests never source prod trading env; reset cannot affect LIVE.

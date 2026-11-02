@@ -1,5 +1,51 @@
 # Public integration contracts — Phase 9
 
+## Current product decision — empirical flat simulation fees (2026-11-03)
+
+DEMO V2 intentionally does not replicate exact Polymarket fee rounding.
+Simulation uses a fixed empirical fee of $0.068 per BUY/SELL execution,
+derived from $111.81 across 1,644 historical operations. This is a deliberate
+research model assumption, **not an authoritative Polymarket fee formula**.
+The operator supplied 832 entries/$70.83 and 812 exits/$40.98;
+111.81 / 1644 = 0.0680109489… rounded by the product decision to 0.068.
+This change does not independently re-audit those historical rows.
+
+`DEMO_FLAT_FEE_PER_ACTION` is optional and defaults to `Decimal("0.068")`.
+Invalid, nonfinite, negative or binary-float configuration fails before startup;
+zero and nonnegative Decimal overrides are allowed. No environment override is
+needed to use the default. Configuration belongs to DEMO only.
+
+- BUY: shares × observed ask + fee is debited as cash. Shares are unchanged.
+- SELL (TP/SL): shares × observed bid − fee is the signed cash credit. Even at
+  bid=0, the fee is charged; it is not capped at gross proceeds.
+- Official resolution: shares × 1/0, with zero additional fee. The entry fee
+  remains part of net P&L. No synthetic sale is generated.
+- Default buy/sell round trip: $0.136 total fees; resolution: $0.068 total fees.
+- Example: 5 × 0.74 entry debits 3.768; 5 × 0.96 sale credits 4.732;
+  net P&L is 0.964. All accounting uses Decimal and API decimal strings.
+
+Policy provenance is `EMPIRICAL_FLAT_AVERAGE`, with configured `per_action`,
+policy version, historical sample size and observed total. Entry fee evidence,
+entry/exit provenance and ledger retain the assumptions and charges at execution
+time; existing positions/history are never rewritten when configuration changes.
+Trade `buy_fee`, `sell_fee`, `total_fees`, `net_pnl` still report persisted charges.
+The market `fee` field and health `fee_model` expose the current simulation policy;
+they do not reclassify research evidence as verified exchange fees.
+
+The runtime no longer constructs, polls, stores or gates entries on an exact fee
+provider. `CURRENT_FEE_ROUNDING_UNVERIFIED`, unavailable metadata and failed fee
+APIs are **not execution/readiness blockers**. Discovery, ordered fresh observations,
+both books, exact triggers, schedules, required underlying context, DB/worker
+health, critical components and stable recovery remain enforced. There is no
+maker fee exemption in this model. Observed-bid TP is still an immediate virtual
+sale; no maker execution or emergency-exit feature is introduced.
+
+The exact-fee research provider, captured public fixtures and tests are retained
+for research only. BUY/SELL cash semantics were established in that work; exact
+operator rounding remains unknown. Earlier release-blocker conclusions below
+are historical and superseded by this explicit product decision.
+
+
 Verification date: 2026-10-30 (Asia/Jerusalem). Public snapshot started at
 2026-10-30T09:09:14.146105+00:00 UTC. Status is evidence at observation time, not a
 promise that the same instance remains current. No authenticated Polymarket call,
@@ -52,7 +98,10 @@ Unsupported explicit market protocols fail closed; presence of legacy IDs does
 not justify selecting them on a Protocol V2/unknown-version market. Supporting
 Position IDs is not added in Phase 9. See [market version selection](https://docs.polymarket.com/market-data/market-details).
 
-## Fee contract — PARTIAL, fee-bearing entries still blocked (rechecked 2026-11-02)
+## Historical exact-fee research contract — PARTIAL (rechecked 2026-11-02)
+
+The following evidence describes the research provider, not the current execution
+policy. Its unsupported rounding never blocks empirical DEMO executions.
 
 Authority: [current official fees](https://docs.polymarket.com/trading/fees), Gamma
 per-market schedule and the [official CTF Exchange V2 source pinned at ccc0596](https://github.com/Polymarket/ctf-exchange-v2/blob/ccc0596074f4dfd62c944fbca4de252893b82b4b/src/exchange/mixins/Trading.sol).

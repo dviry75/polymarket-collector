@@ -82,13 +82,13 @@ def test_public_worker_fake_pipeline_and_recovery(repository,market,rule):
         await worker.start()
         try:
             await worker.discover_once()
-            await worker.fees_once()
             await worker.references_once()
             await worker.reference_once(market.instance_id)
             await worker.demand_once()
             assert data.wanted==(market,)
             assert not worker.entry_gate(rule,market)  # Socket is not fresh books.
             data.latest={market.up_token_id:True,market.down_token_id:True}
+            await worker.demand_once()
             assert worker.entry_gate(rule,market)
             generation=repository.next_generation()
             worker.decisions.begin_generation(generation)
@@ -115,12 +115,11 @@ def test_public_worker_fake_pipeline_and_recovery(repository,market,rule):
     asyncio.run(run())
 
 
-def test_stale_discovery_fee_reference_and_database_gating(repository,market,rule):
+def test_stale_discovery_and_database_gating(repository,market,rule):
     worker=runtime(repository)
     worker.database_ok=worker.engine_ok=True
     worker.current={market.definition.key:market.instance_id}
     worker.discovery_at=datetime.now(timezone.utc)
-    worker.fees[market.instance_id]=verified_fee()
     assert worker.dependencies(rule,market)
     worker.discovery_at-=timedelta(seconds=31)
     assert not worker.dependencies(rule,market)

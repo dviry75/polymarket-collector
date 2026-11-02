@@ -31,7 +31,16 @@ Open position at official resolution: winner 1.00, loser 0.00. Exit reason MARKE
 Create/edit/enable/disable/duplicate/delete/archive. Edits affect future entries only. Every position preserves entry-time rule snapshot/version. Disable/delete stops new entries only; existing positions continue. Preserve historical attribution; prefer soft-delete/archive.
 
 ## Fees/accounting
-Trade size is configured in gross shares. Model current/applicable Polymarket market fee behavior, not a historical average when accurate fee data exists. BUY deducts cash and fee may reduce net shares. SELL uses net shares, observed exit bid, sell fee, net proceeds. Persist gross shares, entry notional, buy fee, net shares, gross exit proceeds, sell fee, total fees, net proceeds, net P&L. If required fee data is unavailable/unreliable, new entries fail closed until healthy.
+DEMO intentionally uses an empirical flat fee, not exact Polymarket rounding.
+`DEMO_FLAT_FEE_PER_ACTION` defaults to Decimal("0.068"); invalid/nonfinite/negative
+values fail. BUY debits shares × observed ask + fee, with shares unchanged.
+Every simulated SELL debits fee from shares × observed bid, including a negative
+net credit when fee exceeds proceeds. Official resolution pays shares × 1/0
+without another fee. Default buy/sell round-trip fees=0.136; resolution fees=0.068.
+Persist action-time charges and `EMPIRICAL_FLAT_AVERAGE` provenance (operator
+summary: 1,644 historical operations/$111.81). Preserve prior research/history.
+Exact exchange fee metadata/rounding/provider availability never gates entries.
+All other eligibility and critical health requirements remain.
 
 ## Wallets
 Global wallet starts at $0 with no lower bound. Entry deducts cash; exit/resolution returns cash. Also expose a per-rule wallet. Filtered KPI wallet may represent scoped net cash flow for the filtered set.
@@ -52,7 +61,7 @@ Listen to a market only when at least one enabled rule is currently eligible to 
 Never reconstruct entry/TP/SL events that happened during a data gap. If reconnect snapshot itself satisfies a condition, act on that fresh snapshot. Official verified resolution may still close already-open positions.
 
 ## Health/self-healing
-Expose READY/DEGRADED/NOT_READY. Monitor market WS connectivity and actual data freshness, underlying feed freshness, discovery/resolution, fee-data readiness, DB and rule engine/worker health. Critical faults fail closed for new entries. Automatically reconnect/re-subscribe/re-resolve/retry. Resume only after required dependencies become healthy/stable. Do not fabricate missed events.
+Expose READY/DEGRADED/NOT_READY. Monitor market WS connectivity and actual data freshness, underlying feed freshness, discovery/resolution, configured simulation fee validity, DB and rule engine/worker health. Critical faults fail closed for new entries. Automatically reconnect/re-subscribe/re-resolve/retry. Resume only after required dependencies become healthy/stable. Do not fabricate missed events.
 
 ## Persistence
 Do not auto-prune research history. Persist rules/versions, market instances, trades/positions, wallet ledger, fees, underlying observations, trigger/exit provenance and relevant health incidents. High-volume raw telemetry may be stored efficiently; preserve research-relevant history.

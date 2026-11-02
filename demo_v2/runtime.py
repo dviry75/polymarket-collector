@@ -7,13 +7,11 @@ import json
 
 from .domain.eligibility import entry_eligible
 from .domain.models import market_definitions
-from .domain.trading import FeeState
 from .engine import DemoEngine
 from .health import ComponentHealth, HealthState, StabilityGate
-from .persistence.repository import dump, instance_model, utc
+from .persistence.repository import instance_model
 from .providers.contracts import Providers
 from .providers.discovery import GammaDiscovery, GammaResolution
-from .providers.fees import GammaFeeProvider
 from .providers.market_ws import PublicMarketWS
 from .providers.public_http import PublicHTTP
 from .providers.subscriptions import current_instances, subscription_demand
@@ -29,11 +27,12 @@ class DemoRuntime:
         self.providers = providers or Providers()
         self.clients, self.tasks = [], []
         self.reference_tasks={}
-        self.instances, self.metadata, self.current, self.fees, self.references = {}, {}, {}, {}, {}
+        self.instances, self.metadata, self.current, self.references = {}, {}, {}, {}
         self.discovery_at = None
         self.database_ok = self.engine_ok = False
         self.stability = StabilityGate(config.recovery_stability_seconds)
-        self.engine = DemoEngine(repository,clock=clock,max_age=config.observation_max_age_seconds,entry_gate=self.entry_gate)
+        self.engine = DemoEngine(repository,clock=clock,max_age=config.observation_max_age_seconds,entry_gate=self.entry_gate,
+            flat_fee_per_action=config.flat_fee_per_action)
         self._stop = asyncio.Event()
         self._issues = {}
 
@@ -52,20 +51,20 @@ class DemoRuntime:
                     and self.current.get(instance.definition.key) == instance.instance_id)
 
     def dependencies(self, rule, instance):
-        fee = self.fees.get(instance.instance_id)
         reference = self.references.get(instance.instance_id)
         spec = rule.get("spec")
         if spec is None:
             from .domain.trading import RuleSpec
             spec = RuleSpec.model_validate_json(rule["snapshot_json"])
         return bool(self.database_ok and self.engine_ok and self.discovery_fresh(instance)
-            and fee is not None and fee.current(self.clock()).state == FeeState.VALID
             and (not spec.underlying_filters or (reference and reference.valid(instance,self.clock(),self.config.observation_max_age_seconds))))
 
     def entry_gate(self, rule, instance):
         data = self.providers.market_data
         tokens = (instance.up_token_id,instance.down_token_id)
-        healthy = self.dependencies(rule,instance) and data is not None and all(data.token_ready(token) for token in tokens)
+        healthy = (self.dependencies(rule,instance) and data is not None
+            and all(data.token_ready(token) for token in tokens)
+            and all(c.state == HealthState.READY for c in self.health.snapshot().components if c.critical))
         return self.stability.ready((rule["id"],instance.instance_id),healthy)
 
     async def discover_once(self):
@@ -91,31 +90,6 @@ class DemoRuntime:
             self.current = {}
             self.discovery_at = None
             raise
-
-    async def fees_once(self):
-        provider = self.providers.fees
-        if provider is None:
-            raise RuntimeError("FEES_NOT_CONFIGURED")
-        wanted = set(self.current.values()) | {p["instance_id"] for p in self.repository.positions(status="OPEN")}
-        for instance_id in wanted:
-            try:
-                evidence = await provider.parameters(self.instances[instance_id])
-                if evidence is None or evidence.instance_id != instance_id:
-                    self.fees.pop(instance_id,None)
-                    continue
-                self.fees[instance_id] = evidence
-                with self.repository.database.transaction() as conn:
-                    conn.execute("INSERT OR REPLACE INTO demo_v2_fee_evidence VALUES (?,?,?,?,?)",(
-                        instance_id,evidence.state.value,utc(evidence.observed_at),evidence.source,dump(evidence.evidence())))
-            except Exception:
-                self.fees.pop(instance_id,None)
-        current = [self.fees[i].current(self.clock()) if i in self.fees else None for i in wanted]
-        failed = [e for e in current if e is None or e.state != FeeState.VALID]
-        ready = bool(wanted) and not failed
-        reasons = {e.reason for e in failed if e is not None and e.reason}
-        reason = (next(iter(reasons)) if len(reasons)==1 and all(e is not None and e.reason for e in failed)
-                  else "VALID_FEE_EVIDENCE_UNAVAILABLE")
-        self.record("fee_provider",ready,"" if ready else reason,critical=False)
 
     async def references_once(self):
         if self.providers.underlying is None:
@@ -229,7 +203,7 @@ class DemoRuntime:
                 instance = self.instances.get(observation.instance_id)
                 if instance is None:
                     raise ValueError("UNKNOWN_INSTANCE")
-                self.engine.process(observation,instance,self.fees.get(instance.instance_id),self.references.get(instance.instance_id))
+                self.engine.process(observation,instance,reference=self.references.get(instance.instance_id))
                 if self.engine.reason:
                     self.decisions.invalidate(self.engine.reason)
                     if self.providers.market_data is not None:
@@ -267,7 +241,7 @@ class DemoRuntime:
             binance=PublicHTTP("https://api.binance.com")
             self.clients=[gamma,binance]
             self.providers=Providers(discovery=GammaDiscovery(gamma),resolution=GammaResolution(gamma),
-                fees=GammaFeeProvider(gamma),underlying=BinanceResearchProvider(binance))
+                underlying=BinanceResearchProvider(binance))
         if self.providers.discovery is not None and self.providers.market_data is None:
             self.providers=Providers(discovery=self.providers.discovery,resolution=self.providers.resolution,
                 fees=self.providers.fees,underlying=self.providers.underlying,credentials=self.providers.credentials,
@@ -277,12 +251,12 @@ class DemoRuntime:
         self.record("engine_worker",True)
         jobs=[("database",self.database_once,2)]
         if self.providers.discovery is not None:
-            jobs += [("discovery",self.discover_once,10),("fee_provider",self.fees_once,30),
+            jobs += [("discovery",self.discover_once,10),
                 ("underlying_provider",self.references_once,1),("resolution_provider",self.resolution_once,10),
                 ("market_websocket",self.demand_once,0.25)]
             self.tasks.append(asyncio.create_task(self.providers.market_data.run(),name="demo-market-ws"))
         else:
-            for name in ("discovery","market_websocket","market_data_freshness","fee_provider","underlying_provider","resolution_provider"):
+            for name in ("discovery","market_websocket","market_data_freshness","underlying_provider","resolution_provider"):
                 self.record(name,False,"PUBLIC_PROVIDERS_DISABLED",critical=False)
         self.tasks.append(asyncio.create_task(self.consume(),name="demo-decisions"))
         for name,operation,interval in jobs:

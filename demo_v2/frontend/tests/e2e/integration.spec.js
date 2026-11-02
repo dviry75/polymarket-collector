@@ -24,8 +24,8 @@ test('real cookie login, server cohorts/pagination/detail, complete rule actions
   await expect(page.locator('[data-kpi="Total trades"]')).toHaveText('4');
   await page.locator('[data-action=clear]').click();await expect(page.locator('[data-kpi="Total trades"]')).toHaveText('12');
   await page.locator('[data-frame="1h"]').click();await expect(page.locator('.market').filter({hasText:'ETH'})).toContainText('0.7300');
-  await page.locator('[data-action=health]').first().click();await expect(page.locator('[role=dialog]')).toContainText('CURRENT_FEE_ROUNDING_UNVERIFIED');await page.locator('[data-action=close]').click();
-  await expect(page.locator('.banner')).toContainText('חישוב העמלות');
+  await page.locator('[data-action=health]').first().click();await expect(page.locator('[role=dialog]')).not.toContainText('CURRENT_FEE_ROUNDING_UNVERIFIED');await page.locator('[data-action=close]').click();
+  await expect(page.locator('.banner')).not.toContainText('חישוב העמלות');
   expect(await page.locator('.market').evaluateAll(cards=>cards.every(card=>card.scrollWidth<=card.clientWidth))).toBeTruthy();
   await page.screenshot({path:'test-results/overview-desktop.png',fullPage:true});
 
@@ -96,4 +96,44 @@ test('concurrent rule edits retain draft on 409, original names remain literal, 
   await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));await refreshed;
   await expect(page.locator('#form-errors')).toContainText('הנתונים השתנו');await expect(page.locator('[data-draft=name]')).toHaveValue('שינוי שלא נשמר');
   await page.locator('[data-action=logout]').click();await confirm(page);await expect(page.locator('#login-form')).toBeVisible();expect(errors).toEqual([]);
+});
+
+
+test('fee-enabled market: UI rule, fresh non-trigger then exact trigger creates a flat-fee simulated position',async({page})=>{
+  await login(page);
+  const session=await api(page,'/auth/current');
+  const headers={'X-Demo-CSRF':session.csrf_token};
+  await page.request.post(prefix+'/maintenance/factory-reset',{headers,data:{confirmation:'FACTORY_RESET_DEMO'}});
+  await page.locator('[data-action=create]').click();
+  await page.locator('[data-draft=name]').fill('Flat fee exact entry');
+  await page.locator('[data-market="BTC 5m"]').uncheck();
+  await page.locator('[data-market="ETH 1h"]').check();
+  await page.locator('[data-draft=entry]').fill('0.74');
+  await page.locator('[data-draft=shares]').fill('5');
+  await page.locator('#rule-form button[type=submit]').click();
+  await expect(page.locator('[data-testid="rules-table"]')).toContainText('Flat fee exact entry');
+  const rule=(await api(page,'/rules')).items.find(r=>r.spec.name==='Flat fee exact entry');
+  const before=await page.request.post(prefix+'/__test__/observation',{headers,data:{ask:'0.75'}});
+  expect(before.ok()).toBeTruthy();const observed=await before.json();expect(observed.processed).toBe(2);expect(observed.fees_enabled).toBe(true);
+  expect((await api(page,'/trades')).total).toBe(0);
+  const triggered=await page.request.post(prefix+'/__test__/observation',{headers,data:{ask:'0.74'}});
+  expect(triggered.ok()).toBeTruthy();
+  expect((await triggered.json()).exact_fee_provider_configured).toBe(false);
+  const trades=await api(page,'/trades');expect(trades.total).toBe(1);
+  const row=trades.items[0];
+  expect(row.rule_id).toBe(rule.id);expect(row.status).toBe('OPEN');
+  expect(row.entry_price).toBe('0.74');expect(row.buy_fee).toBe('0.068');
+  expect(row.cash_debit).toBe('3.768');expect(row.net_shares).toBe('5');
+  expect(row.fee_evidence.method).toBe('EMPIRICAL_FLAT_AVERAGE');
+  expect(row.entry_provenance.observation.source).toBe('BROWSER_FAKE_FEE_ENABLED_FEED');
+  expect((await api(page,'/health')).blocker_codes).not.toContain('CURRENT_FEE_ROUNDING_UNVERIFIED');
+  await page.locator('[data-nav=trades]').last().click();
+  await page.locator('[data-action=refresh]').first().click();
+  await expect(page.locator('[data-testid="trades-table"] tbody tr')).toHaveCount(1);
+  await expect(page.locator('[data-testid="trades-table"]')).toContainText('Flat fee exact entry');
+  await expect(page.locator('[data-testid="trades-table"]')).toContainText('$0.068');
+  await page.screenshot({path:'test-results/flat-fee-entry.png',fullPage:true});
+  await page.locator('[data-nav=maintenance]').click();
+  await expect(page.locator('.maintenance')).toContainText('$0.068');
+  await page.screenshot({path:'test-results/flat-fee-methodology.png',fullPage:true});
 });

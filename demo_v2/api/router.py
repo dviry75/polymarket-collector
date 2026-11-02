@@ -196,10 +196,9 @@ async def markets(request: Request):
                 "best_ask":observation.best_ask if observation else None,
                 "observed_at":observation.observed_at if observation else None,
                 "fresh":bool(data and data.token_ready(token)),"listening":token in getattr(data,"token_map",{})}
-        evidence=runtime.fees.get(instance_id)
         instances.append({**asdict(instance),"prices":prices,"is_current":instance_id in runtime.current.values(),
             "seconds_from_start":str((now-instance.starts_at).total_seconds()),
-            "fee":evidence.current(now).evidence() if evidence else None})
+            "fee":runtime.engine.fee_policy.evidence()})
     return respond({"definitions":request.app.state.repository.definitions(),"instances":instances,"as_of":now})
 
 
@@ -210,6 +209,7 @@ async def health(request: Request):
     snapshot=request.app.state.health.snapshot()
     return respond({**asdict(snapshot),"entries_allowed":snapshot.entries_allowed,
         "blocker_codes":[c.reason for c in snapshot.components if c.reason],
+        "fee_model":runtime.engine.fee_policy.evidence(),
         "market_data":data.health() if data and hasattr(data,"health") else None,
         "discovery_at":runtime.discovery_at,"recovery_stability_seconds":str(runtime.config.recovery_stability_seconds),
         "engine_generation":runtime.engine.generation,"engine_reason":runtime.engine.reason,

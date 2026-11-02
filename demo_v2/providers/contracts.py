@@ -43,7 +43,7 @@ class MarketResolution(Protocol):
 
 class FeeProvider(Protocol):
     async def parameters(self, instance: MarketInstance) -> FeeEvidence | None:
-        """None means unavailable/unreliable and must block affected entries."""
+        """Research-only exact exchange contract; never a DEMO execution dependency."""
         ...
 
 

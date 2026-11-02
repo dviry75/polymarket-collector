@@ -141,8 +141,8 @@ def test_virtual_execution_is_once_and_real_match_splitting_is_a_fidelity_limit(
 
 
 @pytest.mark.parametrize("bid,ask,reason,sell_fee,net", [
-    ("0.8", "0.81", "TAKE_PROFIT", "1.12", "78.88"),
-    ("0.4", "0.41", "STOP_LOSS", "1.68", "38.32"),
+    ("0.8", "0.81", "TAKE_PROFIT", "0.068", "79.932"),
+    ("0.4", "0.41", "STOP_LOSS", "0.068", "39.932"),
 ])
 def test_engine_tp_and_sl_are_taker_and_persist_cash_accounting_and_execution_provenance(
         repository, market, bid, ask, reason, sell_fee, net):
@@ -153,15 +153,15 @@ def test_engine_tp_and_sl_are_taker_and_persist_cash_accounting_and_execution_pr
     fee = fake_cash_fee()
     worker.process(quote(ask="0.5", bid="0.49"), market, fee)
     opened = repository.positions()[0]
-    assert Decimal(opened["cash_debit_text"]) == Decimal("51.75")
-    assert Decimal(opened["net_shares_text"]) == 100 and repository.wallet() == Decimal("-51.75")
+    assert Decimal(opened["cash_debit_text"]) == Decimal("50.068")
+    assert Decimal(opened["net_shares_text"]) == 100 and repository.wallet() == Decimal("-50.068")
     worker.process(quote(2, ask=ask, bid=bid), market, fee)
     closed = repository.positions()[0]
     assert closed["exit_reason"] == reason and Decimal(closed["sell_fee_text"]) == Decimal(sell_fee)
     assert Decimal(closed["net_proceeds_text"]) == Decimal(net)
-    assert repository.wallet() == Decimal(net) - Decimal("51.75")
+    assert repository.wallet() == Decimal(net) - Decimal("50.068")
     evidence = json.loads(closed["fee_evidence_json"])
-    assert evidence["taker_only"] is True and evidence["aggregation"] == "ONCE_PER_VIRTUAL_EXECUTION"
+    assert evidence["method"] == "EMPIRICAL_FLAT_AVERAGE" and evidence["aggregation"] == "ONCE_PER_VIRTUAL_EXECUTION"
     for field in ("entry_provenance_json", "exit_provenance_json"):
         execution = json.loads(closed[field])["execution"]
         assert execution["liquidity_role"] == "TAKER" and execution["model"] == VIRTUAL_EXECUTION
@@ -180,24 +180,7 @@ def test_resolution_uses_all_shares_with_no_fabricated_sell_fee(repository, mark
     closed = repository.positions()[0]
     assert Decimal(closed["net_proceeds_text"]) == payout and Decimal(closed["sell_fee_text"]) == 0
     assert closed["exit_reason"] == "MARKET_RESOLUTION"
-    assert repository.wallet() == Decimal(payout) - Decimal("51.75")
-
-
-def test_runtime_reports_exact_remaining_blocker_without_enabling_entries(repository, market):
-    from test_runtime import runtime
-    fee = replace(fake_cash_fee(), state=FeeState.UNSUPPORTED, rounding="UNKNOWN", reason=ROUNDING_BLOCKER)
-    class Fees:
-        async def parameters(self, instance):
-            return fee
-    from demo_v2.providers.contracts import Providers
-    worker = runtime(repository, providers=Providers(fees=Fees()))
-    worker.instances[market.instance_id] = market
-    worker.current[market.definition.key] = market.instance_id
-    asyncio.run(worker.fees_once())
-    snapshot = worker.health.snapshot()
-    component = next(c for c in snapshot.components if c.component == "fee_provider")
-    assert component.reason == ROUNDING_BLOCKER and not snapshot.entries_allowed
-    assert worker.fees[market.instance_id].state == FeeState.UNSUPPORTED
+    assert repository.wallet() == Decimal(payout) - Decimal("50.068")
 
 
 def test_new_public_snapshot_records_taker_only_for_all_21_families(market):

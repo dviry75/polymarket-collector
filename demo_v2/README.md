@@ -121,13 +121,25 @@ Binance research and an older official resolution were smoke-tested read-only.
 Phase 9 verified all 21 current/next families and all seven spot research pairs.
 Exact identities/timestamps and the HYPE futures-versus-spot distinction are recorded
 in the integration evidence. These are point-in-time checks, not sustained-load results.
-Fee-enabled public markets intentionally block entries until current tie/per-match
-rounding is verified. An explicit fees-disabled market can supply valid
-zero evidence. Production provisioning/review and deployment are separate work.
+DEMO execution uses the intentional `EMPIRICAL_FLAT_AVERAGE` simulation assumption:
+`DEMO_FLAT_FEE_PER_ACTION` defaults to Decimal("0.068"), no override needed.
+BUY debits shares × ask + fee and keeps every share. SELL credits shares × bid −
+fee, even when negative. Resolution pays shares × 1/0 with no additional fee.
+A default round trip costs 0.136; a resolved position costs 0.068. Provenance
+records the configured action-time fee and the operator-supplied basis of
+$111.81 over 1,644 historical operations. Invalid/nonfinite/negative settings fail.
+
+Exact Polymarket fee rounding remains unknown and is not replicated. Its provider
+and previous research are retained separately; missing/unsupported exact fees
+cannot block subscriptions, readiness or simulated entries. All other guards
+remain. `/health` (authenticated API) includes `fee_model`; market `fee` is the
+simulation policy, and trade evidence/ledger retain historical action charges.
+Frontend fees preserve sub-cent precision. See `docs/FEE_MODEL_REVIEW.md`.
+Production provisioning/review and deployment are separate work.
 
 ## Deployment preparation
 
 `deploy/DEPLOYMENT.md` contains the reviewed installation/update/rollback plan;
 `deploy/REVIEW.md` records actual host evidence and outstanding conditions. Units,
 proxy profiles and operator helpers are preparation only. Nothing was installed
-or activated on the host. Fee-bearing entries remain fail-closed.
+or activated as part of this source change. The empirical fee change is not deployed.

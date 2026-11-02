@@ -31,6 +31,13 @@ export function formatDecimal(value, digits=2, signed=false) {
 }
 /** @param {string|null|undefined} value @param {boolean} [signed] */
 export const formatMoney = (value,signed=false) => {const display=formatDecimal(value,2,signed);return display==='—'?display:display.replace(/^(−|\+)?/, '$1$');};
+/** Fee amounts retain their sub-cent precision (including configured overrides).
+ * @param {string|null|undefined} value */
+export function formatFee(value) {
+  if(value==null)return '—';
+  try {return '$'+formatDecimal(value,Math.max(3,decimalParts(value).scale));}
+  catch {return '—';}
+}
 export const freshRule = () => ({id:'',versionId:'',name:'',markets:['BTC 5m'],entry:'0.74',shares:'5',frequency:1,tpOn:false,tp:'0.96',slOn:false,sl:'0.66',enabled:true,archived:false,schedule:/** @type {{day:number,start:string,end:string}[]} */([]),windows:/** @type {{start:number,end:number}[]} */([]),conditions:/** @type {{op:string,measure:string,direction:string,min:string,max:string}[]} */([]),tradeCount:0,wallet:'0',pnl:'0'});
 /** @param {any} row */
 export function mapRule(row) {

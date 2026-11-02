@@ -29,7 +29,8 @@ DEMO config -> app lifespan -> dedicated migrations/repository + independent aut
 public Gamma -> verified families/instances -> entry/held-position demand -> public WS
 WS snapshots + ordered delta transitions -> DecisionStream -> DemoEngine -> atomic DB
                                        -> TelemetryBuffer -> optional diagnostics only
-public fee/research workers -> timestamped evidence cache -> entry/exit provenance
+DEMO FlatFeePolicy (configured Decimal) -> entry/exit fee evidence + cash ledger
+public underlying research workers -> timestamped context cache -> entry/exit provenance
 public official resolution -> independent atomic 1/0 settlement + immutable cash ledger
 REST -> same repositories/read-model cohorts; reset -> invalidate generation + atomic delete
 ```
@@ -73,3 +74,9 @@ No LIVE credential lookup/copy occurs. All writes require CSRF after login.
 REST financial values are strings, polling is supported, and generated OpenAPI
 plus README define the frontend contract. Public fee-enabled entries remain
 UNSUPPORTED until the missing operator tie/per-match rounding policy is verified.
+
+Execution fees use the DEMO-owned empirical flat policy (default 0.068 per
+BUY/SELL, zero at official resolution). The optional exact exchange FeeProvider
+contract/module is retained only for research: it is not constructed/polled by
+runtime and cannot block demand, readiness or entries. Historical research JSON
+and prior positions remain unchanged. See `FEE_MODEL_REVIEW.md`.

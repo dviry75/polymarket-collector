@@ -231,8 +231,8 @@ class DemoRepository:
         if not 0 <= price <= 1 or sell_fee < 0:
             raise ValueError("invalid exit financials")
         gross = decimal(row["net_shares_text"])*price
-        if sell_fee > gross:
-            raise ValueError("sell fee exceeds proceeds")
+        # A fixed cash fee can exceed a small (or zero) sale's proceeds.
+        # Keep the signed credit; never waive/cap the fee or reduce shares.
         if reason == ExitReason.MARKET_RESOLUTION and (price not in (0, 1) or sell_fee != 0):
             raise ValueError("settlement must use 1/0 with no sell fee")
         net = gross-sell_fee

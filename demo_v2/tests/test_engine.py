@@ -38,10 +38,10 @@ def test_shared_quota_concurrent_positions_independent_rules(repository,market,r
 
 
 @pytest.mark.parametrize("state", [FeeState.UNKNOWN,FeeState.STALE,FeeState.UNSUPPORTED])
-def test_invalid_fee_blocks_without_default(repository,market,rule,state):
+def test_unverified_exchange_fee_does_not_block_flat_simulation(repository,market,rule,state):
     worker=engine(repository,market)
     worker.process(quote(),market,verified_fee(state=state,rate=Decimal(0)))
-    assert repository.positions() == [] and repository.wallet() == 0
+    assert len(repository.positions()) == 1 and repository.wallet() == Decimal("-3.768")
 
 
 @pytest.mark.parametrize("bid,reason", [("0.63","STOP_LOSS"),("0.97","TAKE_PROFIT")])
