@@ -109,8 +109,13 @@ class DemoRuntime:
                         instance_id,evidence.state.value,utc(evidence.observed_at),evidence.source,dump(evidence.evidence())))
             except Exception:
                 self.fees.pop(instance_id,None)
-        ready = bool(wanted) and all(i in self.fees and self.fees[i].current(self.clock()).state==FeeState.VALID for i in wanted)
-        self.record("fee_provider",ready,"" if ready else "VALID_FEE_EVIDENCE_UNAVAILABLE",critical=False)
+        current = [self.fees[i].current(self.clock()) if i in self.fees else None for i in wanted]
+        failed = [e for e in current if e is None or e.state != FeeState.VALID]
+        ready = bool(wanted) and not failed
+        reasons = {e.reason for e in failed if e is not None and e.reason}
+        reason = (next(iter(reasons)) if len(reasons)==1 and all(e is not None and e.reason for e in failed)
+                  else "VALID_FEE_EVIDENCE_UNAVAILABLE")
+        self.record("fee_provider",ready,"" if ready else reason,critical=False)
 
     async def references_once(self):
         if self.providers.underlying is None:

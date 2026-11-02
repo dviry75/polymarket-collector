@@ -108,7 +108,9 @@ def test_verified_cash_units_do_not_promote_unverified_operator_rounding():
     assert evidence.buy_units==evidence.sell_units=="CASH"
     assert evidence.rate==Decimal(row["market_metadata"]["feeSchedule"]["rate"])
     assert evidence.rounding=="UNKNOWN"
-    assert evidence.reason=="CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED"
+    assert evidence.reason=="CURRENT_FEE_ROUNDING_UNVERIFIED"
+    assert evidence.taker_only is True
+    assert evidence.aggregation=="ONCE_PER_VIRTUAL_EXECUTION"
     with pytest.raises(ValueError): evidence.buy(Decimal(100),Decimal("0.5"))
 
 

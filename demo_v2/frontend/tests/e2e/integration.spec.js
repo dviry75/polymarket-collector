@@ -24,7 +24,7 @@ test('real cookie login, server cohorts/pagination/detail, complete rule actions
   await expect(page.locator('[data-kpi="Total trades"]')).toHaveText('4');
   await page.locator('[data-action=clear]').click();await expect(page.locator('[data-kpi="Total trades"]')).toHaveText('12');
   await page.locator('[data-frame="1h"]').click();await expect(page.locator('.market').filter({hasText:'ETH'})).toContainText('0.7300');
-  await page.locator('[data-action=health]').first().click();await expect(page.locator('[role=dialog]')).toContainText('CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED');await page.locator('[data-action=close]').click();
+  await page.locator('[data-action=health]').first().click();await expect(page.locator('[role=dialog]')).toContainText('CURRENT_FEE_ROUNDING_UNVERIFIED');await page.locator('[data-action=close]').click();
   await expect(page.locator('.banner')).toContainText('חישוב העמלות');
   expect(await page.locator('.market').evaluateAll(cards=>cards.every(card=>card.scrollWidth<=card.clientWidth))).toBeTruthy();
   await page.screenshot({path:'test-results/overview-desktop.png',fullPage:true});

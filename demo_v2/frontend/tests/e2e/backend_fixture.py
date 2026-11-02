@@ -75,7 +75,7 @@ def main():
         async def seeded(application):
             async with original(application):
                 app.state.runtime.current[definition.key]=market.instance_id
-                app.state.health.record(ComponentHealth("fee_provider",HealthState.NOT_READY,"CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED",False))
+                app.state.health.record(ComponentHealth("fee_provider",HealthState.NOT_READY,"CURRENT_FEE_ROUNDING_UNVERIFIED",False))
                 yield
         app.router.lifespan_context=seeded
         uvicorn.run(app,host="127.0.0.1",port=52971,log_level="error",access_log=False)

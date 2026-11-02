@@ -22,8 +22,9 @@ Audit `239d6bd`, Phase 1 `ce76b60`; remote base `d26dda4`.
 - Immutable entry snapshots, shared quota, independent positions and ledger commit
   together. Share fees are not debited twice; settlement has no sell fee.
 - Missing fee evidence blocks entries. Phase 9 verified CASH units for current CTF
-  markets; fee-enabled schedules remain UNSUPPORTED until operator tie/per-match
-  aggregation rounding is verified. No default rate.
+  markets; fee-enabled schedules remain UNSUPPORTED until charged-fee rounding is
+  verified. The 2026-11-02 review explicitly models one virtual taker execution,
+  not real maker matches or a resting maker TP. No default rate.
 - Binance USDT is a labelled research proxy, distinct from Chainlink TWAP oracle.
   Per-instance workers keep blocked feeds from starving healthy ones.
 - Missing auth fails closed. Separate DEMO credentials/secret/cookie/revocation;
@@ -48,11 +49,14 @@ unsubscribe and data-health transitions passed without CLOB HTTP. The original
 urllib URL still returns 403; current HTTPX public CLOB reads return 200. Cause
 cannot be uniquely attributed, but the runtime has no CLOB HTTP dependency.
 
-Fee formula, current parameters, BUY/SELL CASH units and five-decimal precision
-are verified. Exact tie and per-match aggregation rounding remain the only critical
-public-entry blocker. Counterexample: 5 × 0.07 × 0.01 × 0.99 = 0.003465; legitimate
-rounding conventions give different cash results. All captured markets charge fees,
-so public entries remain fail-closed; no fallback or default-zero trade was created.
+Fee formula, current parameters, BUY/SELL CASH units, taker-only maker exemption,
+five-decimal precision and the documented minimum are verified. Exact charged-fee
+rounding remains the critical public-entry blocker: CURRENT_FEE_ROUNDING_UNVERIFIED.
+Counterexample: 5 × 0.07 × 0.01 × 0.99 = 0.003465; legitimate rounding conventions
+give different cash results. Real multi-match parity remains a documented limit of
+the single-execution product model, not a feature claimed by DEMO. All captured
+markets charge fees, so public entries remain fail-closed; no fallback or default-zero
+trade was created. Supporting balance observations do not resolve exact ties.
 
 Local loopback API smoke passed using temporary resources/test credentials; it
 stopped cleanly. Evidence and exact matrix are in INTEGRATION_CONTRACTS.md and
@@ -68,7 +72,7 @@ rounding contract. No new product feature, UI or deployment was added in Phase 9
 |---|---|---|
 | 21 market families | READY | 21/21 verified snapshot; none unavailable in this check |
 | Market WS | READY | Native public snapshots, reconnect/generation/unsubscribe verified |
-| Fees | BLOCKED | Exact operator tie and per-match aggregation rounding unverified; UNSUPPORTED retained |
+| Fees | BLOCKED | CURRENT_FEE_ROUNDING_UNVERIFIED; UNSUPPORTED retained; real multi-match replication not modeled |
 | Underlying feeds | READY | 7/7 spot research providers verified; all 21 contexts; proxy/oracle distinction explicit |
 | Resolution | READY | 21/21 historical final winners verified; no fabricated sell fee |
 | Rule Engine | READY | Exact triggers, rearm/quota and full validation pass; public entries intentionally fee-gated |
@@ -82,6 +86,26 @@ Tests: **199 passed, 0 failed, 0 skipped** (141 prior + 58 Phase 9 regressions).
 Command: `PYTHONDONTWRITEBYTECODE=1 python -m pytest -c demo_v2/pytest.ini demo_v2/tests -q`.
 Phase 9 commit: `test: verify DEMO V2 public integrations and release readiness`
 (the commit containing this section; final SHA/push outcome in the delivery reply).
+
+## Fee evidence reconciliation — 2026-11-02
+
+**PARTIAL; fee-enabled entries remain disabled.** See `FEE_MODEL_REVIEW.md` for
+the authoritative sources, operator-supplied supporting production evidence,
+historical-data exclusions, virtual-execution boundary and remaining tie proof.
+The current official exchange source and Python SDK were reviewed read-only; fresh
+public fee configuration was verified for 21/21 families without account actions.
+
+Explicit TAKER entry/TP/SL provenance and `taker_only` policy are persisted through
+existing JSON fields; no schema migration. The documented minimum is applied before
+rounding. Public evidence still has unknown rounding and UNSUPPORTED state. The
+health component now exposes its specific common blocker, retaining the generic
+unavailable reason for absent or mixed evidence. No guard is weakened.
+
+Validation: **233 backend tests passed**, including 27 new fee regressions;
+**14 frontend unit/contract tests and 3 Chrome E2E tests passed** using temporary
+fake dependencies. No deployment, service restart, LIVE source/DB/config mutation
+or historical-row repair. Pre-existing Rubik frontend work remains outside this
+fee commit. Commit and push results are reported in the task delivery.
 
 ## Earlier package Git delivery (2026-10-29)
 

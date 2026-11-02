@@ -52,7 +52,7 @@ Unsupported explicit market protocols fail closed; presence of legacy IDs does
 not justify selecting them on a Protocol V2/unknown-version market. Supporting
 Position IDs is not added in Phase 9. See [market version selection](https://docs.polymarket.com/market-data/market-details).
 
-## Fee contract — PARTIAL, fee-bearing entries still blocked
+## Fee contract — PARTIAL, fee-bearing entries still blocked (rechecked 2026-11-02)
 
 Authority: [current official fees](https://docs.polymarket.com/trading/fees), Gamma
 per-market schedule and the [official CTF Exchange V2 source pinned at ccc0596](https://github.com/Polymarket/ctf-exchange-v2/blob/ccc0596074f4dfd62c944fbca4de252893b82b4b/src/exchange/mixins/Trading.sol).
@@ -68,16 +68,41 @@ corroborates notional+fee cash cost. Historical share-deduction formulas belong 
 other contract generations and are not current-market authority. Generic share-fee
 arithmetic remains tested for explicit fake contracts; public CTF evidence records CASH.
 
-Official docs specify five decimal places but not an exact tie rule or whether
-rounding is applied per individual maker match before aggregation. The operator
-supplies fee amounts to the contract; the contract validates limits, not this
-calculation policy. SDK budget estimates do not establish charged-fee rounding.
+Official docs specify five decimal places and a 0.00001 minimum (smaller raw fees
+round to zero), but not an exact tie rule. The operator supplies fee amounts to
+the contract; the contract validates limits, not this calculation policy. The
+current SDK at aa94ec431e3d4946576fb7c0d079fe1c14fcf676 still estimates BUY budget
+without quantizing the charged fee. SDK order-amount rounding does not establish
+charged-fee rounding.
 Counterexample with current rate: 5 shares at 0.01 gives raw 0.003465; DOWN gives
 0.00346, HALF_UP gives 0.00347. Two 2.5-share matches with HALF_UP total 0.00346.
-Both missing rules affect real accepted quantities, so neither can be guessed.
+Both can affect real accepted quantities, so neither is declared verified.
+
+DEMO does not consume book depth or create resting orders: entry at best ask and
+TP/SL at observed best bid are all TAKER executions. Its explicit model is one
+virtual execution at one observed price for the configured/held shares, with fee
+applied once. Real maker-match aggregation is not simulated and real fragmented
+order parity is not claimed. This product boundary does not justify guessing
+rounding; the counterexample remains a research-fidelity limitation. See
+[the complete fee audit and release conditions](FEE_MODEL_REVIEW.md).
+
+Official `feeSchedule.takerOnly=true` establishes zero maker fees for that
+configuration. This flag is now explicit in fee evidence; false/missing/malformed
+flags never reuse taker math for makers. No maker execution engine is added.
+The fresh public fixture `../tests/fixtures/fee_contract_20261102.json` rechecks
+all 21 families, with the same rate/exponent/taker-only configuration captured at
+its timestamp. It does not establish rounding or become a runtime default.
+
+The operator's new production observations (32/32 cash-fee BUYs, 189/190 fee-free
+maker SELLs, and 418/559 exact formula-matching taker SELLs) are **supporting
+production evidence**, distinct from the **authoritative fee contract**. No raw
+boundary fills were provided or production analysis rerun. Historical pre-3.9
+zero-bps/zero-fee VERIFIED rows and external_fills maker fees are not authority.
+DEMO imports neither table; regression tests reject legacy zero metadata alone.
 
 Fee-enabled evidence stays **UNSUPPORTED**, with exact blocker
-CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED. No enabling configuration
+CURRENT_FEE_ROUNDING_UNVERIFIED (superseding the Phase 9
+CURRENT_TIE_ROUNDING_AND_FILL_AGGREGATION_UNVERIFIED reason). No enabling configuration
 bypass and no fallback rate. Official non-boundary examples (100 shares at 0.10,
 0.20, 0.30, 0.50, 0.90) are tested; the cash example at 0.50 gives 1.75 fee,
 51.75 buy debit for 100 net shares, and 48.25 sell cash. Only explicit

@@ -40,6 +40,11 @@ class FeeState(StrEnum):
     UNSUPPORTED = "UNSUPPORTED"
 
 
+class LiquidityRole(StrEnum):
+    TAKER = "TAKER"
+    MAKER = "MAKER"
+
+
 class ExitReason(StrEnum):
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"

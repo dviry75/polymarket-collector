@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from .domain.eligibility import entry_eligible
-from .domain.trading import ExitReason, FeeState, decimal
+from .domain.trading import ExitReason, FeeState, LiquidityRole, decimal
 from .persistence.repository import dump, identifier, text, utc
 from .providers.book_primitives import exact_trigger
 from .providers.underlying import movement_matches
+from .providers.fees import VIRTUAL_EXECUTION
 
 
 class DemoEngine:
@@ -70,7 +71,9 @@ class DemoEngine:
             stored = conn.execute("SELECT * FROM demo_v2_instances WHERE id=?",(instance.instance_id,)).fetchone()
             if not stored or not stored["verified"] or stored["resolution_status"] != "PENDING":
                 return []
-            provenance = {"observation":obs,"market":instance,"underlying":reference.evidence() if reference else None}
+            provenance = {"observation":obs,"market":instance,"underlying":reference.evidence() if reference else None,
+                "execution":{"model":VIRTUAL_EXECUTION,"liquidity_role":LiquidityRole.TAKER.value,
+                             "fee_application":"ONCE_PER_VIRTUAL_EXECUTION"}}
             # Exits are independent of current rule enablement, schedules and entry health.
             for row in conn.execute("SELECT * FROM demo_v2_positions WHERE status='OPEN' AND instance_id=? AND token_id=?",
                                     (instance.instance_id,obs.token_id)).fetchall():
@@ -83,7 +86,9 @@ class DemoEngine:
                 elif bid is not None and row["sl_text"] is not None and bid <= decimal(row["sl_text"]):
                     reason = ExitReason.STOP_LOSS
                 if reason and applicable and applicable.state == FeeState.VALID:
-                    fee_amount = applicable.fee(decimal(row["net_shares_text"]),bid)
+                    # TP is an immediate observed-bid sale, just like SL. It is
+                    # not a resting maker order and receives no maker exemption.
+                    fee_amount = applicable.fee(decimal(row["net_shares_text"]),bid,liquidity=LiquidityRole.TAKER)
                     position = repo.close_position(row["id"],price=bid,sell_fee=fee_amount,reason=reason,
                         occurred_at=obs.observed_at,provenance={**provenance,"fee":applicable.evidence()},conn=conn)
                     self._research(conn,row["id"],instance,reference,"EXIT")
@@ -108,7 +113,7 @@ class DemoEngine:
                     and exact_trigger(previous["last_ask_text"],spec.entry_trigger))
                 trigger = eligible and exact_trigger(obs.best_ask,spec.entry_trigger) and not prior_at_trigger
                 if trigger and repo.entry_count(rule["id"],instance.instance_id,conn) < spec.entry_frequency:
-                    amounts = applicable.buy(spec.gross_shares,obs.best_ask)
+                    amounts = applicable.buy(spec.gross_shares,obs.best_ask,liquidity=LiquidityRole.TAKER)
                     position = repo.open_position(rule_id=rule["id"],version_id=rule["current_version_id"],
                         observation=obs,amounts=amounts,fee_evidence=applicable.evidence(),provenance=provenance,
                         idempotency_key=f"{rule['id']}:{instance.instance_id}:{obs.generation}:{obs.sequence}",conn=conn)
