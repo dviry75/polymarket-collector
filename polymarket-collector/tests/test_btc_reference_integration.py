@@ -448,6 +448,45 @@ def test_dashboard_trade_history_exposes_deal_btc_fields():
         assert item["btc"]["btc_exit_missing_reason"] is None
 
 
+def test_dashboard_external_deal_table_carries_deal_btc_fields():
+    import sqlite3
+    from live.dashboard_read_model import DashboardReadModel, resolve_window
+    from scripts.migrate_external_fills import DDL
+    from test_dashboard_v1 import NOW, build_db, seed_verified_lifecycle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        with sqlite3.connect(repo.db_path) as conn:
+            conn.executescript(DDL)
+            for trade_id, slug in (("t1", "btc-updown-5m-1786529400"), ("t2", "btc-updown-5m-other")):
+                conn.execute(
+                    "INSERT INTO external_fills(trade_id,condition_id,event_slug,side,price,size,"
+                    "notional_usd,fee_usd,matched_at,raw_json,ingested_at)"
+                    " VALUES(?,?,?,'BUY',0.74,10,7.4,0,'2026-08-12T10:00:03+00:00','{}',"
+                    "'2026-08-12T10:00:04+00:00')",
+                    (trade_id, f"condition-{trade_id}", slug),
+                )
+            conn.execute(
+                "UPDATE live_strategy_deals SET btc_open_price_text='80000',"
+                "btc_entry_price_text='80025.5',btc_entry_directional_delta_usd='25.5',"
+                "btc_gate_reason='BTC_GATE_PASS',btc_gate_mode='observe',"
+                "btc_exit_type='STOP',btc_exit_price_text='79990',"
+                "btc_exit_directional_delta_usd='-10'"
+            )
+        model = DashboardReadModel(LiveRepository(repo.db_path, query_only=True))
+        items = {
+            item["event_slug"]: item
+            for item in model.external_deal_history(resolve_window("today", now=NOW))["items"]
+        }
+        btc = items["btc-updown-5m-1786529400"]["btc"]
+        assert btc["btc_open_price"] == 80000
+        assert btc["btc_entry_directional_delta_usd"] == 25.5
+        assert btc["btc_exit_type"] == "STOP"
+        assert btc["btc_exit_price"] == 79990
+        assert "btc" not in items["btc-updown-5m-other"]  # no local deal for that event
+
+
 def test_gate_error_blocks_in_enforce_only(harness_factory):
     def boom(**_kwargs):
         raise RuntimeError("evaluation bug")

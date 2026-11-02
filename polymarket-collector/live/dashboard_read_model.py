@@ -746,6 +746,32 @@ class DashboardReadModel:
             }
         return out
 
+    def _btc_enrichment(self, event_slugs: list[str]) -> dict[str, dict[str, Any]]:
+        """Per-event BTC (Chainlink) reference overlay for the deal table.
+
+        A deal's event_id is the event slug of its external fills. Returns {}
+        until the trader has migrated the BTC deal columns.
+        """
+        slugs = [s for s in dict.fromkeys(event_slugs) if s]
+        if not slugs:
+            return {}
+        columns = {
+            str(row.get("name"))
+            for row in self._all("PRAGMA table_info(live_strategy_deals)")
+        }
+        if "btc_open_price_text" not in columns:
+            return {}
+        placeholders = ",".join("?" for _ in slugs)
+        rows = self._all(
+            f"""
+            SELECT event_id, {",".join(DEAL_BTC_TEXT_FIELDS + DEAL_BTC_RAW_FIELDS)}
+            FROM live_strategy_deals
+            WHERE event_id IN ({placeholders})
+            """,
+            tuple(slugs),
+        )
+        return {str(row.get("event_id")): {"btc": _deal_btc_fields(row)} for row in rows}
+
     def _external_floor(self) -> str:
         override = os.environ.get("EXTERNAL_FILLS_SINCE")
         if override:
@@ -807,6 +833,7 @@ class DashboardReadModel:
         ]
         enrichment = self._exit_audit_enrichment(condition_ids)
         entry_enrichment = self._entry_liquidity_enrichment(condition_ids)
+        btc_enrichment = self._btc_enrichment([row.get("event_slug") for row in rows])
         items = []
         for row in rows:
             buy_size = float(row.get("buy_size") or 0.0)
@@ -835,6 +862,7 @@ class DashboardReadModel:
             }
             item.update(enrichment.get(row.get("condition_id"), {}))
             item.update(entry_enrichment.get(row.get("condition_id"), {}))
+            item.update(btc_enrichment.get(row.get("event_slug"), {}))
             items.append(item)
         return {
             "items": items, "page": page, "page_size": page_size,
