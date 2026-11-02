@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from .data_api import DEFAULT_DATA_API_HOST, fetch_all_async
 from .repository import now_iso
 
 
@@ -28,7 +29,7 @@ class AccountIdentityResult:
 
 
 class PublicAccountIdentityClient:
-    def __init__(self, data_host: str = "https://data-api.polymarket.com", timeout: float = 10):
+    def __init__(self, data_host: str = DEFAULT_DATA_API_HOST, timeout: float = 10):
         self.data_host = data_host.rstrip("/")
         self.timeout = timeout
 
@@ -39,16 +40,23 @@ class PublicAccountIdentityClient:
     async def resolve(self, profile_address: str) -> AccountIdentityResult:
         if not self.validate_address(profile_address):
             return AccountIdentityResult("INVALID_ADDRESS", profile_address, error="Profile address must be a 0x-prefixed Ethereum address")
-        params = {"user": profile_address, "limit": 500, "sizeThreshold": 0}
+        params = {"user": profile_address, "limit": 500}
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                positions_response = await client.get(f"{self.data_host}/positions", params=params)
-                positions_response.raise_for_status()
-                positions = positions_response.json()
-                closed_response = await client.get(f"{self.data_host}/positions", params={**params, "redeemable": "true"})
-                closed_positions = closed_response.json() if closed_response.status_code < 400 else []
-                trades_response = await client.get(f"{self.data_host}/trades", params={"user": profile_address, "limit": 100})
-                trades = trades_response.json() if trades_response.status_code < 400 else []
+                positions = await fetch_all_async(client, self.data_host, "/positions", params)
+                try:
+                    closed_positions = await fetch_all_async(
+                        client, self.data_host, "/positions", {**params, "status": "REDEEMABLE"}
+                    )
+                except httpx.HTTPStatusError:
+                    closed_positions = []
+                try:
+                    trades = await fetch_all_async(
+                        client, self.data_host, "/trades",
+                        {"user": profile_address, "limit": 100}, max_pages=1, truncate=True,
+                    )
+                except httpx.HTTPStatusError:
+                    trades = []
         except httpx.TimeoutException:
             return AccountIdentityResult("UNAVAILABLE", profile_address, error="Public account request timed out")
         except httpx.HTTPStatusError as exc:
@@ -94,19 +102,18 @@ class PublicAccountIdentityClient:
             raise ValueError("invalid condition id")
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    f"{self.data_host}/activity",
-                    params={
+                payload = await fetch_all_async(
+                    client,
+                    self.data_host,
+                    "/activity",
+                    {
                         "user": profile_address,
-                        "market": condition_id,
+                        "condition": condition_id,
                         "type": "REDEEM",
                         "limit": 100,
-                        "sortBy": "TIMESTAMP",
-                        "sortDirection": "DESC",
+                        "sort_direction": "DESC",
                     },
                 )
-                response.raise_for_status()
-                payload = response.json()
         except httpx.TimeoutException as exc:
             raise RuntimeError("public redemption request timed out") from exc
         except httpx.HTTPStatusError as exc:

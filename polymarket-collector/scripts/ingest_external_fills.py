@@ -17,7 +17,7 @@ feed this, all read-only, all HTTP GET:
      read-only optimisation this first checks the trader's ``live_markets``
      cache (itself populated from this exact public endpoint, so no request
      avoided is no accuracy lost) before making a live HTTP call.
-  3. ``data-api.polymarket.com/activity?type=REDEEM`` (public, no auth) --
+  3. ``data-api.polymarket.com/v2/activity?type=REDEEM`` (public, no auth) --
      the actual USD payout for a resolved position (win = $1/share, loss =
      $0). Without this, a position bought and held to resolution (never
      manually sold) looks like a pure loss forever, even if it won.
@@ -61,6 +61,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from live.data_api import fetch_all  # noqa: E402
 from live.repository import LiveRepository  # noqa: E402
 
 DEFAULT_ENV_FILE = "/etc/polymarket-live/trader.env"
@@ -227,21 +228,11 @@ def fetch_clob_incremental(
 
 def fetch_data_trades(config: dict[str, str]) -> list[dict[str, Any]]:
     """Public, unauthenticated enrichment feed (event slug / title)."""
-    rows: list[dict[str, Any]] = []
-    offset, size = 0, 500
     with httpx.Client(timeout=45) as client:
-        while True:
-            response = client.get(
-                config["data_host"] + "/trades",
-                params={"user": config["proxy_wallet"], "takerOnly": "false", "limit": size, "offset": offset},
-            )
-            response.raise_for_status()
-            page = response.json()
-            rows.extend(page)
-            if len(page) < size:
-                break
-            offset += len(page)
-    return rows
+        return fetch_all(
+            client, config["data_host"], "/trades",
+            {"user": config["proxy_wallet"], "taker_only": "false", "start": 1, "limit": 1000},
+        )
 
 
 def fetch_redemptions(config: dict[str, str]) -> list[dict[str, Any]]:
@@ -250,27 +241,12 @@ def fetch_redemptions(config: dict[str, str]) -> list[dict[str, Any]]:
     Modest volume (one event per resolved position) -- a full walk every run
     is cheap and simple; no watermark needed, mirrors fetch_data_trades.
     """
-    rows: list[dict[str, Any]] = []
-    offset, size = 0, 500
     with httpx.Client(timeout=45) as client:
-        while True:
-            response = client.get(
-                config["data_host"] + "/activity",
-                params={
-                    "user": config["proxy_wallet"], "type": "REDEEM",
-                    "limit": size, "offset": offset,
-                    "sortBy": "TIMESTAMP", "sortDirection": "DESC",
-                },
-            )
-            response.raise_for_status()
-            page = response.json()
-            if not isinstance(page, list):
-                break
-            rows.extend(page)
-            if len(page) < size:
-                break
-            offset += len(page)
-    return rows
+        return fetch_all(
+            client, config["data_host"], "/activity",
+            {"user": config["proxy_wallet"], "type": "REDEEM", "start": 1,
+             "limit": 1000, "sort_direction": "DESC"},
+        )
 
 
 # --------------------------------------------------------------------------- #

@@ -33,6 +33,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from live.data_api import fetch_all  # noqa: E402
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -176,22 +179,11 @@ def fetch_clob_trades(config: dict[str, str]) -> list[dict[str, Any]]:
 
 
 def fetch_data_trades(config: dict[str, str]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    offset, size = 0, 500
     with httpx.Client(timeout=45) as client:
-        while True:
-            response = client.get(
-                config["data_host"] + "/trades",
-                params={"user": config["proxy_wallet"], "takerOnly": "false",
-                        "limit": size, "offset": offset},
-            )
-            response.raise_for_status()
-            page = response.json()
-            rows.extend(page)
-            if len(page) < size:
-                break
-            offset += len(page)
-    return rows
+        return fetch_all(
+            client, config["data_host"], "/trades",
+            {"user": config["proxy_wallet"], "taker_only": "false", "start": 1, "limit": 1000},
+        )
 
 
 def build_rows(clob: list[dict[str, Any]], data: list[dict[str, Any]],

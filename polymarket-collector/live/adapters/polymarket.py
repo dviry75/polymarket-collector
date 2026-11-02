@@ -8,9 +8,11 @@ from time import monotonic
 from typing import Any, Callable, Protocol
 
 from eth_account import Account
+import httpx
 
 from .base import TradingAdapter
 from ..config import LiveConfig
+from ..data_api import fetch_all_async
 from ..api_observability import PriorityRequestObserver, RequestPriority
 from ..order_attempts import OrderAttemptRecorder, StartedAttempt
 from ..order_book import canonical_decimal, decimal_value
@@ -505,18 +507,22 @@ class RealPolymarketTradingAdapter(TradingAdapter):
         }
 
     async def get_positions(self) -> list[dict[str, Any]]:
-        client = await self._client()
-
+        # Public Data API v2 (the SDK's list_positions still targets retired v1).
+        # Default status OPEN is the held-token superset, resolved-unredeemed
+        # winners included -- the same set v1 /positions served.
         async def collect() -> list[dict[str, Any]]:
-            pages = client.list_positions(
-                user=self.config.funder_address or self.config.profile_address,
-                size_threshold=0,
-                page_size=100,
-            )
-            return [
-                self._normalize_position(position)
-                async for position in pages.iter_items()
-            ]
+            async with httpx.AsyncClient(timeout=20) as http:
+                rows = await fetch_all_async(
+                    http,
+                    self.config.data_api_host,
+                    "/positions",
+                    {
+                        "user": self.config.funder_address or self.config.profile_address,
+                        "limit": 500,
+                    },
+                    parse_float=Decimal,
+                )
+            return [self._normalize_position(row) for row in rows]
 
         return await self._request_observer.call(
             "positions.list", RequestPriority.RECONCILIATION, collect
