@@ -69,3 +69,29 @@ are reported in the task delivery after the operator authentication step.
 
 Uncommitted rounding-forensics work remains outside this release. All Git changes
 for this task are under `demo_v2/`.
+
+
+## Installed verification — 2026-11-03
+
+The operator completed the administrator authentication. Release
+`8dcf2a26932de530d39092207a33bf1bc78eb25f` is installed, with the DEMO service
+running from the new release since 01:29:06 Asia/Jerusalem, PID 134800 and zero
+automatic restarts at verification. The deployment log confirms both verified
+backups and preservation of existing rule/position/ledger IDs. No env/unit/proxy/
+DNS/firewall/LIVE changes were made.
+
+The existing authenticated session survived. Live UI resource cards update, local
+Rubik is served, and Maintenance reports the configured empirical fee 0.068.
+Installed resource/engine/runtime hashes match the reviewed source. All 21 market
+families are discovered. This proves installation, not sustained trading readiness.
+
+**Operational readiness is NOT_READY, not an all-green release sign-off.**
+The authenticated UI reports `BOOKS_STALE_OR_MISSING`; the public market socket
+alternates between connected and reconnecting. Some underlying research contexts
+also intermittently report unavailable. A separate bounded in-memory public WS
+probe (no DB/engine) observed stale/missing HYPE-1h/HYPE-5m books and a conservative
+reconnect, followed by fresh snapshots. The installed readiness endpoint also
+showed blocked responses and an intermittent 3-second request timeout. These are
+recorded issues, not a claim that all runtime instability has one proven cause.
+The old exact-fee blocker is absent. Guards were not loosened, no synthetic entry
+was injected, and no rules/history were modified to make verification pass.

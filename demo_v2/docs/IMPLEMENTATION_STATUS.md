@@ -7,9 +7,11 @@ and host network telemetry. Four responsive cards, background sampling, cached A
 reads, explicit scope/freshness and selected local Rubik typography are verified.
 Clean candidate: **286 backend tests, 18 frontend tests and 4 Chrome E2E workflows
 passed**. The approved fee change is included. Offline update/backup/rollback
-artifacts are prepared; installation requires local Ubuntu administrator
-authentication. Runtime outcome is recorded in the task delivery, not inferred
-from source/test readiness. See `RESOURCE_HEALTH.md`.
+artifacts were installed after Ubuntu administrator authentication. Release
+`8dcf2a2` is running and the live UI/resources/fee configuration are verified.
+**Runtime remains NOT_READY because market-data freshness is not stable**;
+this is not an all-green trading readiness sign-off. See `RESOURCE_HEALTH.md`
+for the bounded public-data probe and outstanding operational findings.
 
 ## Current fee release — 2026-11-03
 
