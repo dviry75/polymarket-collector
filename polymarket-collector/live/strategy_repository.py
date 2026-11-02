@@ -829,6 +829,13 @@ class StrategyRepository:
                 "CREATE INDEX IF NOT EXISTS idx_live_strategy_fills_created_at "
                 "ON live_strategy_fills(created_at DESC)"
             )
+            # mark_reconciled_provenance joins fills to intents by intent_id on
+            # the event loop after every reconciliation; without this it scans
+            # the fill table per deal (seconds-long loop stalls at ~1.7k deals).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_strategy_fills_intent_id "
+                "ON live_strategy_fills(intent_id)"
+            )
             conn.execute("DROP INDEX IF EXISTS idx_live_strategy_one_active_exit")
             conn.execute(
                 """
