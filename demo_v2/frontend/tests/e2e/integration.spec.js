@@ -136,4 +136,35 @@ test('fee-enabled market: UI rule, fresh non-trigger then exact trigger creates 
   await page.locator('[data-nav=maintenance]').click();
   await expect(page.locator('.maintenance')).toContainText('$0.068');
   await page.screenshot({path:'test-results/flat-fee-methodology.png',fullPage:true});
+  await checkHealthResources(page);
 });
+
+
+async function checkHealthResources(page){
+  await page.locator('[data-nav=trades]').last().click();
+  await expect.poll(async()=>((await api(page,'/health')).resources.process.cpu_percent),{timeout:10000}).not.toBeNull();
+  await page.locator('[data-action=refresh]').first().click();
+  await page.locator('[data-action=health]').first().click();
+  const panel=page.locator('[data-testid=resource-panel]');
+  await expect(panel).toHaveAttribute('data-resource-state','AVAILABLE');
+  await expect(panel.locator('[data-resource]')).toHaveCount(4);
+  for(const text of ['CPU','RAM','אחסון','תעבורת רשת','השרת כולו','תהליך DEMO'])await expect(panel).toContainText(text);
+  await expect(panel.locator('[data-resource=ram] .resource-value')).not.toHaveText('—');
+  await expect(panel.locator('[data-resource=network]')).toContainText('/s');
+  const first=await panel.locator('.resource-status small').textContent();
+  // Existing 10-second API poll updates the open drawer; no close/reopen needed.
+  await expect(panel.locator('.resource-status small')).not.toHaveText(first,{timeout:15000});
+  await page.evaluate(()=>document.fonts.ready);
+  expect(await page.evaluate(()=>document.fonts.check('14px Rubik','אבג'))).toBe(true);
+  expect(await page.locator('body').evaluate(el=>getComputedStyle(el).fontFamily)).toContain('Rubik');
+  await page.screenshot({path:'test-results/health-resources-desktop.png',fullPage:true});
+  await page.setViewportSize({width:390,height:844});
+  expect(await panel.evaluate(el=>el.scrollWidth<=el.clientWidth)).toBeTruthy();
+  expect(await page.locator('[role=dialog]').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBeTruthy();
+  await page.screenshot({path:'test-results/health-resources-mobile.png',fullPage:true});
+  // Failed/stale health must never keep looking live in the open panel.
+  await page.route('**/demo/api/v1/health',route=>route.abort('failed'));
+  await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+  await expect(panel).toHaveAttribute('data-resource-state','UNAVAILABLE');
+  await expect(panel.locator('[data-resource=ram] .resource-value')).toHaveText('—');
+}

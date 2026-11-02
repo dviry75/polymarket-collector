@@ -4,7 +4,11 @@ The supplied Hebrew RTL vanilla JavaScript ES-module application is integrated,
 not replaced by a framework. The ZIP's `dist/` contained its original source; that
 source now lives in `src/`. `styles.css` is byte-identical to the supplied file.
 `integration.css` only fits real bid/ask pairs and longer backend IDs into the
-existing cards/table. Layout, icons, forms, dialogs, colors and typography remain.
+existing cards/table. Layout, icons, forms, dialogs and colors remain.
+The user-selected Rubik font is applied by `src/typography.css`, including form
+controls and numeric displays with tabular figures. Hebrew and Latin variable
+WOFF2 files are served locally, with no runtime Google Fonts dependency. The
+redistribution license and source/checksum records accompany the font assets.
 The standalone mock HTML and seed/local-storage repository are not shipped.
 `docs/UX.md` preserves the original prototype design notes, not the runtime contract.
 
@@ -102,3 +106,9 @@ workflows, strict API/model typecheck + UI syntax check, production build and
 were visually checked. No lint configuration existed. Fee-enabled entries remain
 blocked pending the existing fee-contract verification; this integration does not
 relax that gate. Deployment Review is a separate next step.
+
+
+Health includes responsive resource cards with explicit backend/host scope labels.
+`src/resources.js` formats telemetry only (financial Decimal handling is unchanged).
+Open cards refresh with health polling and hide stale/error values. Tests include
+CPU/RAM/storage/rates, unavailable data, mobile fit and local Rubik font loading.

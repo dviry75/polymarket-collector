@@ -17,11 +17,11 @@ const server=createServer(async(req,res)=>{
   }
   if(!path.startsWith('/demo/')){res.writeHead(302,{Location:'/demo/'});res.end();return;}
   const file=resolve(root,decodeURIComponent(path.slice(6)||'index.html'));
-  if(!file.startsWith(resolve(root)+'/')||file.includes('/node_modules/')||!['.html','.js','.css'].includes(extname(file))){res.writeHead(404);res.end();return;}
+  if(!file.startsWith(resolve(root)+'/')||file.includes('/node_modules/')||!['.html','.js','.css','.woff2'].includes(extname(file))){res.writeHead(404);res.end();return;}
   try{
     let body=await readFile(file);
     if(file.endsWith('/src/config.js')&&process.env.DEMO_API_BASE)body=Buffer.from('export const API_BASE = '+JSON.stringify(process.env.DEMO_API_BASE)+';\n');
-    res.writeHead(200,{'Content-Type':({'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'})[extname(file)],'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(body);
+    res.writeHead(200,{'Content-Type':({'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.woff2':'font/woff2'})[extname(file)],'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(body);
   }catch{res.writeHead(404);res.end();}
 });
 server.listen(Number(process.env.DEMO_FRONTEND_PORT||5173),'127.0.0.1',()=>console.log('DEMO local frontend on loopback port '+server.address().port));

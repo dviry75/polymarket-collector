@@ -2,6 +2,7 @@ import {assets,frames,durations,names,days,freshRule,validateRule,rulePayload,ma
 import {createClient,errorMessage} from './api/client.js';
 import {API_BASE} from './config.js';
 import {t,localize} from './he.js';
+import {resourcesHTML} from './resources.js';
 const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"'A-Za-z]/g,c=>'&#'+c.codePointAt(0)+';');
 
@@ -92,8 +93,13 @@ async function tradeDetails(id){
     openOverlay(`${drawerHead(tr.id)}<div style="display:flex;gap:8px">${badge(tr.asset+' '+tr.tf)}${badge(tr.side,tr.side==='UP'?'up':'down')}${badge(tr.status,tr.status==='OPEN'?'info':'')}</div><div class="pnl-large ${tone(tr.pnl)}">${money(tr.pnl,true)}</div><small>${tr.status==='OPEN'?'Net P&L is available once this trade closes.':'Realized net P&L · After fees'}</small><div class="drawer-section"><h3>Execution</h3>${detailList([['Rule',esc(tr.ruleName)],['Entry time',date(tr.entered)+' · '+time(tr.entered)],['Entry price',price(tr.entry)],['מניות ברוטו',esc(row.gross_shares)],['מניות נטו',esc(row.net_shares)],['Exit time',tr.exited?date(tr.exited)+' · '+time(tr.exited):'—'],['Exit price',price(tr.exit)],['Exit reason',esc(exitLabel(tr.reason))],['עמלת קנייה',formatFee(row.buy_fee)],['עמלת קנייה במניות',esc(row.buy_fee_shares??'—')],['עמלת מכירה',formatFee(row.sell_fee)],['Total fees',formatFee(row.total_fees)],['חיוב בכניסה',money(row.cash_debit)],['תקבול ביציאה',money(row.net_proceeds)]])}</div><div class="drawer-section"><h3>Underlying asset · ${esc(tr.asset)}</h3>${detailList([['Price at market open',money(tr.underlyingOpen)],['Price at entry',money(tr.underlyingEntry)],['Price at exit',money(tr.underlyingExit)],['Movement at entry',movement(tr.movementEntry)],['Movement at exit',movement(tr.movementExit)],['תנועה במהלך העסקה',movement(row.underlying_movements?.during_trade)],['מקור מחקר',esc(u?.current?.source??'—')],['סוג מקור',esc(u?.current?.reference_type??'—')],['מקור הכרעה',esc(u?.settlement_reference??'—')]])}<small>${u?.is_research_proxy?'מחיר מחקר חלופי; אינו מחיר ההכרעה הרשמי.':''}</small></div><div class="helper" style="margin-top:25px">All timestamps use Asia/Jerusalem.</div>`);
   }catch(error){if(sequence===overlaySequence&&data.user)openOverlay(drawerHead('פרטי עסקה')+`<p role="alert">${esc(errorMessage(error))}</p><button data-trade="${esc(id)}">ניסיון נוסף</button>`);}
 }
+function healthContent(){
+  const h=data.health,state=data.errors.health?'UNKNOWN':healthState(h);
+  return `${badge(state,state==='READY'?'up':'demo')}<p class="subtitle">${data.errors.health?'נתוני מצב קודמים אינם עדכניים.':h?.entries_allowed?'כניסות חדשות מותרות לפי בדיקות השרת.':'כניסות חדשות חסומות או שמצב המערכת אינו ידוע.'}</p>${resourcesHTML(h?.resources,Date.now(),!!data.errors.health)}<h3 class="health-components-heading">רכיבי המערכת</h3>${(h?.components??[]).map(c=>`<div class="health-row"><div><b>${esc(c.component)}</b><small>${esc(c.reason??'—')}</small></div>${badge(c.state,c.state==='READY'?'up':'down')}</div>`).join('')||'<p>אין נתוני מצב זמינים.</p>'}<small>עודכן ${time(data.healthFetchedAt)}</small><div class="helper">${(h?.blocker_codes??[]).map(code=>esc(code)).join('<br>')}</div>`;
+}
 function healthDetails(){
-  const h=data.health,state=data.errors.health?'UNKNOWN':healthState(h);openOverlay(`${drawerHead('System health')}${badge(state,state==='READY'?'up':'demo')}<p class="subtitle">${data.errors.health?'נתוני מצב קודמים אינם עדכניים.':h?.entries_allowed?'כניסות חדשות מותרות לפי בדיקות השרת.':'כניסות חדשות חסומות או שמצב המערכת אינו ידוע.'}</p>${(h?.components??[]).map(c=>`<div class="health-row"><div><b>${esc(c.component)}</b><small>${esc(c.reason??'—')}</small></div>${badge(c.state,c.state==='READY'?'up':'down')}</div>`).join('')||'<p>אין נתוני מצב זמינים.</p>'}<small>עודכן ${time(data.healthFetchedAt)}</small><div class="helper">${(h?.blocker_codes??[]).map(code=>esc(code)).join('<br>')}</div>`);
+  openOverlay(`${drawerHead('System health')}<div id="health-details-content">${healthContent()}</div>`);
+  $('#overlay .drawer').classList.add('health-drawer');
 }
 
 function confirmAction(title,body,action,label='Confirm',typed=false){modalAction=action;openOverlay(`<div class="modal-symbol">${icon('shield')}</div><h2 id="dialog-title">${title}</h2><p>${body}</p>${typed?'<label for="confirm-text">Type RESET DEMO to confirm</label><input id="confirm-text" autocomplete="off" placeholder="RESET DEMO">':''}<div id="dialog-error" role="alert" class="down"></div><div class="modal-actions"><button data-action="close">Cancel</button><button class="danger solid" data-action="confirm" ${typed?'disabled':''}>${label}</button></div>`,true);modalAction=action;}
@@ -104,7 +110,7 @@ async function refresh({clear=false,quiet=false}={}){
   const current=++revision;cohortController?.abort();cohortController=new AbortController();const signal=cohortController.signal;
   loading=true;
   if(clear){data.trades=[];data.total=0;data.kpi=null;data.tradesLoaded=false;}
-  if(!quiet)render();
+  if(!quiet&&!$('#rule-form'))render();
   let query;
   try{query=cohortQuery(f);}catch(error){data.errors.trades=error;loading=false;render();return;}
   const fullJobs={rules:()=>api.rules(),markets:()=>api.markets(),health:()=>api.health(),trades:()=>api.trades({...query,limit:'10',offset:String((page-1)*10)},signal),kpi:()=>api.kpi(query,signal)};
@@ -122,9 +128,13 @@ async function refresh({clear=false,quiet=false}={}){
     } catch(error) { data.errors[key]=error;if(key==='kpi')data.kpi=null; }
   }
   healthMode=data.errors.health?'UNKNOWN':healthState(data.health);loading=false;data.loaded=true;
+  const healthContentTarget=$('#health-details-content');
+  if(healthContentTarget)healthContentTarget.innerHTML=localize(healthContent());
   if(page>Math.max(1,Math.ceil(data.total/10))&&!data.errors.trades){page=Math.max(1,Math.ceil(data.total/10));await refresh({clear:true});return;}
   const active=document.activeElement;
-  if(!quiet||(!route.startsWith('rule/')&&!active?.matches('input,select,textarea')))render();
+  // A navigation/health refresh must not detach a mounted rule input while
+  // its input event is updating the draft. Keep the editor and its focus intact.
+  if(!$('#rule-form')&&(!quiet||(!route.startsWith('rule/')&&!active?.matches('input,select,textarea'))))render();
   else {const status=$('.health-btn');if(status){status.className='health-btn '+(healthMode==='READY'?'up':'warn');status.innerHTML='<i class="dot"></i>'+esc(t(healthMode))+icon('down');}}
 }
 async function mutate(action,success='הפעולה הושלמה.'){
@@ -219,7 +229,7 @@ window.addEventListener('offline',()=>{data.errors.markets=new Error('OFFLINE');
 window.addEventListener('online',()=>{if(data.user)refresh();});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&data.user)refresh({quiet:true});});
 setInterval(()=>{if(!document.hidden&&data.user&&!loading&&!busy)refresh({quiet:true});},10000);
-setInterval(()=>{if(document.hidden||route!=='trades')return;document.querySelectorAll('[data-ends]').forEach(el=>{el.textContent=el.dataset.ends?mmss(Math.max(0,Math.ceil((Date.parse(el.dataset.ends)-Date.now())/1000)))+' לסיום':'—';});
+setInterval(()=>{if(document.hidden)return;const resourcePanel=$('#health-details-content .resource-panel');if(resourcePanel){const holder=document.createElement('div');holder.innerHTML=resourcesHTML(data.health?.resources,Date.now(),!!data.errors.health);resourcePanel.replaceWith(holder.firstElementChild);}if(route!=='trades')return;document.querySelectorAll('[data-ends]').forEach(el=>{el.textContent=el.dataset.ends?mmss(Math.max(0,Math.ceil((Date.parse(el.dataset.ends)-Date.now())/1000)))+' לסיום':'—';});
   // Repaint market freshness when the backend snapshot ages, without refreshing or changing inputs.
   if(data.user&&data.markets){const markets=$('.markets');if(markets){const holder=document.createElement('div');holder.innerHTML=marketStrip();markets.replaceWith(holder.querySelector('.markets'));}}
 },1000);

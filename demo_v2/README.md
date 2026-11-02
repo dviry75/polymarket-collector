@@ -143,3 +143,13 @@ Production provisioning/review and deployment are separate work.
 `deploy/REVIEW.md` records actual host evidence and outstanding conditions. Units,
 proxy profiles and operator helpers are preparation only. Nothing was installed
 or activated as part of this source change. The empirical fee change is not deployed.
+
+
+## Resource health dashboard
+
+The authenticated health API and health drawer show backend CPU/RAM, host load/RAM,
+DEMO database storage, filesystem capacity and host network receive/send rates.
+Read-only sampling runs every two seconds; the UI refreshes on its existing poll
+and marks unavailable/stale readings explicitly. Network counters include other
+host applications/LAN/virtual interfaces and are not per-DEMO or household usage.
+See `docs/RESOURCE_HEALTH.md` for scopes, units, failure behavior and deployment.

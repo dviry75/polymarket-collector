@@ -1,0 +1,26 @@
+/* Self-hosted Rubik: Hebrew, Latin and existing intermediate UI weights. */
+@font-face {
+  font-family: 'Rubik';
+  font-style: normal;
+  font-weight: 300 900;
+  font-display: swap;
+  src: url('./assets/fonts/rubik-v31/rubik-hebrew.woff2') format('woff2');
+  unicode-range: U+0307-0308, U+0590-05FF, U+200C-2010, U+20AA, U+25CC, U+FB1D-FB4F;
+}
+@font-face {
+  font-family: 'Rubik';
+  font-style: normal;
+  font-weight: 300 900;
+  font-display: swap;
+  src: url('./assets/fonts/rubik-v31/rubik-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+:root { --demo-font-ui: 'Rubik', Arial, sans-serif; }
+body, button, input, select, textarea,
+.mono, .num, .stat-value, .market-prices b, .pnl-large, .quote-book {
+  font-family: var(--demo-font-ui);
+}
+.mono, .num, .stat-value, .market-prices b, .pnl-large, .quote-book,
+input[type='number'], input[type='time'], input[type='date'] {
+  font-variant-numeric: tabular-nums;
+}

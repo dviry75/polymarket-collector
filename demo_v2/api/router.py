@@ -210,6 +210,7 @@ async def health(request: Request):
     return respond({**asdict(snapshot),"entries_allowed":snapshot.entries_allowed,
         "blocker_codes":[c.reason for c in snapshot.components if c.reason],
         "fee_model":runtime.engine.fee_policy.evidence(),
+        "resources":request.app.state.resources.snapshot(),
         "market_data":data.health() if data and hasattr(data,"health") else None,
         "discovery_at":runtime.discovery_at,"recovery_stability_seconds":str(runtime.config.recovery_stability_seconds),
         "engine_generation":runtime.engine.generation,"engine_reason":runtime.engine.reason,

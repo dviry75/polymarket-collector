@@ -16,6 +16,7 @@ from .persistence.repository import DemoRepository
 from .providers.contracts import Providers
 from .streams import DecisionStream, TelemetryBuffer
 from .runtime import DemoRuntime
+from .resources import ResourceMonitor
 
 
 def create_app(config: DemoConfig | None = None, *, providers: Providers | None = None) -> FastAPI:
@@ -31,18 +32,23 @@ def create_app(config: DemoConfig | None = None, *, providers: Providers | None 
     telemetry=TelemetryBuffer(settings.telemetry_capacity)
     runtime=DemoRuntime(settings,repository,registry,decisions,telemetry,providers)
 
+    resources=ResourceMonitor(settings.data_dir)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
             await runtime.start()
             auth.initialize()
+            await resources.start()
             yield
         finally:
+            await resources.close()
             await runtime.close()
             registry.record(ComponentHealth("database", HealthState.NOT_READY, "STOPPED"))
 
     app = FastAPI(title="Polymarket DEMO V2", version="0.8.0", lifespan=lifespan, docs_url=None, redoc_url=None,
         description="Isolated simulated trading only. Cookie auth and X-Demo-CSRF on writes. Financial decimals are JSON strings.")
+    app.state.resources = resources
     app.state.config = settings
     app.state.database = database
     app.state.health = registry

@@ -1,5 +1,16 @@
 # DEMO V2 implementation status
 
+## Resource health dashboard — 2026-11-03
+
+Authenticated health now includes read-only backend CPU/RAM, host CPU/RAM, disk
+and host network telemetry. Four responsive cards, background sampling, cached API
+reads, explicit scope/freshness and selected local Rubik typography are verified.
+Clean candidate: **286 backend tests, 18 frontend tests and 4 Chrome E2E workflows
+passed**. The approved fee change is included. Offline update/backup/rollback
+artifacts are prepared; installation requires local Ubuntu administrator
+authentication. Runtime outcome is recorded in the task delivery, not inferred
+from source/test readiness. See `RESOURCE_HEALTH.md`.
+
 ## Current fee release — 2026-11-03
 
 **FEE BLOCKER: NONE. SIMULATED ENTRIES: ENABLED when other guards pass.**
