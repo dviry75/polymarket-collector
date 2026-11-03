@@ -67,3 +67,11 @@ test('empirical fees and historical fee amounts retain sub-cent precision',()=>{
   assert.equal(formatFee('0'),'$0.000');
   assert.equal(formatFee(null),'—');
 });
+
+
+test('trade serial comes from durable API identity and is never synthesized from page order',()=>{
+  const row={id:'uuid-kept',serial_number:12345,market:{definition_id:'ETH-1h'}};
+  assert.equal(mapTrade(row).serialNumber,12345);
+  assert.equal(mapTrade(row).id,'uuid-kept');
+  assert.equal(mapTrade({...row,serial_number:undefined}).serialNumber,null);
+});

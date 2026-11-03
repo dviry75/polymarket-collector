@@ -77,3 +77,15 @@ Frontend is owned by a separate UI agent. Codex/backend work must not implement 
 
 ## Deployment/isolation
 DEMO V2 lives in this repo but must have separate app entrypoint, service, DB, config/env, logs/runtime state and reverse-proxy route. Planned route: https://demo-poly.dvirtechnologies.com/demo/. No real-trading adapters/order submission in DEMO execution.
+
+## Trade serial numbers
+Each DEMO trade has a stable positive global `serial_number` displayed as #N in
+the trade list, details and new email reports. Existing UUIDs remain API identity.
+At first upgraded startup, missing historical numbers are allocated in ascending
+entry time with UUID as a deterministic tie-breaker. Subsequent numbers follow
+committed creation order, even when observation timestamps arrive out of order.
+Numbers do not change with filters, pagination, closing, restart or rule edits.
+Both explicit reset operations remove deleted-trade mappings but retain the
+high-water mark, so deleted numbers are not reused. Numbers are not guaranteed
+to remain gap-free after deletion. Metadata-only backfill does not change
+financial rows, UUIDs, ledgers, balances, timestamps or historical charges.

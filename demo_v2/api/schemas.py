@@ -34,6 +34,7 @@ class RuleList(BaseModel):
 
 class TradeView(ExtensibleView):
     id: str
+    serial_number: int = Field(ge=1,le=9007199254740991,description="Stable global DEMO trade number; UUID remains API identity")
     rule_id: str
     rule_version_id: str
     instance_id: str

@@ -53,3 +53,7 @@ demo-notifications { display: block; margin-bottom: 20px; }
 .notification-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0; }
 .notification-panel .helper { margin: 20px 0; }
 @media (max-width: 600px) { .notification-events, .notification-schedule { grid-template-columns: 1fr; } .notification-panel { padding: 15px; } }
+
+.table-heading .table-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.page-size-control{display:inline-flex;align-items:center;gap:8px;white-space:nowrap;color:var(--muted);font-size:12px}
+.page-size-control select{width:auto;min-width:68px}

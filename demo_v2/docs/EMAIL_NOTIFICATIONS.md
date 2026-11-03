@@ -174,3 +174,21 @@ SMTP on 2026-11-03, using STARTTLS and EHLO `dvirtechnologies.com`. This resolve
 the relay rejection for this test; inbox receipt and DKIM/DMARC results are not
 yet verified. The sender now identifies its domain in EHLO and adds a Date header.
 No deployment, service restart or private environment changes were performed.
+
+## Per-recipient categories
+
+Each saved mailbox has its own event checkboxes. For example, one address can
+receive SYSTEM_FAULT/NETWORK_HIGH while another receives DAILY_SUMMARY and
+PERIODIC_SUMMARY. Clear all types for one address to mute its automatic mail.
+An enabled workspace still needs at least one active recipient/category pair.
+The UI retains a clearly labeled default selection for newly added recipients;
+existing addresses have explicit individual choices after the next save.
+
+Settings use `recipient_events` in the existing metadata JSON. Older saved
+records without the field continue to route the original events to the original
+recipients; reading settings does not rewrite them or bump the revision. No
+schema/dependency/private environment changes are needed. Queue insertion and
+delivery both enforce subscriptions, including types enabled only through an
+individual override. Daily time, periodic interval and resource thresholds are
+shared and labeled accordingly. The test button remains an explicit confirmation
+to send a TEST message to all saved addresses; it does not change subscriptions.

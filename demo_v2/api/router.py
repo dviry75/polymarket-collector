@@ -181,7 +181,8 @@ async def trade_detail(position_id: str,request: Request):
         row=conn.execute("SELECT * FROM demo_v2_positions WHERE id=?",(position_id,)).fetchone()
         if not row:
             raise KeyError("trade not found")
-        row=dict(row)
+        from ..persistence.trade_serials import view as serial_view
+        row=serial_view(conn,row)
         version=dict(conn.execute("SELECT * FROM demo_v2_rule_versions WHERE id=?",(row["rule_version_id"],)).fetchone())
         underlying=[dict(value) for value in conn.execute("SELECT * FROM demo_v2_underlying WHERE position_id=? ORDER BY observed_at,id",(position_id,))]
         ledger=[dict(value) for value in conn.execute("SELECT * FROM demo_v2_ledger WHERE position_id=? ORDER BY occurred_at,id",(position_id,))]

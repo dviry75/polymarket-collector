@@ -44,3 +44,8 @@
   summary of 1,644 historical operations/$111.81. Exact Polymarket rounding stays
   unknown/research-only; no fee-specific entry/readiness dependency. Preserve
   previous research, historical charges and all other trading guards.
+
+- D-039 (2026-11-03): Stable global human trade serials alongside UUIDs. Reuse
+  transactional DEMO metadata for allocation/backfill; keep financial schema and
+  values unchanged. Backfill by entry time/UUID, then allocate by creation order.
+  Preserve high-water mark across both resets; show serial in list/details/mail.

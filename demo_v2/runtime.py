@@ -231,6 +231,7 @@ class DemoRuntime:
 
     async def start(self):
         self.repository.database.migrate()
+        self.repository.ensure_trade_serials()
         self.database_ok=self.repository.database.probe()
         self.record("database",self.database_ok)
         for row in self.repository.instances():

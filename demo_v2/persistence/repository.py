@@ -11,6 +11,7 @@ from uuid import uuid4
 from ..domain.models import MarketInstance, MarketObservation, OfficialResolution
 from ..domain.trading import EntryAmounts, ExitReason, RuleSpec, Side, classify, decimal, text
 from .database import DemoDatabase
+from . import trade_serials
 
 
 def now_iso() -> str:
@@ -49,6 +50,10 @@ def utc(value: datetime) -> str:
 class DemoRepository:
     def __init__(self, database: DemoDatabase):
         self.database = database
+
+    def ensure_trade_serials(self):
+        with self.database.transaction() as conn:
+            trade_serials.ensure(conn)
 
     def definitions(self) -> list[dict]:
         with self.database.connect() as conn:
@@ -170,7 +175,7 @@ class DemoRepository:
                     idempotency_key=idempotency_key, conn=connection)
         previous = conn.execute("SELECT * FROM demo_v2_positions WHERE idempotency_key=?", (idempotency_key,)).fetchone()
         if previous:
-            return dict(previous)
+            return trade_serials.view(conn,previous)
         rule = conn.execute("""SELECT r.*,v.snapshot_json FROM demo_v2_rules r JOIN demo_v2_rule_versions v
             ON v.id=r.current_version_id WHERE r.id=?""", (rule_id,)).fetchone()
         if not rule or not rule["enabled"] or rule["archived"] or rule["current_version_id"] != version_id:
@@ -190,6 +195,8 @@ class DemoRepository:
         count = self.entry_count(rule_id, observation.instance_id, conn)
         if count >= spec.entry_frequency:
             raise ValueError("shared entry frequency exhausted")
+        if not conn.execute("SELECT 1 FROM demo_v2_meta WHERE key=?",(trade_serials.COUNTER,)).fetchone():
+            trade_serials.ensure(conn)
         position_id = identifier()
         fields = dict(
             id=position_id, idempotency_key=idempotency_key, rule_id=rule_id, rule_version_id=version_id,
@@ -205,11 +212,12 @@ class DemoRepository:
             entry_provenance_json=dump(provenance), fee_evidence_json=dump(fee_evidence), result="OPEN",
         )
         conn.execute(f"INSERT INTO demo_v2_positions ({','.join(fields)}) VALUES ({','.join('?' for _ in fields)})", tuple(fields.values()))
+        trade_serials.allocate(conn,position_id)
         conn.execute("""INSERT INTO demo_v2_entry_counts VALUES (?,?,1)
             ON CONFLICT(rule_id,instance_id) DO UPDATE SET count=count+1""", (rule_id, observation.instance_id))
         self.save_runtime(conn, rule_id, version_id, observation, observation.best_ask, "ENTRY")
         self._ledger(conn, position_id, rule_id, "ENTRY", -amounts.cash_debit, utc(observation.observed_at), provenance)
-        return dict(conn.execute("SELECT * FROM demo_v2_positions WHERE id=?", (position_id,)).fetchone())
+        return trade_serials.view(conn,conn.execute("SELECT * FROM demo_v2_positions WHERE id=?", (position_id,)).fetchone())
 
     def _ledger(self, conn, position_id, rule_id, kind, amount, timestamp, provenance):
         conn.execute("INSERT INTO demo_v2_ledger VALUES (?,?,?,?,?,?,?,?)", (
@@ -226,7 +234,7 @@ class DemoRepository:
         if not row:
             raise KeyError("position not found")
         if row["status"] == "CLOSED":
-            return dict(row)
+            return trade_serials.view(conn,row)
         price, sell_fee = decimal(price), decimal(sell_fee)
         if not 0 <= price <= 1 or sell_fee < 0:
             raise ValueError("invalid exit financials")
@@ -243,7 +251,7 @@ class DemoRepository:
             timestamp, text(price), reason.value, dump(provenance), text(sell_fee), text(gross), text(net), text(pnl), classify(pnl).value, position_id,
         ))
         self._ledger(conn, position_id, row["rule_id"], "SETTLEMENT" if reason == ExitReason.MARKET_RESOLUTION else "EXIT", net, timestamp, provenance)
-        return dict(conn.execute("SELECT * FROM demo_v2_positions WHERE id=?", (position_id,)).fetchone())
+        return trade_serials.view(conn,conn.execute("SELECT * FROM demo_v2_positions WHERE id=?", (position_id,)).fetchone())
 
     def resolve(self, resolution: OfficialResolution, *, reference=None) -> int:
         with self.database.transaction() as conn:
@@ -278,7 +286,7 @@ class DemoRepository:
             if value is not None:
                 clauses.append(f"{key}=?")
                 params.append(value)
-        query = "SELECT * FROM demo_v2_positions" + (" WHERE "+" AND ".join(clauses) if clauses else "") + " ORDER BY entry_at,id"
+        query = "SELECT p.*,CAST(m.value AS INTEGER) AS serial_number FROM demo_v2_positions p LEFT JOIN demo_v2_meta m ON m.key='trade_serial:'||p.id" + (" WHERE "+" AND ".join("p."+clause for clause in clauses) if clauses else "") + " ORDER BY entry_at,id"
         with self.database.connect() as conn:
             return [dict(row) for row in conn.execute(query, params)]
 
@@ -292,6 +300,7 @@ class DemoRepository:
             conn.execute("UPDATE demo_v2_meta SET value='1' WHERE key='resetting'")
             for table in ("ledger", "underlying", "positions", "entry_runtime", "entry_counts"):
                 conn.execute(f"DELETE FROM demo_v2_{table}")
+            conn.execute("DELETE FROM demo_v2_meta WHERE key GLOB ?",(trade_serials.PREFIX+"*",))
             if factory:
                 conn.execute("UPDATE demo_v2_rules SET current_version_id=NULL")
                 conn.execute("DELETE FROM demo_v2_rule_versions")

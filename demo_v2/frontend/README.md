@@ -126,3 +126,16 @@ the DNS/readiness checks. No SMTP credentials are configured through the browser
 The local dev/preview server returns 400 for malformed URLs/percent-encoded
 static paths; source and built-mode regression tests verify continued service,
 ordinary assets, traversal rejection and encoded API identifiers.
+
+Trade table page size is selectable (10/25/50/100; default 10) and saved as a
+non-sensitive local browser preference. Changing it resets to the first page and
+updates API limit/offset, page count and displayed range. Filters and durable
+trade serials remain unchanged; KPI scope continues to cover the full filter.
+Invalid or unavailable local storage falls back to 10; requests remain bounded.
+
+Mail settings include individual category checkboxes per recipient, plus default
+categories for newly added addresses. The recipient-list update button preserves
+unsaved individual choices; saving also synchronizes additions/removals. No
+selection for an address means no automatic alerts for that address. Shared
+schedule/threshold fields are labeled as shared. Existing legacy settings inherit
+the previous global categories until edited.

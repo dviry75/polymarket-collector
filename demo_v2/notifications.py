@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from pydantic import Field, field_validator, model_validator
 
 from .domain.trading import FrozenModel, decimal, text
+from .persistence.trade_serials import number as trade_serial_number
 
 
 LOCAL = ZoneInfo('Asia/Jerusalem')
@@ -66,6 +67,7 @@ class NotificationSettings(FrozenModel):
     enabled: bool = False
     recipients: Annotated[tuple[str,...],Field(max_length=10)] = ()
     events: tuple[Event,...] = ('SYSTEM_FAULT','SYSTEM_RECOVERY','DAILY_SUMMARY','PERIODIC_SUMMARY')
+    recipient_events: dict[str,tuple[Event,...]] = Field(default_factory=dict,max_length=10)
     daily_time: str = '08:00'
     periodic_hours: Literal[1,3,6] = 3
     network_mib_per_second: Annotated[float,Field(ge=0.01,le=100000,allow_inf_nan=False)] = 10
@@ -82,6 +84,26 @@ class NotificationSettings(FrozenModel):
             raise ValueError('כתובת נמען כפולה')
         return cleaned
 
+    @field_validator('recipient_events')
+    @classmethod
+    def subscriptions(cls, values):
+        cleaned={}
+        for address,events in values.items():
+            key=mailbox(address).lower()
+            if key in cleaned:raise ValueError('בחירת התראות כפולה לנמען')
+            if len(set(events))!=len(events):raise ValueError('סוג התראה כפול לנמען')
+            cleaned[key]=events
+        return cleaned
+
+    def events_for(self,recipient):
+        return self.recipient_events.get(recipient.lower(),self.events)
+
+    def subscribed(self,event):
+        return any(event in self.events_for(recipient) for recipient in self.recipients)
+
+    def allows(self,recipient,event):
+        return recipient.lower() in {r.lower() for r in self.recipients} and event in self.events_for(recipient)
+
     @field_validator('daily_time')
     @classmethod
     def schedule(cls, value):
@@ -93,7 +115,9 @@ class NotificationSettings(FrozenModel):
     def valid(self):
         if len(set(self.events))!=len(self.events):
             raise ValueError('סוג התראה כפול')
-        if self.enabled and (not self.recipients or not self.events):
+        if set(self.recipient_events)-{r.lower() for r in self.recipients}:
+            raise ValueError('בחירת התראות לכתובת שאינה ברשימת הנמענים')
+        if self.enabled and (not self.recipients or not any(self.events_for(r) for r in self.recipients)):
             raise ValueError('להפעלה יש לבחור לפחות נמען אחד וסוג התראה אחד')
         return self
 
@@ -209,7 +233,7 @@ class Notifications:
             record,settings=self.settings(conn)
             queue=load(conn,QUEUE_KEY,[])
             state=load(conn,STATE_KEY,{})
-        return {**record,'sender':self.config.sender,'timezone':'Asia/Jerusalem',
+        return {**record,'settings':settings.model_dump(mode='json'),'sender':self.config.sender,'timezone':'Asia/Jerusalem',
             'transport':{'state':'CONFIGURED' if self.config.enabled else 'DISABLED',
                          'reason':'' if self.config.enabled else 'DEMO_EMAIL_ENABLED_FALSE'},
             'catalog':[{'code':key,'label':value} for key,value in EVENTS.items()],
@@ -238,9 +262,10 @@ class Notifications:
         return self.view()
 
     def enqueue(self,queue,state,settings,event,event_id,subject,body,*,test=False):
-        if not settings.enabled or (event not in settings.events and not test):return
+        if not settings.enabled or (not settings.subscribed(event) and not test):return
         now=self.clock().isoformat()
         for recipient in settings.recipients:
+            if not test and not settings.allows(recipient,event):continue
             key=hashlib.sha256((event_id+'\0'+recipient.lower()).encode()).hexdigest()
             if any(q['id']==key for q in queue):continue
             while len(queue)>=MAX_QUEUE:
@@ -276,7 +301,7 @@ class Notifications:
         rule_name=json.loads(rule[0])['name'] if rule else position['rule_id']
         market=conn.execute('SELECT definition_id FROM demo_v2_instances WHERE id=?',(position['instance_id'],)).fetchone()
         def stamp(value):return datetime.fromisoformat(value).astimezone(LOCAL).strftime('%d/%m/%Y %H:%M:%S') if value else '—'
-        return '\n'.join((f"עסקת DEMO: {position['id']}",f"חוק: {rule_name}",
+        return '\n'.join((f"עסקת DEMO #{trade_serial_number(conn,position['id'])} | מזהה: {position['id']}",f"חוק: {rule_name}",
             f"שוק: {market[0] if market else position['instance_id']} | צד: {position['side']}",
             f"כניסה: {stamp(position['entry_at'])} | מחיר {position['entry_price_text']} | מניות {position['net_shares_text']}",
             f"סגירה: {stamp(position['exit_at'])} | מחיר {position['exit_price_text'] or '—'} | סיבה {EVENTS.get(position['exit_reason'],'פתוחה')}",
@@ -338,7 +363,7 @@ class Notifications:
                                       ('DAILY_SUMMARY',daily_boundary(now,settings.daily_time),None)]:
                     key='periodic_at' if kind=='PERIODIC_SUMMARY' else 'daily_at'
                     previous=state.get(key)
-                    if previous and end>datetime.fromisoformat(previous) and kind in settings.events:
+                    if previous and end>datetime.fromisoformat(previous) and settings.subscribed(kind):
                         # Three/six-hour wall-clock blocks may span a DST change.
                         start=((end.astimezone(LOCAL)-span).astimezone(UTC) if settings.periodic_hours!=1 else end-span) if span else (end.astimezone(LOCAL)-timedelta(days=1)).astimezone(UTC)
                         self.enqueue(queue,state,settings,kind,kind+':'+end.isoformat(),EVENTS[kind],self.summary(conn,start,end))
@@ -393,7 +418,7 @@ class Notifications:
                 ('RAM_HIGH',snapshot.get('host',{}).get('ram_percent'),settings.ram_percent,'%'),
                 ('DISK_HIGH',snapshot.get('disk',{}).get('percent'),settings.disk_percent,'%')]
         for event,value,threshold,unit in values:
-            if event not in settings.events:
+            if not settings.subscribed(event):
                 observed.pop(event,None)
                 continue
             item=observed.setdefault(event,{'notified':False,'since':None,'recovery_since':None})
@@ -431,7 +456,7 @@ class Notifications:
                 queue=load(conn,QUEUE_KEY,[])
                 item=next((q for q in queue if q['status']=='PENDING' and datetime.fromisoformat(q['next_at'])<=now),None)
                 if not item:return
-                if item['recipient'] not in settings.recipients or (item['event']!='TEST' and item['event'] not in settings.events):
+                if item['recipient'].lower() not in {r.lower() for r in settings.recipients} or (item['event']!='TEST' and not settings.allows(item['recipient'],item['event'])):
                     item['status']='CANCELED';save(conn,QUEUE_KEY,queue);return
                 item['status']='SENDING';item['attempts']+=1
                 save(conn,QUEUE_KEY,queue)

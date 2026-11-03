@@ -70,6 +70,7 @@ def test_trade_events_opt_in_durable_dedup_no_backfill_and_recipients(repository
     assert len(queue(worker))==2
     assert {q['event'] for q in queue(worker)}=={'POSITION_OPENED'}
     assert all('ETH test' in q['body'] for q in queue(worker))
+    assert all(f"עסקת DEMO #{current['serial_number']}" in q['body'] for q in queue(worker))
     repo=repository
     repo.close_position(current['id'],price=__import__('decimal').Decimal('0.96'),sell_fee=__import__('decimal').Decimal('0.068'),reason=ExitReason.TAKE_PROFIT,occurred_at=datetime.now(UTC),provenance={})
     worker.collect();assert len(queue(worker))==4
@@ -323,3 +324,84 @@ def test_resource_short_spike_gap_and_restart_never_count_as_continuity(reposito
     {'resource_duration_seconds':9},{'resource_duration_seconds':3601}])
 def test_resource_threshold_validation(fields):
     with pytest.raises(ValidationError):NotificationSettings(**fields)
+
+
+def test_per_recipient_routing_legacy_defaults_and_all_event_categories(repository):
+    from demo_v2.notifications import EVENTS
+    worker,_,_,_=service(repository)
+    first=tuple(list(EVENTS)[::2]);second=tuple(list(EVENTS)[1::2])
+    enable(worker,events=(),recipient_events={'ONE@example.com':first,'two@example.com':second})
+    settings=NotificationSettings.model_validate(worker.view()['settings'])
+    assert settings.recipient_events['one@example.com']==first
+    with worker.database.transaction() as conn:
+        state={};items=[]
+        for event in EVENTS:worker.enqueue(items,state,settings,event,event,event,'fake body')
+        assert len(items)==len(EVENTS)
+        for item in items:
+            assert item['event'] in (first if item['recipient']=='one@example.com' else second)
+    # Old settings without recipient_events retain the exact old recipients/events.
+    with worker.database.transaction() as conn:
+        save(conn,SETTINGS_KEY,{'revision':7,'settings':{'enabled':True,'recipients':['one@example.com','two@example.com'],'events':['SYSTEM_FAULT']}})
+    view=worker.view()
+    assert view['revision']==7 and view['settings']['recipient_events']=={}
+    with worker.database.connect() as conn:
+        assert 'recipient_events' not in load(conn,SETTINGS_KEY,{})['settings']  # GET does not mutate old settings.
+    settings=NotificationSettings.model_validate(view['settings'])
+    items=[];worker.enqueue(items,{},settings,'SYSTEM_FAULT','fault','fault','fake')
+    assert {q['recipient'] for q in items}=={'one@example.com','two@example.com'}
+
+
+@pytest.mark.parametrize('fields',[
+    {'recipient_events':{'other@example.com':['SYSTEM_FAULT']}},
+    {'recipient_events':{'one@example.com':['TEST']}},
+    {'recipient_events':{'one@example.com':['SYSTEM_FAULT','SYSTEM_FAULT']}},
+    {'recipient_events':{'one@example.com':[],'ONE@example.com':['SYSTEM_FAULT']}},
+    {'recipient_events':{'one@example.com':[],'two@example.com':[]}},
+])
+def test_per_recipient_validation_rejects_unknown_duplicate_and_empty_active_subscriptions(fields):
+    with pytest.raises(ValidationError):
+        NotificationSettings(enabled=True,recipients=('one@example.com','two@example.com'),**fields)
+
+
+def test_recipient_trade_routing_override_disable_and_test_send(repository,rule):
+    worker,_,_,sent=service(repository)
+    enable(worker,events=('DAILY_SUMMARY',),recipient_events={
+        'one@example.com':('POSITION_OPENED',),'two@example.com':()})
+    open_position(repository,rule,1);worker.collect()
+    assert [(q['recipient'],q['event']) for q in queue(worker)]==[('one@example.com','POSITION_OPENED')]
+    asyncio.run(worker.deliver_once());assert len(sent)==1
+    # Explicit test is labeled as such and authorized to all saved recipients.
+    worker.queue_test()
+    assert {q['recipient'] for q in queue(worker) if q['event']=='TEST'}=={'one@example.com','two@example.com'}
+    # Preference changes cancel old pending sends, and unsubscribed recipients stay excluded.
+    enable(worker,events=('DAILY_SUMMARY',),recipient_events={
+        'one@example.com':(),'two@example.com':('POSITION_OPENED',)})
+    open_position(repository,rule,2);worker.collect()
+    pending=[q for q in queue(worker) if q['status']=='PENDING']
+    assert [(q['recipient'],q['event']) for q in pending]==[('two@example.com','POSITION_OPENED')]
+
+
+@pytest.mark.parametrize('event',['DAILY_SUMMARY','PERIODIC_SUMMARY','CPU_HIGH'])
+def test_collect_uses_effective_recipient_union_not_global_defaults(repository,event):
+    worker,now,_,_=service(repository)
+    enable(worker,events=(),recipient_events={'one@example.com':(event,),'two@example.com':()})
+    if event=='CPU_HIGH':
+        resources=FakeResources(now);resources.values['cpu']=99;worker.resources=resources
+        worker.collect();resource_tick(worker,now,62)
+    else:
+        worker.collect();now[0]+=timedelta(days=1);worker.collect()
+    assert [(q['recipient'],q['event']) for q in queue(worker)]==[('one@example.com',event)]
+
+
+def test_delivery_checks_recipient_specific_subscription_even_for_existing_queue(repository):
+    worker,_,_,sent=service(repository)
+    settings=enable(worker,events=('SYSTEM_FAULT',))
+    with worker.database.transaction() as conn:
+        items=[];state={}
+        worker.enqueue(items,state,settings,'SYSTEM_FAULT','old','fault','fake')
+        save(conn,QUEUE_KEY,items)
+        settings=NotificationSettings(enabled=True,recipients=settings.recipients,events=(),
+            recipient_events={'one@example.com':(),'two@example.com':('SYSTEM_FAULT',)})
+        save(conn,SETTINGS_KEY,{'revision':2,'settings':settings.model_dump(mode='json')})
+    asyncio.run(worker.deliver_once());assert queue(worker)[0]['status']=='CANCELED' and not sent
+    asyncio.run(worker.deliver_once());assert len(sent)==1 and sent[0]['recipient']=='two@example.com'

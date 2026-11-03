@@ -99,7 +99,7 @@ export function cohortQuery(f) {
 export function mapTrade(row,rules=[]) {
   const [asset,tf]=(row.market?.definition_id??[row.asset,row.timeframe].join('-')).split('-');
   const entry=row.entry_provenance?.underlying, exit=row.exit_provenance?.underlying;
-  return {raw:row,id:row.id,ruleId:row.rule_id,ruleName:row.rule_snapshot?.name??rules.find(r=>r.id===row.rule_id)?.name??row.rule_id,asset,tf,market:asset+' '+tf,side:row.side,status:row.status,
+  return {raw:row,id:row.id,serialNumber:row.serial_number??null,ruleId:row.rule_id,ruleName:row.rule_snapshot?.name??rules.find(r=>r.id===row.rule_id)?.name??row.rule_id,asset,tf,market:asset+' '+tf,side:row.side,status:row.status,
     entry:row.entry_price,exit:row.exit_price,shares:row.gross_shares,fees:row.total_fees,pnl:row.net_pnl,entered:row.entry_at,exited:row.exit_at,reason:row.exit_reason,
     underlyingOpen:entry?.baseline?.price??null,underlyingEntry:entry?.current?.price??null,underlyingExit:exit?.current?.price??null,movementEntry:row.underlying_movements?.open_to_entry??null,movementExit:row.underlying_movements?.open_to_exit??null};
 }
