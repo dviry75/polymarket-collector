@@ -123,6 +123,70 @@ def test_operator_watchdog_opens_email_outbox_immediately_and_resolves():
         temporary.cleanup()
 
 
+def test_operator_watchdog_waits_for_grace_before_email():
+    from live.pause_recovery import OPERATOR_ACTION_EMAIL_GRACE_SECONDS
+
+    temporary, base, strategy = build_repo()
+    try:
+        strategy.acquire_pause(
+            actor="operator", reason="OPERATOR_PAUSE", owner="OPERATOR"
+        )
+        acquired = datetime.fromisoformat(
+            strategy.pause_record()["pause_acquired_at"].replace("Z", "+00:00")
+        )
+        early = strategy.watchdog_operator_action(
+            actor="test",
+            threshold_seconds=OPERATOR_ACTION_EMAIL_GRACE_SECONDS,
+            now=acquired + timedelta(seconds=300),
+        )
+        assert early is None
+        assert strategy.critical_email_outbox() == []
+
+        late = strategy.watchdog_operator_action(
+            actor="test",
+            threshold_seconds=OPERATOR_ACTION_EMAIL_GRACE_SECONDS,
+            now=acquired + timedelta(
+                seconds=OPERATOR_ACTION_EMAIL_GRACE_SECONDS + 1
+            ),
+        )
+        assert late["status"] == "OPEN"
+        assert len(strategy.critical_email_outbox()) == 1
+    finally:
+        temporary.cleanup()
+
+
+def test_operator_watchdog_skips_email_when_pause_clears_within_grace():
+    from live.pause_recovery import OPERATOR_ACTION_EMAIL_GRACE_SECONDS
+
+    temporary, base, strategy = build_repo()
+    try:
+        strategy.acquire_pause(
+            actor="operator", reason="OPERATOR_PAUSE", owner="OPERATOR"
+        )
+        assert strategy.watchdog_operator_action(
+            actor="test",
+            threshold_seconds=OPERATOR_ACTION_EMAIL_GRACE_SECONDS,
+        ) is None
+        base.set_states({
+            "pause_entries": "false",
+            "pause_state": "TRADING",
+            "pause_owner": "NONE",
+            "pause_reason": "",
+            "pause_cause": "",
+            "release_policy": "AUTO_WHEN_CLEAN",
+            "operator_action_required": "false",
+        }, "test")
+        strategy.watchdog_operator_action(
+            actor="test",
+            threshold_seconds=OPERATOR_ACTION_EMAIL_GRACE_SECONDS,
+            now=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        assert strategy.critical_email_outbox() == []
+        assert strategy.active_alerts() == []
+    finally:
+        temporary.cleanup()
+
+
 def test_orphaned_reconciliation_runs_are_terminalized_once_with_audit():
     temporary, base, _strategy = build_repo()
     try:
