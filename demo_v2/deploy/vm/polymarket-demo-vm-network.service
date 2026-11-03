@@ -1,0 +1,16 @@
+[Unit]
+Description=Isolated Polymarket DEMO VM network boundary
+Wants=network-online.target
+After=network-online.target
+Before=polymarket-demo-vm-dns.service polymarket-demo-vm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -B /usr/local/lib/polymarket-demo-vm/network.py
+RuntimeDirectory=polymarket-demo-vm-network
+RuntimeDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
