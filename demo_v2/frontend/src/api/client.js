@@ -70,6 +70,10 @@ export function createClient(base = '/demo/api/v1', transport = globalThis.fetch
     kpi: (query, signal) => request('/kpi' + queryString(query), { signal }),
     markets: () => request('/markets'),
     health: () => request('/health'),
+    notifications: () => request('/notifications'),
+    /** @param {unknown} settings @param {number} revision */
+    saveNotifications: (settings,revision) => request('/notifications',{method:'PUT',body:{settings,expected_revision:revision}}),
+    testNotifications: () => request('/notifications/test',{method:'POST'}),
     /** Confirmation must come from an explicit UI confirmation action. @param {'RESET_TRADING_DATA'|'FACTORY_RESET_DEMO'} confirmation */
     reset: confirmation => request('/maintenance/' + (confirmation === 'RESET_TRADING_DATA' ? 'reset-trading-data' : 'factory-reset'), { method: 'POST', body: { confirmation } })
   };

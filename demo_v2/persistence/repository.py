@@ -299,6 +299,9 @@ class DemoRepository:
             conn.execute("UPDATE demo_v2_meta SET value='0' WHERE key='resetting'")
             conn.execute("UPDATE demo_v2_meta SET value=CAST(value AS INTEGER)+1 WHERE key='generation'")
 
+            from ..notifications import reset_trading_notifications
+            reset_trading_notifications(conn)
+
     def incident(self, component: str, code: str, details: dict | None = None) -> None:
         with self.database.transaction() as conn:
             conn.execute("INSERT INTO demo_v2_incidents VALUES (?,?,?,?,?)", (identifier(), now_iso(), component, code, dump(details or {})))

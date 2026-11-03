@@ -7,7 +7,9 @@ const root=fileURLToPath(new URL(process.argv.includes('--built')?'../build/':'.
 const target=new URL(process.env.DEMO_BACKEND_TARGET||'http://127.0.0.1:8000');
 if(target.protocol!=='http:'||!['127.0.0.1','localhost','[::1]'].includes(target.hostname)||target.username||target.password)throw new Error('Development backend must be loopback HTTP');
 const server=createServer(async(req,res)=>{
-  const path=new URL(req.url,'http://localhost').pathname;
+  let path;
+  try{path=new URL(req.url,'http://localhost').pathname;}
+  catch{res.writeHead(400,{'Cache-Control':'no-store'});res.end();return;}
   if(path.startsWith('/demo/api/v1/')){
     const proxy=request(new URL(req.url,target),{method:req.method,headers:{...req.headers,host:target.host}},upstream=>{
       res.writeHead(upstream.statusCode,upstream.headers);upstream.pipe(res);
@@ -16,7 +18,9 @@ const server=createServer(async(req,res)=>{
     proxy.setTimeout(15000,()=>proxy.destroy());req.pipe(proxy);return;
   }
   if(!path.startsWith('/demo/')){res.writeHead(302,{Location:'/demo/'});res.end();return;}
-  const file=resolve(root,decodeURIComponent(path.slice(6)||'index.html'));
+  let file;
+  try{file=resolve(root,decodeURIComponent(path.slice(6)||'index.html'));}
+  catch{res.writeHead(400,{'Cache-Control':'no-store'});res.end();return;}
   if(!file.startsWith(resolve(root)+'/')||file.includes('/node_modules/')||!['.html','.js','.css','.woff2'].includes(extname(file))){res.writeHead(404);res.end();return;}
   try{
     let body=await readFile(file);

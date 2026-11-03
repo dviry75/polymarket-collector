@@ -9,9 +9,62 @@ async function login(page){
 async function api(page,path){const response=await page.request.get(prefix+path);expect(response.ok()).toBeTruthy();return response.json();}
 async function confirm(page){await expect(page.locator('[role=dialog]')).toBeVisible();await page.locator('[data-action=confirm]').click();await expect(page.locator('[role=dialog]')).toHaveCount(0);}
 
+async function checkNotificationSettings(page){
+  const errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.locator('[data-nav=maintenance]').click();
+  const form=page.locator('#notification-form');await expect(form).toBeVisible();
+  await form.locator('[name=recipients]').fill('first@example.com\nsecond@example.com');
+  await form.locator('[name=enabled]').check();
+  await form.locator('[value=NETWORK_HIGH]').check();
+  await form.locator('[value=RAM_HIGH]').check();
+  await form.locator('[name=network_mib_per_second]').fill('2.5');
+  await form.locator('[name=ram_percent]').fill('85');
+  await form.locator('[name=resource_duration_seconds]').fill('90');
+  for(const hours of ['1','3','6']){
+    await form.locator('[name=periodic_hours]').selectOption(hours);
+    await form.locator('[name=daily_time]').fill('09:30');
+    await form.locator('[value=POSITION_OPENED]').uncheck();
+    await form.locator('[type=submit]').click();
+    await expect(page.locator('[data-mail-feedback]')).toContainText('נשמרו');
+    const saved=await api(page,'/notifications');
+    expect(saved.settings.periodic_hours).toBe(Number(hours));
+    expect(saved.settings.recipients).toEqual(['first@example.com','second@example.com']);
+    expect(saved.settings.events).toContain('PERIODIC_SUMMARY');
+    expect(saved.settings.events).toContain('NETWORK_HIGH');
+    expect(saved.settings.events).toContain('RAM_HIGH');
+    expect(saved.settings.events).not.toContain('CPU_HIGH');
+    expect(saved.settings.network_mib_per_second).toBe(2.5);
+    expect(saved.settings.ram_percent).toBe(85);
+    expect(saved.settings.resource_duration_seconds).toBe(90);
+    expect(saved.settings.events).not.toContain('POSITION_OPENED');
+  }
+  await form.locator('[name=recipients]').fill('unsaved@example.com');
+  await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+  await expect(form.locator('[name=recipients]')).toHaveValue('unsaved@example.com');
+  await page.reload();await expect(page.locator('#notification-form')).toBeVisible();
+  await expect(page.locator('[name=recipients]')).toHaveValue('first@example.com\nsecond@example.com');
+  await expect(page.locator('[name=network_mib_per_second]')).toHaveValue('2.5');
+  await expect(page.locator('[value=NETWORK_HIGH]')).toBeChecked();
+  await expect(page.locator('[data-mail-action=test]')).toBeDisabled();
+  await expect(page.locator('[data-mail-history]')).toContainText('שליחה כבויה בשרת');
+  const privateFields=await api(page,'/notifications');
+  expect(JSON.stringify(privateFields)).not.toContain('SMTP_PASSWORD');expect(privateFields.deliveries).toEqual([]);
+  await page.locator('[name=recipients]').fill('');await page.locator('[name=enabled]').uncheck();
+  await page.locator('#notification-form [type=submit]').click();
+  await expect(page.locator('[data-mail-feedback]')).toContainText('נשמרו');
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.locator('.notification-panel').evaluate(el=>el.scrollWidth<=el.clientWidth)).toBeTruthy();
+  await page.screenshot({path:'test-results/notification-settings-mobile.png',fullPage:true});
+  await page.setViewportSize({width:1440,height:1000});
+  await page.screenshot({path:'test-results/notification-settings-desktop.png',fullPage:true});
+  expect(errors).toEqual([]);
+}
+
 test('real cookie login, server cohorts/pagination/detail, complete rule actions, confirmed resets and logout',async({page})=>{
   const errors=[];page.on('pageerror',error=>errors.push(error.message));
   await login(page);
+  await checkNotificationSettings(page);
+  await page.locator('[data-nav=trades]').last().click();
   const kpi=await api(page,'/kpi');
   await expect(page.locator('[data-kpi="Total trades"]')).toHaveText(String(kpi.total_trades));
   await expect(page.locator('[data-kpi="Wallet"]')).toHaveText('−$16.48');

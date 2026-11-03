@@ -40,3 +40,16 @@
 .resource-panel[data-resource-state="STALE"] .resource-value,
 .resource-panel[data-resource-state="UNAVAILABLE"] .resource-value { color: var(--muted); }
 @media (max-width: 480px) { .resource-grid { grid-template-columns: 1fr; } .resource-panel { padding: 13px; } }
+
+demo-notifications { display: block; margin-bottom: 20px; }
+.notification-panel { padding: 22px; }
+.notification-panel h2, .notification-panel h3 { margin-bottom: 10px; }
+.notification-panel p { line-height: 1.8; margin-bottom: 14px; }
+.notification-panel .field { margin: 16px 0; }
+.notification-panel textarea { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 7px; font: inherit; background: var(--field); color: var(--fg); resize: vertical; }
+.notification-panel fieldset { margin: 18px 0; border: 1px solid var(--border); border-radius: 7px; padding: 14px; }
+.notification-events, .notification-schedule { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
+.notification-check { display: flex; gap: 8px; align-items: center; }
+.notification-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0; }
+.notification-panel .helper { margin: 20px 0; }
+@media (max-width: 600px) { .notification-events, .notification-schedule { grid-template-columns: 1fr; } .notification-panel { padding: 15px; } }

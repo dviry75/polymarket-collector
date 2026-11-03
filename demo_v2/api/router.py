@@ -13,6 +13,7 @@ from ..persistence.repository import dump
 from .dependencies import require_demo_session
 from .read_model import TradeFilter, TradeQuery, cohort, kpi, trade_view
 from .schemas import SessionView,RuleView,RuleList,TradePage,TradeDetail,KPIView,MarketList,HealthView
+from ..notifications import NotificationSettings
 
 
 PREFIX="/demo/api/v1"
@@ -37,6 +38,26 @@ class RuleUpdate(FrozenModel):
 
 class Reset(FrozenModel):
     confirmation: str
+
+
+class NotificationUpdate(FrozenModel):
+    settings: NotificationSettings
+    expected_revision: Annotated[int,Field(ge=0)]
+
+
+@router.get('/notifications',tags=['Notifications'])
+async def notifications(request: Request):
+    return respond(request.app.state.notifications.view())
+
+
+@router.put('/notifications',tags=['Notifications'])
+async def update_notifications(body: NotificationUpdate,request: Request):
+    return respond(request.app.state.notifications.update(body.settings,body.expected_revision))
+
+
+@router.post('/notifications/test',tags=['Notifications'])
+async def test_notifications(request: Request):
+    return respond(request.app.state.notifications.queue_test())
 
 
 @auth_router.post("/login",response_model=SessionView)

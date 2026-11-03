@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .domain.fees import DEFAULT_FLAT_FEE, FlatFeePolicy
+from .notifications import MailConfig
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class DemoConfig:
     recovery_stability_seconds: float = 2.0
     session_cookie_secure: bool = True
     flat_fee_per_action: Decimal = DEFAULT_FLAT_FEE
+    mail: MailConfig = field(default_factory=MailConfig, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "flat_fee_per_action", FlatFeePolicy(self.flat_fee_per_action).per_action)
@@ -74,4 +76,5 @@ class DemoConfig:
             recovery_stability_seconds=float(env.get("DEMO_RECOVERY_STABILITY_SECONDS", "2")),
             session_cookie_secure=env.get("DEMO_COOKIE_SECURE", "true").lower() != "false",
             flat_fee_per_action=env.get("DEMO_FLAT_FEE_PER_ACTION", "0.068"),
+            mail=MailConfig.from_env(env),
         )

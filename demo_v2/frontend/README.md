@@ -112,3 +112,17 @@ Health includes responsive resource cards with explicit backend/host scope label
 `src/resources.js` formats telemetry only (financial Decimal handling is unchanged).
 Open cards refresh with health polling and hide stale/error values. Tests include
 CPU/RAM/storage/rates, unavailable data, mobile fit and local Rubik font loading.
+
+## Email notification settings
+
+Maintenance now includes a Hebrew recipient/category panel with daily scheduling
+and detailed reports every 1, 3 or 6 hours, saved through the authenticated API.
+Transaction alerts are opt-in. The test button queues a real test only after the
+server mail transport and saved recipient settings are enabled, with explicit
+confirmation. Delivery status distinguishes SMTP acceptance from inbox delivery.
+See `../docs/EMAIL_NOTIFICATIONS.md` for private DEMO relay configuration and
+the DNS/readiness checks. No SMTP credentials are configured through the browser.
+
+The local dev/preview server returns 400 for malformed URLs/percent-encoded
+static paths; source and built-mode regression tests verify continued service,
+ordinary assets, traversal rejection and encoded API identifiers.

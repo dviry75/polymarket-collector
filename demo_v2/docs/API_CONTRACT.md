@@ -21,3 +21,17 @@ Maintenance API: Reset Trading Data, Factory Reset Demo. Never touch LIVE.
 Streaming: if WS/SSE is used, document contracts for live prices, health changes and trade changes. Polling is acceptable where simpler but live UX must stay timely.
 
 Prefer generated OpenAPI where practical and keep contract updated for the external UI agent.
+
+Notifications: authenticated `GET/PUT /demo/api/v1/notifications` exposes/saves
+enabled state, up to 10 recipients, opt-in categories, Jerusalem daily time and
+1/3/6-hour periodic reports. PUT requires CSRF and expected_revision.
+`POST /demo/api/v1/notifications/test` queues an explicit rate-limited test to
+saved recipients only when both preference and private server transport gates
+are enabled. Status distinguishes SMTP acceptance, failure and uncertain results;
+neither credentials nor message bodies are returned. See EMAIL_NOTIFICATIONS.md.
+
+Resource notification additions: opt-in event codes `NETWORK_HIGH`, `CPU_HIGH`,
+`RAM_HIGH`, `DISK_HIGH`; settings `network_mib_per_second` (0.01–100000, default 10),
+`cpu_percent`, `ram_percent`, `disk_percent` (1–100, default 90), and
+`resource_duration_seconds` (10–3600, default 60). Metrics use existing host
+telemetry; alert once per incident, rearm after 120 seconds below 80% of threshold.
