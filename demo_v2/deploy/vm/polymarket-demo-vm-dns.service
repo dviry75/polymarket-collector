@@ -23,7 +23,9 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_UNIX
+# dnsmasq uses read-only netlink queries to enumerate its bound interfaces.
+# AF_NETLINK grants no network administration capability.
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 IPAddressDeny=any

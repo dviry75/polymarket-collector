@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from demo_v2.deploy.vm import controller,guest,migrate
+from demo_v2.deploy.vm import controller,guest,migrate,install_base,verify_guest
 
 
 def baseline():
@@ -97,3 +97,63 @@ def test_migration_manifest_checksum_failure_precedes_staging(tmp_path):
     (tmp_path/'manifest.json').write_text('{}')
     with pytest.raises(ValueError,match='checksum'):
         migrate.stage_bundle(tmp_path,'0'*64)
+
+
+def test_managed_base_retry_stops_only_dedicated_vm_and_dns(tmp_path,monkeypatch):
+    monkeypatch.setattr(install_base,'CONF',tmp_path)
+    calls=[]
+    def run(*args,**kwargs):
+        calls.append(args)
+        return SimpleNamespace(stdout='0\n')
+    monkeypatch.setattr(install_base,'run',run)
+    install_base.stop_incomplete_base(False)
+    assert not calls
+    install_base.stop_incomplete_base(True)
+    assert calls==[
+        ('systemctl','stop','polymarket-demo-vm.service','polymarket-demo-vm-dns.service'),
+        ('systemctl','show','polymarket-demo-vm.service','-p','MainPID','--value')]
+
+
+@pytest.mark.parametrize('marker',('migration-state.json','writer-in-vm','runtime-target.json'))
+def test_base_retry_refuses_application_migration_state_before_stopping_any_service(tmp_path,monkeypatch,marker):
+    monkeypatch.setattr(install_base,'CONF',tmp_path)
+    (tmp_path/marker).write_text('fake state')
+    calls=[];monkeypatch.setattr(install_base,'run',lambda *args,**kwargs:calls.append(args))
+    with pytest.raises(SystemExit,match='migration state exists'):
+        install_base.stop_incomplete_base(True)
+    assert not calls
+
+
+def test_base_retry_fails_if_vm_keeps_running(tmp_path,monkeypatch):
+    monkeypatch.setattr(install_base,'CONF',tmp_path)
+    monkeypatch.setattr(install_base,'run',lambda *args,**kwargs:SimpleNamespace(stdout='123\n'))
+    with pytest.raises(SystemExit,match='did not stop'):
+        install_base.stop_incomplete_base(True)
+
+
+def test_public_probe_distinguishes_dns_failure_without_exposing_exception_text(monkeypatch):
+    def failed(*args):raise verify_guest.socket.gaierror('private diagnostic details')
+    monkeypatch.setattr(verify_guest.socket,'getaddrinfo',failed)
+    assert verify_guest.public_probe('fake.test')=={
+        'dns':False,'tcp':False,'tls':False,'failed_stage':'dns','error_type':'gaierror'}
+
+
+def test_public_probe_tries_another_address_and_verifies_tls(monkeypatch):
+    addresses=[('192.0.2.1',443),('192.0.2.2',443)]
+    monkeypatch.setattr(verify_guest.socket,'getaddrinfo',lambda *args:[(2,1,6,'',a) for a in addresses])
+    attempted=[]
+    class Socket:
+        def settimeout(self,value):pass
+        def connect(self,address):
+            attempted.append(address)
+            if address==addresses[0]:raise ConnectionRefusedError('fake failure')
+        def close(self):pass
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+    monkeypatch.setattr(verify_guest.socket,'socket',lambda *args:Socket())
+    def wrap(raw,server_hostname):
+        assert server_hostname=='fake.test'
+        return raw
+    monkeypatch.setattr(verify_guest.ssl,'create_default_context',lambda:SimpleNamespace(wrap_socket=wrap))
+    assert verify_guest.public_probe('fake.test')=={'dns':True,'tcp':True,'tls':True}
+    assert attempted==addresses

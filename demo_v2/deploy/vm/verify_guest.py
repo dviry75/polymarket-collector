@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 from pathlib import Path
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -22,6 +23,34 @@ def command():
         '-o','IdentitiesOnly=yes','-o','ConnectTimeout=5','-o','StrictHostKeyChecking=yes',
         '-o','HostKeyAlias=polymarket-demo-vm','-o','UserKnownHostsFile='+str(known),
         'demoadmin@'+GUEST]
+
+
+def public_probe(host):
+    """Safe per-stage evidence; never return payloads, addresses or exception text."""
+    detail={'dns':False,'tcp':False,'tls':False}
+    stage='dns'
+    deadline=time.monotonic()+15
+    try:
+        addresses=socket.getaddrinfo(host,443,socket.AF_INET,socket.SOCK_STREAM)
+        if not addresses:raise socket.gaierror()
+        detail['dns']=True;stage='tcp'
+        # Try every resolved IPv4, just as create_connection would normally do.
+        failure=None
+        for family,kind,protocol,_,address in addresses:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise TimeoutError()
+            raw=socket.socket(family,kind,protocol);raw.settimeout(min(5,remaining))
+            try:raw.connect(address)
+            except OSError as exc:raw.close();failure=exc;continue
+            with raw:
+                detail['tcp']=True;stage='tls'
+                with ssl.create_default_context().wrap_socket(raw,server_hostname=host):
+                    detail['tls']=True
+            break
+        else:raise failure or OSError()
+    except OSError as exc:
+        detail.update(failed_stage=stage,error_type=type(exc).__name__)
+    return detail
 
 
 def main():
@@ -52,25 +81,26 @@ def main():
         for t in threads:t.start()
         for addr in ('192.168.33.24',GATEWAY):
             with socket.create_connection((addr,52990),timeout=2) as c:assert c.recv(20)==b'CANARY'
-        code='''import json,os,socket,ssl
+        import inspect
+        code='import json,os,socket,ssl,time\n'+inspect.getsource(public_probe)+'''
 assert os.geteuid()==0
 results={"guest_root_probe":True}
 for name,host,port in [("home_router_blocked","192.168.33.1",80),("host_lan_blocked","192.168.33.24",52990),("host_bridge_blocked","172.31.250.1",52990),("host_api_not_exposed","172.31.250.1",8010)]:
  try:
   s=socket.create_connection((host,port),timeout=2);s.close();results[name]=False
  except OSError:results[name]=True
-for name,host in [("gamma_dns_tls","gamma-api.polymarket.com"),("binance_dns_tls","api.binance.com")]:
- try:
-  with socket.create_connection((host,443),timeout=10) as raw:
-   with ssl.create_default_context().wrap_socket(raw,server_hostname=host):pass
-  results[name]=True
- except OSError:results[name]=False
-print(json.dumps(results))
+diagnostics={}
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+ jobs={name:pool.submit(public_probe,host) for name,host in [("gamma_dns_tls","gamma-api.polymarket.com"),("binance_dns_tls","api.binance.com")]}
+ for name,job in jobs.items():
+  detail=job.result();diagnostics[name]=detail;results[name]=detail['tls']
+print(json.dumps({'checks':results,'public_connectivity':diagnostics}))
 assert all(results.values()),"Guest network validation failed"
 '''
+        code='import concurrent.futures\n'+code
         p=subprocess.run(ssh+['sudo','-n','python3','-'],input=code,capture_output=True,text=True,timeout=70)
-        results=json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {'status':'NO_GUEST_RESULT'}
-        report={'status':'PASS' if p.returncode==0 else 'FAIL','checks':results,'production_data_used':False,'public_forwarding_enabled':False}
+        result=json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {'checks':{'status':'NO_GUEST_RESULT'}}
+        report={'status':'PASS' if p.returncode==0 else 'FAIL',**result,'production_data_used':False,'public_forwarding_enabled':False}
         if args.report:args.report.write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report))
         if p.returncode:raise SystemExit('VM boundary checks did not all pass; do not expose the VM')

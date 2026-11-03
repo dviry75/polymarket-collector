@@ -75,6 +75,14 @@ rerun an interrupted migration, delete its journal or start against the stale DB
 Inspect the journal and complete recovery first. Automatic code rollback for
 ordinary releases is separate and never restores history.
 
+A base-only failure before `migration-state.json` exists can be retried with a
+newly checksummed, reviewed bundle. The installer stops only the managed QEMU/DNS
+units before updating them, preserves the guest disk/seed/SSH identity and repeats
+containment checks before transferring state. It refuses base reinstall once any
+application migration journal or writer/target marker exists. DNS needs AF_NETLINK
+for dnsmasq's interface enumeration; it still runs without CAP_NET_ADMIN, with the
+same IP filters and firewall. Connectivity reports distinguish DNS, TCP and TLS.
+
 ## Every future authorized fix/release
 
 1. Read `demo_v2/AGENTS.md`; inspect Git/actual guest state. Preserve other chats'

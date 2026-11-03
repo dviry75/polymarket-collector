@@ -43,12 +43,22 @@ def write(path,data,mode=0o644):
     path.write_text(data);path.chmod(mode)
 
 
+def stop_incomplete_base(managed):
+    # This retry is safe only before app provisioning/state transfer has begun.
+    if any((CONF/name).exists() for name in ('migration-state.json','writer-in-vm','runtime-target.json')):
+        raise SystemExit('Application migration state exists; inspect recovery instead of reinstalling the base VM')
+    if managed:
+        # Stop the DNS restart cycle and its dependent QEMU before replacing units.
+        # Preserve the guest disk, SSH identity, private seed and network firewall.
+        run('systemctl','stop','polymarket-demo-vm.service','polymarket-demo-vm-dns.service')
+        if run('systemctl','show','polymarket-demo-vm.service','-p','MainPID','--value',quiet=True).stdout.strip()!='0':
+            raise SystemExit('Managed VM did not stop; refusing to continue')
+
+
 def main():
     if os.geteuid()!=0:raise SystemExit('Use sudo in your own terminal')
     if socket.gethostname()!='dvir-technologies':raise SystemExit('Unexpected host')
     if not Path('/dev/kvm').exists():raise SystemExit('KVM unavailable')
-    mem=next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
-    if mem<2048*1024:raise SystemExit('Less than 2 GiB RAM available; free resources before creating the 1.5 GiB guest')
     if shutil.disk_usage('/var/lib').free<8*1024**3:raise SystemExit('Insufficient free disk space')
     before=status()
     manifest=json.loads((BUNDLE/'manifest.json').read_text())
@@ -66,6 +76,10 @@ def main():
         raise SystemExit('Private controller directory must be operator-owned mode 0700')
     marker=CONF/'stage3-managed.json'
     managed=marker.is_file() and not marker.is_symlink() and marker.stat().st_uid==0
+    stop_incomplete_base(managed)
+    # A managed retry must release its existing guest's RAM before this check.
+    mem=next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:'))
+    if mem<2048*1024:raise SystemExit('Less than 2 GiB RAM available; free resources before creating the 1.5 GiB guest')
     if not managed:
         for name in ('polymarket-demo-vm','polymarket-demo-dns'):
             try:pwd.getpwnam(name)
