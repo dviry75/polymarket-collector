@@ -5990,7 +5990,8 @@ class StrategyRepository:
                 0.0, (observed_now - acquired).total_seconds()
             )
         except (TypeError, ValueError):
-            age_seconds = 0.0
+            # Unknown acquisition time must not suppress the alert forever.
+            age_seconds = float(threshold_seconds)
         action_required = (
             str(pause.get("operator_action_required", "false")).lower()
             == "true"
