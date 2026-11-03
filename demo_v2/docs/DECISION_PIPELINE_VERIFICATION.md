@@ -115,5 +115,29 @@ readiness, while counters and incident history retain past failures.
 - The additional public diagnostics only read unauthenticated data and counted
   frame/parser statistics; they did not submit orders or change running rules.
 
-The follow-up requires a new checksummed code-only promotion and authenticated
-feed verification; installing the prior release does not install this correction.
+## Follow-up deployment verification
+
+Release `14c96ac7c6ef40e74e58492a6f2a207d9b69e445` was promoted at
+2026-11-03 11:07:51 Asia/Jerusalem. The updater verified both WAL-aware backups,
+existing records, private settings and trade serials; prior release was retained.
+The service runs this release with PID 450892 and zero automatic restarts.
+No env/unit/nginx/DNS/firewall/LIVE changes were made.
+
+Authenticated UI checks from approximately 11:09 through the 11:10 five-minute
+rollover showed the owner alive, all three shard connections healthy, progressing
+FIFO delivery and fresh current-market books after new market IDs appeared.
+The earlier active overflow alerts did not recur in the observed samples, and old
+transport alerts no longer remained active after recovery. Sampled queue ages were
+0–80.3ms and event-loop peak lag was 22.9ms. CPU, API+owner RSS, disk/WAL and host NIC
+telemetry refreshed in the UI; the existing login was retained.
+
+Queue totals span retired generations and deliberate subscription resynchronization,
+so cumulative published/delivered differences are not claimed to be zero. Bounded
+queues still fence rather than replay obsolete generations. This is a short observed
+production window, not a new one-hour soak of this follow-up release.
+
+Liveness returned the simulation-only payload and readiness returned HTTP 200.
+Overall health can alternate READY/DEGRADED as optional underlying source timestamps
+age; those reasons remain visible and gate rules requiring that reference. DB/auth/
+owner remained healthy, and scoped permission for eligible entries remained enabled.
+No user rule/history reset, real order or test notification was used for validation.
