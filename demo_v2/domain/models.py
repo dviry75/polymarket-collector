@@ -100,6 +100,7 @@ class MarketObservation:
     best_bid: Decimal | None
     best_ask: Decimal | None
     book_ready: bool = True
+    market_epoch: int = 0
 
     def __post_init__(self) -> None:
         require_aware(self.observed_at)

@@ -120,8 +120,9 @@ class DemoRepository:
 
     def rules(self) -> list[dict]:
         with self.database.connect() as conn:
-            ids = [row[0] for row in conn.execute("SELECT id FROM demo_v2_rules ORDER BY created_at,id")]
-        return [self.rule(rule_id) for rule_id in ids]
+            rows=conn.execute("""SELECT r.*,v.version,v.snapshot_json FROM demo_v2_rules r
+                JOIN demo_v2_rule_versions v ON v.id=r.current_version_id ORDER BY r.created_at,r.id""").fetchall()
+            return [{**dict(row),"spec":RuleSpec.model_validate_json(row["snapshot_json"])} for row in rows]
 
     def update_rule(self, rule_id: str, spec: RuleSpec, *, expected_version: str | None = None) -> dict:
         with self.database.transaction() as conn:

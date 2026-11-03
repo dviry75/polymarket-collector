@@ -118,3 +118,24 @@ def test_resource_api_requires_session_is_cached_and_unavailable_telemetry_does_
             assert 'resources' in (await client.get('/openapi.json')).json()['components']['schemas']['HealthView']['properties']
         assert app.state.resources._task.done()
     asyncio.run(run())
+
+
+def test_decision_process_cpu_rss_aggregation_and_restart_rebaseline(tmp_path):
+    import os
+    proc_files(tmp_path)
+    child=tmp_path/'123';child.mkdir()
+    fields=['0']*22
+    fields[11]='100';fields[12]='50';fields[19]='999'
+    (child/'stat').write_text('123 (demo owner) '+' '.join(fields))
+    (child/'statm').write_text('400 20')
+    stamp=[10.];cpu=[1.]
+    monitor=ResourceMonitor(tmp_path,proc_root=tmp_path,decision_pid=lambda:123,clock=lambda:stamp[0],cpu_clock=lambda:cpu[0])
+    monitor.sample()
+    assert monitor.snapshot()['process']['rss_bytes']==70*os.sysconf('SC_PAGE_SIZE')
+    assert monitor.snapshot()['process']['scope']=='DEMO_SERVICE_PROCESSES'
+    stamp[0]+=2;cpu[0]+=.5;fields[11]=str(100+os.sysconf('SC_CLK_TCK'))
+    (child/'stat').write_text('123 (demo owner) '+' '.join(fields));monitor.sample()
+    assert monitor.snapshot()['process']['cpu_percent']==75
+    fields[19]='1000';fields[11]='1'
+    (child/'stat').write_text('123 (demo owner) '+' '.join(fields));stamp[0]+=2;monitor.sample()
+    assert monitor.snapshot()['process']['cpu_percent'] is None

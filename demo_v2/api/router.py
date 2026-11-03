@@ -1,4 +1,5 @@
 from dataclasses import asdict
+import asyncio
 from datetime import datetime
 from decimal import Decimal
 import json
@@ -46,17 +47,17 @@ class NotificationUpdate(FrozenModel):
 
 
 @router.get('/notifications',tags=['Notifications'])
-async def notifications(request: Request):
+def notifications(request: Request):
     return respond(request.app.state.notifications.view())
 
 
 @router.put('/notifications',tags=['Notifications'])
-async def update_notifications(body: NotificationUpdate,request: Request):
+def update_notifications(body: NotificationUpdate,request: Request):
     return respond(request.app.state.notifications.update(body.settings,body.expected_revision))
 
 
 @router.post('/notifications/test',tags=['Notifications'])
-async def test_notifications(request: Request):
+def test_notifications(request: Request):
     return respond(request.app.state.notifications.queue_test())
 
 
@@ -74,7 +75,7 @@ async def login(body: Login, request: Request):
     principal=await auth.validate(body.username,password)
     if principal is None:
         raise HTTPException(401,detail={"code":"DEMO_INVALID_CREDENTIALS"})
-    token=auth.create_session(principal.subject)
+    token=await asyncio.to_thread(auth.create_session,principal.subject)
     response=respond({"user":principal.subject,"csrf_token":auth.csrf(token)})
     config=request.app.state.config
     response.set_cookie(config.session_cookie_name,token,max_age=config.session_ttl_seconds,
@@ -91,7 +92,7 @@ async def current_session(request: Request, principal=Depends(require_demo_sessi
 @router.post("/auth/logout",tags=["Authentication"])
 async def logout(request: Request):
     """Revoke all DEMO sessions, including sessions issued before a process restart."""
-    request.app.state.auth.revoke()
+    await asyncio.to_thread(request.app.state.auth.revoke)
     response=respond({"logged_out":True,"scope":"ALL_DEMO_SESSIONS"})
     response.delete_cookie("demo_v2_session",path="/demo/",secure=request.app.state.config.session_cookie_secure,
                            httponly=True,samesite="strict")
@@ -106,7 +107,7 @@ def rule_view(repository,row):
 
 
 @router.get("/rules",tags=["Rules"],response_model=RuleList)
-async def rules(request: Request):
+def rules(request: Request):
     repo=request.app.state.repository
     return respond({"items":[rule_view(repo,row) for row in repo.rules()]})
 
@@ -114,11 +115,12 @@ async def rules(request: Request):
 @router.post("/rules",status_code=201,tags=["Rules"],response_model=RuleView)
 async def create_rule(body: RuleSpec,request: Request):
     repo=request.app.state.repository
-    return respond(rule_view(repo,repo.create_rule(body)),201)
+    row=await request.app.state.runtime.command("create_rule",body)
+    return respond(await asyncio.to_thread(rule_view,repo,row),201)
 
 
 @router.get("/rules/{rule_id}",tags=["Rules"],response_model=RuleView)
-async def get_rule(rule_id: str,request: Request):
+def get_rule(rule_id: str,request: Request):
     repo=request.app.state.repository
     return respond(rule_view(repo,repo.rule(rule_id)))
 
@@ -127,11 +129,12 @@ async def get_rule(rule_id: str,request: Request):
 async def update_rule(rule_id: str,body: RuleUpdate,request: Request):
     """Full validated spec; compare current version to avoid lost concurrent edits."""
     repo=request.app.state.repository
-    return respond(rule_view(repo,repo.update_rule(rule_id,body.spec,expected_version=body.expected_version_id)))
+    row=await request.app.state.runtime.command("update_rule",rule_id,body.spec,expected_version=body.expected_version_id)
+    return respond(await asyncio.to_thread(rule_view,repo,row))
 
 
 @router.get("/rules/{rule_id}/versions",tags=["Rules"])
-async def versions(rule_id: str,request: Request):
+def versions(rule_id: str,request: Request):
     repo=request.app.state.repository
     repo.rule(rule_id)
     with repo.database.connect() as conn:
@@ -143,11 +146,12 @@ async def versions(rule_id: str,request: Request):
 @router.post("/rules/{rule_id}/{action}",tags=["Rules"],response_model=RuleView)
 async def rule_action(rule_id: str, action: Literal["enable","disable","duplicate","archive"],request: Request):
     repo=request.app.state.repository
-    row=repo.rule(rule_id)
+    row=await asyncio.to_thread(repo.rule,rule_id)
     fields=row["spec"].model_dump(mode="json")
     if action=="duplicate":
         fields.update(name=(fields["name"][:110]+" (copy)"),archived=False,enabled=False)
-        return respond(rule_view(repo,repo.create_rule(RuleSpec.model_validate(fields))),201)
+        created=await request.app.state.runtime.command("create_rule",RuleSpec.model_validate(fields))
+        return respond(await asyncio.to_thread(rule_view,repo,created),201)
     if action=="enable":
         if fields["archived"]:
             raise HTTPException(409,detail={"code":"DEMO_RULE_ARCHIVED"})
@@ -156,8 +160,8 @@ async def rule_action(rule_id: str, action: Literal["enable","disable","duplicat
         fields["enabled"]=False
     elif action=="archive":
         fields.update(enabled=False,archived=True)
-    updated=repo.update_rule(rule_id,RuleSpec.model_validate(fields),expected_version=row["current_version_id"])
-    return respond(rule_view(repo,updated))
+    updated=await request.app.state.runtime.command("update_rule",rule_id,RuleSpec.model_validate(fields),expected_version=row["current_version_id"])
+    return respond(await asyncio.to_thread(rule_view,repo,updated))
 
 
 @router.delete("/rules/{rule_id}",tags=["Rules"],response_model=RuleView)
@@ -167,7 +171,7 @@ async def archive_rule(rule_id: str,request: Request):
 
 
 @router.get("/trades",tags=["Trades"],response_model=TradePage)
-async def trades(request: Request,filters: Annotated[TradeQuery,Query()]):
+def trades(request: Request,filters: Annotated[TradeQuery,Query()]):
     """Newest first by entry time/id; date interval [from_date,to_date). Decimal strings."""
     rows=cohort(request.app.state.repository,filters)
     limit,offset=filters.limit,filters.offset
@@ -175,7 +179,7 @@ async def trades(request: Request,filters: Annotated[TradeQuery,Query()]):
 
 
 @router.get("/trades/{position_id}",tags=["Trades"],response_model=TradeDetail)
-async def trade_detail(position_id: str,request: Request):
+def trade_detail(position_id: str,request: Request):
     repo=request.app.state.repository
     with repo.database.connect() as conn:
         row=conn.execute("SELECT * FROM demo_v2_positions WHERE id=?",(position_id,)).fetchone()
@@ -191,7 +195,7 @@ async def trade_detail(position_id: str,request: Request):
 
 
 @router.get("/kpi",tags=["KPI"],response_model=KPIView)
-async def get_kpi(request: Request,filters: Annotated[TradeFilter,Query()]):
+def get_kpi(request: Request,filters: Annotated[TradeFilter,Query()]):
     """Same entry cohort as trades; wallet is all signed ledger cash for that cohort.
 
     Success is positive/(positive+negative)*100, null when denominator is zero.
@@ -209,7 +213,7 @@ async def markets(request: Request):
     now=runtime.clock()
     instances=[]
     for instance_id,instance in runtime.instances.items():
-        if instance_id not in runtime.current.values() and not request.app.state.repository.positions(instance_id=instance_id,status="OPEN"):
+        if instance_id not in runtime.current.values() and not any(p["instance_id"]==instance_id for p in runtime.projection["positions"]):
             continue
         prices={}
         for side,token in (("UP",instance.up_token_id),("DOWN",instance.down_token_id)):
@@ -221,7 +225,7 @@ async def markets(request: Request):
         instances.append({**asdict(instance),"prices":prices,"is_current":instance_id in runtime.current.values(),
             "seconds_from_start":str((now-instance.starts_at).total_seconds()),
             "fee":runtime.engine.fee_policy.evidence()})
-    return respond({"definitions":request.app.state.repository.definitions(),"instances":instances,"as_of":now})
+    return respond({"definitions":await asyncio.to_thread(request.app.state.repository.definitions),"instances":instances,"as_of":now})
 
 
 @router.get("/health",tags=["Health"],response_model=HealthView)
@@ -233,6 +237,10 @@ async def health(request: Request):
         "blocker_codes":[c.reason for c in snapshot.components if c.reason],
         "fee_model":runtime.engine.fee_policy.evidence(),
         "resources":request.app.state.resources.snapshot(),
+        "pipeline":runtime.pipeline_health(),
+        "underlying":runtime.reference_diagnostics,
+        "entry_scope":"HEALTHY_MARKETS_AND_RULE_DEPENDENCIES_ONLY",
+        "global_blocker_codes":[c.reason for c in snapshot.components if c.critical and c.reason],
         "market_data":data.health() if data and hasattr(data,"health") else None,
         "discovery_at":runtime.discovery_at,"recovery_stability_seconds":str(runtime.config.recovery_stability_seconds),
         "engine_generation":runtime.engine.generation,"engine_reason":runtime.engine.reason,

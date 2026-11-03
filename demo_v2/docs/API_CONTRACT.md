@@ -22,6 +22,29 @@ Streaming: if WS/SSE is used, document contracts for live prices, health changes
 
 Prefer generated OpenAPI where practical and keep contract updated for the external UI agent.
 
+## Scoped readiness and pipeline diagnostics
+
+`GET /health` stays public shallow liveness. `GET /ready` returns 503 only for
+NOT_READY, and 200 with an explicit state for READY/DEGRADED. Authenticated
+`GET /demo/api/v1/health` adds `entry_scope`, `global_blocker_codes`, `pipeline`
+and `underlying` diagnostics. `entries_allowed=true` means global prerequisites
+permit evaluation; each rule still needs its own fresh/stable market/research
+inputs, schedule/window, current version and remaining quota. A stale local book
+cannot grant entries, even when another market keeps the global state DEGRADED.
+
+`pipeline.streams` contains per-timeframe queue depth/capacity/high-water,
+published/delivered/rejected counts, invalidation reasons and monotonic age.
+`pipeline.decision_metrics` contains per-shard owner observation/commit counts,
+processing/commit time and explicitly fenced local observations. Worker failure
+returns `503 DEMO_DECISION_WORKER_UNAVAILABLE` for commands with uncertain/no
+acknowledgement; callers must reload durable state rather than blindly retry.
+Rule version conflicts remain 409. Commands and financial actions share one owner.
+Historical reads run outside the ASGI loop; health consumes cached metrics only.
+
+Market-data health distinguishes READY_EMPTY (verified snapshot, null prices),
+READY, STALE and AWAITING_SNAPSHOT, with exchange and receipt ages. Reference
+health distinguishes source age from last successful HTTP fetch age; a newly
+fetched old trade remains ineligible for filters requiring fresh data.
 Notifications: authenticated `GET/PUT /demo/api/v1/notifications` exposes/saves
 enabled state, up to 10 recipients, opt-in categories, Jerusalem daily time and
 1/3/6-hour periodic reports. PUT requires CSRF and expected_revision.

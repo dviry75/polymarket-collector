@@ -63,3 +63,19 @@ def test_atomic_promotion_and_rollback_preserve_releases_and_guard_incomplete_li
     with pytest.raises(RuntimeError,match='unfinished'):
         updater.promote(new)
     assert (tmp_path/'current').resolve()==old
+
+
+def test_deployment_preserves_private_preferences_sessions_and_trade_serials(repository,rule,monkeypatch):
+    import demo_v2.deploy.update_release as updater
+    from conftest import open_position
+    monkeypatch.setattr(updater,'DATABASE',repository.database.config.db_path)
+    open_position(repository,rule)
+    with repository.database.transaction() as conn:
+        conn.execute("INSERT INTO demo_v2_meta VALUES ('notification_settings','fake-test-preferences')")
+    before=updater.preserved_settings()
+    open_position(repository,rule,2)
+    updater.verify_settings(before)  # a new legitimate trade may advance the high-water mark
+    with repository.database.transaction() as conn:
+        conn.execute("UPDATE demo_v2_meta SET value='changed-fake-preferences' WHERE key='notification_settings'")
+    with pytest.raises(RuntimeError,match='preferences'):
+        updater.verify_settings(before)

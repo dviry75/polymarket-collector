@@ -73,7 +73,7 @@ def test_health_model_handles_all_states_and_critical_blockers():
     assert registry.snapshot().entries_allowed
     registry.record(ComponentHealth("telemetry", HealthState.NOT_READY, critical=False))
     assert registry.snapshot().state == HealthState.DEGRADED
-    assert not registry.snapshot().entries_allowed
+    assert registry.snapshot().entries_allowed  # Only critical faults gate every market.
     registry.record(ComponentHealth("fees", HealthState.DEGRADED))
     assert registry.snapshot().state == HealthState.NOT_READY
     assert "secret" not in json.dumps(asdict(registry.snapshot()))

@@ -446,21 +446,35 @@ class Notifications:
                         item['notified']=False
                 else:item['recovery_since']=None
 
+    def _claim_delivery(self):
+        now=self.clock()
+        with self.database.transaction() as conn:
+            _,settings=self.settings(conn)
+            if not settings.enabled:return None
+            queue=load(conn,QUEUE_KEY,[])
+            item=next((q for q in queue if q['status']=='PENDING' and datetime.fromisoformat(q['next_at'])<=now),None)
+            if not item:return None
+            if item['recipient'].lower() not in {r.lower() for r in settings.recipients} or (item['event']!='TEST' and not settings.allows(item['recipient'],item['event'])):
+                item['status']='CANCELED';save(conn,QUEUE_KEY,queue);return None
+            item['status']='SENDING';item['attempts']+=1
+            save(conn,QUEUE_KEY,queue)
+            return dict(item)
+
+    def _complete_delivery(self,item,status,error):
+        with self.database.transaction() as conn:
+            queue=load(conn,QUEUE_KEY,[])
+            saved=next((q for q in queue if q['id']==item['id']),None)
+            if saved:
+                saved.update(status=status,error=error)
+                if status=='SENT':saved['sent_at']=self.clock().isoformat()
+                if status=='PENDING':saved['next_at']=(self.clock()+timedelta(seconds=60*item['attempts'])).isoformat()
+                save(conn,QUEUE_KEY,queue)
+
     async def deliver_once(self):
         if not self.config.enabled:return
         async with self.send_lock:
-            now=self.clock()
-            with self.database.transaction() as conn:
-                _,settings=self.settings(conn)
-                if not settings.enabled:return
-                queue=load(conn,QUEUE_KEY,[])
-                item=next((q for q in queue if q['status']=='PENDING' and datetime.fromisoformat(q['next_at'])<=now),None)
-                if not item:return
-                if item['recipient'].lower() not in {r.lower() for r in settings.recipients} or (item['event']!='TEST' and not settings.allows(item['recipient'],item['event'])):
-                    item['status']='CANCELED';save(conn,QUEUE_KEY,queue);return
-                item['status']='SENDING';item['attempts']+=1
-                save(conn,QUEUE_KEY,queue)
-                item=dict(item)
+            item=await asyncio.to_thread(self._claim_delivery)
+            if item is None:return
             status,error='SENT',''
             try:
                 await asyncio.to_thread(self.transport,item)
@@ -471,16 +485,9 @@ class Notifications:
             except Exception:
                 # May have been accepted remotely. Do not guess or duplicate.
                 status,error='UNKNOWN','SMTP_RESULT_UNCERTAIN'
-            with self.database.transaction() as conn:
-                queue=load(conn,QUEUE_KEY,[])
-                saved=next((q for q in queue if q['id']==item['id']),None)
-                if saved:
-                    saved.update(status=status,error=error)
-                    if status=='SENT':saved['sent_at']=self.clock().isoformat()
-                    if status=='PENDING':saved['next_at']=(self.clock()+timedelta(seconds=60*item['attempts'])).isoformat()
-                    save(conn,QUEUE_KEY,queue)
+            await asyncio.to_thread(self._complete_delivery,item,status,error)
 
-    async def start(self):
+    def _initialize(self):
         with self.database.transaction() as conn:
             state=load(conn,STATE_KEY,{})
             # Keep incident deduplication, but never count downtime as continuity.
@@ -491,12 +498,15 @@ class Notifications:
             for q in queue:
                 if q['status']=='SENDING':q.update(status='UNKNOWN',error='INTERRUPTED_SEND')
             save(conn,QUEUE_KEY,queue)
+
+    async def start(self):
+        await asyncio.to_thread(self._initialize)
         self.task=asyncio.create_task(self.run(),name='demo-notifications')
 
     async def run(self):
         while not self.stop.is_set():
             try:
-                self.collect()
+                await asyncio.to_thread(self.collect)
                 await self.deliver_once()
                 self.runtime_error=''
             except asyncio.CancelledError:raise

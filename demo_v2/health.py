@@ -24,7 +24,7 @@ class HealthSnapshot:
 
     @property
     def entries_allowed(self) -> bool:
-        return self.state == HealthState.READY
+        return bool(self.components) and all(c.state == HealthState.READY for c in self.components if c.critical)
 
 
 class HealthRegistry:

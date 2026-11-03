@@ -15,10 +15,13 @@ import time
 class ResourceMonitor:
     def __init__(self, data_dir, *, proc_root=Path('/proc'), interval=2.0,
                  clock=time.monotonic, cpu_clock=time.process_time,
-                 now=lambda: datetime.now(timezone.utc)):
+                 now=lambda: datetime.now(timezone.utc), decision_pid=None):
         self.data_dir, self.proc_root = Path(data_dir), Path(proc_root)
         self.interval, self.clock, self.cpu_clock, self.now = interval, clock, cpu_clock, now
         self._cpu_previous = self._network_previous = None
+        self.decision_pid=decision_pid
+        self._child_cpu=0.0
+        self._child_identity=None
         self._task = None
         self._snapshot = self._empty()
 
@@ -37,7 +40,7 @@ class ResourceMonitor:
         # guest/guest_nice are already included in user/nice, never add twice.
         values = [int(value) for value in fields[1:9]]
         total, idle = sum(values), values[3] + (values[4] if len(values) > 4 else 0)
-        current = (self.clock(), self.cpu_clock(), total, idle)
+        current = (self.clock(), self.cpu_clock()+self._child_cpu, total, idle)
         process_percent = host_percent = elapsed = None
         previous = self._cpu_previous
         if previous:
@@ -104,12 +107,41 @@ class ResourceMonitor:
                 sizes[name] = 0
         return {**sizes, 'total_bytes':sum(sizes.values())}
 
+    def _decision_process(self):
+        if self.decision_pid is None:
+            return None
+        pid=self.decision_pid()
+        if not isinstance(pid,int) or pid<=0:
+            raise ValueError("Decision process unavailable")
+        # Only kernel resource counters; never process environments or files.
+        fields=(self.proc_root/str(pid)/"stat").read_text().rsplit(")",1)[1].split()
+        identity=(pid,fields[19])  # pid + kernel process start time
+        if self._child_identity!=identity:
+            self._cpu_previous=None
+            self._child_identity=identity
+        self._child_cpu=(int(fields[11])+int(fields[12]))/os.sysconf("SC_CLK_TCK")
+        pages=[int(v) for v in (self.proc_root/str(pid)/"statm").read_text().split()[:2]]
+        page_size=os.sysconf("SC_PAGE_SIZE")
+        return {"pid":pid,"rss_bytes":pages[1]*page_size,"virtual_memory_bytes":pages[0]*page_size}
+
     def sample(self):
         result = self._empty()
         result['sampled_at'] = self.now()
         result['process'] = dict(scope='DEMO_BACKEND_PROCESS', cpu_percent=None, rss_bytes=None,
                                  virtual_memory_bytes=None)
         result['host'] = dict(logical_cpus=os.cpu_count(), cpu_percent=None)
+        child=None
+        try:
+            child=self._decision_process()
+        except (OSError,ValueError,IndexError):
+            self._cpu_previous=None
+            self._child_cpu=0.0
+            self._child_identity=None
+            result['unavailable'].append('decision_process')
+        if self.decision_pid is not None:
+            result['process']['scope']='DEMO_SERVICE_PROCESSES'
+            result['process']['aggregation']='SUM_OF_PROCESS_RSS_INCLUDES_SHARED_PAGES'
+            result['decision_process']=child
         try:
             process, host, elapsed = self._cpu()
             result['process']['cpu_percent'] = process
@@ -125,9 +157,12 @@ class ResourceMonitor:
         try:
             pages = [int(value) for value in (self.proc_root/'self/statm').read_text().split()[:2]]
             page_size = os.sysconf('SC_PAGE_SIZE')
-            result['process'].update(virtual_memory_bytes=pages[0]*page_size, rss_bytes=pages[1]*page_size)
+            result['process'].update(virtual_memory_bytes=pages[0]*page_size+(child['virtual_memory_bytes'] if child else 0),
+                rss_bytes=pages[1]*page_size+(child['rss_bytes'] if child else 0))
         except (OSError, ValueError, IndexError):
             result['unavailable'].append('process_memory')
+        if self.decision_pid is not None and child is None:
+            result['process'].update(rss_bytes=None,virtual_memory_bytes=None,cpu_percent=None)
         try:
             usage = shutil.disk_usage(self.data_dir)
             result['disk'] = dict(scope='DEMO_DATA_FILESYSTEM', total_bytes=usage.total,
@@ -145,7 +180,7 @@ class ResourceMonitor:
             self._network_previous = None
             result['unavailable'].append('network')
         result['state'] = ('AVAILABLE' if not result['unavailable'] else
-                           'UNAVAILABLE' if len(result['unavailable']) == 6 else 'PARTIAL')
+                           'UNAVAILABLE' if len(result['unavailable']) == (7 if self.decision_pid is not None else 6) else 'PARTIAL')
         # Atomic replacement: request handlers only read the last complete sample.
         self._snapshot = result
 

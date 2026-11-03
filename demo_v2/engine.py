@@ -22,6 +22,8 @@ class DemoEngine:
         self.generation = 0
         self.last_sequence = 0
         self.reason = "AWAITING_GENERATION"
+        self.durable_generation = None
+        self.observation_guard = lambda obs: ""
 
     def begin_generation(self, generation):
         if generation <= self.generation:
@@ -62,10 +64,15 @@ class DemoEngine:
             if any(not 0 <= (now-at).total_seconds() <= self.max_age for at in (obs.observed_at,obs.received_at)):
                 self.invalidate("OBSERVATION_AGED_WHILE_WAITING_FOR_DATABASE")
                 return []
+            fence=self.observation_guard(obs)
+            if fence:
+                if fence!="MARKET_FENCED":
+                    self.invalidate(fence)
+                return []
             reference=reference if reference and reference.valid(instance,now,self.max_age) else None
             # Reject actions racing an explicit reset or newer transport generation.
             durable_generation = int(conn.execute("SELECT value FROM demo_v2_meta WHERE key='generation'").fetchone()[0])
-            if durable_generation != obs.generation:
+            if durable_generation != (self.durable_generation if self.durable_generation is not None else obs.generation):
                 self.invalidate("DURABLE_GENERATION_CHANGED")
                 return []
             stored = conn.execute("SELECT * FROM demo_v2_instances WHERE id=?",(instance.instance_id,)).fetchone()

@@ -24,6 +24,9 @@ class DemoConfig:
     observation_max_age_seconds: float = 5.0
     decision_queue_capacity: int = 1024
     telemetry_capacity: int = 64
+    decision_max_queue_delay_seconds: float = 1.0
+    transport_idle_seconds: float = 30.0
+    snapshot_timeout_seconds: float = 10.0
     public_data_enabled: bool = False
     recovery_stability_seconds: float = 2.0
     session_cookie_secure: bool = True
@@ -49,6 +52,9 @@ class DemoConfig:
             raise ValueError("DEMO_SESSION_TTL_SECONDS must be positive")
         if not math.isfinite(self.observation_max_age_seconds) or self.observation_max_age_seconds <= 0:
             raise ValueError("DEMO_OBSERVATION_MAX_AGE_SECONDS must be finite and positive")
+        for name in ("decision_max_queue_delay_seconds","transport_idle_seconds","snapshot_timeout_seconds"):
+            if not math.isfinite(getattr(self,name)) or getattr(self,name)<=0:
+                raise ValueError(name+" must be finite and positive")
         if self.decision_queue_capacity <= 0 or self.telemetry_capacity <= 0:
             raise ValueError("DEMO queue capacities must be positive")
         if not math.isfinite(self.recovery_stability_seconds) or self.recovery_stability_seconds < 0:
@@ -72,6 +78,9 @@ class DemoConfig:
             observation_max_age_seconds=float(env.get("DEMO_OBSERVATION_MAX_AGE_SECONDS", "5")),
             decision_queue_capacity=int(env.get("DEMO_DECISION_QUEUE_CAPACITY", "1024")),
             telemetry_capacity=int(env.get("DEMO_TELEMETRY_CAPACITY", "64")),
+            decision_max_queue_delay_seconds=float(env.get("DEMO_DECISION_MAX_QUEUE_DELAY_SECONDS","1")),
+            transport_idle_seconds=float(env.get("DEMO_TRANSPORT_IDLE_SECONDS","30")),
+            snapshot_timeout_seconds=float(env.get("DEMO_SNAPSHOT_TIMEOUT_SECONDS","10")),
             public_data_enabled=env.get("DEMO_PUBLIC_DATA_ENABLED", "false").lower() == "true",
             recovery_stability_seconds=float(env.get("DEMO_RECOVERY_STABILITY_SECONDS", "2")),
             session_cookie_secure=env.get("DEMO_COOKIE_SECURE", "true").lower() != "false",

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 import asyncio
+import time
 
 from ..domain.trading import Comparison, Direction, Measurement, decimal
 from ..domain.models import require_aware
@@ -83,6 +84,7 @@ class BinanceResearchProvider:
         self.http, self.clock = http, clock
         self.symbols, self.baselines, self.latest_points = {}, {}, {}
         self._locks,self._latest_fetched={},{}
+        self._http_seconds={}
 
     async def context(self, instance, metadata):
         mapping = source_mapping(instance, metadata)
@@ -113,7 +115,9 @@ class BinanceResearchProvider:
         point = self.latest_points.get(symbol)
         fetched=self._latest_fetched.get(symbol)
         if point is None or fetched is None or (now-fetched).total_seconds() >= 2:
+            started=time.monotonic()
             trades = await self.http.get("/api/v3/trades", params={"symbol":symbol,"limit":1})
+            self._http_seconds[symbol]=time.monotonic()-started
             if len(trades) != 1:
                 return None
             point = ReferencePoint(decimal(trades[0]["price"]), datetime.fromtimestamp(int(trades[0]["time"])/1000, timezone.utc),
@@ -122,3 +126,18 @@ class BinanceResearchProvider:
             self._latest_fetched[symbol] = self.clock()
         return ReferenceContext(instance.instance_id, instance.definition.asset.value,
             self.baselines[instance.instance_id], point, authority)
+
+    def diagnostics(self, instance, metadata):
+        mapping=source_mapping(instance,metadata)
+        if mapping is None:
+            return {"state":"UNMAPPED_REFERENCE","is_research_proxy":True}
+        symbol,_=mapping
+        point=self.latest_points.get(symbol)
+        fetched=self._latest_fetched.get(symbol)
+        now=self.clock()
+        return {"state":"SAMPLED" if point else "AWAITING_REFERENCE", "is_research_proxy":True,
+            "source":"BINANCE_SPOT_RESEARCH", "fetched_at":fetched,
+            "source_observed_at":point.observed_at if point else None,
+            "fetch_age_seconds":(now-fetched).total_seconds() if fetched else None,
+            "source_age_seconds":(now-point.observed_at).total_seconds() if point else None,
+            "http_seconds":self._http_seconds.get(symbol)}

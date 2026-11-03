@@ -1,6 +1,7 @@
 """Credential-only DEMO authentication; no LIVE config/session lookup."""
 
 import base64
+import asyncio
 from collections import OrderedDict
 import hashlib
 import hmac
@@ -16,6 +17,7 @@ class DemoAuth:
     def __init__(self, config, database, *, clock=time.time):
         self.config, self.database, self.clock = config, database, clock
         self._attempts = OrderedDict()
+        self._validation_lock=asyncio.Lock()
 
     def configured(self):
         return bool(self.config.login_username and len(self.config.session_secret)>=32 and
@@ -56,6 +58,18 @@ class DemoAuth:
         return limited
 
     async def validate(self, username, password):
+        # Argon2 is CPU/memory work; never pause the public-data event loop.
+        async with self._validation_lock:
+            work=asyncio.create_task(asyncio.to_thread(self._validate,username,password))
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # Keep the memory-heavy verifier serialized even if its HTTP
+                # caller disconnects while the native hash is still running.
+                await work
+                raise
+
+    def _validate(self, username, password):
         if not self.configured():
             return None
         expected=self.config.login_password_hash

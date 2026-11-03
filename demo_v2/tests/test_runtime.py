@@ -140,3 +140,89 @@ def test_worker_error_does_not_kill_retry_loop(repository):
     assert len(calls)==2
     with repository.database.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM demo_v2_incidents").fetchone()[0]==1
+
+
+def test_gate_epoch_records_unobserved_local_dependency_gap(repository,market,rule):
+    class Data:
+        ready=True
+        def token_ready(self,token):return self.ready
+    data=Data();worker=runtime(repository,Providers(market_data=data))
+    worker.database_ok=worker.engine_ok=True
+    worker.current={market.definition.key:market.instance_id};worker.discovery_at=worker.clock()
+    assert worker.entry_gate(rule,market)
+    data.ready=False;assert not worker.entry_gate(rule,market)
+    data.ready=True;assert worker.entry_gate(rule,market)
+    assert worker._gate_epochs[(rule['id'],market.instance_id)]==1
+
+
+def test_retired_waiter_cannot_poison_first_snapshot_of_new_generation(repository,market,rule):
+    class Data:
+        status='CONNECTED'
+        latest={}
+        def token_ready(self,token):return token in self.latest
+        async def resync(self,reason):self.latest.clear()
+        async def close(self):pass
+    data=Data();worker=runtime(repository,Providers(market_data=data))
+    async def run():
+        await worker.start()
+        try:
+            worker.current={market.definition.key:market.instance_id};worker.discovery_at=worker.clock()
+            for index,ask in enumerate(('0.75','0.74'),1):
+                generation=await worker.command('next_generation')
+                data.latest={market.up_token_id:True,market.down_token_id:True}
+                worker.decisions.begin_generation(generation)
+                worker.decisions.publish(quote(generation=generation,ask=ask))
+                for _ in range(200):
+                    if worker.engine.generation==generation:break
+                    await asyncio.sleep(.002)
+                assert worker.engine.generation==generation and not worker.decisions.reason
+                await asyncio.sleep(.01)  # consumer now waits on the old queue
+            assert len(repository.positions())==1
+        finally:
+            await worker.close()
+    asyncio.run(run())
+
+
+def test_dead_owner_restarts_without_replay_and_retains_financial_state(repository,market,rule):
+    class Data:
+        status='CONNECTED'
+        latest={}
+        resyncs=[]
+        def token_ready(self,token):return token in self.latest
+        async def resync(self,reason):self.latest.clear();self.resyncs.append(reason)
+        async def close(self):pass
+    data=Data();worker=runtime(repository,Providers(market_data=data))
+    async def publish(ask):
+        generation=await worker.command('next_generation')
+        data.latest={market.up_token_id:True,market.down_token_id:True}
+        worker.decisions.begin_generation(generation);worker.decisions.publish(quote(generation=generation,ask=ask))
+        for _ in range(300):
+            if worker.engine.generation==generation:break
+            await asyncio.sleep(.002)
+        assert worker.engine.generation==generation
+    async def run():
+        await worker.start()
+        try:
+            # Exercise supervision deterministically instead of racing the
+            # periodic heartbeat with explicit fault injection in this test.
+            for task in worker.tasks:
+                if task.get_name()=='demo-database':
+                    task.cancel();await asyncio.gather(task,return_exceptions=True)
+            worker.current={market.definition.key:market.instance_id};worker.discovery_at=worker.clock()
+            await publish('.74')
+            assert len(repository.positions())==1
+            old_pid=worker.owner.projection['pid']
+            worker.owner.process.kill();await asyncio.to_thread(worker.owner.process.join,2)
+            await asyncio.sleep(.12)
+            assert not worker.entry_gate(rule,market)
+            await worker.database_once()
+            assert worker.owner.alive and worker.owner.projection['pid']!=old_pid
+            assert data.resyncs[-1]=='DECISION_WORKER_RESTARTED'
+            assert len(repository.positions())==repository.entry_count(rule['id'],market.instance_id)==1
+            await publish('.75')
+            assert len(repository.positions())==1  # no replay of uncertain/old inputs
+            await publish('.74')
+            assert len(repository.positions())==repository.entry_count(rule['id'],market.instance_id)==2
+        finally:
+            await worker.close()
+    asyncio.run(run())

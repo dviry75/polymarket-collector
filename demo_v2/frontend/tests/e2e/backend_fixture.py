@@ -90,7 +90,7 @@ def main():
             stamp=datetime.now(timezone.utc)
             runtime.discovery_at=stamp
             runtime.current[definition.key]=market.instance_id
-            generation=repo.next_generation()
+            generation=await runtime.command("next_generation")
             app.state.decisions.begin_generation(generation)
             samples=[]
             for sequence,(token,bid,ask) in enumerate([
@@ -108,6 +108,8 @@ def main():
                     break
                 await asyncio.sleep(0.01)
             return {"generation":generation,"processed":runtime.engine.last_sequence,
+                "engine_reason":runtime.engine.reason,"entry_gates":[runtime.entry_gate(r,market) for r in runtime.projection["rules"]],
+                "critical_health":[c.reason for c in runtime.health.snapshot().components if c.critical and c.reason],
                 "fees_enabled":json.loads(repo.instance(market.instance_id)["metadata_json"])["feesEnabled"],
                 "exact_fee_provider_configured":runtime.providers.fees is not None}
 

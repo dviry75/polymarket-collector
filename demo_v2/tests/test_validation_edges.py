@@ -158,13 +158,21 @@ def test_exhausted_rule_unsubscribes_after_last_position_closes(repository,marke
     worker.instances[market.instance_id]=market
     worker.current[market.definition.key]=market.instance_id
     worker.discovery_at=datetime.now(timezone.utc)
+    # This is a demand unit test; production gets these projections from its
+    # serialized owner rather than re-reading mutable SQL in the event loop.
+    def refresh():
+        worker.owner.projection={"rules":repository.rules(),"positions":repository.positions(status="OPEN"),
+            "counts":{(rule["id"],market.instance_id):repository.entry_count(rule["id"],market.instance_id)}}
+    refresh()
     asyncio.run(worker.demand_once())
     assert data.wanted==(market,)
     position=open_position(repository,rule)
+    refresh()
     asyncio.run(worker.demand_once())
     assert data.wanted==(market,)
     repository.close_position(position["id"],price=Decimal("0.74"),sell_fee=Decimal(0),reason=ExitReason.TAKE_PROFIT,
         occurred_at=datetime.now(timezone.utc),provenance={})
+    refresh()
     asyncio.run(worker.demand_once())
     assert not data.wanted
 

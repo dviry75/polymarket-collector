@@ -326,6 +326,28 @@ def test_resource_threshold_validation(fields):
     with pytest.raises(ValidationError):NotificationSettings(**fields)
 
 
+
+def test_slow_notification_collection_does_not_pause_event_loop(repository,monkeypatch):
+    import threading
+    worker,_,_,_=service(repository)
+    started=threading.Event();release=threading.Event()
+    def blocked():
+        started.set()
+        assert release.wait(3)
+    monkeypatch.setattr(worker,'collect',blocked)
+    async def run():
+        task=asyncio.create_task(worker.run())
+        try:
+            for _ in range(200):
+                if started.is_set():break
+                await asyncio.sleep(.005)
+            assert started.is_set() and not task.done()
+        finally:
+            release.set()
+            worker.stop.set()
+            await asyncio.wait_for(task,2)
+    asyncio.run(run())
+
 def test_per_recipient_routing_legacy_defaults_and_all_event_categories(repository):
     from demo_v2.notifications import EVENTS
     worker,_,_,_=service(repository)

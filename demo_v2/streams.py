@@ -4,6 +4,7 @@ import asyncio
 from collections import OrderedDict
 from datetime import datetime, timezone
 import math
+import time
 from typing import Callable
 
 from .domain.models import MarketObservation, require_aware
@@ -23,6 +24,7 @@ class DecisionStream:
     def __init__(
         self, *, capacity: int = 1024, max_age_seconds: float = 5,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        max_queue_delay_seconds: float | None = None, monotonic=time.monotonic,
     ) -> None:
         if capacity < 1 or not math.isfinite(max_age_seconds) or max_age_seconds <= 0:
             raise ValueError("decision capacity and maximum age must be positive")
@@ -32,6 +34,15 @@ class DecisionStream:
         self._generation = 0
         self._last_sequence = 0
         self.reason = "AWAITING_GENERATION"
+        self._monotonic=monotonic
+        self._max_queue_delay=max_age_seconds if max_queue_delay_seconds is None else max_queue_delay_seconds
+        if not math.isfinite(self._max_queue_delay) or self._max_queue_delay<=0:
+            raise ValueError("queue delay must be finite and positive")
+        self.published=self.delivered=self.rejected=self.high_water=0
+        self.last_queue_delay=0.0
+        self._published_at={}
+        self.invalidations={}
+        self.on_state_change=lambda generation,active:None
 
     def begin_generation(self, generation: int) -> None:
         if generation <= self._generation:
@@ -42,8 +53,10 @@ class DecisionStream:
         self._generation = generation
         self._last_sequence = 0
         self.reason = ""
+        self.on_state_change(generation,True)
 
     def _discard_pending(self) -> None:
+        self._published_at.clear()
         while not self._queue.empty():
             self._queue.get_nowait()
 
@@ -59,9 +72,12 @@ class DecisionStream:
         if not reason:
             raise ValueError("invalidation requires a reason")
         self.reason = reason
+        self.on_state_change(self._generation,False)
+        self.invalidations[reason]=self.invalidations.get(reason,0)+1
         self._retire_queue()
 
     def _reject(self, reason: str) -> None:
+        self.rejected+=1
         self.invalidate(reason)
         raise ObservationRejected(reason)
 
@@ -83,6 +99,9 @@ class DecisionStream:
         if self._queue.full():
             self._reject("DECISION_QUEUE_OVERFLOW")
         self._queue.put_nowait(observation)
+        self._published_at[observation.sequence]=self._monotonic()
+        self.published+=1
+        self.high_water=max(self.high_water,self._queue.qsize())
         self._last_sequence = observation.sequence
 
     async def next_observation(self) -> MarketObservation:
@@ -96,8 +115,20 @@ class DecisionStream:
             raise ObservationRejected(self.reason or "GENERATION_MISMATCH")
         # Waiting for a consumer must not turn a formerly fresh quote into a
         # stale decision. Recheck at delivery, not only at ingress.
+        self.last_queue_delay=self._monotonic()-self._published_at.pop(observation.sequence,self._monotonic())
+        if self.last_queue_delay>self._max_queue_delay:
+            self._reject("DECISION_QUEUE_DELAY_EXCEEDED")
         self._check_fresh(observation)
+        self.delivered+=1
         return observation
+
+    def snapshot(self):
+        now=self._monotonic()
+        return {"generation":self._generation,"reason":self.reason,"depth":self._queue.qsize(),
+            "capacity":self._queue.maxsize,"high_water":self.high_water,"published":self.published,
+            "delivered":self.delivered,"rejected":self.rejected,"invalidations":dict(self.invalidations),
+            "oldest_seconds":max(0,now-min(self._published_at.values())) if self._published_at else 0,
+            "last_delivery_seconds":self.last_queue_delay}
 
 
 class TelemetryBuffer:

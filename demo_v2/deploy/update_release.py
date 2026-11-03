@@ -87,6 +87,25 @@ def state_ids():
                 for table in ('demo_v2_rules','demo_v2_positions','demo_v2_ledger')}
 
 
+
+def preserved_settings():
+    # Compare private fingerprints in memory only; never log setting values,
+    # recipients, auth fingerprints, or their digests in deployment evidence.
+    with sqlite3.connect(DATABASE.as_uri()+'?mode=ro',uri=True) as connection:
+        rows=connection.execute("""SELECT key,value FROM demo_v2_meta WHERE
+            key IN ('session_version','auth_fingerprint','notification_settings','trade_serial_counter')
+            OR key GLOB 'trade_serial:*'""").fetchall()
+        return {key:int(value) if key=='trade_serial_counter' else hashlib.sha256(value.encode()).digest()
+                for key,value in rows}
+
+
+def verify_settings(before):
+    after=preserved_settings()
+    if any((after.get(key,-1)<value if key=='trade_serial_counter' else after.get(key)!=value)
+           for key,value in before.items()):
+        raise RuntimeError('Existing DEMO session, notification preferences or trade serials were changed')
+
+
 def promote(release):
     pending = ROOT/'current.next'
     if pending.exists() or pending.is_symlink():
@@ -137,15 +156,7 @@ def update(bundle, expected):
     run(python,'-m','pip','check')
     # Verify the release-specific interpreter/imports/sampler with disposable state.
     test_env = {**ENV,'PYTHONPATH':str(release/'app')+':'+str(release/'app/polymarket-collector')}
-    run(python,'-c', 'import tempfile; from pathlib import Path; '
-        'from demo_v2.resources import ResourceMonitor; from demo_v2.app import create_app; '
-        'from demo_v2.config import DemoConfig; '
-        'folder=tempfile.TemporaryDirectory(prefix="demo-release-check-"); '
-        'settings=DemoConfig(data_dir=Path(folder.name)); app=create_app(settings); '
-        'monitor=ResourceMonitor(settings.data_dir); monitor.sample(); '
-        'assert monitor.snapshot()["state"]=="AVAILABLE"; '
-        'assert str(settings.flat_fee_per_action)=="0.068"; '
-        'print("Isolated release imports, resources and default fee verified")',env=test_env)
+    run(python,'-m','demo_v2.deploy.release_check',env=test_env)
     for root, dirs, files in os.walk(release):
         for name in dirs+files:
             path = Path(root)/name
@@ -168,6 +179,7 @@ def update(bundle, expected):
         run(python,str(release/'app/demo_v2/deploy/backup_sqlite.py'),
             '--source',str(DATABASE),'--destination',str(final_backup))
         previous_ids = state_ids()
+        previous_settings=preserved_settings()
         promote(release)
         switched = True
         run('systemctl','start',UNIT)
@@ -177,7 +189,7 @@ def update(bundle, expected):
         pid = property_value('MainPID')
         if Path('/proc/'+pid+'/cwd').resolve() != release/'app':
             raise RuntimeError('Running process does not use the reviewed release')
-        for name in ('index.html','src/app.js','src/resources.js','src/typography.css'):
+        for name in ('index.html','src/app.js','src/resources.js','src/pipeline.js','src/typography.css'):
             with urlopen('http://127.0.0.1:8080/demo/'+name,timeout=5) as response:
                 actual = hashlib.sha256(response.read()).hexdigest()
             if actual != digest(release/'frontend/demo'/name):
@@ -185,6 +197,7 @@ def update(bundle, expected):
         current_ids = state_ids()
         if any(not ids <= current_ids[table] for table,ids in previous_ids.items()):
             raise RuntimeError('Existing DEMO records were not preserved')
+        verify_settings(previous_settings)
     except BaseException:
         if switched:
             run('systemctl','stop',UNIT)
@@ -195,7 +208,8 @@ def update(bundle, expected):
     record = dict(release_sha=manifest['release_sha'],previous_sha=manifest['previous_sha'],
                   deployed_at=datetime.now(timezone.utc).isoformat(),backup=str(final_backup),
                   records_preserved={table:len(ids) for table,ids in previous_ids.items()},
-                  env_changed=False,service_config_changed=False,proxy_changed=False)
+                  env_changed=False,service_config_changed=False,proxy_changed=False,
+                  private_settings_and_trade_serials_preserved=True)
     records=ROOT/'deployment-state'
     records.mkdir(mode=0o700,exist_ok=True)
     with (records/(manifest['release_sha']+'.json')).open('x') as output:

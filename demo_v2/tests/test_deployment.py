@@ -132,7 +132,7 @@ def test_cold_service_restart_restores_positions_and_requires_fresh_generation_a
             async with running_client(app) as client:
                 await login(client)
                 for attempt in range(500):
-                    if data.wanted and app.state.runtime.discovery_at:break
+                    if data.wanted==(market,) and app.state.runtime.discovery_at:break
                     await asyncio.sleep(.002)
                 assert data.wanted==(market,) and data.generation>previous
                 previous=data.generation

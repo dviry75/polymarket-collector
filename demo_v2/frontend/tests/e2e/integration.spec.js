@@ -231,7 +231,8 @@ test('fee-enabled market: UI rule, fresh non-trigger then exact trigger creates 
   expect((await api(page,'/trades')).total).toBe(0);
   const triggered=await page.request.post(prefix+'/__test__/observation',{headers,data:{ask:'0.74'}});
   expect(triggered.ok()).toBeTruthy();
-  expect((await triggered.json()).exact_fee_provider_configured).toBe(false);
+  const triggerResult=await triggered.json();expect(triggerResult.engine_reason).toBe('');
+  expect(triggerResult.entry_gates).toContain(true);expect(triggerResult.exact_fee_provider_configured).toBe(false);
   const trades=await api(page,'/trades');expect(trades.total).toBe(1);
   const row=trades.items[0];
   expect(row.rule_id).toBe(rule.id);expect(row.status).toBe('OPEN');
@@ -261,7 +262,8 @@ async function checkHealthResources(page){
   const panel=page.locator('[data-testid=resource-panel]');
   await expect(panel).toHaveAttribute('data-resource-state','AVAILABLE');
   await expect(panel.locator('[data-resource]')).toHaveCount(4);
-  for(const text of ['CPU','RAM','אחסון','תעבורת רשת','השרת כולו','תהליך DEMO'])await expect(panel).toContainText(text);
+  await expect(page.locator('[aria-label="צינור נתוני השוק"]')).toContainText('תהליך החלטות פעיל');
+  for(const text of ['CPU','RAM','אחסון','תעבורת רשת','השרת כולו','תהליכי DEMO'])await expect(panel).toContainText(text);
   await expect(panel.locator('[data-resource=ram] .resource-value')).not.toHaveText('—');
   await expect(panel.locator('[data-resource=network]')).toContainText('/s');
   const first=await panel.locator('.resource-status small').textContent();

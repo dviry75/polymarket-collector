@@ -1,3 +1,4 @@
+import {pipelineHTML} from './pipeline.js';
 import {assets,frames,durations,names,days,freshRule,validateRule,rulePayload,mapRule,mapTrade,cohortQuery,formatDecimal,formatMoney,formatFee,compareDecimal,marketState,healthState} from './model.js';
 import {createClient,errorMessage} from './api/client.js';
 import {API_BASE} from './config.js';
@@ -108,7 +109,7 @@ async function tradeDetails(id){
 }
 function healthContent(){
   const h=data.health,state=data.errors.health?'UNKNOWN':healthState(h);
-  return `${badge(state,state==='READY'?'up':'demo')}<p class="subtitle">${data.errors.health?'נתוני מצב קודמים אינם עדכניים.':h?.entries_allowed?'כניסות חדשות מותרות לפי בדיקות השרת.':'כניסות חדשות חסומות או שמצב המערכת אינו ידוע.'}</p>${resourcesHTML(h?.resources,Date.now(),!!data.errors.health)}<h3 class="health-components-heading">רכיבי המערכת</h3>${(h?.components??[]).map(c=>`<div class="health-row"><div><b>${esc(c.component)}</b><small>${esc(c.reason??'—')}</small></div>${badge(c.state,c.state==='READY'?'up':'down')}</div>`).join('')||'<p>אין נתוני מצב זמינים.</p>'}<small>עודכן ${time(data.healthFetchedAt)}</small><div class="helper">${(h?.blocker_codes??[]).map(code=>esc(code)).join('<br>')}</div>`;
+  return `${badge(state,state==='READY'?'up':'demo')}<p class="subtitle">${data.errors.health?'נתוני מצב קודמים אינם עדכניים.':h?.entries_allowed?'כניסות חדשות מותרות רק בשווקים ובכללים שהתלויות שלהם תקינות.':'כניסות חדשות חסומות או שמצב המערכת אינו ידוע.'}</p>${resourcesHTML(h?.resources,Date.now(),!!data.errors.health)}${pipelineHTML(h?.pipeline,!!data.errors.health)}<h3 class="health-components-heading">רכיבי המערכת</h3>${(h?.components??[]).map(c=>`<div class="health-row"><div><b>${esc(c.component)}</b><small>${esc(c.reason??'—')}</small></div>${badge(c.state,c.state==='READY'?'up':'down')}</div>`).join('')||'<p>אין נתוני מצב זמינים.</p>'}<small>עודכן ${time(data.healthFetchedAt)}</small><div class="helper">${(h?.blocker_codes??[]).map(code=>esc(code)).join('<br>')}</div>`;
 }
 function healthDetails(){
   openOverlay(`${drawerHead('System health')}<div id="health-details-content">${healthContent()}</div>`);

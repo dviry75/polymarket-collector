@@ -1,6 +1,7 @@
 """Independent ASGI factory: uvicorn demo_v2.app:create_app --factory."""
 
 from contextlib import asynccontextmanager
+import asyncio
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -17,6 +18,7 @@ from .providers.contracts import Providers
 from .streams import DecisionStream, TelemetryBuffer
 from .runtime import DemoRuntime
 from .resources import ResourceMonitor
+from .decision_worker import DecisionWorkerUnavailable
 from .notifications import Notifications
 
 
@@ -33,14 +35,14 @@ def create_app(config: DemoConfig | None = None, *, providers: Providers | None 
     telemetry=TelemetryBuffer(settings.telemetry_capacity)
     runtime=DemoRuntime(settings,repository,registry,decisions,telemetry,providers)
 
-    resources=ResourceMonitor(settings.data_dir)
+    resources=ResourceMonitor(settings.data_dir,decision_pid=lambda:runtime.owner.process.pid if runtime.owner.alive else None)
     notifications=Notifications(repository,registry,settings.mail,resources=resources)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
             await runtime.start()
-            auth.initialize()
+            await asyncio.to_thread(auth.initialize)
             await resources.start()
             await notifications.start()
             yield
@@ -85,6 +87,12 @@ def create_app(config: DemoConfig | None = None, *, providers: Providers | None 
         return JSONResponse({"detail":{"code":"DEMO_VALIDATION_ERROR","errors":[
             {"loc":list(error["loc"]),"type":error["type"],"msg":error["msg"]} for error in exc.errors()]}},status_code=422)
 
+    @app.exception_handler(DecisionWorkerUnavailable)
+    async def worker_unavailable(request,exc):
+        runtime.engine_ok=False
+        runtime.record("engine_worker",False,"DECISION_WORKER_UNAVAILABLE")
+        return JSONResponse({"detail":{"code":"DEMO_DECISION_WORKER_UNAVAILABLE"}},status_code=503)
+
     @app.exception_handler(sqlite3.Error)
     async def database_failure(request,exc):
         runtime.database_ok=False
@@ -98,7 +106,7 @@ def create_app(config: DemoConfig | None = None, *, providers: Providers | None 
     @app.get("/ready")
     async def readiness(request: Request, response: Response) -> dict[str, str | bool]:
         snapshot = request.app.state.health.snapshot()
-        if snapshot.state != HealthState.READY:
+        if snapshot.state == HealthState.NOT_READY:
             response.status_code = 503
         return {"state": snapshot.state.value, "entries_allowed": snapshot.entries_allowed}
 

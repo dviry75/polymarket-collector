@@ -193,3 +193,57 @@ def test_openapi_lists_filters_and_cookie_auth_without_secret_values(tmp_path):
     assert {"rule_id","asset","timeframe","status","side","from_date","to_date","movement_min","limit","offset"}<=params
     assert schema["components"]["securitySchemes"]["APIKeyCookie"]["in"]=="cookie"
     assert FAKE_PASSWORD not in str(schema) and app.state.config.session_secret not in str(schema)
+
+
+def test_slow_historical_read_does_not_block_health_event_loop(tmp_path,monkeypatch):
+    import threading
+    import demo_v2.api.router as route_module
+    started=threading.Event();release=threading.Event()
+    original=route_module.cohort
+    def blocked(*args,**kwargs):
+        started.set()
+        if not release.wait(3):
+            raise AssertionError('history reader did not yield the event loop')
+        return original(*args,**kwargs)
+    monkeypatch.setattr(route_module,'cohort',blocked)
+    app=app_for(tmp_path)
+    async def run():
+        async with running_client(app) as client:
+            await login(client)
+            query=asyncio.create_task(client.get(PREFIX+'/trades'))
+            try:
+                for _ in range(200):
+                    if started.is_set():break
+                    await asyncio.sleep(.005)
+                assert started.is_set()
+                response=await asyncio.wait_for(client.get('/health'),timeout=1)
+                assert response.status_code==200 and not query.done()
+            finally:
+                release.set()
+            assert (await query).status_code==200
+    asyncio.run(run())
+
+
+def test_canceled_login_does_not_start_parallel_memory_heavy_hash(tmp_path,monkeypatch):
+    import threading
+    auth=app_for(tmp_path).state.auth
+    started=threading.Event();release=threading.Event();calls=[]
+    def verifier(*args):
+        calls.append(1);started.set()
+        assert release.wait(3)
+        return None
+    monkeypatch.setattr(auth,'_validate',verifier)
+    async def run():
+        first=asyncio.create_task(auth.validate('fake-user','fake-password'))
+        for _ in range(100):
+            if started.is_set():break
+            await asyncio.sleep(.005)
+        assert started.is_set()
+        first.cancel()
+        second=asyncio.create_task(auth.validate('fake-user','fake-password'))
+        await asyncio.sleep(.02)
+        assert len(calls)==1  # native hash still running despite HTTP cancellation
+        release.set()
+        result=await asyncio.gather(first,second,return_exceptions=True)
+        assert isinstance(result[0],asyncio.CancelledError) and result[1] is None and len(calls)==2
+    asyncio.run(run())
