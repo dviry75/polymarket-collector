@@ -16,6 +16,7 @@ from demo_v2.decision_worker import CachedEngine, DecisionOwner, DecisionWorker,
 from demo_v2.domain.models import market_definitions
 from demo_v2.domain.trading import RuleSpec
 from demo_v2.health import ComponentHealth, HealthState
+from demo_v2.providers.contracts import Providers
 from demo_v2.providers.market_pool import MarketDataPool
 from demo_v2.providers.market_ws import PublicMarketWS
 from demo_v2.streams import DecisionStream, ObservationRejected, TelemetryBuffer
@@ -343,3 +344,97 @@ def test_shared_fences_have_no_crash_sensitive_process_mutex(repository):
     worker=DecisionWorker(repository.database.config)
     assert not hasattr(worker.stream_fences,'get_lock')
     assert not hasattr(worker.market_fences,'get_lock')
+
+
+def test_wire_burst_waits_for_consumer_without_losing_prices(market):
+    async def run():
+        stream=DecisionStream(capacity=8,clock=lambda:NOW)
+        manager=PublicMarketWS(stream,TelemetryBuffer(1),generation_factory=lambda:1,clock=lambda:NOW)
+        await manager.set_subscriptions([market]);manager.begin_generation()
+        class WS:
+            reads=0
+            async def recv(self):
+                if self.reads==64:
+                    await asyncio.Future()
+                self.reads+=1
+                message=snapshot(market,market.up_token_id,ask='.74' if self.reads%2 else '.75')
+                return json.dumps({**message,'hash':str(self.reads)})
+        ws=WS();receiver=asyncio.create_task(manager._receive(ws))
+        try:
+            for _ in range(1000):
+                if stream.capacity_waits:break
+                if receiver.done():await receiver
+                await asyncio.sleep(0)
+            assert stream.capacity_waits and ws.reads==4 and stream.snapshot()['depth']==4
+            # Model an owner temporarily occupied with another serialized request.
+            await asyncio.sleep(.02)
+            assert ws.reads==4 and not stream.reason
+            seen=[await asyncio.wait_for(stream.next_observation(),1) for _ in range(64)]
+            assert [o.sequence for o in seen]==list(range(1,65))
+            assert [o.best_ask for o in seen]==[Decimal('.74' if n%2 else '.75') for n in range(1,65)]
+            assert stream.published==stream.delivered==64 and not stream.rejected and not stream.invalidations
+            assert len(manager.telemetry.drain())==1
+        finally:
+            receiver.cancel();await asyncio.gather(receiver,return_exceptions=True)
+    asyncio.run(run())
+
+
+def test_backpressure_keeps_existing_deadline_and_generation_fences():
+    async def run():
+        stream=DecisionStream(capacity=2,clock=lambda:NOW,max_queue_delay_seconds=.02)
+        stream.begin_generation(1);stream.publish(quote(at=NOW))
+        with pytest.raises(ObservationRejected,match='DECISION_QUEUE_DELAY_EXCEEDED'):
+            await stream.wait_for_capacity()
+        assert stream.reason=='DECISION_QUEUE_DELAY_EXCEEDED'
+        stream.begin_generation(2);stream.publish(quote(at=NOW,generation=2))
+        waiter=asyncio.create_task(stream.wait_for_capacity());await asyncio.sleep(0)
+        stream.begin_generation(3)
+        with pytest.raises(ObservationRejected,match='GENERATION_CHANGED'):
+            await waiter
+        assert stream._generation==3 and not stream.reason
+        stream.publish(quote(at=NOW,generation=3))
+        waiter=asyncio.create_task(stream.wait_for_capacity());await asyncio.sleep(0)
+        stream.invalidate('DISCONNECTED')
+        with pytest.raises(ObservationRejected,match='DISCONNECTED'):
+            await waiter
+    asyncio.run(run())
+
+
+def test_shard_health_recovers_without_hiding_current_queue_or_book_faults(repository,market,rule):
+    async def run():
+        instance=replace(market,starts_at=NOW-timedelta(seconds=1),ends_at=NOW+timedelta(hours=1))
+        pool=MarketDataPool(TelemetryBuffer(),generation_factory=lambda:1,config=repository.database.config,on_issue=lambda *args:None)
+        worker=runtime(repository,Providers(market_data=pool));worker.clock=lambda:NOW
+        worker.database_ok=worker.engine_ok=True;worker.discovery_at=NOW
+        worker.instances={instance.instance_id:instance};worker.current={instance.definition.key:instance.instance_id}
+        worker.owner.projection['rules']=[rule]
+        await worker.demand_once()
+        shard=pool.shards['1h'];shard.clock=lambda:NOW;shard.decisions._clock=lambda:NOW
+        shard.begin_generation()
+        for token in (instance.up_token_id,instance.down_token_id):shard.process_message(snapshot(instance,token))
+        worker.issue('market_websocket:1h','OLD_OVERFLOW')
+        await worker.demand_once()
+        assert worker.health._components['market_websocket:1h'].state==HealthState.READY
+        assert 'market_websocket:1h' not in worker._issues
+        shard.decisions.invalidate('CURRENT_QUEUE_FAULT')
+        await worker.demand_once()
+        assert worker.health._components['market_websocket:1h'].reason=='CURRENT_QUEUE_FAULT'
+        assert worker.health._components['market_websocket:5m'].state==HealthState.READY
+        shard.begin_generation(2);await worker.demand_once()
+        assert worker.health._components['market_websocket:1h'].state==HealthState.READY
+        assert worker.health._components['market:'+instance.instance_id].state==HealthState.NOT_READY
+    asyncio.run(run())
+
+
+def test_retired_capacity_wait_timeout_cannot_poison_new_generation(monkeypatch):
+    async def run():
+        stream=DecisionStream(capacity=2,clock=lambda:NOW)
+        stream.begin_generation(1);stream.publish(quote(at=NOW))
+        async def expired_wait():
+            stream.begin_generation(2)
+            raise asyncio.TimeoutError()
+        monkeypatch.setattr(stream._progress,'wait',expired_wait)
+        with pytest.raises(ObservationRejected,match='GENERATION_CHANGED'):
+            await stream.wait_for_capacity()
+        assert stream._generation==2 and not stream.reason and not stream.invalidations
+    asyncio.run(run())

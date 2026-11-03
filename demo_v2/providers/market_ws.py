@@ -203,6 +203,7 @@ class PublicMarketWS:
 
     async def _receive(self, ws):
         while not self._stop.is_set():
+            await self.decisions.wait_for_capacity()
             try:
                 raw=await asyncio.wait_for(ws.recv(),timeout=1.0)
             except asyncio.TimeoutError:

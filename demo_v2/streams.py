@@ -43,6 +43,8 @@ class DecisionStream:
         self._published_at={}
         self.invalidations={}
         self.on_state_change=lambda generation,active:None
+        self._progress=asyncio.Event()
+        self.capacity_waits=0
 
     def begin_generation(self, generation: int) -> None:
         if generation <= self._generation:
@@ -54,6 +56,7 @@ class DecisionStream:
         self._last_sequence = 0
         self.reason = ""
         self.on_state_change(generation,True)
+        self._progress.set()
 
     def _discard_pending(self) -> None:
         self._published_at.clear()
@@ -75,6 +78,41 @@ class DecisionStream:
         self.on_state_change(self._generation,False)
         self.invalidations[reason]=self.invalidations.get(reason,0)+1
         self._retire_queue()
+        self._progress.set()
+
+    async def wait_for_capacity(self) -> None:
+        """Pause transport between wire frames, never discard/coalesce observations.
+
+        Leave half the FIFO available for the next atomic wire frame. Waiting
+        uses the oldest queued observation's existing deadline, so a slow owner
+        still fails closed rather than disguising stale input as fresh traffic.
+        """
+        generation=self._generation
+        high_water=max(1,self._queue.maxsize//2)
+        waiting=False
+        while True:
+            if generation!=self._generation:
+                raise ObservationRejected("GENERATION_CHANGED")
+            if self.reason:
+                raise ObservationRejected(self.reason)
+            if self._queue.qsize()<high_water:
+                return
+            if not waiting:
+                self.capacity_waits+=1
+                waiting=True
+            self._progress.clear()
+            oldest=min(self._published_at.values(),default=self._monotonic())
+            remaining=oldest+self._max_queue_delay-self._monotonic()
+            if remaining<=0:
+                self._reject("DECISION_QUEUE_DELAY_EXCEEDED")
+            try:
+                await asyncio.wait_for(self._progress.wait(),timeout=remaining)
+            except asyncio.TimeoutError:
+                if generation!=self._generation:
+                    raise ObservationRejected("GENERATION_CHANGED") from None
+                if self.reason:
+                    raise ObservationRejected(self.reason) from None
+                self._reject("DECISION_QUEUE_DELAY_EXCEEDED")
 
     def _reject(self, reason: str) -> None:
         self.rejected+=1
@@ -109,6 +147,7 @@ class DecisionStream:
             raise ObservationRejected(self.reason)
         queue = self._queue
         observation = await queue.get()
+        self._progress.set()
         if observation is None or queue is not self._queue:
             raise ObservationRejected(self.reason or "GENERATION_CHANGED")
         if self.reason or observation.generation != self._generation:
@@ -127,6 +166,7 @@ class DecisionStream:
         return {"generation":self._generation,"reason":self.reason,"depth":self._queue.qsize(),
             "capacity":self._queue.maxsize,"high_water":self.high_water,"published":self.published,
             "delivered":self.delivered,"rejected":self.rejected,"invalidations":dict(self.invalidations),
+            "capacity_waits":self.capacity_waits,
             "oldest_seconds":max(0,now-min(self._published_at.values())) if self._published_at else 0,
             "last_delivery_seconds":self.last_queue_delay}
 

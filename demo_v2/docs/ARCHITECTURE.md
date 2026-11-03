@@ -33,8 +33,11 @@ telemetry sampling/coalescing cannot choose the prices the engine sees.
 One spawned process owns decisions, parsed rule/open-position/quota caches, rearm
 state and all rule/financial mutations. A private inherited pipe allows one request
 in flight, with at most 64 ordered observations per request. Each FIFO remains
-bounded (default 1024); overload or age failure fences and resynchronizes the
-connection instead of dropping selected prices. No executor task is created per
+bounded (default 1024). At half capacity, the receiver waits before reading the
+next wire frame; every queued observation retains its existing deadline. A large
+atomic frame can still overflow, and a sustained stall still fails the unchanged
+queue-age budget. Either failure fences/resynchronizes the connection instead of
+dropping selected prices. No executor task is created per
 observation. ASGI continues receiving data while the owner waits for SQLite.
 
 Commands (rule version edits, reset, discovery writes, official settlement) serialize
@@ -74,6 +77,10 @@ the affected timeframe shard. Resubscribe clears affected depth/epochs before ne
 snapshots. No old/new generation mixing or entry/TP/SL backfill is allowed.
 Verified empty books are `READY_EMPTY` with null prices; missing books remain
 `AWAITING_SNAPSHOT`. Neither invents bids or asks.
+
+Shard connection health is recomputed from its current transport and FIFO state;
+a recovered connection clears the old active alert while counters/incidents retain
+history. Book/source readiness remains separate and is never forced healthy.
 
 Health is hierarchical: DB/owner/auth integrity failures block all entries;
 connection and market failures block their own dependencies; underlying availability

@@ -209,6 +209,13 @@ class DemoRuntime:
                 and self.projection["counts"].get((rule["id"],instance.instance_id),0)<rule["spec"].entry_frequency)
         await data.set_subscriptions(demand)
         self.owner.retain_markets({i.instance_id for i in demand})
+        if isinstance(data,MarketDataPool):
+            for key,shard in data.shards.items():
+                ready=not shard.token_map or (shard.status=="CONNECTED" and not shard.decisions.reason)
+                component="market_websocket:"+key
+                self.record(component,ready,"" if ready else shard.decisions.reason or "SOCKET_DISCONNECTED",critical=False)
+                if ready:
+                    self._issues.pop(component,None)
         # Sample unhealthy states continuously even when no actionable tick arrives.
         for rule in rules:
             for instance in instances:

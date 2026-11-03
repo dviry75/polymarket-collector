@@ -83,3 +83,37 @@ rules/history to make verification pass.
   294 positions/588 ledger rows, verified Decimal cash/quota/integrity/idempotency.
 - Production-pinned interpreter: disposable startup/decision child/resource checks
   passed. No real SMTP/provider/deployment operations were used as tests.
+
+## Installed-feed verification and follow-up
+
+Release `3618fa472fa770055685d6424964f9c89d422097` was installed at
+2026-11-03 10:50:29 Asia/Jerusalem. The updater verified backups, existing IDs,
+private settings and serial continuity. The service remained active with zero
+restarts; liveness and readiness returned 200. Authenticated UI showed the new
+API+owner CPU/RAM, disk/NIC cards and all three queues; login was retained.
+
+Actual feed inspection found repeated 5m/15m FIFO overflow during bursts and a
+separate active-health alert that stayed unhealthy after the shard recovered.
+Do not treat the earlier shallow deployment success as complete feed validation.
+
+The follow-up adds receiver backpressure between wire frames at half FIFO capacity,
+retaining every observation and the original one-second queue deadline. A stalled
+owner, oversized atomic frame, disconnect or retired generation still fences input.
+Shard health now reflects current transport/FIFO state independently of book/source
+readiness, while counters and incident history retain past failures.
+
+- Backend after follow-up: **374 passed** with temp/fake dependencies.
+- New regressions cover a paused consumer plus a 64-price wire burst, unchanged
+  deadline failure, disconnect/generation wakeups, a retired wait timing out during
+  recovery, and clearing a historical alert without hiding active queue/book faults.
+- Synthetic wire-receiver load: 123,392 frames, 123,434 observations in 30.83s,
+  all delivered/processed, zero rejection/invalidation, all three queues drained.
+  Producer bursts were 512 frames; queue high-water was 512 of 1024. Observed
+  throughput was ~4,003 frames/s, maximum loop lag 9.59ms. The requested producer
+  rate was 8,000/s; bounded backpressure limited the achieved rate. This is not an
+  8,000/s sustained-capacity claim or a guarantee for an arbitrary public feed.
+- The additional public diagnostics only read unauthenticated data and counted
+  frame/parser statistics; they did not submit orders or change running rules.
+
+The follow-up requires a new checksummed code-only promotion and authenticated
+feed verification; installing the prior release does not install this correction.
