@@ -34,8 +34,9 @@ snapshot or the development checkout's HEAD. Recheck them before every operation
 - Host-enforced nftables: private bridge/TAP only; deny guest initiation toward
   host, private/LAN/link-local/multicast networks, observed home public IPv4,
   spoofed source addresses and IPv6. Deny unsolicited incoming forwarding. Allow
-  public TCP 80/443 for packages/data, 465/587 for existing TLS mail, UDP 123 for
-  clock, and DNS only through the restricted host relay. Guest root cannot change
+  public TCP 80/443 for packages/data, 465/587 for existing TLS mail, 4460 for
+  authenticated NTS time key exchange, UDP 123 for clock, and DNS only through
+  the restricted host relay. Guest root cannot change
   host enforcement. This is containment, not immunity to hypervisor vulnerabilities.
 - Guest DNS uses the host resolver, preserving the existing ISP configuration.
   The saved home-public-IP deny value must be refreshed/reviewed if the ISP address
@@ -170,6 +171,18 @@ and containment pass before writing COMPLETE.
    root journal describes initial migration; the actual guest `current` symlink
    describes later deployed revisions. READY/DEGRADED are scoped, not a guarantee
    of an executed trade in each of the 21 definitions.
+
+Verify the guest's `chronyc tracking` reports `Leap status: Normal` and
+`timedatectl show -p NTPSynchronized` is yes before interpreting exchange ages.
+Ubuntu 26.04 chrony uses NTS; UDP 123 alone cannot establish authenticated time.
+The narrowly reviewed `repair_nts.py` applies only the public TCP 4460 addition
+to an existing renderer after hash/target checks, using host administrator
+authentication and the existing atomic dedicated-table initializer. It retains
+the private/home/IPv6 guards and does not restart the VM/app. Run the disposable
+packet checks first; recheck real NTS synchronization and containment afterward.
+Never disable NTS, alter time manually or weaken quote freshness to mask drift.
+
+Reference: [Ubuntu chrony/NTS setup](https://ubuntu.com/server/docs/how-to/networking/chrony-client/).
 
 Host old wrappers under `work/demo-deployment-*` are historical artifacts after
 cutover. Never use them to update or restart a host financial writer.

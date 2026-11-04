@@ -44,7 +44,9 @@ def render(uplink, public_ip):
         iifname "{BRIDGE}" ip saddr != {GUEST} counter name blocked_other drop
         iifname "{BRIDGE}" ip daddr @nonpublic_v4 counter name blocked_private drop
         iifname "{BRIDGE}" ip daddr @home_public_v4 counter name blocked_private drop
-        iifname "{BRIDGE}" oifname "{uplink}" tcp dport {{ 80, 443, 465, 587 }} accept
+        # Ubuntu chrony authenticates public NTP via NTS-KE (TCP 4460).
+        # Private/home/host destinations above remain blocked on every port.
+        iifname "{BRIDGE}" oifname "{uplink}" tcp dport {{ 80, 443, 465, 587, 4460 }} accept
         iifname "{BRIDGE}" oifname "{uplink}" udp dport 123 accept
         oifname "{BRIDGE}" ip daddr {GUEST} ct state established,related accept
         oifname "{BRIDGE}" counter name blocked_inbound drop
