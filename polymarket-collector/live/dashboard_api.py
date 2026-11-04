@@ -16,6 +16,7 @@ from .auth import COOKIE_NAME, LiveAuthManager
 from .config import LiveConfig
 from .dashboard_infrastructure import InfrastructureSampler
 from .dashboard_read_model import DashboardQueryError, DashboardReadModel, resolve_window
+from .notification_prefs import NotificationPrefsError, describe as describe_notification_prefs, save_enabled as save_notification_prefs
 from .repository import LiveRepository
 from .trade_export_queue import ExportQueueError, enqueue as enqueue_export, list_recipients
 
@@ -281,6 +282,32 @@ def external_export(body: ExportRequestBody, request: Request) -> DashboardRespo
     except ExportQueueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _response(result)
+
+
+class NotificationPrefsBody(BaseModel):
+    enabled: dict[str, dict[str, bool]]
+
+
+@router.get("/notifications/preferences", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def notification_preferences() -> DashboardResponse:
+    recipients = list_recipients()
+    data = describe_notification_prefs(recipients)
+    data["quality"] = "REAL" if recipients else "UNAVAILABLE"
+    return _response(data)
+
+
+@router.post("/notifications/preferences", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
+def update_notification_preferences(body: NotificationPrefsBody, request: Request) -> DashboardResponse:
+    _model_value, _infra_value, auth = _services()
+    token = request.cookies.get(COOKIE_NAME)
+    if not auth.verify_csrf(token, request.headers.get("x-live-csrf-token")):
+        raise HTTPException(status_code=403, detail="csrf verification failed")
+    try:
+        data = save_notification_prefs(body.enabled, list_recipients())
+    except NotificationPrefsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    data["quality"] = "REAL"
+    return _response(data)
 
 
 @router.get("/trade-statistics", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
