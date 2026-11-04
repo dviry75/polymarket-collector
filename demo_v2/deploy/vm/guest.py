@@ -1,6 +1,7 @@
 """Root helper for this dedicated KVM guest only; never load private env values."""
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,13 +19,14 @@ ROOT=Path('/opt/polymarket-demo-v2')
 DATA=Path('/var/lib/polymarket-demo-v2')
 DB=DATA/'demo_v2.sqlite3'
 ENV=Path('/etc/polymarket-demo-v2/demo.env')
+ARCHIVES=Path('/var/backups/polymarket-demo-v2/migration')
 UNIT='polymarket-demo-v2.service'
 SAFE_ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','PYTHONDONTWRITEBYTECODE':'1',
           'DEBIAN_FRONTEND':'noninteractive','NEEDRESTART_MODE':'l','PIP_CONFIG_FILE':'/dev/null'}
 
 
-def run(*args,capture=False,env=None):
-    return subprocess.run(args,check=True,text=True,env=env or SAFE_ENV,
+def run(*args,capture=False,env=None,cwd=None):
+    return subprocess.run(args,check=True,text=True,env=env or SAFE_ENV,cwd=cwd,
         stdout=subprocess.PIPE if capture else None).stdout
 
 
@@ -96,7 +98,46 @@ def verify():
             'release':release.name,'database':snapshot(),'env_digest':digest(ENV)}
 
 
-def provision(bundle,sha):
+def require_stopped_guest():
+    if subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0:
+        raise RuntimeError('Guest writer must be stopped')
+    if run('systemctl','show',UNIT,'--property=MainPID','--value',capture=True).strip()!='0':
+        raise RuntimeError('Guest writer PID remains present')
+
+
+def check_release_access(release):
+    spec=importlib.util.spec_from_file_location('demo_release_files',release/'app/demo_v2/deploy/release_files.py')
+    permissions=importlib.util.module_from_spec(spec);spec.loader.exec_module(permissions)
+    permissions.grant_release_access(ROOT,release)
+    run('runuser','-u','polymarket-demo-v2','--',str(release/'venv/bin/python'),
+        '-m','demo_v2.deploy.release_check',cwd=release/'app',env={**SAFE_ENV,
+        'PYTHONPATH':str(release/'app')+':'+str(release/'app/polymarket-collector')})
+    for name in ('index.html','src/app.js','src/resources.js'):
+        run('runuser','-u','www-data','--','test','-r',str(release/'frontend/demo'/name))
+
+
+def park_rolled_back_state(previous_sha):
+    require_stopped_guest()
+    if subprocess.run(['systemctl','is-enabled','--quiet',UNIT]).returncode==0:
+        raise RuntimeError('Retired guest writer must be disabled')
+    if (ROOT/'current').resolve()!=ROOT/'releases'/previous_sha:
+        raise RuntimeError('Rolled-back guest release changed; inspect before retry')
+    if not DB.is_file() or not ENV.is_file():raise RuntimeError('Expected parked guest state is incomplete')
+    snapshot(DB)  # Verify DEMO-only DB integrity; do not print private metadata.
+    import tempfile
+    parent=ARCHIVES;parent.mkdir(mode=0o700,parents=True,exist_ok=True);parent.chmod(0o700)
+    saved=Path(tempfile.mkdtemp(prefix='rolled-back-',dir=parent));saved.chmod(0o700)
+    for source in (DB,Path(str(DB)+'-wal'),Path(str(DB)+'-shm'),ENV):
+        if source.exists():source.rename(saved/source.name)
+    print('Stopped guest state archived privately; fresh final host state is required.')
+
+
+def provision(bundle,sha,previous_sha=None):
+    if previous_sha:
+        require_stopped_guest()
+        if DB.exists() or ENV.exists():raise RuntimeError('Old guest state must be archived before reprovisioning')
+        if (ROOT/'current').resolve()!=ROOT/'releases'/previous_sha:
+            raise RuntimeError('Unexpected guest release during reprovisioning')
     manifest=json.loads((bundle/'manifest.json').read_text())
     if manifest['release_sha']!=sha:raise ValueError('Guest release identity mismatch')
     for name,expected in manifest['files'].items():
@@ -118,22 +159,27 @@ def provision(bundle,sha):
     run(python,'-m','pip','--isolated','install','--disable-pip-version-check','--no-index','--no-deps',
         '--find-links='+str(bundle/'wheels'),'-r',str(release/'app/demo_v2/deploy/requirements.lock'))
     run(python,'-m','pip','check')
-    run(python,'-m','demo_v2.deploy.release_check',env={**SAFE_ENV,
-        'PYTHONPATH':str(release/'app')+':'+str(release/'app/polymarket-collector')})
+    check_release_access(release)
     for name in ('app','venv','frontend'):
-        (ROOT/name).symlink_to('current/'+name)
-    (ROOT/'current').symlink_to('releases/'+sha)
-    for root,dirs,files in os.walk(release):
-        for name in dirs+files:
-            path=Path(root)/name
-            if not path.is_symlink():path.chmod(path.stat().st_mode & ~0o022)
+        link=ROOT/name
+        if previous_sha:
+            if not link.is_symlink() or os.readlink(link)!='current/'+name:raise RuntimeError('Unexpected guest layout link')
+        else:link.symlink_to('current/'+name)
+    if previous_sha:
+        pending=ROOT/'current.next'
+        if pending.exists() or pending.is_symlink():raise RuntimeError('Unfinished guest promotion link')
+        pending.symlink_to('releases/'+sha);pending.replace(ROOT/'current')
+    else:(ROOT/'current').symlink_to('releases/'+sha)
     shutil.copyfile(bundle/'app.service',Path('/etc/systemd/system')/UNIT)
     Path('/etc/systemd/system/'+UNIT).chmod(0o644)
     snippet=Path('/etc/nginx/snippets/polymarket-demo-v2-api.conf')
     shutil.copyfile(bundle/'nginx-api.conf',snippet);snippet.chmod(0o644)
     site=Path('/etc/nginx/sites-available/polymarket-demo-v2.conf')
     shutil.copyfile(bundle/'nginx-guest.conf',site);site.chmod(0o644)
-    enabled=Path('/etc/nginx/sites-enabled/polymarket-demo-v2.conf');enabled.symlink_to(site)
+    enabled=Path('/etc/nginx/sites-enabled/polymarket-demo-v2.conf')
+    if previous_sha:
+        if not enabled.is_symlink() or enabled.resolve()!=site:raise RuntimeError('Unexpected guest nginx link')
+    else:enabled.symlink_to(site)
     default=Path('/etc/nginx/sites-enabled/default')
     if default.is_symlink():default.unlink()  # Stock site inside this new guest only.
     run('nginx','-t');run('systemctl','daemon-reload')
@@ -179,12 +225,14 @@ def main():
     if os.geteuid()!=0 or socket.gethostname()!='polymarket-demo-vm':raise SystemExit('Dedicated guest root only')
     if run('systemd-detect-virt',capture=True).strip()!='kvm':raise SystemExit('Expected KVM guest')
     parser=argparse.ArgumentParser()
-    parser.add_argument('operation',choices=('prepare-os','empty-check','provision','import-state','verify','export-state','stop','start'))
-    parser.add_argument('--bundle',type=Path);parser.add_argument('--sha');args=parser.parse_args()
+    parser.add_argument('operation',choices=('prepare-os','empty-check','provision','park-rolled-back-state','reprovision','import-state','verify','export-state','stop','start'))
+    parser.add_argument('--bundle',type=Path);parser.add_argument('--sha');parser.add_argument('--previous-sha');args=parser.parse_args()
     os.umask(0o077)
     if args.operation=='prepare-os':prepare_os()
     elif args.operation=='empty-check':require_empty_guest();print('EMPTY_GUEST_CONFIRMED')
     elif args.operation=='provision':provision(args.bundle.resolve(),args.sha)
+    elif args.operation=='park-rolled-back-state':park_rolled_back_state(args.previous_sha)
+    elif args.operation=='reprovision':provision(args.bundle.resolve(),args.sha,previous_sha=args.previous_sha)
     elif args.operation=='import-state':import_state(args.bundle.resolve())
     elif args.operation=='verify':print(json.dumps(verify()))  # Controller captures; never echo private fingerprints.
     elif args.operation=='export-state':

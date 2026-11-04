@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -154,14 +155,14 @@ def update(bundle, expected):
         '--no-index','--no-deps','--find-links='+str(private/'wheels'),'-r',
         str(release/'app/demo_v2/deploy/requirements.lock'))
     run(python,'-m','pip','check')
-    # Verify the release-specific interpreter/imports/sampler with disposable state.
+    # Private staging keeps umask 0077. Public release parents/files must also be
+    # traversable/readable by the app and nginx workers, without becoming writable.
+    spec=importlib.util.spec_from_file_location('demo_release_files',release/'app/demo_v2/deploy/release_files.py')
+    permissions=importlib.util.module_from_spec(spec);spec.loader.exec_module(permissions)
+    permissions.grant_release_access(ROOT,release)
+    # Verify the actual service identity, not root, with disposable state only.
     test_env = {**ENV,'PYTHONPATH':str(release/'app')+':'+str(release/'app/polymarket-collector')}
-    run(python,'-m','demo_v2.deploy.release_check',env=test_env)
-    for root, dirs, files in os.walk(release):
-        for name in dirs+files:
-            path = Path(root)/name
-            if not path.is_symlink():
-                path.chmod(path.stat().st_mode & ~0o022)
+    run('runuser','-u','polymarket-demo-v2','--',python,'-m','demo_v2.deploy.release_check',env=test_env,cwd=release/'app')
     # Nothing in the immutable release contains an env/credential/DB copy.
     backup_dir = Path('/var/backups/polymarket-demo-v2')
     backup_dir.mkdir(mode=0o700,exist_ok=True)

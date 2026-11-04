@@ -78,6 +78,11 @@ schema compatibility, promotes immutable code, preserves records/settings/serial
 and rolls code back on failure. Do not run the host's old deployment wrappers or
 updater as a workaround, and do not edit installed guest source in place.
 
+Before cutover, verify the exported release with disposable state as the actual
+`polymarket-demo-v2` service user from its app working directory, and static-file
+access as `www-data`. A root-only startup check misses permission failures. Public
+code/venv/frontend need read/traverse access; private env/DB/backups remain private.
+
 Management uses the existing operator-only SSH key under
 `/home/dvir/Documents/Codex/2026-10-29/new-chat/work/demo-vm-private/` and the pinned
 guest host key under `/etc/polymarket-demo-vm/guest-host-key.pub`. Never print/read key

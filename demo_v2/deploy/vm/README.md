@@ -102,6 +102,24 @@ exit status and QEMU identity, then requires a changed guest boot ID and repeats
 containment before provisioning code or moving any financial state. SSH loss
 alone is never evidence of a successful update/reboot.
 
+After a verified `ROLLED_BACK`, the host is again the current writer. A reviewed
+`prepare-migration --retry-rolled-back` bundle must match both the restored host
+release and the retired guest release. It preserves the journal chain, requires
+the guest writer disabled/stopped, archives its old DB/WAL/SHM/config privately,
+and provisions a fresh committed release without rerunning OS bootstrap. It
+reuses only the exact root-owned host cutover condition created earlier. Fresh
+host backups/state are taken at the new cutover; the stale guest copy is never
+reused as current truth. Other journal phases still require separate recovery.
+
+Public release directories are explicitly traversable (0755), and code/static
+files readable (0644, existing executable files 0755), regardless of root's
+umask 0077. The shared release-permissions helper covers initial guest install and
+future code updates. It does not follow symlinks or change private env/DB/backups.
+Before stopping the host writer, startup/decision-child checks use disposable
+state as the actual app user from the release app directory; nginx file access
+is checked as `www-data`. This catches the 2026-11-04 `200/CHDIR` failure that the
+previous root-only check missed.
+
 ## Every future authorized fix/release
 
 1. Read `demo_v2/AGENTS.md`; inspect Git/actual guest state. Preserve other chats'

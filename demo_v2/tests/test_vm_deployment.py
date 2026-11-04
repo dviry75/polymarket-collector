@@ -222,3 +222,57 @@ def test_bootstrap_can_recover_ssh_disconnect_but_still_waits_for_job_exit(monke
         return result
     monkeypatch.setattr(migrate,'ssh',ssh)
     migrate.wait_bootstrap('fake-bootstrap.service')
+
+
+@pytest.mark.parametrize('phase',('PROVISIONING','RETRY_PREPARING','CUTOVER_LOCKED','GUEST_STARTING','GUEST_RUNNING','PROXY_SWITCHED','COMPLETE'))
+def test_rolled_back_retry_requires_completed_single_writer_recovery(phase):
+    with pytest.raises(RuntimeError,match='completed rollback'):
+        migrate.validate_rolled_back_retry({'phase':phase,'previous_sha':'old','release_sha':'guest'},
+            {'previous_sha':'old','retry_guest_sha':'guest'})
+
+
+def test_rolled_back_retry_matches_both_host_and_retired_guest_releases():
+    previous={'phase':'ROLLED_BACK','previous_sha':'host','release_sha':'guest'}
+    manifest={'previous_sha':'host','retry_guest_sha':'guest'}
+    migrate.validate_rolled_back_retry(previous,manifest)
+    for change in ({'previous_sha':'changed-host'},{'retry_guest_sha':'changed-guest'}):
+        with pytest.raises(RuntimeError):migrate.validate_rolled_back_retry(previous,{**manifest,**change})
+
+
+def test_guest_state_archive_preserves_all_private_files_without_overwriting_them(tmp_path,monkeypatch,capsys):
+    root=tmp_path/'runtime';release=root/'releases'/'old';release.mkdir(parents=True)
+    (root/'current').symlink_to(release)
+    data=tmp_path/'state';data.mkdir();db=data/'demo_v2.sqlite3';env=tmp_path/'demo.env'
+    files=(db,Path(str(db)+'-wal'),Path(str(db)+'-shm'),env)
+    for index,path in enumerate(files):path.write_text('fake-private-'+str(index));path.chmod(0o600)
+    for name,value in (('ROOT',root),('DB',db),('ENV',env),('ARCHIVES',tmp_path/'archive')):
+        monkeypatch.setattr(guest,name,value)
+    monkeypatch.setattr(guest,'require_stopped_guest',lambda:None)
+    monkeypatch.setattr(guest.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=1))
+    monkeypatch.setattr(guest,'snapshot',lambda path:baseline())
+    guest.park_rolled_back_state('old')
+    saved=next((tmp_path/'archive').iterdir())
+    assert saved.stat().st_mode&0o777==0o700
+    for index,path in enumerate(files):
+        assert not path.exists()
+        assert (saved/path.name).read_text()=='fake-private-'+str(index)
+    assert 'fake-private' not in capsys.readouterr().out
+
+
+def test_active_guest_cannot_be_archived_even_when_host_wants_a_retry(monkeypatch):
+    monkeypatch.setattr(guest.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=0))
+    with pytest.raises(RuntimeError,match='writer must be stopped'):guest.park_rolled_back_state('old')
+
+
+def test_retry_only_reuses_the_exact_root_owned_retired_host_condition(tmp_path,monkeypatch):
+    guard=tmp_path/'writer-in-vm';monkeypatch.setattr(migrate,'GUARD',guard)
+    content='[Unit]\nConditionPathExists=!'+str(guard)+'\n'
+    dropin=SimpleNamespace(exists=lambda:True,is_symlink=lambda:False,
+        stat=lambda:SimpleNamespace(st_uid=0),read_text=lambda:content)
+    monkeypatch.setattr(migrate,'DROPIN',dropin)
+    migrate.check_host_guard(True)
+    with pytest.raises(RuntimeError):migrate.check_host_guard(False)
+    content='[Unit]\nUnreviewed=change\n'
+    with pytest.raises(RuntimeError):migrate.check_host_guard(True)
+    guard.write_text('active guard')
+    with pytest.raises(RuntimeError,match='writer guard'):migrate.check_host_guard(True)

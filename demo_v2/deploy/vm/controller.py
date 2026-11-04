@@ -109,10 +109,15 @@ server {
         'previous_sha':previous,'tool_commit':commit,'host_nginx_sha256':digest(site)}
     if args.resume_provisioning:
         fields['host_vm_unit_sha256']=digest(Path('/etc/systemd/system/polymarket-demo-vm.service'))
+    if args.retry_rolled_back:
+        current=ssh('readlink','-f','/opt/polymarket-demo-v2/current',capture=True).strip()
+        if not re.fullmatch('/opt/polymarket-demo-v2/releases/[a-f0-9]{40}',current):raise RuntimeError('Unexpected guest release')
+        fields['retry_guest_sha']=Path(current).name
     checksum=write_manifest(output,fields)
     script=output/'migrate-demo.sh'
     command=['/usr/bin/python3',str(output/'migrate.py'),'--bundle',str(output),'--manifest-sha256',checksum]
     if args.resume_provisioning:command.append('--resume-provisioning')
+    if args.retry_rolled_back:command.append('--retry-rolled-back')
     script.write_text('#!/usr/bin/env bash\nset -euo pipefail\n'+shlex.join(command)+'\n')
     script.chmod(0o755)
     print('Migration bundle: '+str(output))
@@ -169,7 +174,9 @@ def main():
     migrate=commands.add_parser('prepare-migration')
     migrate.add_argument('--release-bundle',type=Path,required=True);migrate.add_argument('--image-dir',type=Path,required=True)
     migrate.add_argument('--output',type=Path,required=True)
-    migrate.add_argument('--resume-provisioning',action='store_true',help='Reviewed recovery of PROVISIONING with an empty guest only')
+    recovery=migrate.add_mutually_exclusive_group()
+    recovery.add_argument('--resume-provisioning',action='store_true',help='Reviewed recovery of PROVISIONING with an empty guest only')
+    recovery.add_argument('--retry-rolled-back',action='store_true',help='Reviewed retry after a completed state-preserving rollback')
     deploy=commands.add_parser('deploy');deploy.add_argument('--sha',default='HEAD')
     deploy.add_argument('--output',type=Path,required=True);deploy.add_argument('--node',type=Path)
     deploy.add_argument('--wheels',type=Path)

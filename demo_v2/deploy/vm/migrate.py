@@ -30,6 +30,7 @@ UNIT='polymarket-demo-v2.service'
 SITE=Path('/etc/nginx/sites-available/polymarket-demo-v2.conf')
 STATE=CONF/'migration-state.json'
 GUARD=CONF/'writer-in-vm'
+DROPIN=Path('/etc/systemd/system')/(UNIT+'.d')/'00-vm-cutover.conf'
 SSH_OPTIONS=['-i',str(PRIVATE/'id_ed25519'),'-o','BatchMode=yes','-o','IdentitiesOnly=yes',
     '-o','ConnectTimeout=5','-o','StrictHostKeyChecking=yes','-o','HostKeyAlias=polymarket-demo-vm',
     '-o','UserKnownHostsFile='+str(PRIVATE/'known_hosts')]
@@ -112,6 +113,21 @@ def proxy_verify(stage):
 def validate_provisioning_resume(previous,manifest):
     if previous.get('phase')!='PROVISIONING' or previous.get('previous_sha')!=manifest['previous_sha']:
         raise RuntimeError('Only matching pre-cutover PROVISIONING may resume; inspect recovery state')
+
+
+def validate_rolled_back_retry(previous,manifest):
+    if (previous.get('phase')!='ROLLED_BACK' or previous.get('previous_sha')!=manifest['previous_sha']
+            or previous.get('release_sha')!=manifest.get('retry_guest_sha')):
+        raise RuntimeError('Retry requires matching completed rollback and retired guest release')
+
+
+def check_host_guard(retry=False):
+    dropin=DROPIN
+    if GUARD.exists() or GUARD.is_symlink():raise RuntimeError('Existing host writer guard requires recovery inspection')
+    if dropin.exists() or dropin.is_symlink():
+        expected='[Unit]\nConditionPathExists=!'+str(GUARD)+'\n'
+        if not retry or dropin.is_symlink() or dropin.stat().st_uid!=0 or dropin.read_text()!=expected:
+            raise RuntimeError('Existing host cutover condition requires inspection')
 
 
 def resume_empty_base(stage,manifest):
@@ -231,7 +247,9 @@ def rollback(stage,remote,helper,state):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--bundle',type=Path,required=True)
     parser.add_argument('--manifest-sha256',required=True)
-    parser.add_argument('--resume-provisioning',action='store_true');args=parser.parse_args()
+    recovery=parser.add_mutually_exclusive_group()
+    recovery.add_argument('--resume-provisioning',action='store_true')
+    recovery.add_argument('--retry-rolled-back',action='store_true');args=parser.parse_args()
     if os.geteuid()!=0 or socket.gethostname()!='dvir-technologies':raise SystemExit('Run with sudo on the dedicated development host')
     os.umask(0o077)
     import fcntl
@@ -242,14 +260,14 @@ def main():
             previous=json.loads(STATE.read_text())
             if previous.get('phase')=='COMPLETE':
                 print('DEMO migration already complete; use the VM release workflow.');return
-            if not args.resume_provisioning:
+            if not (args.resume_provisioning or args.retry_rolled_back):
                 raise RuntimeError('Existing migration journal requires inspection; do not overwrite state or start a second writer')
-        elif args.resume_provisioning:raise RuntimeError('No provisioning journal exists to resume')
-        if GUARD.exists() or Path('/etc/systemd/system/'+UNIT+'.d/00-vm-cutover.conf').exists():
-            raise RuntimeError('Existing host writer guard requires inspection')
+        elif args.resume_provisioning or args.retry_rolled_back:raise RuntimeError('No migration journal exists to recover')
+        check_host_guard(args.retry_rolled_back)
         stage,manifest=stage_bundle(args.bundle.resolve(),args.manifest_sha256)
         if previous:
-            validate_provisioning_resume(previous,manifest)
+            if args.retry_rolled_back:validate_rolled_back_retry(previous,manifest)
+            else:validate_provisioning_resume(previous,manifest)
             shutil.copyfile(STATE,stage/'previous-migration-state.json')
         sha=manifest['release_sha'];previous_sha=manifest['previous_sha']
         if (ROOT/'current').resolve()!=ROOT/'releases'/previous_sha:raise RuntimeError('Installed release changed; rebuild migration bundle')
@@ -269,12 +287,15 @@ def main():
             raise RuntimeError('Configured SMTP port needs a reviewed firewall exception before migration')
         helper=load_helper(stage/'guest.py')
         # Reuse the verified base network/QEMU preparation. No existing app restart.
-        if previous:remote=resume_empty_base(stage,manifest)
+        if previous and not args.retry_rolled_back:remote=resume_empty_base(stage,manifest)
+        elif args.retry_rolled_back:
+            if ssh('hostname',capture=True).strip()!='polymarket-demo-vm' or ssh('systemd-detect-virt',capture=True).strip()!='kvm':
+                raise RuntimeError('Retry target is not the dedicated KVM guest')
         else:run('/usr/bin/python3',str(stage/'install_base.py'),timeout=1800)
-        state={'phase':'PROVISIONING','release_sha':sha,'previous_sha':previous_sha,'host_was_enabled':
+        state={'phase':'RETRY_PREPARING' if args.retry_rolled_back else 'PROVISIONING','release_sha':sha,'previous_sha':previous_sha,'host_was_enabled':
             subprocess.run(['systemctl','is-enabled','--quiet',UNIT]).returncode==0,'backup_directory':str(stage)}
         record(state)
-        if not previous:remote=ssh('mktemp','-d','/home/demoadmin/demo-migration-XXXXXX',capture=True).strip()
+        if not previous or args.retry_rolled_back:remote=ssh('mktemp','-d','/home/demoadmin/demo-migration-XXXXXX',capture=True).strip()
         if not re.fullmatch('/home/demoadmin/demo-migration-[A-Za-z0-9]+',remote):raise RuntimeError('Unexpected guest staging path')
         state['guest_staging']=remote;record(state)
         app=stage/'guest-bundle';app.mkdir(mode=0o700)
@@ -282,10 +303,13 @@ def main():
             shutil.copyfile(stage/name,app/name)
         shutil.copyfile(stage/'release-manifest.json',app/'manifest.json');shutil.copytree(stage/'wheels',app/'wheels')
         upload(str(app)+'/.',remote+'/')
-        bootstrap_os(remote,state)
+        if args.retry_rolled_back:
+            ssh('sudo','-n','python3',remote+'/guest.py','park-rolled-back-state','--previous-sha',manifest['retry_guest_sha'])
+            ssh('sudo','-n','python3',remote+'/guest.py','reprovision','--bundle',remote,'--sha',sha,'--previous-sha',manifest['retry_guest_sha'])
+        else:bootstrap_os(remote,state)
         run('runuser','-u','dvir','--','python3','/usr/local/lib/polymarket-demo-vm/verify_guest.py',
             '--wait','180','--report',str(PRIVATE/'updated-guest-boundary-result.json'),timeout=260)
-        ssh('sudo','-n','python3',remote+'/guest.py','provision','--bundle',remote,'--sha',sha)
+        if not args.retry_rolled_back:ssh('sudo','-n','python3',remote+'/guest.py','provision','--bundle',remote,'--sha',sha)
         # Preparing the guest may take minutes; recheck concurrent host changes.
         if (ROOT/'current').resolve()!=ROOT/'releases'/previous_sha or digest(SITE)!=manifest['host_nginx_sha256']:
             raise RuntimeError('Host changed during provisioning; leave the original writer active')
@@ -296,9 +320,9 @@ def main():
         state['phase']='CUTOVER_LOCKED';record(state)
         try:
             # Persist a boot/manual-start guard before stopping the old writer.
-            dropin=Path('/etc/systemd/system')/(UNIT+'.d');dropin.mkdir(exist_ok=True)
-            guard_conf=dropin/'00-vm-cutover.conf'
-            if guard_conf.exists():raise RuntimeError('Existing host cutover guard requires inspection')
+            DROPIN.parent.mkdir(exist_ok=True)
+            guard_conf=DROPIN
+            if guard_conf.exists():check_host_guard(args.retry_rolled_back)
             guard_conf.write_text('[Unit]\nConditionPathExists=!'+str(GUARD)+'\n');guard_conf.chmod(0o644)
             GUARD.write_text('DEMO financial writer belongs to the isolated VM.\n');GUARD.chmod(0o600)
             run('systemctl','daemon-reload');run('systemctl','stop',UNIT);run('systemctl','disable',UNIT)
