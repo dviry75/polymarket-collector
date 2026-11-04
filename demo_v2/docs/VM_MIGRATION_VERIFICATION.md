@@ -48,3 +48,17 @@ global prerequisites were ready; market/rule eligibility remains independently
 gated. This evidence does not claim fresh books or successful execution in all
 21 definitions. Detailed market diagnosis and browser login require normal DEMO
 authentication; no session was forged or password read to obtain it.
+
+## Follow-up: login latency repaired
+
+The first normal login exposed insufficient soft-limit headroom: the running
+service plus the serialized 64 MiB Argon2 verifier exceeded MemoryHigh=256M.
+Guest service memory pressure exceeded 60% over a minute; a synthetic invalid
+credential request timed out after 30 seconds. The browser aborts at 12 seconds.
+
+MemoryHigh was raised to 384M, retaining MemoryMax=512M and all authentication,
+isolation and trading gates. No service restart or credential change was needed.
+The new limit is persisted as a guest systemd property and in the deployment
+template. Synthetic invalid-credential checks then returned the expected 401 in
+0.286 seconds via guest nginx and 0.225 seconds via the host relay. They used an
+invented username/random password, never the operator password or a forged session.

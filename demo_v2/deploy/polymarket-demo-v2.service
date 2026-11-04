@@ -53,7 +53,8 @@ AmbientCapabilities=
 LimitNOFILE=4096
 TasksMax=64
 MemoryAccounting=true
-MemoryHigh=256M
+# Reserve headroom for the serialized 64 MiB Argon2 verifier above the app/owner.
+MemoryHigh=384M
 MemoryMax=512M
 CPUWeight=20
 

@@ -21,6 +21,12 @@ snapshot or the development checkout's HEAD. Recheck them before every operation
   `/etc/polymarket-demo-v2/demo.env`, `/var/lib/polymarket-demo-v2/demo_v2.sqlite3`.
   API binds guest loopback 8010; guest nginx serves frontend/API at loopback and
   private guest IP 8080. Host is the only initiator allowed to reach guest services.
+  App memory budget: MemoryHigh=384M, MemoryMax=512M. Reserve the serialized
+  64 MiB Argon2 verifier above the running app/decision owner; do not size this
+  from idle/temp-DB startup alone. The initial 256M soft limit caused heavy
+  reclaim stalls and login timeouts despite healthy unauthenticated GET probes.
+  The guest's persistent systemd MemoryHigh property was updated without restart;
+  the deployment template matches it. The hard cap/auth settings are unchanged.
 - Host-enforced nftables: private bridge/TAP only; deny guest initiation toward
   host, private/LAN/link-local/multicast networks, observed home public IPv4,
   spoofed source addresses and IPv6. Deny unsolicited incoming forwarding. Allow
