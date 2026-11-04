@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from demo_v2.api.read_model import TradeFilter,cohort,kpi,trade_view
+from demo_v2.api.read_model import TradeQuery,trade_page,kpi
 from demo_v2.domain.models import OfficialResolution
 from demo_v2.domain.trading import ExitReason,FeeState,RuleSpec
 from demo_v2.engine import DemoEngine
@@ -94,18 +94,18 @@ def test_flat_cash_fee_ledger_not_double_counted_and_movement_cohort(repository,
     worker=engine(repository,market)
     worker.process(quote(),market,verified_fee(),context(market,"101.5"))
     worker.process(quote(2,bid="0.97",ask="0.98"),market,verified_fee(),context(market,"103"))
-    rows=cohort(repository,TradeFilter(movement_min="1",movement_max="2"))
+    filters=TradeQuery(movement_min="1",movement_max="2")
+    rows=trade_page(repository,filters)["items"]
     assert len(rows)==1
     row=rows[0]
-    assert Decimal(row["cash_debit_text"])==Decimal(row["entry_notional_text"])+Decimal("0.068")
-    assert Decimal(row["net_proceeds_text"])-Decimal(row["cash_debit_text"])==repository.wallet()==Decimal(row["net_pnl_text"])
-    stats=kpi(repository,rows)
+    assert Decimal(row["cash_debit"])==Decimal(row["entry_notional"])+Decimal("0.068")
+    assert Decimal(row["net_proceeds"])-Decimal(row["cash_debit"])==repository.wallet()==Decimal(row["net_pnl"])
+    stats=kpi(repository,filters)
     assert Decimal(stats["wallet"])==repository.wallet()
-    assert Decimal(stats["total_fees"])==Decimal(row["buy_fee_text"])+Decimal(row["sell_fee_text"])
-    view=trade_view(row)
-    assert view["underlying_movements"]["open_to_entry"]["percent"]=="1.5"
-    assert view["underlying_movements"]["during_trade"]["absolute"]=="1.5"
-    assert cohort(repository,TradeFilter(movement_min="2",movement_max="3"))==[]
+    assert Decimal(stats["total_fees"])==Decimal(row["buy_fee"])+Decimal(row["sell_fee"])
+    assert row["underlying_movements"]["open_to_entry"]["percent"]=="1.5"
+    assert row["underlying_movements"]["during_trade"]["absolute"]=="1.5"
+    assert trade_page(repository,TradeQuery(movement_min="2",movement_max="3"))["items"]==[]
 
 
 def test_catalog_retains_verified_provider_identity(repository,market):

@@ -1,7 +1,6 @@
 from dataclasses import asdict
 import asyncio
 from datetime import datetime
-from decimal import Decimal
 import json
 from typing import Annotated, Literal
 
@@ -9,10 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import Field, SecretStr
 
-from ..domain.trading import FrozenModel, RuleSpec, decimal, text
+from ..domain.trading import FrozenModel, RuleSpec
 from ..persistence.repository import dump
 from .dependencies import require_demo_session
-from .read_model import TradeFilter, TradeQuery, cohort, kpi, trade_view
+from .read_model import TradeFilter, TradeQuery, trade_page, kpi, trade_view, rule_summary
 from .schemas import SessionView,RuleView,RuleList,TradePage,TradeDetail,KPIView,MarketList,HealthView
 from ..notifications import NotificationSettings
 
@@ -100,10 +99,7 @@ async def logout(request: Request):
 
 
 def rule_view(repository,row):
-    positions=repository.positions(rule_id=row["id"])
-    realized=sum((decimal(p["net_pnl_text"]) for p in positions if p["status"]=="CLOSED"),Decimal(0))
-    return {key:value for key,value in row.items() if key!="snapshot_json"} | {
-        "trade_count":len(positions),"wallet":str(repository.wallet(row["id"])),"net_pnl":text(realized)}
+    return {key:value for key,value in row.items() if key!="snapshot_json"} | rule_summary(repository,row["id"])
 
 
 @router.get("/rules",tags=["Rules"],response_model=RuleList)
@@ -173,9 +169,7 @@ async def archive_rule(rule_id: str,request: Request):
 @router.get("/trades",tags=["Trades"],response_model=TradePage)
 def trades(request: Request,filters: Annotated[TradeQuery,Query()]):
     """Newest first by entry time/id; date interval [from_date,to_date). Decimal strings."""
-    rows=cohort(request.app.state.repository,filters)
-    limit,offset=filters.limit,filters.offset
-    return respond({"items":[trade_view(row) for row in rows[offset:offset+limit]],"total":len(rows),"limit":limit,"offset":offset})
+    return respond(trade_page(request.app.state.repository,filters))
 
 
 @router.get("/trades/{position_id}",tags=["Trades"],response_model=TradeDetail)
@@ -202,7 +196,7 @@ def get_kpi(request: Request,filters: Annotated[TradeFilter,Query()]):
     Open and break-even trades are excluded from that denominator.
     """
     repo=request.app.state.repository
-    return respond(kpi(repo,cohort(repo,filters)))
+    return respond(kpi(repo,filters))
 
 
 @router.get("/markets",tags=["Markets"],response_model=MarketList)

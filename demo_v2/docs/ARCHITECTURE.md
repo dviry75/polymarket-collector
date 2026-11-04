@@ -49,6 +49,14 @@ uncertain request is never retried: fence ingress, retire the owner, reload dura
 state and request fresh generations. This is one ASGI worker plus one decision
 process per DEMO DB; do not run multiple independent apps against the same DB.
 
+History reads select/count the shared cohort in SQLite without loading all market
+metadata or trade evidence. Trade pagination sorts narrow IDs before fetching JSON
+for at most 200 rows. KPI and rule totals stream narrow financial columns using
+Decimal arithmetic, with no floating-point SQL sums or unbounded ID lists. Related
+totals/page rows share a short WAL read snapshot. Movement filters use exact Decimal
+comparisons and date filters retain timezone-aware inclusive/exclusive boundaries.
+Read endpoints never allocate serials or mutate financial/session state.
+
 ## Financial and recovery boundaries
 
 Every observation is evaluated. A non-action tick changes volatile rearm state,

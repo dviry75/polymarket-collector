@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from demo_v2.api.read_model import trade_view, kpi
+from demo_v2.api.read_model import TradeFilter, trade_view, kpi
 from demo_v2.config import DemoConfig
 from demo_v2.domain.fees import FlatFeePolicy, DEFAULT_FLAT_FEE, FEE_METHOD
 from demo_v2.domain.models import OfficialResolution, market_definitions
@@ -62,7 +62,7 @@ def test_entry_sell_roundtrip_api_ledger_and_pnl(repository,market,rule):
     assert closed['sell_fee']=='0.068' and closed['total_fees']=='0.136'
     assert closed['net_proceeds']=='4.732' and closed['net_pnl']=='0.964'
     assert repository.wallet()==Decimal('0.964')
-    assert kpi(repository,[row])['total_fees']=='0.136'
+    assert kpi(repository,TradeFilter())['total_fees']=='0.136'
     for field in ('fee_evidence','entry_provenance','exit_provenance'):
         evidence=closed[field] if field=='fee_evidence' else closed[field]['fee']
         assert evidence['method']==FEE_METHOD and evidence['per_action']=='0.068'

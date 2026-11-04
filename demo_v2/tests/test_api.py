@@ -199,13 +199,13 @@ def test_slow_historical_read_does_not_block_health_event_loop(tmp_path,monkeypa
     import threading
     import demo_v2.api.router as route_module
     started=threading.Event();release=threading.Event()
-    original=route_module.cohort
+    original=route_module.trade_page
     def blocked(*args,**kwargs):
         started.set()
         if not release.wait(3):
             raise AssertionError('history reader did not yield the event loop')
         return original(*args,**kwargs)
-    monkeypatch.setattr(route_module,'cohort',blocked)
+    monkeypatch.setattr(route_module,'trade_page',blocked)
     app=app_for(tmp_path)
     async def run():
         async with running_client(app) as client:
