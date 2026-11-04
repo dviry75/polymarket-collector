@@ -146,6 +146,17 @@ and containment pass before writing COMPLETE.
 
 ## Every future authorized fix/release
 
+For an explicitly requested additional DEMO account, run the committed helper
+inside the guest with its release venv and working directory:
+`python -m demo_v2.deploy.provision_env --output /etc/polymarket-demo-v2/demo.env --add-user <username>`
+as guest root, using the private terminal prompts. Automation may instead send
+an Argon2id hash over pinned SSH stdin with `--hash-stdin`; never put passwords or
+hashes in argv, output, source or release bundles. The helper preserves the primary
+credentials/session secret and makes a root-private backup before an atomic env
+update. It rejects existing usernames, does not alter DB or LIVE, and does not
+restart services. Restart only the guest app after provisioning, then verify a
+normal login without printing its cookie/CSRF token. Accounts share one workspace.
+
 1. Read `demo_v2/AGENTS.md`; inspect Git/actual guest state. Preserve other chats'
    changes. Implement only in source, and run relevant temp/fake tests on the host.
 2. Commit and push the exact intended revision. Deploy committed source; uncommitted

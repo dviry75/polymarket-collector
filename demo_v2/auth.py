@@ -8,8 +8,8 @@ import hmac
 import json
 import secrets
 import time
-import re
 
+from .config import encoded_password_hash
 from .domain.models import Principal
 
 
@@ -21,8 +21,14 @@ class DemoAuth:
 
     def configured(self):
         return bool(self.config.login_username and len(self.config.session_secret)>=32 and
-            (self.config.login_password_hash.startswith("$argon2id$") or
-             re.fullmatch(r"sha256:[0-9a-f]{64}",self.config.login_password_hash)))
+            encoded_password_hash(self.config.login_password_hash))
+
+    def _credentials(self):
+        return {self.config.login_username:self.config.login_password_hash, **dict(self.config.additional_users)}
+
+    def _user_fingerprint(self, username):
+        value=username+"\0"+self._credentials()[username]
+        return hmac.new(self.config.session_secret.encode(),value.encode(),hashlib.sha256).hexdigest()
 
     def _fingerprint(self):
         value=self.config.login_username+"\0"+self.config.login_password_hash
@@ -72,7 +78,9 @@ class DemoAuth:
     def _validate(self, username, password):
         if not self.configured():
             return None
-        expected=self.config.login_password_hash
+        credentials=self._credentials()
+        # Unknown users still pay the same serialized password verification cost.
+        expected=credentials.get(username,self.config.login_password_hash)
         valid=False
         if expected.startswith("$argon2id$"):
             try:
@@ -83,13 +91,14 @@ class DemoAuth:
         elif expected.startswith("sha256:"):
             digest="sha256:"+hashlib.sha256(password.encode()).hexdigest()
             valid=hmac.compare_digest(digest,expected)
-        username_valid=hmac.compare_digest(username.encode(),self.config.login_username.encode())
+        username_valid=username in credentials
         return Principal(username) if valid and username_valid else None
 
     def create_session(self, username):
-        if not self.configured():
+        if not self.configured() or username not in self._credentials():
             raise ValueError("DEMO auth is not configured")
         payload=json.dumps({"sub":username,"iat":int(self.clock()),"version":self.version(),
+            "credential":self._user_fingerprint(username),
             "nonce":secrets.token_urlsafe(24),"aud":"DEMO_V2"},sort_keys=True,separators=(",",":")).encode()
         encoded=base64.urlsafe_b64encode(payload).decode().rstrip("=")
         signature=hmac.new(self.config.session_secret.encode(),encoded.encode(),hashlib.sha256).hexdigest()
@@ -105,8 +114,15 @@ class DemoAuth:
                 return None
             payload=json.loads(base64.urlsafe_b64decode(encoded+"="*(-len(encoded)%4)))
             age=self.clock()-payload["iat"]
-            if (payload["aud"]!="DEMO_V2" or payload["sub"]!=self.config.login_username or
+            if (payload["aud"]!="DEMO_V2" or payload["sub"] not in self._credentials() or
                     not 0 <= age <= self.config.session_ttl_seconds or payload["version"]!=self.version()):
+                return None
+            credential=payload.get("credential")
+            if credential is None:
+                # Preserve existing primary-account sessions across adding a user.
+                if payload["sub"]!=self.config.login_username:
+                    return None
+            elif not isinstance(credential,str) or not hmac.compare_digest(credential,self._user_fingerprint(payload["sub"])):
                 return None
             return Principal(payload["sub"])
         except (ValueError,KeyError,TypeError,UnicodeError):

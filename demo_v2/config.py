@@ -3,12 +3,32 @@
 from dataclasses import dataclass, field
 from decimal import Decimal
 import math
+import json
 import os
+import re
 from pathlib import Path
 from typing import Mapping
 
 from .domain.fees import DEFAULT_FLAT_FEE, FlatFeePolicy
 from .notifications import MailConfig
+
+
+def encoded_password_hash(value: str) -> bool:
+    return isinstance(value, str) and bool(value.startswith("$argon2id$") or re.fullmatch(r"sha256:[0-9a-f]{64}", value))
+
+
+def parse_additional_users(value: str) -> tuple[tuple[str, str], ...]:
+    def unique(pairs):
+        if len(dict(pairs)) != len(pairs):
+            raise ValueError("Duplicate DEMO user")
+        return dict(pairs)
+    try:
+        users = json.loads(value, object_pairs_hook=unique)
+        if not isinstance(users, dict):
+            raise ValueError()
+        return tuple(users.items())
+    except (ValueError, TypeError):
+        raise ValueError("DEMO_AUTH_USERS_JSON must map unique usernames to password hashes") from None
 
 
 @dataclass(frozen=True)
@@ -17,6 +37,7 @@ class DemoConfig:
     db_path: Path | None = None
     login_username: str = field(default="", repr=False)
     login_password_hash: str = field(default="", repr=False)
+    additional_users: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     session_secret: str = field(default="", repr=False)
     session_cookie_name: str = "demo_v2_session"
     session_cookie_path: str = "/demo/"
@@ -34,6 +55,20 @@ class DemoConfig:
     mail: MailConfig = field(default_factory=MailConfig, repr=False)
 
     def __post_init__(self) -> None:
+        users = tuple(tuple(item) for item in self.additional_users)
+        seen = {self.login_username}
+        if len(users) > 20:
+            raise ValueError("At most 20 additional DEMO users")
+        for item in users:
+            if len(item) != 2:
+                raise ValueError("Invalid additional DEMO user")
+            username, password_hash = item
+            if (not isinstance(username, str) or not username.strip() or len(username) > 120
+                    or any(ord(c) < 32 or ord(c) == 127 for c in username)
+                    or username in seen or not encoded_password_hash(password_hash)):
+                raise ValueError("Invalid or duplicate additional DEMO credentials")
+            seen.add(username)
+        object.__setattr__(self, "additional_users", users)
         object.__setattr__(self, "flat_fee_per_action", FlatFeePolicy(self.flat_fee_per_action).per_action)
         root = Path(self.data_dir).expanduser().resolve()
         candidate = Path(self.db_path) if self.db_path else root / "demo_v2.sqlite3"
@@ -73,6 +108,7 @@ class DemoConfig:
             db_path=Path(path) if path else None,
             login_username=env.get("DEMO_AUTH_USERNAME", env.get("DEMO_LOGIN_USERNAME", "")),
             login_password_hash=env.get("DEMO_AUTH_PASSWORD_HASH", env.get("DEMO_LOGIN_PASSWORD_HASH", "")),
+            additional_users=parse_additional_users(env.get("DEMO_AUTH_USERS_JSON", "{}")),
             session_secret=env.get("DEMO_SESSION_SECRET", ""),
             session_ttl_seconds=int(env.get("DEMO_SESSION_TTL_SECONDS", "86400")),
             observation_max_age_seconds=float(env.get("DEMO_OBSERVATION_MAX_AGE_SECONDS", "5")),

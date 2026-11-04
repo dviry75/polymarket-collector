@@ -1,6 +1,6 @@
 """One cohort predicate for trades, fees, success and scoped ledger cash flow."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import json
 from typing import Annotated, Literal
@@ -23,6 +23,8 @@ class TradeFilter(FrozenModel):
     movement_measurement: Literal["PERCENT","ABSOLUTE"] = "PERCENT"
     movement_min: Decimal | None = None
     movement_max: Decimal | None = None
+    entry_elapsed_min_seconds: Annotated[int, Field(ge=0, lt=3600)] | None = None
+    entry_elapsed_max_seconds: Annotated[int, Field(gt=0, le=3600)] | None = None
 
     @field_validator("movement_min","movement_max",mode="before")
     @classmethod
@@ -38,6 +40,9 @@ class TradeFilter(FrozenModel):
             raise ValueError("from_date must precede exclusive to_date")
         if self.movement_min is not None and self.movement_max is not None and self.movement_min>self.movement_max:
             raise ValueError("movement bounds reversed")
+        if (self.entry_elapsed_min_seconds is not None and self.entry_elapsed_max_seconds is not None
+                and self.entry_elapsed_min_seconds >= self.entry_elapsed_max_seconds):
+            raise ValueError("entry elapsed start must precede exclusive end")
         return self
 
 
@@ -72,6 +77,19 @@ def _selection(conn, filters):
                     and (filters.to_date is None or at < filters.to_date))
         conn.create_function("demo_entry_interval", 1, in_interval, deterministic=True)
         clauses.append("demo_entry_interval(p.entry_at)")
+    elapsed_filter = filters.entry_elapsed_min_seconds is not None or filters.entry_elapsed_max_seconds is not None
+    if elapsed_filter:
+        lower = timedelta(seconds=filters.entry_elapsed_min_seconds or 0)
+        upper = (timedelta(seconds=filters.entry_elapsed_max_seconds)
+                 if filters.entry_elapsed_max_seconds is not None else None)
+
+        def in_market_interval(entry, start, end):
+            at, begins, ends = map(datetime.fromisoformat, (entry, start, end))
+            elapsed = at - begins
+            return begins <= at < ends and elapsed >= lower and (upper is None or elapsed < upper)
+
+        conn.create_function("demo_entry_elapsed", 3, in_market_interval, deterministic=True)
+        clauses.append("demo_entry_elapsed(p.entry_at,i.starts_at,i.ends_at)")
     if filters.movement_min is not None or filters.movement_max is not None:
         def in_movement(value):
             underlying = json.loads(value).get("underlying")
@@ -84,7 +102,7 @@ def _selection(conn, filters):
         conn.create_function("demo_entry_movement", 1, in_movement, deterministic=True)
         clauses.append("demo_entry_movement(p.entry_provenance_json)")
     source = " FROM demo_v2_positions p"
-    if filters.asset is not None or filters.timeframe is not None:
+    if filters.asset is not None or filters.timeframe is not None or elapsed_filter:
         source += " JOIN demo_v2_instances i ON i.id=p.instance_id"
     return source, (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 

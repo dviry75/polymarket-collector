@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {freshRule,mapRule,rulePayload,validateRule,mapTrade,cohortQuery,jerusalemDayStart,formatDecimal,formatMoney,formatFee,compareDecimal,marketState,healthState} from '../src/model.js';
+import {freshRule,mapRule,rulePayload,validateRule,mapTrade,cohortQuery,entryTimeLimit,jerusalemDayStart,formatDecimal,formatMoney,formatFee,compareDecimal,marketState,healthState} from '../src/model.js';
 
 test('decimal display rounds exactly without losing huge values or raw precision',()=>{
   const raw='9007199254740993.739999999999';
@@ -74,4 +74,19 @@ test('trade serial comes from durable API identity and is never synthesized from
   assert.equal(mapTrade(row).serialNumber,12345);
   assert.equal(mapTrade(row).id,'uuid-kept');
   assert.equal(mapTrade({...row,serial_number:undefined}).serialNumber,null);
+});
+
+
+test('elapsed entry filter follows market duration and is part of the shared trade/KPI cohort',()=>{
+  for(const [tf,limit] of [['5m',300],['15m',900],['1h',3600]]){
+    assert.equal(entryTimeLimit({tf}),limit);
+    assert.equal(entryTimeLimit({market:'ETH '+tf,tf:'1h'}),limit);
+    const query=cohortQuery({tf,entryStart:'60',entryEnd:String(limit)});
+    assert.equal(query.entry_elapsed_min_seconds,'60');
+    assert.equal(query.entry_elapsed_max_seconds,String(limit));
+  }
+  assert.equal(entryTimeLimit({}),3600);
+  assert.equal(cohortQuery({entryStart:'0',entryEnd:''}).entry_elapsed_min_seconds,'0');
+  assert.equal(cohortQuery({entryEnd:''}).entry_elapsed_max_seconds,undefined);
+  assert.equal(cohortQuery({}).entry_elapsed_min_seconds,undefined);
 });

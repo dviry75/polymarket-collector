@@ -4,13 +4,26 @@ Product-level contract; exact schemas may evolve. Frontend is separate.
 
 Principles: authenticated JSON APIs, unambiguous timestamps, decimal-safe money/prices, pagination, documented filters, stable machine-readable errors, health/freshness semantics, no secrets.
 
-Auth: DEMO login using same credential source/values as LIVE where safe; separate DEMO session; logout/current-user.
+Auth: privately provisioned DEMO credentials; no LIVE env/DB lookup. Separate DEMO session; logout/current-user. Optional additional accounts are configured through `DEMO_AUTH_USERS_JSON` (username to encoded password hash), alongside the existing primary account. All accounts share the DEMO workspace and permissions; usernames do not imply roles. Production accepts Argon2id only. Adding an account preserves existing primary sessions; additional sessions are bound to their configured account/hash. Logout retains its documented all-DEMO-sessions revocation semantics.
 
 Rules API: list/get/create/edit-version/enable/disable/duplicate-or-copy/delete-archive. Include id, name, markets, exact trigger, share size, frequency, TP/SL, weekly schedule, internal windows, underlying conditions, status, timestamps, trade count, rule-wallet/accounting.
 
 Trades API: list/filter OPEN+CLOSED by rule, asset, market, timeframe, side, status, date range and underlying movement dimensions. Trade detail should include rule/version snapshot, market instance, side, entry/exit timestamps/prices, gross shares, entry notional, buy fee, net shares, exit reason, sell fee, total fees, net proceeds/P&L, underlying open/entry/exit values, movements and provenance.
 
 KPI API: same filter semantics as trade list. Return wallet/scoped net cash flow, success rate, positive, negative, total trades, total fees. Break-even excluded from success denominator.
+
+Elapsed entry filter: both `GET /demo/api/v1/trades` and `/kpi` accept optional
+integer `entry_elapsed_min_seconds` (0–3599, inclusive) and
+`entry_elapsed_max_seconds` (1–3600, exclusive); start must precede end.
+Compare the timezone-aware `entry_at` against each joined market's actual
+`starts_at`, independently of rule entry windows, date filters and telemetry.
+An omitted start means zero; an omitted end means that market's own `ends_at`.
+When active, this predicate always excludes entries outside `[starts_at, ends_at)`.
+It composes with all existing filters and uses the same bounded read path for
+pages and KPI. The UI accepts minutes:seconds and adapts its limit to 5m/15m/1h;
+with mixed markets, offsets are evaluated separately for each market, with its
+own end. Changing to a shorter timeframe resets an out-of-range start to zero
+and an out-of-range end to that market's end. Reset removes this filter.
 
 Market/live-price API: catalog, active market instance/times, UP/DOWN bid/ask summary, freshness and useful listening state. Frontend must not discover token IDs itself.
 

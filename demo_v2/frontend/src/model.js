@@ -85,10 +85,12 @@ export function jerusalemDayStart(day) {
   while(lo<hi){const mid=Math.floor((lo+hi)/2);if(formatter.format(new Date(mid))<day)lo=mid+1;else hi=mid;}
   return new Date(lo).toISOString();
 }
+/** Maximum elapsed entry time for the selected market family. @param {Record<string,string>} f */
+export function entryTimeLimit(f) {return durations[f.market?.split(' ')[1]||f.tf]??3600;}
 /** @param {Record<string,string>} f @returns {Record<string,string>} */
 export function cohortQuery(f) {
   /** @type {Record<string,string>} */const query={};
-  for(const [ui,api] of Object.entries({rule:'rule_id',asset:'asset',tf:'timeframe',side:'side',status:'status',min:'movement_min',max:'movement_max'}))if(f[ui]!==undefined&&f[ui]!=='')query[api]=f[ui];
+  for(const [ui,api] of Object.entries({rule:'rule_id',asset:'asset',tf:'timeframe',side:'side',status:'status',min:'movement_min',max:'movement_max',entryStart:'entry_elapsed_min_seconds',entryEnd:'entry_elapsed_max_seconds'}))if(f[ui]!==undefined&&f[ui]!=='')query[api]=f[ui];
   if(f.market){const [asset,timeframe]=f.market.split(' ');query.asset=asset;query.timeframe=timeframe;}
   if(f.from)query.from_date=jerusalemDayStart(f.from);
   if(f.to){const next=new Date(f.to+'T12:00:00Z');next.setUTCDate(next.getUTCDate()+1);query.to_date=jerusalemDayStart(next.toISOString().slice(0,10));}
