@@ -83,7 +83,9 @@ def _selection(conn, filters):
                     and (filters.movement_max is None or movement <= filters.movement_max))
         conn.create_function("demo_entry_movement", 1, in_movement, deterministic=True)
         clauses.append("demo_entry_movement(p.entry_provenance_json)")
-    source = " FROM demo_v2_positions p JOIN demo_v2_instances i ON i.id=p.instance_id"
+    source = " FROM demo_v2_positions p"
+    if filters.asset is not None or filters.timeframe is not None:
+        source += " JOIN demo_v2_instances i ON i.id=p.instance_id"
     return source, (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -95,10 +97,11 @@ def trade_page(repository, filters):
         total = conn.execute("SELECT count(*)" + source + where, params).fetchone()[0]
         # Materialize only IDs/time/definition before loading wide position JSON.
         # Otherwise an unindexed sort can hold the entire history's evidence.
-        query = ("WITH page AS MATERIALIZED (SELECT p.id,p.entry_at,i.definition_id" + source + where
+        query = ("WITH page AS MATERIALIZED (SELECT p.id,p.entry_at" + source + where
                  + " ORDER BY p.entry_at DESC,p.id DESC LIMIT ? OFFSET ?) "
-                 "SELECT p.*,CAST(m.value AS INTEGER) AS serial_number,page.definition_id "
+                 "SELECT p.*,CAST(m.value AS INTEGER) AS serial_number,i.definition_id "
                  "FROM page JOIN demo_v2_positions p ON p.id=page.id "
+                 "JOIN demo_v2_instances i ON i.id=p.instance_id "
                  "LEFT JOIN demo_v2_meta m ON m.key='trade_serial:'||p.id "
                  "ORDER BY page.entry_at DESC,page.id DESC")
         items = []
