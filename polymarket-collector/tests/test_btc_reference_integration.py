@@ -75,8 +75,14 @@ class Harness:
 
         self.runtime._submit_entry = fake_submit
 
-    def tick(self, offset_ms: int, price) -> None:
+    def tick(self, offset_ms: int, price, *, price_to_beat=None) -> None:
         self.provider.state.ingest(W * 1000 + offset_ms, Decimal(str(price)))
+        if offset_ms == 0:
+            # The window-start TWAP tick is the market's price to beat; by
+            # default it equals the spot open.
+            self.provider.twap_state.ingest(
+                W * 1000, Decimal(str(price if price_to_beat is None else price_to_beat)),
+            )
 
     def trigger(self, tag: str) -> None:
         update = {
@@ -137,6 +143,33 @@ def test_gate_pass_reserves_and_fills_deal_entry_columns(harness_factory):
     evaluation = h.rows("SELECT * FROM live_btc_gate_evaluations")[0]
     assert evaluation["source"] == "DECISION" and evaluation["allowed"] == 1
     assert evaluation["intent_id"] == deal["entry_intent_id"]
+
+
+def test_gate_measures_against_price_to_beat_not_spot_open(harness_factory):
+    # Trade 860 (btc-updown-5m-1793787900): spot open 78485.25, price to beat
+    # (TWAP open) 78446.49, spot at entry 78458.96. Against the spot open Up
+    # looked $26 behind; against the price to beat it was $12 ahead.
+    h = harness_factory(mode="enforce")
+    h.tick(0, "78485.246527368625", price_to_beat="78446.490507973333352448")
+    h.tick(199_000, "78458.956163457505")
+    h.trigger("price-to-beat")
+    assert len(h.submits) == 1
+    h.flush()
+    deal = h.deal()
+    assert deal["btc_open_price_text"] == "78446.490507973333352448"
+    assert deal["btc_entry_directional_delta_usd"] == "12.465655484171647552"
+    assert deal["btc_gate_reason"] == "BTC_GATE_PASS"
+
+
+def test_missing_price_to_beat_fails_closed(harness_factory):
+    h = harness_factory(mode="enforce")
+    h.provider.state.ingest(W * 1000, OPEN)  # spot open only, no TWAP open
+    h.tick(199_000, OPEN + 25)
+    h.trigger("no-price-to-beat")
+    assert h.submits == []
+    h.flush()
+    row = h.rows("SELECT reason FROM live_btc_gate_evaluations WHERE event_id=?", EVENT)[0]
+    assert row["reason"] == "BTC_OPEN_PRICE_UNKNOWN"
 
 
 def test_enforce_block_skips_without_locking_then_next_trigger_enters(harness_factory):
@@ -330,11 +363,11 @@ def test_exit_fill_records_btc_at_fill_time(harness_factory, purpose, action, ex
 
 def test_resolution_records_window_close(harness_factory):
     h = harness_factory()
-    h.tick(0, OPEN)
+    # Price to beat (TWAP open) is $5 above the spot open.
+    h.tick(0, OPEN, price_to_beat=OPEN + 5)
     h.tick(300_000, OPEN + 100)
     # Spot closes up, but the 60s TWAP (the resolution source) closes below
-    # the spot open: the derived outcome follows the TWAP.
-    h.provider.twap_state.ingest(W * 1000, Decimal(OPEN + 5))
+    # the price to beat: the derived outcome follows TWAP vs TWAP.
     h.provider.twap_state.ingest((W + 300) * 1000, Decimal(OPEN - 1))
     position = _open_position(h)
     h.strategy.mark_position_resolved(position["position_id"], winner=True, redeem_pending=True)
@@ -348,7 +381,8 @@ def test_resolution_records_window_close(harness_factory):
     assert deal["btc_exit_price_text"] == "80100"
     assert deal["btc_exit_ts_ms"] == (W + 300) * 1000
     assert deal["btc_exit_age_ms"] == 0
-    assert deal["btc_exit_directional_delta_usd"] == "100"
+    # Measured against the price to beat (80005), not the spot open.
+    assert deal["btc_exit_directional_delta_usd"] == "95"
     assert deal["btc_exit_twap_text"] == "79999"
     assert deal["btc_exit_dust_residual"] == 0
 

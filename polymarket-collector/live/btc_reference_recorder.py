@@ -178,7 +178,7 @@ class BtcReferenceRecorder:
         provider = self.provider
         current = provider.current() if provider is not None else None
         open_tick = (
-            provider.open_price(window_start)
+            provider.reference_open(window_start)
             if provider is not None and window_start is not None else None
         )
         twap = provider.twap_current() if provider is not None else None
@@ -296,7 +296,7 @@ class BtcReferenceRecorder:
         if watch["crossed_ms"] is not None or self.provider is None:
             return
         current = self.provider.current()
-        open_tick = self.provider.open_price(watch["window_start"])
+        open_tick = self.provider.reference_open(watch["window_start"])
         decision = btc_reference_gate(
             watch["side_outcome"],
             open_tick.price if open_tick else None,
@@ -543,8 +543,11 @@ class BtcReferenceRecorder:
                 "open_twap_text": _text(open_twap.price) if open_twap else None,
                 "close_twap_text": _text(close_twap_price),
                 "close_twap_ts_ms": close_twap.ts_ms if close_twap else None,
-                # Resolution is on the TWAP stream: close TWAP vs the open.
-                "derived_outcome": outcome_from(close_twap_price, open_price),
+                # Resolution is TWAP vs TWAP: close TWAP vs the TWAP open
+                # (the price to beat). open_price_text stays the spot open.
+                "derived_outcome": outcome_from(
+                    close_twap_price, open_twap.price if open_twap else None,
+                ),
                 "derived_outcome_spot": outcome_from(
                     close_tick.price if close_tick else None, open_price,
                 ),
@@ -581,7 +584,7 @@ class BtcReferenceRecorder:
         side_outcome = mapping.get(str(deal.get("outcome") or "").upper())
         open_price = decimal_value(deal.get("btc_open_price_text"))
         if open_price is None and provider is not None and window_start is not None:
-            tick = provider.open_price(window_start)
+            tick = provider.reference_open(window_start)
             open_price = tick.price if tick else None
 
         fills = []

@@ -12,8 +12,11 @@ the window open price is the first tick whose payload timestamp is
 window is the open of the next.
 
 The same connection also carries Chainlink's 60-second TWAP stream (the
-market's resolution source), kept in a separate state. The gate uses spot
-only; the TWAP values are recorded for calibration and outcome derivation.
+market's resolution source), kept in a separate state. Polymarket's
+"price to beat" is the TWAP value at the window start (verified against
+Gamma ``eventMetadata.priceToBeat``), so the gate and the deal snapshots
+measure the spot price against ``reference_open`` (the TWAP open), never
+against the spot open.
 """
 
 from __future__ import annotations
@@ -330,7 +333,8 @@ class BtcReferenceProvider:
         self.state = BtcReferenceState(
             open_tick_max_offset_ms=open_tick_max_offset_ms, clock_ms=self._clock_ms,
         )
-        # Chainlink 60s TWAP (resolution source). Never read by the gate.
+        # Chainlink 60s TWAP (resolution source). Its window-start value is
+        # the market's price to beat (see reference_open).
         self.twap_state = BtcReferenceState(
             open_tick_max_offset_ms=open_tick_max_offset_ms, clock_ms=self._clock_ms,
         )
@@ -366,6 +370,15 @@ class BtcReferenceProvider:
 
     def twap_boundary(self, boundary_epoch_seconds: int) -> BtcTick | None:
         return self.twap_state.boundary_status(boundary_epoch_seconds)[0]
+
+    def reference_open(self, window_start: int) -> BtcTick | None:
+        """The market's price to beat: the TWAP tick at the window start.
+
+        The spot open can differ from it by tens of dollars (median ~$12,
+        p90 ~$44 on live data), enough to flip the side. None when the TWAP
+        boundary tick is missing; callers fail closed.
+        """
+        return self.twap_boundary(window_start)
 
     def health(self) -> dict[str, Any]:
         now = self.now_ms()
