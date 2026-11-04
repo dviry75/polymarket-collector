@@ -57,6 +57,19 @@ def retry_after_seconds(exc: BaseException) -> float | None:
             return None
 
 
+RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
+RATE_LIMIT_BACKOFF_CAP_SECONDS = 60.0
+
+
+def rate_limit_backoff_seconds(streak: int) -> float:
+    """1s, 2s, 4s ... capped, for the Nth consecutive 429 without Retry-After."""
+    exponent = max(0, min(int(streak) - 1, 6))
+    return min(
+        RATE_LIMIT_BACKOFF_CAP_SECONDS,
+        RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** exponent),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RequestSample:
     endpoint: str
@@ -83,6 +96,8 @@ class PriorityRequestObserver:
         self._calls: dict[str, int] = defaultdict(int)
         self._errors: dict[str, int] = defaultdict(int)
         self._rate_limits: dict[str, int] = defaultdict(int)
+        # Consecutive 429s per endpoint family, reset by the next success.
+        self._rate_limit_streak: dict[str, int] = defaultdict(int)
 
     @staticmethod
     def _family(endpoint: str) -> str:
@@ -122,7 +137,18 @@ class PriorityRequestObserver:
                 retry_after = retry_after_seconds(exc)
                 if status == 429 or retry_after is not None:
                     self._rate_limits[endpoint] += 1
-                    delay = retry_after if retry_after is not None else 1.0
+                    self._rate_limit_streak[family] += 1
+                    # Without Retry-After, a flat 1s block let every caller
+                    # (periodic, strategy, targeted) re-hit the throttled
+                    # endpoint at once and keep it throttled. Back off
+                    # exponentially per family until a call succeeds.
+                    delay = (
+                        retry_after
+                        if retry_after is not None
+                        else rate_limit_backoff_seconds(
+                            self._rate_limit_streak[family]
+                        )
+                    )
                     self._blocked_until[family] = max(
                         self._blocked_until.get(family, 0.0),
                         time.monotonic() + min(300.0, max(0.05, delay)),
@@ -139,6 +165,7 @@ class PriorityRequestObserver:
                     success=False,
                 ))
                 raise
+            self._rate_limit_streak[family] = 0
             self._samples.append(RequestSample(
                 endpoint=endpoint,
                 priority=int(priority),
@@ -195,6 +222,11 @@ class PriorityRequestObserver:
                 family: round(max(0.0, deadline - now), 3)
                 for family, deadline in self._blocked_until.items()
                 if deadline > now
+            },
+            "rate_limit_streaks": {
+                family: streak
+                for family, streak in self._rate_limit_streak.items()
+                if streak
             },
             "endpoints": endpoints,
         }
