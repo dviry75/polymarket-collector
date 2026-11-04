@@ -1,0 +1,50 @@
+{
+	admin off
+	persist_config off
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2
+		strict_sni_host on
+		max_header_size 32KB
+		timeouts {
+			read_header 15s
+			read_body 15s
+			idle 60s
+		}
+	}
+}
+
+https://demo-poly.dvirtechnologies.com {
+	# Router reservation must keep this host address stable. Never bind the VM bridge.
+	bind 192.168.33.24
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+	request_body {
+		max_size 32KB
+	}
+	@root path / /demo
+	redir @root /demo/ 308
+	@demo path /demo/*
+	handle @demo {
+		reverse_proxy 172.31.250.2:8080 {
+			# Never trust forwarding headers supplied by an Internet client.
+			header_up CF-Connecting-IP {remote_host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto https
+			header_down -Server
+			header_down X-Demo-Runtime-Target polymarket-demo-vm
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+				max_conns_per_host 64
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

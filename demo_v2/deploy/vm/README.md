@@ -146,6 +146,11 @@ and containment pass before writing COMPLETE.
 
 ## Every future authorized fix/release
 
+For explicitly requested direct public HTTPS, read `PUBLIC_HTTPS.md` in this
+directory. The separate host TCP443 ingress never replaces the VM app deployment
+workflow or changes its containment. Its presence in source is not proof of a
+live certificate, router forwarding or verified public reachability.
+
 For an explicitly requested additional DEMO account, run the committed helper
 inside the guest with its release venv and working directory:
 `python -m demo_v2.deploy.provision_env --output /etc/polymarket-demo-v2/demo.env --add-user <username>`
