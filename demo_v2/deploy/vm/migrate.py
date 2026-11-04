@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 ROOT=Path('/opt/polymarket-demo-v2')
@@ -99,15 +99,42 @@ def record(state):
     elif state['phase']=='ROLLED_BACK':public.unlink(missing_ok=True)
 
 
-def proxy_verify(stage):
+class ProxyPending(RuntimeError):
+    """The old nginx workers still serve requests while reload is in progress."""
+
+
+def proxy_probe(stage,base_url,require_target=True):
+    def target(headers):
+        if require_target and headers.get('X-Demo-Runtime-Target')!='polymarket-demo-vm':
+            raise ProxyPending('Host nginx has not switched to the VM relay')
     for name in ('index.html','src/app.js','src/pipeline.js'):
         expected=stage/'served-check'/name
-        with urlopen('http://127.0.0.1:8080/demo/'+name,timeout=5) as response:
+        with urlopen(base_url+'/demo/'+name,timeout=5) as response:
+            target(response.headers)
             if hashlib.sha256(response.read()).hexdigest()!=digest(expected):raise RuntimeError('Host proxy serves another frontend')
-    try:urlopen('http://127.0.0.1:8080/demo/api/v1/health',timeout=5)
+    try:
+        with urlopen(base_url+'/demo/api/v1/health',timeout=5):pass
     except HTTPError as exc:
-        if exc.code!=401:raise
+        try:
+            if exc.code!=401:raise
+            target(exc.headers)
+        finally:exc.close()
     else:raise RuntimeError('Host proxy bypassed authentication')
+
+
+def proxy_verify(stage,timeout=30):
+    deadline=time.monotonic()+timeout
+    while True:
+        try:proxy_probe(stage,'http://127.0.0.1:8080');return
+        except HTTPError as exc:
+            if exc.code not in (502,503,504):raise
+            error=exc
+        except (ProxyPending,URLError,ConnectionError,TimeoutError) as exc:error=exc
+        # systemctl reload only signals nginx. Wait for the actual new relay and
+        # protected API, never infer routing from identical frontend bytes alone.
+        if time.monotonic()>=deadline:
+            raise RuntimeError('VM relay did not pass routing/frontend/auth checks before timeout') from error
+        time.sleep(.25)
 
 
 def validate_provisioning_resume(previous,manifest):
@@ -341,6 +368,7 @@ def main():
             state['phase']='GUEST_RUNNING';record(state)
             # Stage exact frontend byte checks without starting another application.
             with tarfile.open(stage/'frontend.tar') as archive:archive.extractall(stage/'served-check',filter='data')
+            proxy_probe(stage,'http://172.31.250.2:8080',require_target=False)
             state['phase']='PROXY_CHANGING';record(state)
             shutil.copyfile(stage/'nginx-host-proxy.conf',SITE)
             run('nginx','-t');run('systemctl','reload','nginx.service')
@@ -349,6 +377,10 @@ def main():
             # Guest-root containment probes run again after actual app deployment.
             run('runuser','-u','dvir','--','python3','/usr/local/lib/polymarket-demo-vm/verify_guest.py',
                 '--wait','60','--report',str(PRIVATE/'migration-boundary-result.json'),timeout=120)
+            latest=json.loads(ssh('sudo','-n','python3',remote+'/guest.py','verify',capture=True))
+            if (latest['pid']!=result['pid'] or latest['release']!=sha or latest['env_digest']!=digest(ENV)
+                    or not helper.preserves(before,latest['database'])):
+                raise RuntimeError('Guest runtime or preserved state changed during relay verification')
             if property_value('ActiveState')=='active':raise RuntimeError('Second host writer detected')
             state.update(phase='COMPLETE',guest_pid=result['pid'],records_preserved={k:len(v) for k,v in before['ids'].items()},
                 private_settings_preserved=True,host_app_disabled=True,host_proxy_loopback_only=True)

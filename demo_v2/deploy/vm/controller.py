@@ -80,6 +80,7 @@ server {
     server_name demo-poly.dvirtechnologies.com;
     absolute_redirect off;
     server_tokens off;
+    add_header X-Demo-Runtime-Target "polymarket-demo-vm" always;
     set_real_ip_from 127.0.0.1;
     real_ip_header CF-Connecting-IP;
     client_max_body_size 32k;
@@ -96,6 +97,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
+        proxy_hide_header X-Demo-Runtime-Target;
         proxy_connect_timeout 5s;
         proxy_read_timeout 30s;
         proxy_send_timeout 30s;

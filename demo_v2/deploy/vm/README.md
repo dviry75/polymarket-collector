@@ -120,6 +120,17 @@ state as the actual app user from the release app directory; nginx file access
 is checked as `www-data`. This catches the 2026-11-04 `200/CHDIR` failure that the
 previous root-only check missed.
 
+Relay cutover is verified from actual HTTP responses, not `systemctl reload`
+returning: nginx reload signals its master asynchronously. The new host relay
+adds `X-Demo-Runtime-Target: polymarket-demo-vm` to every response; an identical
+old frontend cannot satisfy the gate. Check the private guest frontend/API from
+the host before switching, then allow at most 30 seconds for the new relay plus
+matching frontend and unauthenticated API 401. Only old-route/connection and
+502/503/504 failures are retried. Unexpected auth success or wrong artifact bytes
+fail immediately; persistent transport errors still trigger state-preserving
+rollback. Repeat guest readiness/PID/release/private-state checks after routing
+and containment pass before writing COMPLETE.
+
 ## Every future authorized fix/release
 
 1. Read `demo_v2/AGENTS.md`; inspect Git/actual guest state. Preserve other chats'
