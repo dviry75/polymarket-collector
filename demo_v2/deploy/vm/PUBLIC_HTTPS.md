@@ -1,5 +1,9 @@
 # Direct HTTPS ingress, explicitly authorized 2026-11-04
 
+Initial activation and trusted TLS/login were verified on 2026-11-04; see
+`../../docs/PUBLIC_HTTPS_VERIFICATION.md` for evidence and external-check limits.
+Repeat actual runtime checks instead of relying on that historical record.
+
 Target: `https://demo-poly.dvirtechnologies.com/demo/`. DNS remains at its existing
 provider; no Cloudflare delegation or DNS API key is needed. This runbook records
 the prepared design, not evidence that router forwarding/certificate issuance or
