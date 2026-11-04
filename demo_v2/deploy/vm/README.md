@@ -27,6 +27,10 @@ snapshot or the development checkout's HEAD. Recheck them before every operation
   reclaim stalls and login timeouts despite healthy unauthenticated GET probes.
   The guest's persistent systemd MemoryHigh property was updated without restart;
   the deployment template matches it. The hard cap/auth settings are unchanged.
+  History/KPI reads also need bounded queries: release `7925d70` fixed full-history
+  materialization that overwhelmed this budget after login. See
+  `docs/UI_READ_VERIFICATION.md` relative to `demo_v2/` for measurements and the
+  pending normal-login browser checks; idle/public health alone is insufficient.
 - Host-enforced nftables: private bridge/TAP only; deny guest initiation toward
   host, private/LAN/link-local/multicast networks, observed home public IPv4,
   spoofed source addresses and IPv6. Deny unsolicited incoming forwarding. Allow
