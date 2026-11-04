@@ -83,6 +83,25 @@ application migration journal or writer/target marker exists. DNS needs AF_NETLI
 for dnsmasq's interface enumeration; it still runs without CAP_NET_ADMIN, with the
 same IP filters and firewall. Connectivity reports distinguish DNS, TCP and TLS.
 
+For an inspected OS-bootstrap failure in phase `PROVISIONING`, prepare a new
+bundle with `prepare-migration --resume-provisioning` and run its printed command.
+It preserves the journal chain, requires the original host writer/release/proxy
+and no cutover guards, and independently verifies a dedicated, empty guest before
+restarting only QEMU with the checksummed unit. Existing guest app code, config,
+DB, a running bootstrap job or any later migration phase blocks this recovery.
+Never delete the journal to force a fresh migration.
+
+The QEMU main-loop disk worker pool is explicitly capped at 16, below the total
+`TasksMax=64` budget; the default worker pool alone can grow to 64. A 2026-11-04
+bootstrap failed with `qemu_thread_create: Resource temporarily unavailable`
+during initramfs generation (no memory-limit OOM), consistent with that conflict.
+CPU/RAM/task limits and all network containment remain unchanged. Guest package
+repair starts with `dpkg --configure --pending`, checks a clean package audit and
+runs as a persistent, time-bounded guest systemd job. The controller verifies its
+exit status and QEMU identity, then requires a changed guest boot ID and repeats
+containment before provisioning code or moving any financial state. SSH loss
+alone is never evidence of a successful update/reboot.
+
 ## Every future authorized fix/release
 
 1. Read `demo_v2/AGENTS.md`; inspect Git/actual guest state. Preserve other chats'
@@ -142,3 +161,4 @@ rather than introducing an unrelated hypervisor or bridging into the home LAN.
 - [libvirt NAT semantics](https://libvirt.org/formatnetwork.html): NAT alone permits
   outbound access to the LAN/host; additional host-enforced rules are intentional.
 - [systemd service sandbox controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
+- [QEMU event-loop worker pool defaults](https://www.qemu.org/docs/master/interop/qemu-storage-daemon-qmp-ref.html#object-EventLoopBaseProperties)

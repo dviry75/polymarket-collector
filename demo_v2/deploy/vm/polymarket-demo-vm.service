@@ -10,7 +10,8 @@ Type=simple
 User=polymarket-demo-vm
 Group=polymarket-demo-vm
 SupplementaryGroups=kvm
-ExecStart=/usr/bin/qemu-system-x86_64 -name polymarket-demo-vm -machine q35,accel=kvm -cpu host -m 1536 -smp 2 -drive file=/var/lib/polymarket-demo-vm/disk.qcow2,if=virtio,format=qcow2 -drive file=/var/lib/polymarket-demo-vm/seed.iso,media=cdrom,format=raw,readonly=on -netdev tap,id=demo,ifname=demo-tap0,script=no,downscript=no,vhost=off -device virtio-net-pci,netdev=demo,mac=52:54:00:de:02:01 -display none -serial file:/var/log/polymarket-demo-vm/serial.log -qmp unix:/run/polymarket-demo-vm/qmp.sock,server=on,wait=off -monitor none
+# Keep disk workers below the total TasksMax budget (QEMU defaults to 64 workers).
+ExecStart=/usr/bin/qemu-system-x86_64 -name polymarket-demo-vm -machine q35,accel=kvm -cpu host -m 1536 -smp 2 -object main-loop,id=demo-main-loop,thread-pool-min=0,thread-pool-max=16 -drive file=/var/lib/polymarket-demo-vm/disk.qcow2,if=virtio,format=qcow2 -drive file=/var/lib/polymarket-demo-vm/seed.iso,media=cdrom,format=raw,readonly=on -netdev tap,id=demo,ifname=demo-tap0,script=no,downscript=no,vhost=off -device virtio-net-pci,netdev=demo,mac=52:54:00:de:02:01 -display none -serial file:/var/log/polymarket-demo-vm/serial.log -qmp unix:/run/polymarket-demo-vm/qmp.sock,server=on,wait=off -monitor none
 ExecStop=/usr/bin/python3 -B /usr/local/lib/polymarket-demo-vm/poweroff.py $MAINPID
 Restart=on-failure
 RestartSec=10

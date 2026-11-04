@@ -109,6 +109,92 @@ def proxy_verify(stage):
     else:raise RuntimeError('Host proxy bypassed authentication')
 
 
+def validate_provisioning_resume(previous,manifest):
+    if previous.get('phase')!='PROVISIONING' or previous.get('previous_sha')!=manifest['previous_sha']:
+        raise RuntimeError('Only matching pre-cutover PROVISIONING may resume; inspect recovery state')
+
+
+def resume_empty_base(stage,manifest):
+    # The caller already checked the active host release/proxy and absence of guards.
+    # Independently verify guest identity/emptiness BEFORE restarting QEMU.
+    if ssh('hostname',capture=True).strip()!='polymarket-demo-vm' or ssh('systemd-detect-virt',capture=True).strip()!='kvm':
+        raise RuntimeError('Recovery target is not the dedicated KVM guest')
+    jobs=json.loads(ssh('systemctl','list-units','--all','--output=json','polymarket-demo-vm-bootstrap-*',capture=True))
+    if any(job['sub'] not in ('dead','failed','exited') for job in jobs):
+        raise RuntimeError('A guest bootstrap job is still running; do not interrupt it')
+    remote=ssh('mktemp','-d','/home/demoadmin/demo-migration-XXXXXX',capture=True).strip()
+    if not re.fullmatch('/home/demoadmin/demo-migration-[A-Za-z0-9]+',remote):raise RuntimeError('Unexpected guest staging path')
+    upload(stage/'guest.py',remote+'/guest.py')
+    ssh('sudo','-n','python3',remote+'/guest.py','empty-check')
+    unit=Path('/etc/systemd/system/polymarket-demo-vm.service')
+    if digest(unit)!=manifest.get('host_vm_unit_sha256'):raise RuntimeError('Installed VM unit changed; review before recovery')
+    shutil.copyfile(unit,stage/'host-vm-unit-before.service')
+    run('systemd-analyze','verify',str(stage/unit.name))
+    run('systemctl','stop',unit.name)
+    if run('systemctl','show',unit.name,'--property=MainPID','--value',capture=True).strip()!='0':
+        raise RuntimeError('VM did not stop; refusing unit replacement')
+    shutil.copyfile(stage/unit.name,unit);unit.chmod(0o644)
+    run('systemctl','daemon-reload');run('systemctl','start',unit.name)
+    run('runuser','-u','dvir','--','python3','/usr/local/lib/polymarket-demo-vm/verify_guest.py',
+        '--wait','180','--report',str(PRIVATE/'resumed-base-boundary-result.json'),timeout=260)
+    ssh('sudo','-n','python3',remote+'/guest.py','empty-check')
+    return remote
+
+
+def wait_bootstrap(unit,timeout=1900):
+    deadline=time.monotonic()+timeout
+    vm_pid=run('systemctl','show','polymarket-demo-vm.service','--property=MainPID','--value',capture=True).strip()
+    disconnects=0;next_message=0
+    while time.monotonic()<deadline:
+        if run('systemctl','show','polymarket-demo-vm.service','--property=MainPID','--value',capture=True).strip()!=vm_pid:
+            raise RuntimeError('QEMU restarted during guest bootstrap; package success is unverified')
+        try:
+            output=ssh('systemctl','show',unit,'-p','LoadState','-p','ActiveState','-p','SubState','-p','Result','-p','ExecMainStatus',capture=True)
+            values=dict(line.split('=',1) for line in output.splitlines() if '=' in line)
+            disconnects=0
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode!=255 or disconnects>=3:raise
+            disconnects+=1;time.sleep(5);continue
+        if values.get('LoadState')!='loaded' or values.get('ActiveState')=='failed':
+            raise RuntimeError('Guest bootstrap job failed or disappeared: '+unit)
+        if values.get('ActiveState')=='active' and values.get('SubState')=='exited':
+            if values.get('Result')!='success' or values.get('ExecMainStatus')!='0':
+                raise RuntimeError('Guest bootstrap did not exit successfully: '+unit)
+            return
+        if time.monotonic()>=next_message:
+            print('Guest OS bootstrap running; host DEMO remains active.',flush=True)
+            next_message=time.monotonic()+30
+        time.sleep(5)
+    raise RuntimeError('Guest bootstrap timed out; inspect its job before resuming: '+unit)
+
+
+def bootstrap_os(remote,state):
+    # Package installation survives SSH/session replacement, but never assume a
+    # disconnect means success: inspect the persistent guest unit's exit status.
+    unit='polymarket-demo-vm-bootstrap-'+remote.rsplit('-',1)[-1]+'.service'
+    state['bootstrap_unit']=unit;record(state)
+    try:
+        ssh('sudo','-n','systemd-run','--no-block','--unit='+unit,'--property=Type=oneshot',
+            '--property=RemainAfterExit=yes','--property=TimeoutStartSec=1800',
+            '/usr/bin/python3',remote+'/guest.py','prepare-os')
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode!=255:raise
+    wait_bootstrap(unit)
+    before=ssh('cat','/proc/sys/kernel/random/boot_id',capture=True).strip()
+    try:ssh('sudo','-n','systemctl','reboot')
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode!=255:raise
+    deadline=time.monotonic()+180
+    while time.monotonic()<deadline:
+        time.sleep(3)
+        try:after=ssh('cat','/proc/sys/kernel/random/boot_id',capture=True).strip()
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode!=255:raise
+            continue
+        if after and after!=before:break
+    else:raise RuntimeError('Updated guest did not complete a verified reboot')
+
+
 def rollback(stage,remote,helper,state):
     # Once the guest may have written, never start the stale host DB. Recover the
     # guest's final committed state first; unreachable guest means leave host off.
@@ -144,20 +230,27 @@ def rollback(stage,remote,helper,state):
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--bundle',type=Path,required=True)
-    parser.add_argument('--manifest-sha256',required=True);args=parser.parse_args()
+    parser.add_argument('--manifest-sha256',required=True)
+    parser.add_argument('--resume-provisioning',action='store_true');args=parser.parse_args()
     if os.geteuid()!=0 or socket.gethostname()!='dvir-technologies':raise SystemExit('Run with sudo on the dedicated development host')
     os.umask(0o077)
     import fcntl
     with Path('/run/lock/polymarket-demo-v2-deploy.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        previous=None
         if STATE.exists():
             previous=json.loads(STATE.read_text())
             if previous.get('phase')=='COMPLETE':
                 print('DEMO migration already complete; use the VM release workflow.');return
-            raise RuntimeError('Existing migration journal requires inspection; do not overwrite state or start a second writer')
+            if not args.resume_provisioning:
+                raise RuntimeError('Existing migration journal requires inspection; do not overwrite state or start a second writer')
+        elif args.resume_provisioning:raise RuntimeError('No provisioning journal exists to resume')
         if GUARD.exists() or Path('/etc/systemd/system/'+UNIT+'.d/00-vm-cutover.conf').exists():
             raise RuntimeError('Existing host writer guard requires inspection')
         stage,manifest=stage_bundle(args.bundle.resolve(),args.manifest_sha256)
+        if previous:
+            validate_provisioning_resume(previous,manifest)
+            shutil.copyfile(STATE,stage/'previous-migration-state.json')
         sha=manifest['release_sha'];previous_sha=manifest['previous_sha']
         if (ROOT/'current').resolve()!=ROOT/'releases'/previous_sha:raise RuntimeError('Installed release changed; rebuild migration bundle')
         import tarfile
@@ -176,11 +269,12 @@ def main():
             raise RuntimeError('Configured SMTP port needs a reviewed firewall exception before migration')
         helper=load_helper(stage/'guest.py')
         # Reuse the verified base network/QEMU preparation. No existing app restart.
-        run('/usr/bin/python3',str(stage/'install_base.py'),timeout=1800)
+        if previous:remote=resume_empty_base(stage,manifest)
+        else:run('/usr/bin/python3',str(stage/'install_base.py'),timeout=1800)
         state={'phase':'PROVISIONING','release_sha':sha,'previous_sha':previous_sha,'host_was_enabled':
             subprocess.run(['systemctl','is-enabled','--quiet',UNIT]).returncode==0,'backup_directory':str(stage)}
         record(state)
-        remote=ssh('mktemp','-d','/home/demoadmin/demo-migration-XXXXXX',capture=True).strip()
+        if not previous:remote=ssh('mktemp','-d','/home/demoadmin/demo-migration-XXXXXX',capture=True).strip()
         if not re.fullmatch('/home/demoadmin/demo-migration-[A-Za-z0-9]+',remote):raise RuntimeError('Unexpected guest staging path')
         state['guest_staging']=remote;record(state)
         app=stage/'guest-bundle';app.mkdir(mode=0o700)
@@ -188,11 +282,7 @@ def main():
             shutil.copyfile(stage/name,app/name)
         shutil.copyfile(stage/'release-manifest.json',app/'manifest.json');shutil.copytree(stage/'wheels',app/'wheels')
         upload(str(app)+'/.',remote+'/')
-        ssh('sudo','-n','python3',remote+'/guest.py','prepare-os')
-        try:ssh('sudo','-n','systemctl','reboot')
-        except subprocess.CalledProcessError as exc:
-            if exc.returncode!=255:raise
-        time.sleep(5)
+        bootstrap_os(remote,state)
         run('runuser','-u','dvir','--','python3','/usr/local/lib/polymarket-demo-vm/verify_guest.py',
             '--wait','180','--report',str(PRIVATE/'updated-guest-boundary-result.json'),timeout=260)
         ssh('sudo','-n','python3',remote+'/guest.py','provision','--bundle',remote,'--sha',sha)

@@ -157,3 +157,68 @@ def test_public_probe_tries_another_address_and_verifies_tls(monkeypatch):
     monkeypatch.setattr(verify_guest.ssl,'create_default_context',lambda:SimpleNamespace(wrap_socket=wrap))
     assert verify_guest.public_probe('fake.test')=={'dns':True,'tcp':True,'tls':True}
     assert attempted==addresses
+
+
+@pytest.mark.parametrize('phase',('CUTOVER_LOCKED','GUEST_STARTING','GUEST_RUNNING','PROXY_CHANGING','PROXY_SWITCHED','COMPLETE','ROLLED_BACK'))
+def test_provisioning_resume_never_reenters_a_cutover_or_rollback(phase):
+    with pytest.raises(RuntimeError,match='pre-cutover'):
+        migrate.validate_provisioning_resume({'phase':phase,'previous_sha':'old'},{'previous_sha':'old'})
+
+
+def test_provisioning_resume_rechecks_host_release():
+    migrate.validate_provisioning_resume({'phase':'PROVISIONING','previous_sha':'old'},{'previous_sha':'old'})
+    with pytest.raises(RuntimeError,match='matching'):
+        migrate.validate_provisioning_resume({'phase':'PROVISIONING','previous_sha':'other'},{'previous_sha':'old'})
+
+
+@pytest.mark.parametrize('path',('database','env','current','releases'))
+def test_bootstrap_recovery_refuses_existing_guest_app_or_private_state(tmp_path,monkeypatch,path):
+    root=tmp_path/'app';root.mkdir()
+    db=tmp_path/'data.sqlite3';env=tmp_path/'demo.env'
+    for name,value in (('ROOT',root),('DB',db),('ENV',env)):monkeypatch.setattr(guest,name,value)
+    target={'database':db,'env':env,'current':root/'current','releases':root/'releases'}[path]
+    target.write_text('fake')
+    calls=[];monkeypatch.setattr(guest,'run',lambda *args,**kwargs:calls.append(args))
+    with pytest.raises(RuntimeError,match='empty guest'):guest.prepare_os()
+    assert not calls
+
+
+def test_bootstrap_finishes_interrupted_package_configuration_before_installing(tmp_path,monkeypatch):
+    for name,value in (('ROOT',tmp_path/'app'),('DB',tmp_path/'data.sqlite3'),('ENV',tmp_path/'demo.env')):
+        monkeypatch.setattr(guest,name,value)
+    monkeypatch.setattr(guest.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=3))
+    calls=[]
+    monkeypatch.setattr(guest,'run',lambda *args,**kwargs:calls.append(args) or '')
+    guest.prepare_os()
+    assert calls[0]==('dpkg','--configure','--pending')
+    assert calls[-1]==('dpkg','--audit')
+    assert any('python3-venv' in call and 'nginx' in call for call in calls)
+
+
+@pytest.mark.parametrize('result,exit_status',(('exit-code','1'),('success','1'),('timeout','0')))
+def test_bootstrap_requires_persistent_job_success_not_just_reachable_ssh(monkeypatch,result,exit_status):
+    monkeypatch.setattr(migrate,'run',lambda *args,**kwargs:'100\n')
+    monkeypatch.setattr(migrate,'ssh',lambda *args,**kwargs:
+        f'LoadState=loaded\nActiveState=active\nSubState=exited\nResult={result}\nExecMainStatus={exit_status}\n')
+    with pytest.raises(RuntimeError,match='exit successfully'):migrate.wait_bootstrap('fake-bootstrap.service')
+
+
+def test_bootstrap_rejects_qemu_restart_instead_of_accepting_a_new_guest(monkeypatch):
+    pids=iter(('100\n','200\n'))
+    monkeypatch.setattr(migrate,'run',lambda *args,**kwargs:next(pids))
+    calls=[];monkeypatch.setattr(migrate,'ssh',lambda *args,**kwargs:calls.append(args))
+    with pytest.raises(RuntimeError,match='QEMU restarted'):migrate.wait_bootstrap('fake-bootstrap.service')
+    assert not calls
+
+
+def test_bootstrap_can_recover_ssh_disconnect_but_still_waits_for_job_exit(monkeypatch):
+    monkeypatch.setattr(migrate,'run',lambda *args,**kwargs:'100\n')
+    monkeypatch.setattr(migrate.time,'sleep',lambda _:None)
+    responses=iter((migrate.subprocess.CalledProcessError(255,'fake ssh'),
+        'LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n'))
+    def ssh(*args,**kwargs):
+        result=next(responses)
+        if isinstance(result,Exception):raise result
+        return result
+    monkeypatch.setattr(migrate,'ssh',ssh)
+    migrate.wait_bootstrap('fake-bootstrap.service')

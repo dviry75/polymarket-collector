@@ -157,19 +157,33 @@ def import_state(bundle):
     print('Guest private state imported without displaying values.')
 
 
+def require_empty_guest():
+    if any(path.exists() or path.is_symlink() for path in (DB,ENV,ROOT/'current',ROOT/'releases')):
+        raise RuntimeError('Bootstrap recovery requires an empty guest; existing app/config/state must not be overwritten')
+    if subprocess.run(['systemctl','is-active','--quiet',UNIT]).returncode==0:
+        raise RuntimeError('Guest application is active; refusing bootstrap recovery')
+
+
+def prepare_os():
+    require_empty_guest()
+    # Finish a package transaction interrupted by a guest/hypervisor crash first.
+    run('dpkg','--configure','--pending')
+    run('apt-get','update')
+    run('apt-get','-o','DPkg::Lock::Timeout=300','upgrade','--with-new-pkgs','-y')
+    run('apt-get','-o','DPkg::Lock::Timeout=300','install','--no-install-recommends','-y',
+        'python3-venv','nginx','ca-certificates','libatomic1')
+    if run('dpkg','--audit',capture=True).strip():raise RuntimeError('Guest package configuration is incomplete')
+
+
 def main():
     if os.geteuid()!=0 or socket.gethostname()!='polymarket-demo-vm':raise SystemExit('Dedicated guest root only')
     if run('systemd-detect-virt',capture=True).strip()!='kvm':raise SystemExit('Expected KVM guest')
     parser=argparse.ArgumentParser()
-    parser.add_argument('operation',choices=('prepare-os','provision','import-state','verify','export-state','stop','start'))
+    parser.add_argument('operation',choices=('prepare-os','empty-check','provision','import-state','verify','export-state','stop','start'))
     parser.add_argument('--bundle',type=Path);parser.add_argument('--sha');args=parser.parse_args()
     os.umask(0o077)
-    if args.operation=='prepare-os':
-        if DB.exists():raise RuntimeError('OS bootstrap is only for the empty new guest')
-        run('apt-get','update')
-        run('apt-get','-o','DPkg::Lock::Timeout=300','upgrade','--with-new-pkgs','-y')
-        run('apt-get','-o','DPkg::Lock::Timeout=300','install','--no-install-recommends','-y',
-            'python3-venv','nginx','ca-certificates','libatomic1')
+    if args.operation=='prepare-os':prepare_os()
+    elif args.operation=='empty-check':require_empty_guest();print('EMPTY_GUEST_CONFIRMED')
     elif args.operation=='provision':provision(args.bundle.resolve(),args.sha)
     elif args.operation=='import-state':import_state(args.bundle.resolve())
     elif args.operation=='verify':print(json.dumps(verify()))  # Controller captures; never echo private fingerprints.

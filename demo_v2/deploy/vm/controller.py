@@ -105,11 +105,15 @@ server {
 }
 ''')
     commit=run('git','rev-parse','HEAD',capture=True,cwd=REPO).strip()
-    checksum=write_manifest(output,{'version':1,'purpose':'DEMO_VM_MIGRATION_V1','release_sha':sha,
-        'previous_sha':previous,'tool_commit':commit,'host_nginx_sha256':digest(site)})
+    fields={'version':1,'purpose':'DEMO_VM_MIGRATION_V1','release_sha':sha,
+        'previous_sha':previous,'tool_commit':commit,'host_nginx_sha256':digest(site)}
+    if args.resume_provisioning:
+        fields['host_vm_unit_sha256']=digest(Path('/etc/systemd/system/polymarket-demo-vm.service'))
+    checksum=write_manifest(output,fields)
     script=output/'migrate-demo.sh'
-    script.write_text('#!/usr/bin/env bash\nset -euo pipefail\n'+shlex.join([
-        '/usr/bin/python3',str(output/'migrate.py'),'--bundle',str(output),'--manifest-sha256',checksum])+'\n')
+    command=['/usr/bin/python3',str(output/'migrate.py'),'--bundle',str(output),'--manifest-sha256',checksum]
+    if args.resume_provisioning:command.append('--resume-provisioning')
+    script.write_text('#!/usr/bin/env bash\nset -euo pipefail\n'+shlex.join(command)+'\n')
     script.chmod(0o755)
     print('Migration bundle: '+str(output))
     print('Manifest SHA256: '+checksum)
@@ -165,6 +169,7 @@ def main():
     migrate=commands.add_parser('prepare-migration')
     migrate.add_argument('--release-bundle',type=Path,required=True);migrate.add_argument('--image-dir',type=Path,required=True)
     migrate.add_argument('--output',type=Path,required=True)
+    migrate.add_argument('--resume-provisioning',action='store_true',help='Reviewed recovery of PROVISIONING with an empty guest only')
     deploy=commands.add_parser('deploy');deploy.add_argument('--sha',default='HEAD')
     deploy.add_argument('--output',type=Path,required=True);deploy.add_argument('--node',type=Path)
     deploy.add_argument('--wheels',type=Path)
