@@ -57,6 +57,14 @@ totals/page rows share a short WAL read snapshot. Movement filters use exact Dec
 comparisons and date filters retain timezone-aware inclusive/exclusive boundaries.
 Read endpoints never allocate serials or mutate financial/session state.
 
+Runtime recovery reads only unexpired market instances and expired instances
+with open positions. Discovery still owns current/future identity. After demand
+updates, expired metadata is evicted only when no current/held/subscribed market
+or reference worker needs it; associated volatile research/gate caches follow
+that lifecycle. Historical instances/evidence remain in SQLite for API detail
+and research. This avoids duplicating the full historical catalog in every
+running service or carrying expired metadata across rollovers.
+
 ## Financial and recovery boundaries
 
 Every observation is evaluated. A non-action tick changes volatile rearm state,

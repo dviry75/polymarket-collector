@@ -231,6 +231,37 @@ class DemoRuntime:
         for instance in demand:
             ready=all(data.token_ready(token) for token in (instance.up_token_id,instance.down_token_id))
             self.record("market:"+instance.instance_id,ready,"" if ready else "BOOKS_STALE_OR_MISSING",critical=False)
+        self.prune_runtime_instances(now)
+
+    def prune_runtime_instances(self, now):
+        """Bound volatile market metadata, never delete durable research history.
+
+        Keep held/subscribed markets and reference workers until their existing
+        lifecycle has retired them. This also protects an in-flight reference
+        lookup while discovery advances the current market.
+        """
+        data = self.providers.market_data
+        retained = (set(self.current.values())
+                    | {p["instance_id"] for p in self.projection["positions"]}
+                    | {i.instance_id for i in getattr(data, "token_map", {}).values()}
+                    | set(self.reference_tasks))
+        expired = {key for key, instance in self.instances.items()
+                   if key not in retained and instance.ends_at <= now}
+        for key in expired:
+            self.instances.pop(key)
+            self.metadata.pop(key, None)
+            self.references.pop(key, None)
+            self.reference_diagnostics.pop(key, None)
+            self.health.forget("market:" + key)
+            self.health.forget("underlying:" + key)
+        for mapping in (self._gate_epochs, self._gate_health, self.stability.since):
+            for key in tuple(mapping):
+                if key[1] in expired:
+                    mapping.pop(key)
+        underlying = self.providers.underlying
+        retain = getattr(underlying, "retain_instances", None)
+        if retain is not None:
+            retain(set(self.instances))
 
     async def database_once(self):
         try:
@@ -396,7 +427,7 @@ class DemoRuntime:
         self._projection_at=time.monotonic()
         self.database_ok=True
         self.record("database",self.database_ok)
-        for row in await asyncio.to_thread(self.repository.instances):
+        for row in await asyncio.to_thread(self.repository.runtime_instances, self.clock()):
             self.instances[row["id"]]=instance_model(row)
             self.metadata[row["id"]]=json.loads(row["metadata_json"])
         if self.config.public_data_enabled:

@@ -86,6 +86,9 @@ class BinanceResearchProvider:
         self._locks,self._latest_fetched={},{}
         self._http_seconds={}
 
+    def retain_instances(self, instance_ids):
+        self.baselines = {key: value for key, value in self.baselines.items() if key in instance_ids}
+
     async def context(self, instance, metadata):
         mapping = source_mapping(instance, metadata)
         if mapping is None:

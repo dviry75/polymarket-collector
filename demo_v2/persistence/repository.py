@@ -93,6 +93,14 @@ class DemoRepository:
         with self.database.connect() as conn:
             return [dict(row) for row in conn.execute("SELECT * FROM demo_v2_instances ORDER BY starts_at,id")]
 
+    def runtime_instances(self, at: datetime) -> list[dict]:
+        """Recover current/future and held markets, leaving history on disk."""
+        with self.database.connect() as conn:
+            return [dict(row) for row in conn.execute("""SELECT i.* FROM demo_v2_instances i
+                WHERE i.ends_at>? OR i.id IN (
+                    SELECT instance_id FROM demo_v2_positions WHERE status='OPEN')
+                ORDER BY i.starts_at,i.id""", (utc(at),))]
+
     def instance(self, instance_id: str) -> dict:
         with self.database.connect() as conn:
             row = conn.execute("SELECT * FROM demo_v2_instances WHERE id=?", (instance_id,)).fetchone()
