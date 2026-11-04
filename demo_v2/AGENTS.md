@@ -70,6 +70,9 @@ and the root-owned `/etc/polymarket-demo-vm/migration-state.json` phase. `COMPLE
 plus actual service/network checks establish cutover. Until then the existing host
 DEMO service remains authoritative. Never start both writers or mask a failed check.
 
+Initial cutover was verified on 2026-11-04 (see `docs/VM_MIGRATION_VERIFICATION.md`).
+That record is historical; it never replaces current marker/service/guest checks.
+
 After cutover, use `deploy/vm/controller.py deploy` from the development checkout:
 commit/test/push the intended source, export that exact commit, build frontend,
 upload source/frontend/pinned wheels using pinned SSH, then invoke the existing

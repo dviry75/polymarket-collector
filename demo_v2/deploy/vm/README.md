@@ -1,9 +1,11 @@
 # DEMO: develop on host, run in isolated KVM
 
-Status: **prepared; actual installation/migration must be verified**, not inferred
-from this document. The installed source before migration is release
-`14c96ac7c6ef40e74e58492a6f2a207d9b69e445`. Future runtime truth is the actual
-guest plus root-owned host migration journal, not this historical SHA.
+Status: **initial migration verified on 2026-11-04**. Guest release at cutover:
+`7647781c7eb66fd90f5191f77958bf5b9041060f`. The host writer was disabled/stopped,
+the root-owned target marker became COMPLETE, and live relay/guest checks passed.
+See `docs/VM_MIGRATION_VERIFICATION.md` relative to `demo_v2/`. Future runtime truth
+is the actual guest plus root-owned migration journal/marker, not this historical
+snapshot or the development checkout's HEAD. Recheck them before every operation.
 
 ## Boundaries
 
@@ -181,7 +183,8 @@ comparison fingerprints and is intended only for captured migration verification
 Preparation: 16 packet tests plus 3 network-initializer checks in disposable
 network namespaces. Temp/fake migration tests cover state/settings/serial
 preservation, manifest validation and refusing stale-host recovery when SSH fails.
-Actual VM boot, live containment and migration checks remain required.
+Initial VM boot, live containment and migration checks passed on 2026-11-04;
+repeat the actual checks for future operations rather than relying on old evidence.
 
 This adapts the already-prepared `work/demo-vm-stage3` network/QEMU implementation
 rather than introducing an unrelated hypervisor or bridging into the home LAN.
