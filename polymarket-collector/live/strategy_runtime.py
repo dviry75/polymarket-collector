@@ -17,6 +17,7 @@ from .btc_reference_feed import BtcReferenceProvider
 from .btc_reference_recorder import BtcReferenceRecorder
 from .config import LiveConfig
 from .entry_liquidity import EntryLiquidityCollector
+from .entry_schedule import SCHEDULE_TIMEZONE, in_strict_btc_window, local_time
 from .exit_forensics import ExitEvidenceCollector
 from .exit_supervision import ExitSupervisionTracker
 from .order_book import canonical_decimal, decimal_value
@@ -301,25 +302,42 @@ class LiveStrategyRuntime:
 
     @staticmethod
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
-        instant = at or datetime.now(timezone.utc)
-        local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
-        unrestricted_dates = {
-            "2026-08-21",
-            "2026-09-04",
-            "2026-09-07",
-        }
-        unrestricted_date = local.date().isoformat() in unrestricted_dates
-        inactive = (
-            local.weekday() < 5
-            and 14 <= local.hour < 23
-            and not unrestricted_date
-        )
+        """Entries are open around the clock.
+
+        Inside the weekday 14:00-23:00 Asia/Jerusalem window (which used to
+        close entries) they need the stricter BTC gate minimum instead; see
+        ``_entry_schedule`` for the fail-closed rule when the gate is not
+        enforcing.
+        """
+        local = local_time(at)
+        strict = in_strict_btc_window(local)
         return {
-            "allowed": not inactive,
-            "reason": "ENTRY_SCHEDULE_INACTIVE" if inactive else "ENTRY_SCHEDULE_ACTIVE",
-            "timezone": "Asia/Jerusalem",
+            "allowed": True,
+            "reason": "ENTRY_SCHEDULE_BTC_STRICT" if strict else "ENTRY_SCHEDULE_ACTIVE",
+            "btc_strict_window": strict,
+            "timezone": SCHEDULE_TIMEZONE,
             "local_time": local.isoformat(),
         }
+
+    def _entry_schedule(self) -> dict[str, Any]:
+        """Schedule verdict for the live entry path.
+
+        The window is only open because the BTC gate filters it at the
+        stricter minimum. Without an enforcing gate nothing would filter, so
+        the window stays closed exactly as before.
+        """
+        schedule = self.entry_schedule_status()
+        if not schedule.get("btc_strict_window"):
+            return schedule
+        btc = self._btc
+        if btc is None or btc.mode != "enforce":
+            return {
+                **schedule,
+                "allowed": False,
+                "reason": "ENTRY_SCHEDULE_INACTIVE",
+                "inactive_cause": "BTC_GATE_NOT_ENFORCED",
+            }
+        return schedule
 
     def set_market_freshness_provider(
         self, provider: Callable[[str], dict[str, Any]]
@@ -378,6 +396,8 @@ class LiveStrategyRuntime:
             and not ram_state.get("canary_armed")
         ):
             flags.append("CANARY_NOT_ARMED")
+        if schedule.get("allowed") and schedule.get("btc_strict_window"):
+            flags = [*(flags or ["ACTIVE"]), "BTC_STRICT_WINDOW"]
         return "|".join([self.config.execution_mode, *(flags or ["ACTIVE"])])
 
     def _market(self, condition_id: str) -> dict[str, Any] | None:
@@ -1707,7 +1727,7 @@ class LiveStrategyRuntime:
                     self._entry_trigger_log_state.pop(key, None)
             if not triggers:
                 continue
-            schedule = self.entry_schedule_status()
+            schedule = self._entry_schedule()
             ram_state = self._entry_state_from_ram(event_id)
 
             paused = (
@@ -1792,7 +1812,10 @@ class LiveStrategyRuntime:
                 side = "YES" if token_id == yes_token else "NO" if token_id == no_token else None
                 if side is None:
                     continue
-                evaluation = btc.evaluate(market=market, side=side, token_id=token_id)
+                evaluation = btc.evaluate(
+                    market=market, side=side, token_id=token_id,
+                    strict_window=bool(schedule.get("btc_strict_window")),
+                )
                 btc.note_evaluation(
                     evaluation, source="SHADOW", trading_state=trading_state,
                     remaining_seconds=remaining,
@@ -1992,7 +2015,7 @@ class LiveStrategyRuntime:
             else False
         )
 
-        schedule = self.entry_schedule_status()
+        schedule = self._entry_schedule()
         ram_state = self._entry_state_from_ram(event_id)
 
         decision = choose_entry(
@@ -2156,6 +2179,7 @@ class LiveStrategyRuntime:
             try:
                 btc_evaluation = btc.evaluate(
                     market=market, side=decision.side, token_id=decision.token_id,
+                    strict_window=bool(schedule.get("btc_strict_window")),
                 )
                 btc.note_evaluation(
                     btc_evaluation, source="DECISION",
@@ -2938,7 +2962,7 @@ class LiveStrategyRuntime:
                 }, "strategy")
             self._note_entry_liquidity("note_abort", intent_id, reason=reason)
             return
-        schedule = self.entry_schedule_status()
+        schedule = self._entry_schedule()
         if not schedule["allowed"]:
             reason = str(schedule["reason"])
             self.repo.update_intent(
@@ -5769,7 +5793,7 @@ class LiveStrategyRuntime:
             ),
             "hot_state_refresh_failures": self.hot_state_refresh_failures,
             "last_error": self.last_error,
-            "entry_schedule": self.entry_schedule_status(),
+            "entry_schedule": self._entry_schedule(),
             "btc_reference": self._btc.health() if self._btc is not None else None,
             **self.repo.strategy_status(),
         }

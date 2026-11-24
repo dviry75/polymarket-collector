@@ -551,3 +551,114 @@ def test_deal_entry_bookkeeping_error_still_submits(harness_factory):
     h.runtime._btc.note_deal_entry = boom
     h.trigger("bookkeeping-error")
     assert len(h.submits) == 1
+
+
+# ---------------------------------------------------------------------------
+# Weekday 14:00-23:00 Asia/Jerusalem: entries open with a $30 BTC minimum
+# (live/entry_schedule.py) instead of the window closing entries.
+
+def _strict_schedule(h):
+    h.runtime.entry_schedule_status = lambda at=None: {
+        "allowed": True, "reason": "ENTRY_SCHEDULE_BTC_STRICT",
+        "btc_strict_window": True,
+        "timezone": "Asia/Jerusalem", "local_time": "test",
+    }
+
+
+def test_strict_window_requires_30_then_enters(harness_factory):
+    h = harness_factory(mode="enforce")
+    _strict_schedule(h)
+    h.tick(0, OPEN)
+    h.tick(199_000, OPEN + 29)  # passes the $10 gate, not the $30 one
+    h.trigger("strict-below")
+    assert h.submits == []
+    skipped = h.rows(
+        "SELECT reason_code FROM live_audit_timeline WHERE source='btc_reference_gate'"
+    )
+    assert skipped == [{"reason_code": "BTC_DELTA_BELOW_MIN"}]
+    h.tick(199_500, OPEN + 30)
+    h.trigger("strict-pass")
+    assert len(h.submits) == 1
+    h.flush()
+    rows = h.rows(
+        "SELECT reason, trading_state FROM live_btc_gate_evaluations WHERE source='DECISION'"
+    )
+    assert {row["reason"] for row in rows} == {"BTC_DELTA_BELOW_MIN", "BTC_GATE_PASS"}
+    assert all(row["trading_state"].endswith("|BTC_STRICT_WINDOW") for row in rows)
+
+
+def test_strict_window_down_side_needs_30_down(harness_factory):
+    h = harness_factory(mode="enforce", labels=("Down", "Up"))
+    _strict_schedule(h)
+    h.tick(0, OPEN)
+    h.tick(199_000, OPEN - 20)  # enough outside the window, not inside it
+    h.trigger("strict-down-below")
+    assert h.submits == []
+    h.tick(199_500, OPEN - 31)
+    h.trigger("strict-down-pass")
+    assert len(h.submits) == 1
+
+
+def test_outside_window_keeps_10_minimum(harness_factory):
+    h = harness_factory(mode="enforce")
+    h.tick(0, OPEN)
+    h.tick(199_000, OPEN + 10)
+    h.trigger("normal-10")
+    assert len(h.submits) == 1
+
+
+@pytest.mark.parametrize("mode", ["observe", "off"])
+def test_strict_window_stays_closed_without_enforcing_gate(harness_factory, mode):
+    h = harness_factory(mode=mode)
+    _strict_schedule(h)
+    h.tick(0, OPEN)
+    h.tick(199_000, OPEN + 100)
+    h.trigger("not-enforced")
+    assert h.submits == []
+    schedule = h.runtime._entry_schedule()
+    assert schedule["allowed"] is False
+    assert schedule["reason"] == "ENTRY_SCHEDULE_INACTIVE"
+    assert schedule["inactive_cause"] == "BTC_GATE_NOT_ENFORCED"
+
+
+def test_evaluate_derives_window_from_gate_clock(harness_factory):
+    h = harness_factory(mode="enforce")
+    market = h.base.latest_market("condition")
+    btc = h.runtime._btc
+    # Mon 2026-11-23 15:00 Asia/Jerusalem (13:00 UTC): inside the window.
+    h.clock[0] = int(datetime(2026, 11, 23, 13, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    inside = btc.evaluate(market=market, side="YES", token_id="yes")
+    assert inside["strict_window"] is True and inside["min_delta_usd"] == Decimal("30")
+    # Sun 2026-11-22 15:00 Asia/Jerusalem: Sunday is outside the window.
+    h.clock[0] = int(datetime(2026, 11, 22, 13, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    outside = btc.evaluate(market=market, side="YES", token_id="yes")
+    assert outside["strict_window"] is False and outside["min_delta_usd"] == Decimal("10")
+    # The entry path's own schedule verdict wins over the clock.
+    forced = btc.evaluate(market=market, side="YES", token_id="yes", strict_window=True)
+    assert forced["min_delta_usd"] == Decimal("30")
+    assert btc.health()["window_min_delta_usd"] == "30"
+
+
+def test_window_min_delta_config_validation():
+    ok = LiveConfig(btc_gate_min_delta_usd=Decimal("10"),
+                    btc_gate_window_min_delta_usd=Decimal("30"))
+    assert not [e for e in ok.validation_errors() if "WINDOW_MIN" in e]
+    looser = LiveConfig(btc_gate_min_delta_usd=Decimal("10"),
+                        btc_gate_window_min_delta_usd=Decimal("5"))
+    assert any("LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD" in e for e in looser.validation_errors())
+    capped = LiveConfig(btc_gate_min_delta_usd=Decimal("10"),
+                        btc_gate_window_min_delta_usd=Decimal("30"),
+                        btc_gate_max_delta_usd=Decimal("20"))
+    assert any("LIVE_BTC_GATE_MAX_DELTA_USD" in e for e in capped.validation_errors())
+    assert LiveConfig().btc_gate_window_min_delta_usd == Decimal("30")
+
+
+def test_strict_window_days_match_previous_blackout():
+    from zoneinfo import ZoneInfo
+    from live.entry_schedule import in_strict_btc_window
+    il = ZoneInfo("Asia/Jerusalem")
+    # Week of 2026-11-22: Sun 22 ... Sat 28.
+    assert not in_strict_btc_window(datetime(2026, 11, 22, 16, 0, tzinfo=il))  # Sun
+    for day in (23, 24, 25, 26, 27):  # Mon-Fri
+        assert in_strict_btc_window(datetime(2026, 11, day, 16, 0, tzinfo=il))
+    assert not in_strict_btc_window(datetime(2026, 11, 28, 16, 0, tzinfo=il))  # Sat
