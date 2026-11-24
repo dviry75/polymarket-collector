@@ -776,6 +776,33 @@ class DashboardReadModel:
         )
         return {str(row.get("event_id")): {"btc": _deal_btc_fields(row)} for row in rows}
 
+    def _market_outcome_enrichment(
+        self, condition_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Winning outcome label ("Up"/"Down") of each resolved deal market.
+
+        Source: live_markets.winning_outcome, set when the market resolves.
+        Unresolved markets get no entry (the UI shows "—").
+        """
+        ids = [c for c in dict.fromkeys(condition_ids) if c]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._all(
+            f"""
+            SELECT condition_id, winning_outcome
+            FROM live_markets
+            WHERE condition_id IN ({placeholders})
+              AND market_resolved=1
+              AND COALESCE(winning_outcome,'')<>''
+            """,
+            tuple(ids),
+        )
+        return {
+            str(row.get("condition_id")): {"market_outcome": str(row.get("winning_outcome"))}
+            for row in rows
+        }
+
     def _external_floor(self) -> str:
         override = os.environ.get("EXTERNAL_FILLS_SINCE")
         if override:
@@ -846,6 +873,7 @@ class DashboardReadModel:
         enrichment = self._exit_audit_enrichment(condition_ids)
         entry_enrichment = self._entry_liquidity_enrichment(condition_ids)
         btc_enrichment = self._btc_enrichment([row.get("event_slug") for row in rows])
+        outcome_enrichment = self._market_outcome_enrichment(condition_ids)
         items = []
         for row in rows:
             buy_size = float(row.get("buy_size") or 0.0)
@@ -874,7 +902,9 @@ class DashboardReadModel:
                 "state": state,
                 "quality": "REAL" if fee_gaps == 0 else "PARTIAL",
                 "verified": True,
+                "market_outcome": None,
             }
+            item.update(outcome_enrichment.get(row.get("condition_id"), {}))
             item.update(enrichment.get(row.get("condition_id"), {}))
             item.update(entry_enrichment.get(row.get("condition_id"), {}))
             item.update(btc_enrichment.get(row.get("event_slug"), {}))

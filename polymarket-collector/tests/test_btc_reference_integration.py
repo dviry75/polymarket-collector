@@ -521,6 +521,42 @@ def test_dashboard_external_deal_table_carries_deal_btc_fields():
         assert "btc" not in items["btc-updown-5m-other"]  # no local deal for that event
 
 
+def test_dashboard_external_deal_table_carries_market_outcome():
+    import sqlite3
+    from live.dashboard_read_model import DashboardReadModel, resolve_window
+    from scripts.migrate_external_fills import DDL
+    from test_dashboard_v1 import NOW, build_db, seed_verified_lifecycle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        cases = (("won", "Up", 1, "Up"), ("lost", "Up", 1, "Down"), ("open", "Down", 0, None))
+        for name, _bought, resolved, winner in cases:
+            repo.upsert_market({
+                "event_id": f"event-{name}", "condition_id": f"condition-{name}",
+                "yes_token_id": f"y-{name}", "no_token_id": f"n-{name}",
+                "market_resolved": bool(resolved), "winning_outcome": winner,
+            })
+        with sqlite3.connect(repo.db_path) as conn:
+            conn.executescript(DDL)
+            for name, bought, _resolved, _winner in cases:
+                conn.execute(
+                    "INSERT INTO external_fills(trade_id,condition_id,event_slug,side,outcome,price,"
+                    "size,notional_usd,fee_usd,matched_at,raw_json,ingested_at)"
+                    " VALUES(?,?,?,'BUY',?,0.74,10,7.4,0,'2026-08-12T10:00:03+00:00','{}',"
+                    "'2026-08-12T10:00:04+00:00')",
+                    (f"t-{name}", f"condition-{name}", f"slug-{name}", bought),
+                )
+        model = DashboardReadModel(LiveRepository(repo.db_path, query_only=True))
+        items = {
+            item["event_slug"]: item
+            for item in model.external_deal_history(resolve_window("today", now=NOW))["items"]
+        }
+        assert items["slug-won"]["market_outcome"] == "Up"
+        assert items["slug-lost"]["market_outcome"] == "Down"
+        assert items["slug-open"]["market_outcome"] is None  # not resolved yet
+
+
 def test_gate_error_blocks_in_enforce_only(harness_factory):
     def boom(**_kwargs):
         raise RuntimeError("evaluation bug")
