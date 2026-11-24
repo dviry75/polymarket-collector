@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from .notification_prefs import HOURLY_REPORT, recipients_for
 from .strategy_runtime import LiveStrategyRuntime
 
 
@@ -147,17 +148,23 @@ class EmailService:
             smtp.ehlo()
             smtp.send_message(message)
 
-    def send(self, subject: str, text: str, html_body: str, message_id: str) -> None:
+    def send(self, subject: str, text: str, html_body: str, message_id: str, *, kind: str | None = None) -> bool:
+        """Send to the configured recipients; with ``kind``, only to those the
+        dashboard preferences leave on. Returns False when none are left."""
         if not self.settings.sender or not self.settings.recipients:
             raise RuntimeError("SMTP_FROM and HOURLY_REPORT_RECIPIENTS are required")
+        recipients = recipients_for(kind, self.settings.recipients) if kind else self.settings.recipients
+        if not recipients:
+            return False
         msg = EmailMessage()
         msg["From"] = self.settings.sender
-        msg["To"] = ", ".join(self.settings.recipients)
+        msg["To"] = ", ".join(recipients)
         msg["Subject"] = subject
         msg["Message-ID"] = message_id
         msg.set_content(text)
         msg.add_alternative(html_body, subtype="html")
         self.transport(msg)
+        return True
 
     def send_test(self) -> None:
         self.send("Polymarket Application SMTP Test", "Application SMTP path is operational.",
@@ -277,7 +284,7 @@ class ReportingService:
                 report = dict(existing)
             else:
                 report = self._insert_hour(conn, rows, start, end, coverage, now, delayed)
-            if send and report["email_status"] != "SENT" and int(report["email_attempts"]) < 3:
+            if send and report["email_status"] not in ("SENT", "SKIPPED") and int(report["email_attempts"]) < 3:
                 report = self._send_hour(conn, report, rows, delayed)
             return report
 
@@ -323,13 +330,17 @@ class ReportingService:
         conn.execute("UPDATE live_hourly_reports SET email_status='SENDING',email_attempts=?,updated_at=? WHERE id=?",(attempts,_iso(datetime.now(UTC)),report["id"]))
         try:
             subject,text,body=self._render(report,rows,delayed)
-            self.email.send(subject,text,body,report["message_id"])
+            delivered=self.email.send(subject,text,body,report["message_id"],kind=HOURLY_REPORT)
         except Exception as exc:
             LOG.exception("hourly reporting email failed; trading is unaffected")
             status="AMBIGUOUS" if isinstance(exc,(smtplib.SMTPServerDisconnected,TimeoutError)) else "FAILED"
             conn.execute("UPDATE live_hourly_reports SET email_status=?,email_last_error=?,updated_at=? WHERE id=?",(status,f"{type(exc).__name__}: {exc}"[:500],_iso(datetime.now(UTC)),report["id"]))
         else:
             sent=_iso(datetime.now(UTC))
+            if not delivered:
+                # Every recipient switched this type off in the dashboard.
+                conn.execute("UPDATE live_hourly_reports SET email_status='SKIPPED',email_last_error=NULL,updated_at=? WHERE id=?",(sent,report["id"]))
+                return dict(conn.execute("SELECT * FROM live_hourly_reports WHERE id=?",(report["id"],)).fetchone())
             conn.execute("UPDATE live_hourly_reports SET email_status='SENT',email_sent_at=?,email_last_error=NULL,updated_at=? WHERE id=?",(sent,sent,report["id"]))
         return dict(conn.execute("SELECT * FROM live_hourly_reports WHERE id=?",(report["id"],)).fetchone())
 

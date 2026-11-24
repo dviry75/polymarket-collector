@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
@@ -12,8 +13,11 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters.base import TradingAdapter
+from .btc_reference_feed import BtcReferenceProvider
+from .btc_reference_recorder import BtcReferenceRecorder
 from .config import LiveConfig
 from .entry_liquidity import EntryLiquidityCollector
+from .entry_schedule import SCHEDULE_TIMEZONE, in_strict_btc_window, local_time
 from .exit_forensics import ExitEvidenceCollector
 from .exit_supervision import ExitSupervisionTracker
 from .order_book import canonical_decimal, decimal_value
@@ -23,10 +27,23 @@ from .strategy import (
     StrategyPolicy,
     choose_entry,
     exact_trigger,
+    in_entry_final_minute,
+    remaining_seconds,
     simulate_buy_fak,
     simulate_sell_fak,
 )
 from .strategy_repository import StrategyRepository, stable_id
+from .stop_forensics import StopForensicRecord, StopForensicWriter
+from .stop_obligations import StopObligation
+
+EXIT_SUPERVISION_POSITION_STATES = frozenset({
+    "OPEN",
+    "TP_OPEN",
+    "EXITING",
+    "EXIT_RECONCILIATION_REQUIRED",
+    "QUARANTINED",
+})
+
 
 
 EVENT_WINDOW_PATTERN = re.compile(r"-(\d+)m-(\d+)$")
@@ -64,6 +81,9 @@ class LiveStrategyRuntime:
     # to the SQLite fallback instead of raising AttributeError on the hot path.
     _market_provider: Callable[[str], dict[str, Any] | None] | None = None
     _exit_book_provider: Callable[[str], dict[str, Any] | None] | None = None
+    _btc: BtcReferenceRecorder | None = None
+    _btc_feed_task: asyncio.Task[Any] | None = None
+    _btc_writer_task: asyncio.Task[Any] | None = None
 
     def __init__(
         self,
@@ -73,12 +93,19 @@ class LiveStrategyRuntime:
         adapter: TradingAdapter,
         *,
         reconciliation: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+        targeted_reconciliation: (
+            Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None,
     ):
         self.config = config
         self.base = base_repo
         self.repo = strategy_repo
         self.adapter = adapter
         self.reconciliation = reconciliation
+        self.targeted_reconciliation = targeted_reconciliation
+        self._targeted_reconciliation_tasks: set[asyncio.Task[Any]] = set()
+        self.targeted_reconciliation_scheduled = 0
+        self.targeted_reconciliation_fallbacks = 0
         self.policy = StrategyPolicy(
             entry_price=config.strategy_entry_price,
             entry_max_price=config.strategy_entry_max_price,
@@ -91,6 +118,9 @@ class LiveStrategyRuntime:
             max_exposure=config.max_total_exposure_usd,
             max_shares=config.max_trade_tokens,
             entry_window_seconds=config.strategy_entry_window_seconds,
+            entry_cutoff_seconds_before_close=(
+                config.strategy_entry_cutoff_seconds_before_close
+            ),
         )
         self.policy.validate()
         self._event_locks: dict[str, asyncio.Lock] = {}
@@ -129,6 +159,16 @@ class LiveStrategyRuntime:
             logger=logging.getLogger(f"{__name__}.exit_evidence"),
         )
         self._exit_evidence_task: asyncio.Task[Any] | None = None
+        forensic_path = (
+            config.stop_forensic_db_path
+            or f"{config.live_db_path}.stop-forensics.sqlite3"
+        )
+        self._stop_forensics = StopForensicWriter(
+            forensic_path,
+            queue_capacity=config.stop_forensic_queue_capacity,
+            batch_size=config.stop_forensic_batch_size,
+        )
+        self._stop_forensic_episode_ids: dict[str, str] = {}
         # Entry-liquidity instrumentation: write-only telemetry, drained off the
         # hot path. Every note_* call is a synchronous dict update + deque
         # append; nothing here touches the DB or the BUY submission.
@@ -143,6 +183,16 @@ class LiveStrategyRuntime:
         self._entry_liquidity_enabled = bool(
             config.entry_liquidity_capture_enabled
         )
+        # BTC reference gate: in-memory evaluation on the entry path, persisted
+        # by a separate writer task. The provider is attached by the trader
+        # process (set_btc_reference_provider); without one the gate reads
+        # BTC_FEED_UNAVAILABLE and fails closed in enforce mode.
+        self._btc = BtcReferenceRecorder(
+            config, strategy_repo, base_repo,
+            logger=logging.getLogger(f"{__name__}.btc_reference"),
+        )
+        self._btc_feed_task = None
+        self._btc_writer_task = None
         # P0-C/D: positions already published into hot state, and those still
         # awaiting their first current-state exit evaluation.
         self._known_position_ids: set[str] = set()
@@ -192,6 +242,32 @@ class LiveStrategyRuntime:
         ] = {}
 
         self._stop = asyncio.Event()
+        self._stop_obligation_event = asyncio.Event()
+        self._stop_obligations: OrderedDict[str, StopObligation] = OrderedDict()
+        self._stop_obligation_task: asyncio.Task[Any] | None = None
+        self._stop_latch_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="stop-obligation-latch",
+        )
+        self._stop_owned_positions: set[str] = set()
+        self._stop_generation_watermarks: dict[str, tuple[int, int]] = {}
+        self.stop_obligations_queued = 0
+        self.stop_obligations_coalesced = 0
+        self.stop_obligations_rejected = 0
+        self.stop_obligations_latched = 0
+        self.stop_obligation_failures = 0
+        self.stop_obligation_generation_retries = 0
+        self.stop_obligation_stale_generation_rejections = 0
+        self.stop_obligation_max_depth = 0
+        self.stop_obligation_worst_latch_ms = 0.0
+        self._entry_frame_event = asyncio.Event()
+        self._entry_frames: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._entry_task: asyncio.Task[Any] | None = None
+        self.entry_frames_queued = 0
+        self.entry_frames_coalesced = 0
+        self.entry_frames_processed = 0
+        self.entry_queue_max_depth = 0
+        self.entry_phase_samples: deque[dict[str, float]] = deque(maxlen=256)
         self.frames_processed = 0
         self.last_error = ""
         self._market_freshness: Callable[[str], dict[str, Any]] | None = None
@@ -226,25 +302,42 @@ class LiveStrategyRuntime:
 
     @staticmethod
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
-        instant = at or datetime.now(timezone.utc)
-        local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
-        unrestricted_dates = {
-            "2026-08-21",
-            "2026-09-04",
-            "2026-09-07",
-        }
-        unrestricted_date = local.date().isoformat() in unrestricted_dates
-        inactive = (
-            local.weekday() < 5
-            and 14 <= local.hour < 23
-            and not unrestricted_date
-        )
+        """Entries are open around the clock.
+
+        Inside the weekday 14:00-23:00 Asia/Jerusalem window (which used to
+        close entries) they need the stricter BTC gate minimum instead; see
+        ``_entry_schedule`` for the fail-closed rule when the gate is not
+        enforcing.
+        """
+        local = local_time(at)
+        strict = in_strict_btc_window(local)
         return {
-            "allowed": not inactive,
-            "reason": "ENTRY_SCHEDULE_INACTIVE" if inactive else "ENTRY_SCHEDULE_ACTIVE",
-            "timezone": "Asia/Jerusalem",
+            "allowed": True,
+            "reason": "ENTRY_SCHEDULE_BTC_STRICT" if strict else "ENTRY_SCHEDULE_ACTIVE",
+            "btc_strict_window": strict,
+            "timezone": SCHEDULE_TIMEZONE,
             "local_time": local.isoformat(),
         }
+
+    def _entry_schedule(self) -> dict[str, Any]:
+        """Schedule verdict for the live entry path.
+
+        The window is only open because the BTC gate filters it at the
+        stricter minimum. Without an enforcing gate nothing would filter, so
+        the window stays closed exactly as before.
+        """
+        schedule = self.entry_schedule_status()
+        if not schedule.get("btc_strict_window"):
+            return schedule
+        btc = self._btc
+        if btc is None or btc.mode != "enforce":
+            return {
+                **schedule,
+                "allowed": False,
+                "reason": "ENTRY_SCHEDULE_INACTIVE",
+                "inactive_cause": "BTC_GATE_NOT_ENFORCED",
+            }
+        return schedule
 
     def set_market_freshness_provider(
         self, provider: Callable[[str], dict[str, Any]]
@@ -262,6 +355,50 @@ class LiveStrategyRuntime:
         self._exit_book_provider = provider
         self._exit_evidence.set_book_provider(provider)
         self._entry_liquidity.set_book_provider(provider)
+
+    def set_btc_reference_provider(self, provider: BtcReferenceProvider) -> None:
+        if self._btc is not None:
+            self._btc.provider = provider
+
+    async def start_btc_reference(self) -> None:
+        """Start the BTC feed and its writer. Trader process only (network)."""
+        btc = self._btc
+        if btc is None:
+            return
+        if btc.provider is not None and (
+            self._btc_feed_task is None or self._btc_feed_task.done()
+        ):
+            self._btc_feed_task = asyncio.create_task(
+                btc.provider.run(self._stop), name="btc-reference-feed"
+            )
+        if self._btc_writer_task is None or self._btc_writer_task.done():
+            self._btc_writer_task = asyncio.create_task(
+                btc.run(self._stop), name="btc-reference-writer"
+            )
+
+    def _btc_trading_state(
+        self, schedule: dict[str, Any], ram_state: dict[str, Any]
+    ) -> str:
+        flags = []
+        if not self.enabled():
+            flags.append("DISABLED")
+        if ram_state.get("kill_switch"):
+            flags.append("KILL_SWITCH")
+        if ram_state.get("pause_entries"):
+            flags.append("PAUSED")
+        if ram_state.get("stale"):
+            flags.append("STATE_STALE")
+        if not schedule.get("allowed"):
+            flags.append("SCHEDULE_INACTIVE")
+        if (
+            self.config.execution_mode == "REAL_TRADING"
+            and not self.config.continuous_trading_enabled
+            and not ram_state.get("canary_armed")
+        ):
+            flags.append("CANARY_NOT_ARMED")
+        if schedule.get("allowed") and schedule.get("btc_strict_window"):
+            flags = [*(flags or ["ACTIVE"]), "BTC_STRICT_WINDOW"]
+        return "|".join([self.config.execution_mode, *(flags or ["ACTIVE"])])
 
     def _market(self, condition_id: str) -> dict[str, Any] | None:
         """Use the in-memory market cache on the hot path.
@@ -409,7 +546,7 @@ class LiveStrategyRuntime:
                     or Decimal("0")
                 ) > 0
                 and str(position.get("state") or "").upper()
-                not in {"CLOSED", "RESOLVED_LOSER", "REDEEMED"}
+                in EXIT_SUPERVISION_POSITION_STATES
             )
 
         current_ids = {
@@ -671,6 +808,366 @@ class LiveStrategyRuntime:
             intent_id,
             frame.get("message_hash") or item.get("message_hash") or "",
         )
+
+    def _capture_stop_forensic(
+        self,
+        stage: str,
+        position: dict[str, Any],
+        update: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Bounded best-effort capture; it must never affect the SELL path."""
+        if not getattr(
+            getattr(self, "config", None),
+            "stop_forensic_capture_enabled",
+            False,
+        ):
+            return
+        writer = getattr(self, "_stop_forensics", None)
+        if writer is None:
+            return
+        try:
+            position_id = str(position.get("position_id") or "")
+            trigger_id = str(update.get("_critical_trigger_id") or "")
+            episode_id = trigger_id and f"{trigger_id}:{position_id}"
+            if not episode_id:
+                episode_id = self._stop_forensic_episode_ids.get(position_id, "")
+            if not episode_id:
+                episode_id = stable_id(
+                    "stop-episode",
+                    ":".join((
+                        position_id,
+                        str(position.get("updated_at") or ""),
+                        str(update.get("exchange_timestamp_ms") or ""),
+                    )),
+                )
+            self._stop_forensic_episode_ids[position_id] = episode_id
+            timing = kwargs.pop("timing", None)
+            if not isinstance(timing, dict):
+                timing = update.get("_stop_forensic_timing")
+            record = StopForensicRecord.capture(
+                stage=stage,
+                episode_id=episode_id,
+                position=position,
+                update=update,
+                timing=timing if isinstance(timing, dict) else None,
+                stop_queue_depth=writer.queue_depth(),
+                ladder_buffer_multiple=(
+                    self.config.stop_forensic_ladder_buffer_multiple
+                ),
+                max_ladder_levels=self.config.stop_forensic_max_ladder_levels,
+                **kwargs,
+            )
+            writer.publish(record)
+        except Exception:
+            return
+
+    def _enqueue_stop_obligation(
+        self,
+        position: dict[str, Any],
+        update: dict[str, Any],
+        readiness: dict[str, Any],
+        *,
+        frame_hash: str,
+    ) -> bool:
+        """Publish one per-position STOP obligation without awaiting anything."""
+        mailbox = getattr(self, "_stop_obligations", None)
+        wakeup = getattr(self, "_stop_obligation_event", None)
+        if mailbox is None or wakeup is None:
+            return False
+        obligation = StopObligation.create(
+            position=position,
+            update=update,
+            readiness=readiness,
+            frame_hash=frame_hash,
+            stop_price=self.policy.stop_price,
+        )
+        if obligation is None:
+            self.stop_obligations_rejected += 1
+            return False
+        position_id = obligation.position_id
+        existing = mailbox.get(position_id)
+        if existing is not None:
+            existing_version = (existing.generation, existing.update_number)
+            incoming_version = (obligation.generation, obligation.update_number)
+            if incoming_version < existing_version:
+                self.stop_obligations_rejected += 1
+                return False
+            mailbox[position_id] = obligation
+            self.stop_obligations_coalesced += 1
+        else:
+            mailbox[position_id] = obligation
+        self._stop_owned_positions.add(position_id)
+        self.stop_obligations_queued += 1
+        self.stop_obligation_max_depth = max(
+            self.stop_obligation_max_depth, len(mailbox)
+        )
+        self._capture_stop_forensic(
+            "STOP_OBLIGATION_PUBLISHED", position, update,
+            frame_hash=frame_hash, event_ready=True,
+            integrity_status=obligation.readiness_reason,
+            critical_queue_depth=len(self._critical_frames),
+        )
+        wakeup.set()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        task = getattr(self, "_stop_obligation_task", None)
+        if task is None or task.done():
+            self._stop_obligation_task = loop.create_task(
+                self._stop_obligation_worker(),
+                name="strategy-stop-obligation",
+            )
+        return True
+
+    def _latch_stop_obligation_sync(
+        self, obligation: StopObligation
+    ) -> dict[str, Any]:
+        latched = self.repo.latch_stop_exit(
+            obligation.position_id,
+            busy_timeout_seconds=0.25,
+        )
+        if latched.get("_newly_latched"):
+            self.repo.timeline(
+                severity="WARNING",
+                category="EXIT",
+                component="stop_obligation",
+                source="deterministic_book",
+                event_id=obligation.event_id,
+                condition_id=obligation.condition_id,
+                token_id=obligation.token_id,
+                side="SELL",
+                deal_id=stable_id("deal", obligation.event_id),
+                requested_action="LATCH_MARKET_EXIT",
+                reason_code="STOP_066_MAILBOX_LATCHED",
+                result_status="LATCHED",
+                remaining_shares_text=latched.get("remaining_shares_text"),
+                parameters_json={
+                    "trigger_bid": obligation.best_bid,
+                    "generation": obligation.generation,
+                    "update_number": obligation.update_number,
+                    "frame_hash": obligation.frame_hash,
+                },
+            )
+        return latched
+
+    async def _process_stop_obligation(
+        self, obligation: StopObligation
+    ) -> None:
+        version = (obligation.generation, obligation.update_number)
+        watermark = self._stop_generation_watermarks.get(obligation.token_id)
+        if watermark is not None and version < watermark:
+            self.stop_obligations_rejected += 1
+            self._stop_owned_positions.discard(obligation.position_id)
+            return
+        if self._exit_book_provider is not None:
+            current_book = self._current_top_of_book(obligation.token_id)
+            if current_book is None:
+                self.stop_obligation_generation_retries += 1
+                current = self._stop_obligations.get(obligation.position_id)
+                if current is None or (
+                    current.generation, current.update_number
+                ) < version:
+                    self._stop_obligations[obligation.position_id] = obligation
+                self._stop_obligation_event.set()
+                await asyncio.sleep(0.05)
+                return
+            current_generation = int(current_book.get("generation") or 0)
+            if current_generation > obligation.generation:
+                self.stop_obligation_stale_generation_rejections += 1
+                self.stop_obligations_rejected += 1
+                self._stop_owned_positions.discard(obligation.position_id)
+                return
+            if current_generation < obligation.generation:
+                self.stop_obligation_generation_retries += 1
+                self._stop_obligations[obligation.position_id] = obligation
+                self._stop_obligation_event.set()
+                await asyncio.sleep(0.05)
+                return
+        position = self._position_by_id_from_ram(obligation.position_id)
+        if position is None:
+            self.stop_obligations_rejected += 1
+            self._stop_owned_positions.discard(obligation.position_id)
+            return
+        if (
+            str(position.get("event_id") or "") != obligation.event_id
+            or str(position.get("condition_id") or "") != obligation.condition_id
+            or str(position.get("token_id") or "") != obligation.token_id
+        ):
+            self.stop_obligations_rejected += 1
+            self._stop_owned_positions.discard(obligation.position_id)
+            return
+        self._capture_stop_forensic(
+            "STOP_CONSUMER_STARTED", position, obligation.as_update(),
+            frame_hash=obligation.frame_hash, event_ready=True,
+            integrity_status=obligation.readiness_reason,
+            critical_queue_depth=len(self._critical_frames),
+        )
+        started = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        try:
+            latched = await loop.run_in_executor(
+                self._stop_latch_executor,
+                self._latch_stop_obligation_sync,
+                obligation,
+            )
+        except Exception as exc:
+            self.stop_obligation_failures += 1
+            self.last_error = (
+                f"STOP_OBLIGATION:{type(exc).__name__}:{exc}"
+            )[:500]
+            current = self._stop_obligations.get(obligation.position_id)
+            if current is None or (
+                current.generation,
+                current.update_number,
+            ) < version:
+                self._stop_obligations[obligation.position_id] = obligation
+            self._stop_obligation_event.set()
+            await asyncio.sleep(0.05)
+            return
+        self.stop_obligation_worst_latch_ms = max(
+            self.stop_obligation_worst_latch_ms,
+            (time.perf_counter() - started) * 1000,
+        )
+        self._stop_generation_watermarks[obligation.token_id] = version
+        self.stop_obligations_latched += 1
+        update = obligation.as_update()
+        self._capture_stop_forensic(
+            "STOP_LATCHED",
+            latched,
+            update,
+            frame_hash=obligation.frame_hash,
+            event_ready=True,
+            integrity_status=obligation.readiness_reason,
+            reconciliation_readiness=str(
+                self._hot_state.get("reconciliation_readiness", "NOT_READY")
+            ),
+            critical_queue_depth=len(self._critical_frames),
+            min_price=self.policy.stop_min_price,
+        )
+        await self._refresh_hot_state_once()
+        self._stop_owned_positions.discard(obligation.position_id)
+        self._exit_tracker.mark_stop_latched(obligation.position_id)
+        self._exit_wakeup.set()
+
+    async def _stop_obligation_worker(self) -> None:
+        while not self._stop.is_set():
+            if not self._stop_obligations:
+                self._stop_obligation_event.clear()
+                try:
+                    await self._stop_obligation_event.wait()
+                except asyncio.CancelledError:
+                    break
+            while self._stop_obligations and not self._stop.is_set():
+                _position_id, obligation = self._stop_obligations.popitem(
+                    last=False
+                )
+                await self._process_stop_obligation(obligation)
+
+    def _enqueue_entry_frame(self, context: dict[str, Any]) -> bool:
+        mailbox = getattr(self, "_entry_frames", None)
+        wakeup = getattr(self, "_entry_frame_event", None)
+        if mailbox is None or wakeup is None:
+            return False
+        key = str(context.get("_critical_trigger_id") or "")
+        if not key:
+            return False
+        if key in mailbox:
+            mailbox[key] = context
+            self.entry_frames_coalesced += 1
+        else:
+            mailbox[key] = context
+        self.entry_frames_queued += 1
+        self.entry_queue_max_depth = max(
+            self.entry_queue_max_depth, len(mailbox)
+        )
+        wakeup.set()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        task = getattr(self, "_entry_task", None)
+        if task is None or task.done():
+            self._entry_task = loop.create_task(
+                self._entry_worker(), name="strategy-entry-worker"
+            )
+        return True
+
+    async def _entry_worker(self) -> None:
+        while not self._stop.is_set() or self._entry_frames:
+            if not self._entry_frames:
+                self._entry_frame_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._entry_frame_event.wait(), 0.25
+                    )
+                except asyncio.TimeoutError:
+                    continue
+            if not self._entry_frames:
+                continue
+            _key, context = self._entry_frames.popitem(last=False)
+            timing = context.setdefault("_entry_phase_timing", {})
+            timing["dequeued_monotonic"] = time.perf_counter()
+            enqueued = timing.get("enqueued_monotonic")
+            if enqueued is not None:
+                timing["queue_wait_ms"] = (
+                    timing["dequeued_monotonic"] - enqueued
+                ) * 1000
+            context["_entry_only"] = True
+            context["_skip_entry_evaluation"] = False
+            await self.process_atomic_frame(context)
+            timing["finished_monotonic"] = time.perf_counter()
+            self.entry_frames_processed += 1
+            def elapsed_ms(start: str, end: str) -> float | None:
+                left = timing.get(start)
+                right = timing.get(end)
+                if not isinstance(left, (int, float)) or not isinstance(
+                    right, (int, float)
+                ):
+                    return None
+                return round((right - left) * 1000, 3)
+
+            sample = {
+                "queue_wait_ms": round(
+                    float(timing.get("queue_wait_ms") or 0), 3
+                ),
+                "decision_ms": elapsed_ms(
+                    "decision_started_monotonic",
+                    "decision_finished_monotonic",
+                ),
+                "intent_reserve_ms": elapsed_ms(
+                    "intent_reserve_started_monotonic",
+                    "intent_reserved_monotonic",
+                ),
+                "initial_revalidation_ms": elapsed_ms(
+                    "initial_revalidation_started_monotonic",
+                    "initial_revalidation_finished_monotonic",
+                ),
+                "final_revalidation_ms": elapsed_ms(
+                    "final_guard_started_monotonic",
+                    "final_revalidation_finished_monotonic",
+                ),
+                "submit_ms": elapsed_ms(
+                    "submit_started_monotonic",
+                    "submit_returned_monotonic",
+                ),
+                "total_ms": elapsed_ms(
+                    "enqueued_monotonic", "finished_monotonic"
+                ),
+            }
+            self.entry_phase_samples.append({
+                key: value for key, value in sample.items() if value is not None
+            })
+            self._logger.info(
+                "ENTRY_PHASE_TIMING trigger=%s queue_wait_ms=%.3f total_ms=%.3f",
+                context.get("_critical_trigger_id") or "",
+                float(timing.get("queue_wait_ms") or 0),
+                (
+                    timing["finished_monotonic"]
+                    - float(timing.get("enqueued_monotonic") or timing["finished_monotonic"])
+                ) * 1000,
+            )
 
     def schedule_frame(self, context: dict[str, Any]) -> None:
         if not hasattr(self, "_critical_observed_price_state"):
@@ -950,6 +1447,42 @@ class LiveStrategyRuntime:
                             )),
                         )
                     )
+                    if stop_now and item.get("_critical_stop_latched"):
+                        item["_stop_forensic_timing"] = dict(
+                            context.get("_latency_timing") or {}
+                        )
+                        item["_stop_forensic_event_ready"] = bool(
+                            readiness.get("ready")
+                        )
+                        item["_stop_forensic_integrity_status"] = str(
+                            readiness.get("reason") or "READY"
+                        )
+                        for position in (
+                            self._positions_from_ram(asset_id)
+                            if getattr(self, "_hot_state", None)
+                            else ()
+                        ):
+                            self._capture_stop_forensic(
+                                "STOP_FIRST_SEEN",
+                                position,
+                                item,
+                                timing=context.get("_latency_timing"),
+                                frame_hash=str(context.get("message_hash") or ""),
+                                event_ready=readiness.get("ready"),
+                                integrity_status=readiness.get("reason"),
+                                reconciliation_readiness=str(
+                                    self._hot_state.get(
+                                        "reconciliation_readiness", "NOT_READY"
+                                    )
+                                ),
+                                critical_queue_depth=len(self._critical_frames),
+                            )
+                            self._enqueue_stop_obligation(
+                                position,
+                                item,
+                                readiness,
+                                frame_hash=str(context.get("message_hash") or ""),
+                            )
                     self._trace_critical(
                         "TRIGGER_DETECTED", update=item, context=context
                     )
@@ -1030,6 +1563,21 @@ class LiveStrategyRuntime:
                         condition_id: readiness
                     },
                 }
+                critical["_skip_entry_evaluation"] = True
+                if (
+                    "ENTRY_074" in critical_trigger_types
+                    and bool(readiness.get("ready"))
+                ):
+                    entry_context = {
+                        **critical,
+                        "_entry_only": True,
+                        "_skip_entry_evaluation": False,
+                        "_entry_phase_timing": {
+                            "detected_monotonic": time.perf_counter(),
+                            "enqueued_monotonic": time.perf_counter(),
+                        },
+                    }
+                    self._enqueue_entry_frame(entry_context)
 
                 # A volatile book fires the same critical edge (same market,
                 # same trigger type) many times per second. The STOP obligation
@@ -1086,6 +1634,7 @@ class LiveStrategyRuntime:
 
             isolated = {
                 **context,
+                "_skip_entry_evaluation": True,
                 "updates": updates,
                 "event_readiness": {
                     condition_id: readiness
@@ -1149,6 +1698,12 @@ class LiveStrategyRuntime:
 
     def _observe_entry_trigger(self, context: dict[str, Any]) -> None:
         """Log the 0.74 decision path, including while execution is READ_ONLY."""
+        btc = self._btc
+        if btc is not None and btc.has_watches:
+            try:
+                btc.observe_asks(context.get("updates") or [])
+            except Exception as exc:
+                self.last_error = f"BTC_RECHECK_WATCH:{type(exc).__name__}: {exc}"[:500]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for update in context.get("updates") or []:
             if isinstance(update, dict) and update.get("condition_id"):
@@ -1172,7 +1727,7 @@ class LiveStrategyRuntime:
                     self._entry_trigger_log_state.pop(key, None)
             if not triggers:
                 continue
-            schedule = self.entry_schedule_status()
+            schedule = self._entry_schedule()
             ram_state = self._entry_state_from_ram(event_id)
 
             paused = (
@@ -1215,6 +1770,58 @@ class LiveStrategyRuntime:
                     event_id, outcome, reason, update.get("outcome"),
                     readiness.get("reason") or "NOT_READY",
                 )
+            self._note_btc_shadow(
+                market=market, event_id=event_id, triggers=triggers,
+                schedule=schedule, ram_state=ram_state,
+            )
+
+    def _note_btc_shadow(
+        self,
+        *,
+        market: dict[str, Any],
+        event_id: str,
+        triggers: list[dict[str, Any]],
+        schedule: dict[str, Any],
+        ram_state: dict[str, Any],
+    ) -> None:
+        """Calibration-only gate evaluation of in-window 0.74 triggers.
+
+        Runs whatever the trading state is (pause, kill switch, schedule) and
+        never feeds back into any decision. Memory-only work.
+        """
+        btc = self._btc
+        if btc is None or btc.mode == "off":
+            return
+        try:
+            remaining = remaining_seconds(event_id, datetime.now(timezone.utc))
+            if remaining is None or not (
+                0 < remaining <= self.policy.entry_window_seconds
+            ):
+                return
+            # Entries are closed in the final minute; the gate is still
+            # evaluated there for calibration, tagged as such.
+            trading_state = (
+                "FINAL_MINUTE"
+                if remaining <= self.policy.entry_cutoff_seconds_before_close
+                else self._btc_trading_state(schedule, ram_state)
+            )
+            yes_token = str(market.get("yes_token_id") or "")
+            no_token = str(market.get("no_token_id") or "")
+            for update in triggers:
+                token_id = str(update.get("asset_id") or "")
+                side = "YES" if token_id == yes_token else "NO" if token_id == no_token else None
+                if side is None:
+                    continue
+                evaluation = btc.evaluate(
+                    market=market, side=side, token_id=token_id,
+                    strict_window=bool(schedule.get("btc_strict_window")),
+                )
+                btc.note_evaluation(
+                    evaluation, source="SHADOW", trading_state=trading_state,
+                    remaining_seconds=remaining,
+                )
+        except Exception as exc:
+            self.last_error = f"BTC_SHADOW:{type(exc).__name__}: {exc}"[:500]
 
     async def _frame_worker(self) -> None:
         while (
@@ -1268,6 +1875,9 @@ class LiveStrategyRuntime:
 
     async def process_atomic_frame(self, context: dict[str, Any]) -> None:
         self.frames_processed += 1
+        entry_only = bool(context.get("_entry_only"))
+        evaluate_entry = not bool(context.get("_skip_entry_evaluation"))
+        entry_timing = context.get("_entry_phase_timing")
         updates = [item for item in context.get("updates") or [] if isinstance(item, dict)]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for update in updates:
@@ -1279,6 +1889,32 @@ class LiveStrategyRuntime:
             if not market:
                 continue
             event_id = str(market.get("event_id") or "")
+            if entry_only:
+                try:
+                    await self._process_event(
+                        market=market,
+                        updates=condition_updates,
+                        event_ready=bool(
+                            (context.get("event_readiness") or {})
+                            .get(condition_id, {}).get("ready")
+                        ),
+                        readiness_reason=str(
+                            (context.get("event_readiness") or {})
+                            .get(condition_id, {}).get("reason") or "NOT_READY"
+                        ),
+                        received_at=str(context.get("received_at") or now_iso()),
+                        frame_hash=str(context.get("message_hash") or ""),
+                        manage_positions=False,
+                        evaluate_entry=True,
+                        entry_timing=(
+                            entry_timing if isinstance(entry_timing, dict) else None
+                        ),
+                    )
+                except Exception as exc:
+                    self.last_error = (
+                        f"ENTRY_WORKER:{type(exc).__name__}: {exc}"
+                    )[:500]
+                continue
             lock = self._event_locks.setdefault(event_id, asyncio.Lock())
             async with lock:
                 try:
@@ -1294,6 +1930,8 @@ class LiveStrategyRuntime:
                         ),
                         received_at=str(context.get("received_at") or now_iso()),
                         frame_hash=str(context.get("message_hash") or ""),
+                        manage_positions=True,
+                        evaluate_entry=evaluate_entry,
                     )
                 except Exception as exc:
                     self.last_error = f"{type(exc).__name__}: {exc}"[:500]
@@ -1322,12 +1960,17 @@ class LiveStrategyRuntime:
         readiness_reason: str,
         received_at: str,
         frame_hash: str,
+        manage_positions: bool = True,
+        evaluate_entry: bool = True,
+        entry_timing: dict[str, float] | None = None,
     ) -> None:
         event_id = str(market.get("event_id") or "")
         condition_id = str(market.get("condition_id") or "")
         yes_token = str(market.get("yes_token_id") or "")
         no_token = str(market.get("no_token_id") or "")
         if not self._eligible_market(market):
+            if not evaluate_entry:
+                return
             if any(exact_trigger(update.get("best_ask"), self.policy.entry_price) for update in updates):
                 self.repo.timeline(
                     severity="WARNING", category="DECISION", component="strategy",
@@ -1337,15 +1980,21 @@ class LiveStrategyRuntime:
                 )
             return
 
-        for update in updates:
-            await self._manage_position(
-                market=market, update=update, event_ready=event_ready,
-                frame_hash=frame_hash, received_at=received_at,
-            )
+        if manage_positions:
+            for update in updates:
+                await self._manage_position(
+                    market=market, update=update, event_ready=event_ready,
+                    frame_hash=frame_hash, received_at=received_at,
+                )
 
         if market.get("market_resolved"):
-            await self._handle_resolution(market)
+            if manage_positions:
+                await self._handle_resolution(market)
             return
+        if not evaluate_entry:
+            return
+        if entry_timing is not None:
+            entry_timing["decision_started_monotonic"] = time.perf_counter()
 
         try:
             observed_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
@@ -1366,7 +2015,7 @@ class LiveStrategyRuntime:
             else False
         )
 
-        schedule = self.entry_schedule_status()
+        schedule = self._entry_schedule()
         ram_state = self._entry_state_from_ram(event_id)
 
         decision = choose_entry(
@@ -1390,6 +2039,8 @@ class LiveStrategyRuntime:
             event_id=event_id,
             policy=self.policy,
         )
+        if entry_timing is not None:
+            entry_timing["decision_finished_monotonic"] = time.perf_counter()
         trigger_update = next((
             item for item in updates
             if item.get("_critical_entry_latched")
@@ -1522,6 +2173,37 @@ class LiveStrategyRuntime:
                 )
                 return
 
+        btc = self._btc
+        btc_evaluation: dict[str, Any] | None = None
+        if btc is not None:
+            try:
+                btc_evaluation = btc.evaluate(
+                    market=market, side=decision.side, token_id=decision.token_id,
+                    strict_window=bool(schedule.get("btc_strict_window")),
+                )
+                btc.note_evaluation(
+                    btc_evaluation, source="DECISION",
+                    trading_state=self._btc_trading_state(schedule, ram_state),
+                    remaining_seconds=remaining_seconds(event_id, observed_at),
+                )
+            except Exception as exc:
+                self.last_error = f"BTC_GATE:{type(exc).__name__}: {exc}"[:500]
+                btc_evaluation = None
+                if btc.mode == "enforce":
+                    # Fail closed, but never on observe/off telemetry bugs.
+                    btc_evaluation = btc.error_evaluation(
+                        market=market, side=decision.side, token_id=decision.token_id,
+                    )
+            if btc_evaluation is not None and btc.blocks(btc_evaluation):
+                # Not an event lock: the next 0.74 trigger re-evaluates.
+                await self._record_btc_gate_block(
+                    market=market, decision=decision, evaluation=btc_evaluation,
+                    trigger_update=trigger_update, frame_hash=frame_hash,
+                )
+                return
+
+        if entry_timing is not None:
+            entry_timing["intent_reserve_started_monotonic"] = time.perf_counter()
         reservation = self.repo.reserve_event_entry(
             event_id=event_id, condition_id=condition_id,
             token_id=decision.token_id, side=decision.side,
@@ -1568,9 +2250,18 @@ class LiveStrategyRuntime:
                 )
             return
 
+        if entry_timing is not None:
+            entry_timing["intent_reserved_monotonic"] = time.perf_counter()
+
         self._mark_event_locked_ram(event_id)
 
         intent_id = str(reservation["entry_intent_id"])
+        if btc is not None and btc_evaluation is not None:
+            try:
+                btc.attach_intent(btc_evaluation, intent_id)
+                btc.note_deal_entry(btc_evaluation, intent_id=intent_id)
+            except Exception as exc:  # the reserved intent must still be submitted
+                self.last_error = f"BTC_DEAL_ENTRY:{type(exc).__name__}: {exc}"[:500]
         if trigger_update is not None:
             self._trace_critical(
                 "ENTRY_INTENT_RESERVED", update=trigger_update,
@@ -1593,8 +2284,54 @@ class LiveStrategyRuntime:
         )
         await self._submit_entry(
             market=market, update=selected_update, side=str(decision.side),
-            intent_id=intent_id, fee_rate=fee_rate,
+            intent_id=intent_id, fee_rate=fee_rate, entry_timing=entry_timing,
         )
+
+    async def _record_btc_gate_block(
+        self,
+        *,
+        market: dict[str, Any],
+        decision: Any,
+        evaluation: dict[str, Any],
+        trigger_update: dict[str, Any] | None,
+        frame_hash: str,
+    ) -> None:
+        gate = evaluation["decision"]
+        current = evaluation["current"]
+        open_tick = evaluation["open"]
+        if trigger_update is not None:
+            self._trace_critical(
+                "TERMINAL_RESULT", update=trigger_update,
+                reason=gate.reason, result="SKIPPED",
+            )
+        try:
+            await asyncio.to_thread(
+                self.repo.timeline,
+                severity="WARNING", category="DECISION", component="strategy",
+                source="btc_reference_gate", event_id=str(market.get("event_id") or ""),
+                condition_id=str(market.get("condition_id") or ""),
+                token_id=decision.token_id, side=decision.side,
+                requested_action="ENTRY", reason_code=gate.reason,
+                result_status="SKIPPED",
+                parameters_json={
+                    "mode": "enforce",
+                    "side_outcome": evaluation["side_outcome"],
+                    "open_price": canonical_decimal(open_tick.price) if open_tick else None,
+                    "current_price": canonical_decimal(current.price) if current else None,
+                    "current_age_ms": evaluation["age_ms"],
+                    "delta_usd": (
+                        canonical_decimal(gate.delta_usd)
+                        if gate.delta_usd is not None else None
+                    ),
+                    "directional_delta_usd": (
+                        canonical_decimal(gate.directional_delta_usd)
+                        if gate.directional_delta_usd is not None else None
+                    ),
+                    "frame_hash": frame_hash,
+                },
+            )
+        except Exception as exc:
+            self.last_error = f"BTC_GATE_TIMELINE:{type(exc).__name__}: {exc}"[:500]
 
     def _daily_loss_blocked(self) -> bool:
         try:
@@ -2070,10 +2807,13 @@ class LiveStrategyRuntime:
         side: str,
         intent_id: str,
         fee_rate: Decimal,
+        entry_timing: dict[str, float] | None = None,
     ) -> None:
         event_id = str(market["event_id"])
         condition_id = str(market["condition_id"])
         token_id = str(update.get("asset_id") or "")
+        if entry_timing is not None:
+            entry_timing["submit_pipeline_started_monotonic"] = time.perf_counter()
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         signal_observed_ms = update.get("_critical_latched_at_ms")
         try:
@@ -2131,12 +2871,37 @@ class LiveStrategyRuntime:
                 )
                 return
 
+        # The final-minute cutoff, again on the same clock as choose_entry: a
+        # signal latched before the cutoff must not be sent after it.
+        if in_entry_final_minute(
+            event_id, datetime.now(timezone.utc),
+            self.policy.entry_cutoff_seconds_before_close,
+        ):
+            reason = "ENTRY_REVALIDATION_FINAL_MINUTE"
+            self._abort_entry(
+                intent_id, event_id, update, reason=reason, market=market,
+            )
+            self.repo.record_entry_audit(
+                intent_id, event_id=event_id, revalidation_result=reason,
+                entry_validity=f"ABORTED_{reason}",
+            )
+            self._note_entry_liquidity("note_abort", intent_id, reason=reason)
+            return
+
         # P0-A — initial revalidation against the current authoritative book
         # before entering the adapter's preflight. The final guard below repeats
         # this after signing, immediately before post_order.
         revalidation_book: dict[str, Any] | None = None
         if not self.paper_mode() and self._exit_book_provider is not None:
+            if entry_timing is not None:
+                entry_timing["initial_revalidation_started_monotonic"] = (
+                    time.perf_counter()
+                )
             reval = self._revalidate_entry_signal(market, update, token_id)
+            if entry_timing is not None:
+                entry_timing["initial_revalidation_finished_monotonic"] = (
+                    time.perf_counter()
+                )
             revalidation_book = reval.pop("book", None)
             self.repo.record_entry_audit(
                 intent_id, event_id=event_id,
@@ -2197,7 +2962,7 @@ class LiveStrategyRuntime:
                 }, "strategy")
             self._note_entry_liquidity("note_abort", intent_id, reason=reason)
             return
-        schedule = self.entry_schedule_status()
+        schedule = self._entry_schedule()
         if not schedule["allowed"]:
             reason = str(schedule["reason"])
             self.repo.update_intent(
@@ -2215,6 +2980,8 @@ class LiveStrategyRuntime:
             )
             return
         if self.paper_mode():
+            if entry_timing is not None:
+                entry_timing["submit_started_monotonic"] = time.perf_counter()
             self._note_entry_liquidity(
                 "note_submit", intent_id, update=update,
                 requested_shares=self.policy.max_shares,
@@ -2226,6 +2993,8 @@ class LiveStrategyRuntime:
                 fee_rate=fee_rate,
                 max_shares=self.policy.max_shares,
             )
+            if entry_timing is not None:
+                entry_timing["submit_returned_monotonic"] = time.perf_counter()
             if fill.filled_shares <= 0:
                 self.repo.mark_zero_fill(
                     event_id, "FAK_ZERO_FILL", intent_id=intent_id
@@ -2346,6 +3115,8 @@ class LiveStrategyRuntime:
         )
 
         def final_pre_post_guard() -> dict[str, Any]:
+            if entry_timing is not None:
+                entry_timing["final_guard_started_monotonic"] = time.perf_counter()
             guard_now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             if signal_observed_ms is None:
                 return {
@@ -2360,7 +3131,20 @@ class LiveStrategyRuntime:
                     "reason": "ENTRY_FINAL_REVALIDATION_STALE",
                     "signal_age_ms": signal_age_ms,
                 }
+            if in_entry_final_minute(
+                event_id, datetime.now(timezone.utc),
+                self.policy.entry_cutoff_seconds_before_close,
+            ):
+                return {
+                    "ok": False,
+                    "reason": "ENTRY_FINAL_REVALIDATION_FINAL_MINUTE",
+                    "signal_age_ms": signal_age_ms,
+                }
             final_reval = self._revalidate_entry_signal(market, update, token_id)
+            if entry_timing is not None:
+                entry_timing["final_revalidation_finished_monotonic"] = (
+                    time.perf_counter()
+                )
             final_reval.pop("book", None)
             reason_map = {
                 "ENTRY_REVALIDATION_BOOK_NOT_READY": "ENTRY_FINAL_REVALIDATION_NOT_READY",
@@ -2401,6 +3185,8 @@ class LiveStrategyRuntime:
                 "generation": final_reval.get("generation"),
             }
 
+        if entry_timing is not None:
+            entry_timing["submit_started_monotonic"] = time.perf_counter()
         response = await self.adapter.create_order({
             "idempotency_key": intent_id,
             "durable_intent_reserved": True,
@@ -2417,6 +3203,8 @@ class LiveStrategyRuntime:
             "max_tokens": canonical_decimal(self.policy.max_shares),
             "max_price": "0.76",
         }, pre_post_guard=final_pre_post_guard)
+        if entry_timing is not None:
+            entry_timing["submit_returned_monotonic"] = time.perf_counter()
         status = str(response.get("status") or "unknown").lower()
         remote_id = response.get("polymarket_order_id")
         self._trace_critical(
@@ -2849,6 +3637,9 @@ class LiveStrategyRuntime:
                 str(intent["intent_id"]),
                 reason="TAKE_PROFIT_WAITING_FOR_FULL_SELLABLE_BALANCE",
             )
+            self._schedule_targeted_reconciliation(
+                position, reason="take_profit_waiting_sellable"
+            )
             return
         if self.paper_mode():
             self.repo.update_intent(
@@ -2878,6 +3669,9 @@ class LiveStrategyRuntime:
                     or "INSUFFICIENT_BALANCE"
                 ),
                 normalized_error=response.get("message"),
+            )
+            self._schedule_targeted_reconciliation(
+                position, reason="take_profit_rejected_sellable"
             )
             return
 
@@ -3481,7 +4275,7 @@ class LiveStrategyRuntime:
                 or Decimal("0")
             ) > 0
             and str(position.get("state") or "").upper()
-            != "CLOSED"
+            in EXIT_SUPERVISION_POSITION_STATES
         ]
 
         if self._stop_exhausted_positions:
@@ -3530,7 +4324,8 @@ class LiveStrategyRuntime:
                     decimal_value(position.get("remaining_shares_text"))
                     or Decimal("0")
                 ) > 0
-                and str(position.get("state") or "").upper() != "CLOSED"
+                and str(position.get("state") or "").upper()
+                in EXIT_SUPERVISION_POSITION_STATES
             ]
 
         # P0-E: strict priority ordering + bounded concurrency + tick budget.
@@ -3750,6 +4545,9 @@ class LiveStrategyRuntime:
                 and bid is not None
                 and bid <= self.policy.stop_price
             ):
+                if str(position["position_id"]) in self._stop_owned_positions:
+                    self._exit_wakeup.set()
+                    continue
                 position = self.repo.latch_stop_exit(
                     str(position["position_id"])
                 )
@@ -3789,6 +4587,24 @@ class LiveStrategyRuntime:
                         "latch", position, bid=bid, update=update,
                         source="frame_worker", liquidity_hash=exit_book_hash,
                         latched_at=position.get("updated_at"),
+                    )
+                    self._capture_stop_forensic(
+                        "STOP_LATCHED",
+                        position,
+                        update,
+                        frame_hash=frame_hash,
+                        book_hash=exit_book_hash,
+                        event_ready=event_ready,
+                        integrity_status=update.get(
+                            "_stop_forensic_integrity_status", ""
+                        ),
+                        reconciliation_readiness=str(
+                            self._hot_state.get(
+                                "reconciliation_readiness", "NOT_READY"
+                            )
+                        ),
+                        critical_queue_depth=len(self._critical_frames),
+                        min_price=initial_stop_floor,
                     )
                 await self._refresh_hot_state_once()
 
@@ -4361,6 +5177,21 @@ class LiveStrategyRuntime:
                 )
             ),
         )
+        self._capture_stop_forensic(
+            "EXIT_PRE_SUBMIT",
+            position,
+            update,
+            intent_id=str(intent["intent_id"]),
+            purpose=purpose,
+            frame_hash=frame_hash,
+            book_hash=self._exit_liquidity_hash(update),
+            reconciliation_readiness=str(
+                self._hot_state.get("reconciliation_readiness", "NOT_READY")
+            ),
+            critical_queue_depth=len(self._critical_frames),
+            requested_shares=shares,
+            min_price=min_price,
+        )
         if self.paper_mode():
             fill = simulate_sell_fak(
                 update.get("bids") or [], shares=shares, min_price=min_price,
@@ -4403,6 +5234,20 @@ class LiveStrategyRuntime:
                     else "FILLED" if updated["state"] == "CLOSED" else "PARTIAL"
                 ),
             )
+            self._capture_stop_forensic(
+                "EXIT_RESPONSE_RETURNED",
+                position,
+                update,
+                intent_id=str(intent["intent_id"]),
+                purpose=purpose,
+                frame_hash=frame_hash,
+                requested_shares=shares,
+                min_price=min_price,
+                result_status=(
+                    "ZERO_FILL" if fill.filled_shares == 0
+                    else "FILLED" if updated["state"] == "CLOSED" else "PARTIAL"
+                ),
+            )
             return
 
         response = await self.adapter.create_order({
@@ -4428,6 +5273,20 @@ class LiveStrategyRuntime:
             ),
             remote_order_id=response.get("polymarket_order_id"),
         )
+        self._capture_stop_forensic(
+            "EXIT_RESPONSE_RETURNED",
+            position,
+            update,
+            intent_id=str(intent["intent_id"]),
+            purpose=purpose,
+            frame_hash=frame_hash,
+            requested_shares=shares,
+            min_price=min_price,
+            result_status=str(
+                response.get("status") or response.get("failure_reason") or ""
+            ),
+            remote_order_id=str(response.get("polymarket_order_id") or ""),
+        )
         if self._is_waiting_sellable_response(response):
             self.repo.mark_waiting_sellable(
                 str(intent["intent_id"]),
@@ -4444,6 +5303,9 @@ class LiveStrategyRuntime:
             self.repo.update_intent(
                 str(intent["intent_id"]),
                 submitted_at=None,
+            )
+            self._schedule_targeted_reconciliation(
+                position, reason="exit_rejected_sellable"
             )
             return
 
@@ -4512,6 +5374,40 @@ class LiveStrategyRuntime:
         market = self._market(condition_id) or {}
         return decimal_value(market.get("min_order_size")) or Decimal("0.000001")
 
+    def _schedule_targeted_reconciliation(
+        self, position: dict[str, Any], *, reason: str
+    ) -> None:
+        callback = self.targeted_reconciliation
+        token_id = str(position.get("token_id") or "")
+        if callback is None or not token_id:
+            return
+
+        async def run() -> None:
+            try:
+                result = await callback({
+                    "token_id": token_id,
+                    "position_id": str(position.get("position_id") or ""),
+                    "condition_id": str(position.get("condition_id") or ""),
+                    "reason": reason,
+                })
+                if result.get("status") == "ok":
+                    await self._refresh_hot_state_once()
+                    self._exit_wakeup.set()
+                elif result.get("status") == "requires_full":
+                    self.targeted_reconciliation_fallbacks += 1
+                    await self._reconcile(f"{reason}_targeted_fallback")
+            except Exception as exc:
+                self.last_error = (
+                    f"TARGETED_RECONCILIATION:{type(exc).__name__}:{exc}"
+                )[:500]
+
+        task = asyncio.create_task(
+            run(), name=f"targeted-reconciliation-{token_id[:12]}"
+        )
+        self.targeted_reconciliation_scheduled += 1
+        self._targeted_reconciliation_tasks.add(task)
+        task.add_done_callback(self._targeted_reconciliation_tasks.discard)
+
     async def _reconcile(self, reason: str) -> dict[str, Any]:
         if self.reconciliation is None:
             return {"status": "not_configured"}
@@ -4567,6 +5463,8 @@ class LiveStrategyRuntime:
             return
 
         self._stop.clear()
+        if self.config.stop_forensic_capture_enabled:
+            self._stop_forensics.start()
 
         # Refresh once before workers begin consuming market frames.
         await self._refresh_hot_state_once()
@@ -4604,6 +5502,18 @@ class LiveStrategyRuntime:
             self._frame_task = asyncio.create_task(
                 self._frame_worker(), name="strategy-frame-worker"
             )
+        if (
+            self._stop_obligation_task is None
+            or self._stop_obligation_task.done()
+        ):
+            self._stop_obligation_task = asyncio.create_task(
+                self._stop_obligation_worker(),
+                name="strategy-stop-obligation",
+            )
+        if self._entry_task is None or self._entry_task.done():
+            self._entry_task = asyncio.create_task(
+                self._entry_worker(), name="strategy-entry-worker"
+            )
         if self._exit_task is None or self._exit_task.done():
             self._exit_task = asyncio.create_task(
                 self._exit_supervisor_loop(),
@@ -4631,6 +5541,34 @@ class LiveStrategyRuntime:
 
     async def stop(self) -> None:
         self._stop.set()
+        if self.config.stop_forensic_capture_enabled:
+            await asyncio.to_thread(self._stop_forensics.stop, 2.0)
+
+        if self._stop_obligation_task:
+            self._stop_obligation_event.set()
+            self._stop_obligation_task.cancel()
+            try:
+                await self._stop_obligation_task
+            except asyncio.CancelledError:
+                pass
+            self._stop_obligation_task = None
+        self._stop_latch_executor.shutdown(wait=False, cancel_futures=False)
+
+        if self._entry_task:
+            self._entry_frame_event.set()
+            self._entry_task.cancel()
+            try:
+                await self._entry_task
+            except asyncio.CancelledError:
+                pass
+            self._entry_task = None
+
+        if self._targeted_reconciliation_tasks:
+            tasks = list(self._targeted_reconciliation_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._targeted_reconciliation_tasks.clear()
 
         if self._exit_task:
             self._exit_wakeup.set()
@@ -4689,6 +5627,16 @@ class LiveStrategyRuntime:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._frame_task.cancel()
             self._frame_task = None
+        # Last: the BTC writer does a final flush once the feed has stopped.
+        for name in ("_btc_feed_task", "_btc_writer_task"):
+            task = getattr(self, name, None)
+            if task is None:
+                continue
+            try:
+                await asyncio.wait_for(task, 3)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                task.cancel()
+            setattr(self, name, None)
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
@@ -4771,6 +5719,48 @@ class LiveStrategyRuntime:
             ),
             "exit_supervision": self._exit_tracker.health(),
             "exit_evidence": self._exit_evidence.stats(),
+            "stop_forensics": self._stop_forensics.stats(),
+            "stop_obligations": {
+                "queue_depth": len(self._stop_obligations),
+                "queued": self.stop_obligations_queued,
+                "coalesced": self.stop_obligations_coalesced,
+                "rejected": self.stop_obligations_rejected,
+                "latched": self.stop_obligations_latched,
+                "failures": self.stop_obligation_failures,
+                "generation_retries": (
+                    self.stop_obligation_generation_retries
+                ),
+                "stale_generation_rejections": (
+                    self.stop_obligation_stale_generation_rejections
+                ),
+                "max_depth": self.stop_obligation_max_depth,
+                "worst_latch_ms": round(
+                    self.stop_obligation_worst_latch_ms, 3
+                ),
+                "worker_running": bool(
+                    self._stop_obligation_task
+                    and not self._stop_obligation_task.done()
+                ),
+            },
+            "entry_worker": {
+                "queue_depth": len(self._entry_frames),
+                "queued": self.entry_frames_queued,
+                "coalesced": self.entry_frames_coalesced,
+                "processed": self.entry_frames_processed,
+                "max_depth": self.entry_queue_max_depth,
+                "running": bool(
+                    self._entry_task and not self._entry_task.done()
+                ),
+                "last_phase_sample": (
+                    dict(self.entry_phase_samples[-1])
+                    if self.entry_phase_samples else {}
+                ),
+            },
+            "targeted_reconciliation": {
+                "scheduled": self.targeted_reconciliation_scheduled,
+                "fallbacks": self.targeted_reconciliation_fallbacks,
+                "inflight": len(self._targeted_reconciliation_tasks),
+            },
             "entry_liquidity": self._entry_liquidity.stats(),
             "frame_queue_depth": len(self._pending_frames),
             "frames_coalesced": self.frames_coalesced,
@@ -4803,6 +5793,7 @@ class LiveStrategyRuntime:
             ),
             "hot_state_refresh_failures": self.hot_state_refresh_failures,
             "last_error": self.last_error,
-            "entry_schedule": self.entry_schedule_status(),
+            "entry_schedule": self._entry_schedule(),
+            "btc_reference": self._btc.health() if self._btc is not None else None,
             **self.repo.strategy_status(),
         }

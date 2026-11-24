@@ -18,6 +18,7 @@ import html
 from datetime import datetime, timezone
 
 from live.config import LiveConfig
+from live.notification_prefs import CRITICAL_ACTION
 from live.reporting import EmailService, SMTPSettings
 from live.repository import LiveRepository
 from live.strategy_repository import StrategyRepository
@@ -67,6 +68,7 @@ def main() -> int:
                 text=body,
                 html_body="<pre>" + html.escape(body) + "</pre>",
                 message_id=_message_id(alert_id),
+                kind=CRITICAL_ACTION,
             )
         except Exception as exc:
             failed += 1

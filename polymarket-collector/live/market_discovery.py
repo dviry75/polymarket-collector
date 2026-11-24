@@ -18,6 +18,15 @@ def _dump(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _outcome_labels(market: dict[str, Any]) -> tuple[str | None, str | None]:
+    outcomes = market.get("outcomes") or {}
+    if not isinstance(outcomes, dict):
+        return None, None
+    yes = outcomes.get("yes") or {}
+    no = outcomes.get("no") or {}
+    return (str(yes.get("label") or "") or None, str(no.get("label") or "") or None)
+
+
 def _outcomes(market: dict[str, Any]) -> tuple[str | None, str | None, bool]:
     outcomes = market.get("outcomes") or {}
     if not isinstance(outcomes, dict):
@@ -125,6 +134,9 @@ async def refresh_btc_5m_markets(repo: LiveRepository, client: Any | None = None
                         "market_type": "binary_up_down_5m",
                         "neg_risk": (event.get("trading") or {}).get("neg_risk"),
                         "fee_type": trading.get("fee_type"),
+                        # Which token is Up: the BTC gate never assumes YES=Up.
+                        "yes_outcome_label": _outcome_labels(market)[0],
+                        "no_outcome_label": _outcome_labels(market)[1],
                     },
                     "raw_orderbook": {
                         "validated_tokens": sorted(book_tokens),

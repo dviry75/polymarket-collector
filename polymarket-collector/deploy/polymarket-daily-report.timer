@@ -1,0 +1,13 @@
+[Unit]
+Description=Send the Polymarket daily P&L email at 20:00 Israel time
+
+[Timer]
+# 20:00 sends; the later ticks only retry a FAILED/AMBIGUOUS send (the ledger
+# makes every tick after a successful send a no-op).
+OnCalendar=*-*-* 20:00,10,20,30:00 Asia/Jerusalem
+Persistent=true
+RandomizedDelaySec=10
+Unit=polymarket-daily-report.service
+
+[Install]
+WantedBy=timers.target

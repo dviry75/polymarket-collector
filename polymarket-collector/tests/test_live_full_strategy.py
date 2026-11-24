@@ -186,12 +186,19 @@ def test_zero_fill_allows_new_unique_entry_attempt_and_preserves_history():
                     "PRAGMA index_list('live_strategy_intents')"
                 ).fetchall()
             }
+            position_indexes = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA index_list('live_strategy_positions')"
+                ).fetchall()
+            }
         assert [(row["intent_id"], row["state"]) for row in intents] == [
             (first["entry_intent_id"], "ZERO_FILL"),
             (second["entry_intent_id"], "RESERVED"),
         ]
         assert "idx_live_strategy_one_entry" not in indexes
         assert "idx_live_strategy_one_unresolved_entry" in indexes
+        assert "idx_live_strategy_intents_event_action_state" in indexes
+        assert "idx_live_strategy_positions_token_created" in position_indexes
     finally:
         temp.cleanup()
 
@@ -1182,48 +1189,48 @@ def test_configured_signer_mismatch_fails_before_network_client_creation():
     assert result["signer"] is None
 
 
-def test_entry_schedule_blocks_weekdays_14_to_23_jerusalem():
+def test_entry_schedule_strict_btc_window_weekdays_14_to_23_jerusalem():
     jerusalem = ZoneInfo("Asia/Jerusalem")
-    assert LiveStrategyRuntime.entry_schedule_status(
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 13, 59, 59, tzinfo=jerusalem)
-    )["allowed"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 14, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 22, 59, 59, tzinfo=jerusalem)
-    )["allowed"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 23, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 8, 16, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
+    )["btc_strict_window"]
 
 
-def test_entry_schedule_is_unrestricted_on_configured_dates_jerusalem():
+def test_entry_schedule_strict_window_skips_configured_dates_jerusalem():
     jerusalem = ZoneInfo("Asia/Jerusalem")
-    assert LiveStrategyRuntime.entry_schedule_status(
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 21, 14, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 21, 22, 59, 59, tzinfo=jerusalem)
-    )["allowed"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 9, 4, 14, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 9, 4, 22, 59, 59, tzinfo=jerusalem)
-    )["allowed"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 20, 16, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 24, 16, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["btc_strict_window"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 9, 3, 16, 0, 0, tzinfo=jerusalem)
-    )["allowed"]
+    )["btc_strict_window"]
 
 
 def test_continuous_entry_slot_is_atomic_for_intents_and_positions():

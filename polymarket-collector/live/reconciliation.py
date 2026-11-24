@@ -198,6 +198,10 @@ class ReconciliationWorker:
         self.fill_drift_lookback_hours = float(fill_drift_lookback_hours)
         self._last_trade_fetch: dict[str, Any] = {}
         self._run_lock = asyncio.Lock()
+        self._targeted_lock = asyncio.Lock()
+        self._targeted_duration_ms = _BoundedDurationMetric()
+        self.targeted_runs = 0
+        self.targeted_corrections = 0
         self._consecutive_retries = 0
         self._rate_limit_retry_after = 0.0
         self._gap_backoff = GapBackoffTracker()
@@ -982,6 +986,82 @@ class ReconciliationWorker:
             )
         return handled_tokens
 
+    async def run_targeted_position(
+        self,
+        *,
+        token_id: str,
+        actor: str = "targeted_position",
+    ) -> dict[str, Any]:
+        """Refresh sellability for one known position without publishing READY.
+
+        The fast path is intentionally narrow: it only accepts remote shares
+        exactly equal to local remaining shares. Any financial mismatch is
+        delegated to the full reconciliation pass.
+        """
+        started = time.perf_counter()
+        async with self._targeted_lock:
+            self.targeted_runs += 1
+            try:
+                if self.strategy_repo is None or not token_id:
+                    return {"status": "requires_full", "reason": "TARGET_MISSING"}
+                local = await asyncio.to_thread(
+                    self.strategy_repo.position_for_token, str(token_id)
+                )
+                if local is None:
+                    return {
+                        "status": "requires_full",
+                        "reason": "LOCAL_POSITION_MISSING",
+                    }
+                remote_positions = await self.adapter.get_positions()
+                remote = next((
+                    item for item in remote_positions
+                    if str(item.get("token_id") or "") == str(token_id)
+                ), None)
+                if remote is None:
+                    return {"status": "pending", "reason": "REMOTE_NOT_VISIBLE"}
+                remote_shares = decimal_value(remote.get("size")) or Decimal("0")
+                local_remaining = (
+                    decimal_value(local.get("remaining_shares_text"))
+                    or Decimal("0")
+                )
+                if remote_shares != local_remaining or remote_shares <= 0:
+                    return {
+                        "status": "requires_full",
+                        "reason": "FINANCIAL_MISMATCH",
+                        "local_remaining_shares_text": canonical_decimal(
+                            local_remaining
+                        ),
+                        "remote_shares_text": canonical_decimal(remote_shares),
+                    }
+                local_sellable = (
+                    decimal_value(local.get("sellable_shares_text"))
+                    or Decimal("0")
+                )
+                if local_sellable == remote_shares:
+                    return {"status": "ok", "changed": False}
+                average_price = (
+                    decimal_value(remote.get("average_price"))
+                    or decimal_value(local.get("average_entry_price_text"))
+                    or Decimal("0")
+                )
+                _position, changed = await asyncio.to_thread(
+                    self.strategy_repo.reconcile_remote_position,
+                    event_id=str(local.get("event_id") or ""),
+                    condition_id=str(local.get("condition_id") or ""),
+                    token_id=str(token_id),
+                    outcome=str(local.get("outcome") or remote.get("outcome") or ""),
+                    remote_shares=remote_shares,
+                    average_price=average_price,
+                    source=f"targeted:{actor}",
+                )
+                if changed:
+                    self.targeted_corrections += 1
+                return {"status": "ok", "changed": bool(changed)}
+            finally:
+                self._targeted_duration_ms.observe(
+                    max(0.0, (time.perf_counter() - started) * 1000)
+                )
+
     async def run_once(
         self,
         actor: str = "system",
@@ -1032,6 +1112,16 @@ class ReconciliationWorker:
             },
             "sample_capacity_per_outcome": RECONCILIATION_TELEMETRY_CAPACITY,
             "trade_fetch": dict(self._last_trade_fetch),
+            "targeted_position": {
+                "runs": self.targeted_runs,
+                "corrections": self.targeted_corrections,
+                "duration_ms": self._targeted_duration_ms.snapshot(),
+            },
+            "api_requests": (
+                self.adapter.request_health()
+                if hasattr(self.adapter, "request_health")
+                else {}
+            ),
         }
 
     async def _run_once_serialized(
@@ -1077,8 +1167,9 @@ class ReconciliationWorker:
                         "status": account_status,
                         "error": str(account_mode.get("error") or ""),
                     })
-            balance = await self.adapter.get_balance()
-            allowances = await self.adapter.get_allowances()
+            collateral = await self.adapter.get_collateral_snapshot()
+            balance = dict(collateral.get("balance") or {})
+            allowances = dict(collateral.get("allowances") or {})
             remote_open = await self.adapter.get_open_orders()
             remote_trades, trade_fetch, commit_trade_watermark = (
                 await self._read_account_trades(actor)
@@ -1753,7 +1844,12 @@ class ReconciliationWorker:
                         remote_shares=shares,
                         average_price=decimal_value(remote.get("average_price")) or Decimal("0"),
                     )
-                    if changed:
+                    sellability_only_propagation = bool(
+                        changed
+                        and existing_position is not None
+                        and shares == local_remaining
+                    )
+                    if changed and not sellability_only_propagation:
                         correction_is_bounded_propagation = bool(
                             existing_position is not None
                             and confirmed_exit_value <= 0

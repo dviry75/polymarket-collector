@@ -17,6 +17,10 @@ UNKNOWN_INTENT_STATES = {
     "RECONCILIATION_REQUIRED", "CANCEL_REQUESTED", "CANCEL_UNCERTAIN",
 }
 UNKNOWN_POSITION_STATES = {"EXIT_RECONCILIATION_REQUIRED"}
+# Reconciliation-derived MANUAL_ONLY pauses are routinely de-escalated and
+# released by this engine within ~5 minutes. Only a pause that still needs the
+# operator after this grace is worth a [CRITICAL ACTION] email.
+OPERATOR_ACTION_EMAIL_GRACE_SECONDS = 600.0
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -683,7 +687,8 @@ class PauseRecoveryCoordinator:
             actor="pause_recovery"
         )
         self.strategy_repo.watchdog_operator_action(
-            actor="pause_recovery"
+            actor="pause_recovery",
+            threshold_seconds=OPERATOR_ACTION_EMAIL_GRACE_SECONDS,
         )
         self.strategy_repo.watchdog_reconciliation(
             actor="pause_recovery"

@@ -23,6 +23,13 @@ class TradingAdapter(ABC):
     async def get_allowances(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    async def get_collateral_snapshot(self) -> dict[str, Any]:
+        """Compatibility fallback; real adapters may collapse this to one call."""
+        return {
+            "balance": await self.get_balance(),
+            "allowances": await self.get_allowances(),
+        }
+
     @abstractmethod
     async def get_open_orders(self) -> list[dict[str, Any]]:
         raise NotImplementedError

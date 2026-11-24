@@ -29,6 +29,17 @@ def _decimal_env(name: str, default: str) -> Decimal:
     return value if value.is_finite() else Decimal(default)
 
 
+def _optional_decimal_env(name: str) -> Decimal | None:
+    raw = _env(name, "")
+    if not raw:
+        return None
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return Decimal("NaN")
+    return value
+
+
 def _decimal_tuple_env(name: str, default_csv: str) -> tuple[Decimal, ...]:
     raw = _env(name, default_csv) or default_csv
 
@@ -105,6 +116,7 @@ class LiveConfig:
     strategy_stop_min_price: Decimal = Decimal("0.01")
     strategy_emergency_min_price: Decimal = Decimal("0.01")
     strategy_entry_window_seconds: int = 120
+    strategy_entry_cutoff_seconds_before_close: int = 60
     stop_loss_order_type: str = "FAK"
     # NOTE: max_exit_slippage bounds the *rules/dashboard* projection only; it
     # does NOT constrain STOP_066 / EMERGENCY execution (see strategy_stop_min_price).
@@ -128,6 +140,14 @@ class LiveConfig:
     # behind seconds of stale frames. The cap only ever evicts non-STOP frames.
     critical_frame_coalesce_enabled: bool = True
     critical_frame_max_depth: int = 24
+    # Evidence-only STOP capture: a bounded hot-path queue feeding a dedicated
+    # writer and a SQLite database separate from live state.
+    stop_forensic_capture_enabled: bool = True
+    stop_forensic_db_path: str = ""
+    stop_forensic_queue_capacity: int = 512
+    stop_forensic_batch_size: int = 64
+    stop_forensic_max_ladder_levels: int = 32
+    stop_forensic_ladder_buffer_multiple: Decimal = Decimal("1.25")
     # Stop-loss exit forensics. Full order-book depth at cross/latch/submit is
     # only persisted when the exit was pathological: fill VWAP below
     # deep_capture_max_vwap, or a zero-fill / reject. The acceptable cutoff only
@@ -146,6 +166,18 @@ class LiveConfig:
         Decimal("3"), Decimal("4"), Decimal("5"),
     )
     entry_liquidity_deep_capture_max_vwap: Decimal = Decimal("0.60")
+    # BTC reference gate (Chainlink BTC/USD via Polymarket RTDS). An extra
+    # pre-reservation entry check only; exits never read the BTC feed.
+    btc_feed_provider: str = "rtds"
+    btc_feed_stall_seconds: float = 10.0
+    btc_open_tick_max_offset_ms: int = 2000
+    btc_gate_mode: str = "observe"
+    btc_gate_min_delta_usd: Decimal = Decimal("10")
+    # Stricter minimum inside the weekday 14:00-23:00 Asia/Jerusalem window
+    # (live/entry_schedule.py), which used to close entries entirely.
+    btc_gate_window_min_delta_usd: Decimal = Decimal("30")
+    btc_gate_max_delta_usd: Decimal | None = None
+    btc_max_price_age_ms: int = 5000
     require_clean_runtime: bool = True
     approved_git_sha: str = ""
     approved_runtime_hash: str = ""
@@ -246,6 +278,9 @@ class LiveConfig:
             strategy_stop_min_price=_decimal_env("LIVE_STRATEGY_STOP_MIN_PRICE", "0.01"),
             strategy_emergency_min_price=_decimal_env("LIVE_STRATEGY_EMERGENCY_MIN_PRICE", "0.01"),
             strategy_entry_window_seconds=int(_env("LIVE_STRATEGY_ENTRY_WINDOW_SECONDS", "120") or "120"),
+            strategy_entry_cutoff_seconds_before_close=int(
+                _env("LIVE_STRATEGY_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", "60") or "60"
+            ),
             stop_loss_order_type=_env("LIVE_STOP_LOSS_ORDER_TYPE", "FAK").upper(),
             max_exit_slippage=_decimal_env("LIVE_MAX_EXIT_SLIPPAGE", "0.05"),
             stop_loss_retry_delay_ms=int(_env("LIVE_STOP_LOSS_RETRY_DELAY_MS", "500") or "500"),
@@ -291,6 +326,22 @@ class LiveConfig:
             critical_frame_max_depth=int(
                 _env("LIVE_CRITICAL_FRAME_MAX_DEPTH", "24") or "24"
             ),
+            stop_forensic_capture_enabled=_bool_env(
+                "LIVE_STOP_FORENSIC_CAPTURE_ENABLED", True
+            ),
+            stop_forensic_db_path=_env("LIVE_STOP_FORENSIC_DB_PATH", ""),
+            stop_forensic_queue_capacity=int(
+                _env("LIVE_STOP_FORENSIC_QUEUE_CAPACITY", "512") or "512"
+            ),
+            stop_forensic_batch_size=int(
+                _env("LIVE_STOP_FORENSIC_BATCH_SIZE", "64") or "64"
+            ),
+            stop_forensic_max_ladder_levels=int(
+                _env("LIVE_STOP_FORENSIC_MAX_LADDER_LEVELS", "32") or "32"
+            ),
+            stop_forensic_ladder_buffer_multiple=_decimal_env(
+                "LIVE_STOP_FORENSIC_LADDER_BUFFER_MULTIPLE", "1.25"
+            ),
             exit_forensic_deep_capture_max_vwap=_decimal_env(
                 "LIVE_EXIT_FORENSIC_DEEP_CAPTURE_MAX_VWAP", "0.55"
             ),
@@ -308,6 +359,22 @@ class LiveConfig:
             ),
             entry_liquidity_deep_capture_max_vwap=_decimal_env(
                 "LIVE_ENTRY_LIQUIDITY_DEEP_CAPTURE_MAX_VWAP", "0.60"
+            ),
+            btc_feed_provider=_env("LIVE_BTC_FEED_PROVIDER", "rtds").lower(),
+            btc_feed_stall_seconds=float(
+                _env("LIVE_BTC_FEED_STALL_SECONDS", "10") or "10"
+            ),
+            btc_open_tick_max_offset_ms=int(
+                _env("LIVE_BTC_OPEN_TICK_MAX_OFFSET_MS", "2000") or "2000"
+            ),
+            btc_gate_mode=_env("LIVE_BTC_GATE_MODE", "observe").lower(),
+            btc_gate_min_delta_usd=_decimal_env("LIVE_BTC_GATE_MIN_DELTA_USD", "10"),
+            btc_gate_window_min_delta_usd=_decimal_env(
+                "LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD", "30"
+            ),
+            btc_gate_max_delta_usd=_optional_decimal_env("LIVE_BTC_GATE_MAX_DELTA_USD"),
+            btc_max_price_age_ms=int(
+                _env("LIVE_BTC_MAX_PRICE_AGE_MS", "5000") or "5000"
             ),
             require_clean_runtime=_bool_env("LIVE_REQUIRE_CLEAN_RUNTIME", True),
             approved_git_sha=_env("LIVE_APPROVED_GIT_SHA", "").strip(),
@@ -436,6 +503,8 @@ class LiveConfig:
             errors.append("strategy prices are immutable for this LIVE build")
         if self.strategy_entry_window_seconds != 120:
             errors.append("entry window must remain exactly 120 seconds")
+        if self.strategy_entry_cutoff_seconds_before_close != 60:
+            errors.append("entry cutoff must remain exactly 60 seconds before close")
         if self.order_heartbeat_interval_seconds != 5:
             errors.append("order heartbeat interval must remain exactly 5 seconds")
         if not 0 < self.recovery_stability_seconds <= 5:
@@ -528,6 +597,55 @@ class LiveConfig:
             errors.append(
                 "LIVE_CRITICAL_FRAME_MAX_DEPTH must be between 4 and 1024"
             )
+        if not 8 <= self.stop_forensic_queue_capacity <= 65536:
+            errors.append(
+                "LIVE_STOP_FORENSIC_QUEUE_CAPACITY must be between 8 and 65536"
+            )
+        if not 1 <= self.stop_forensic_batch_size <= 1024:
+            errors.append(
+                "LIVE_STOP_FORENSIC_BATCH_SIZE must be between 1 and 1024"
+            )
+        if not 1 <= self.stop_forensic_max_ladder_levels <= 256:
+            errors.append(
+                "LIVE_STOP_FORENSIC_MAX_LADDER_LEVELS must be between 1 and 256"
+            )
+        if not (
+            Decimal("1") <= self.stop_forensic_ladder_buffer_multiple <= Decimal("10")
+        ):
+            errors.append(
+                "LIVE_STOP_FORENSIC_LADDER_BUFFER_MULTIPLE must be between 1 and 10"
+            )
+        if self.btc_feed_provider not in {"rtds", "polybolt"}:
+            errors.append("LIVE_BTC_FEED_PROVIDER must be rtds or polybolt")
+        if not 2 <= self.btc_feed_stall_seconds <= 120:
+            errors.append("LIVE_BTC_FEED_STALL_SECONDS must be between 2 and 120")
+        if not 0 <= self.btc_open_tick_max_offset_ms <= 10000:
+            errors.append(
+                "LIVE_BTC_OPEN_TICK_MAX_OFFSET_MS must be between 0 and 10000"
+            )
+        if self.btc_gate_mode not in {"off", "observe", "enforce"}:
+            errors.append("LIVE_BTC_GATE_MODE must be off, observe or enforce")
+        if not self.btc_gate_min_delta_usd.is_finite() or self.btc_gate_min_delta_usd < 0:
+            errors.append("LIVE_BTC_GATE_MIN_DELTA_USD must be >= 0")
+        if (
+            not self.btc_gate_window_min_delta_usd.is_finite()
+            or self.btc_gate_window_min_delta_usd < self.btc_gate_min_delta_usd
+        ):
+            errors.append(
+                "LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD must be >= "
+                "LIVE_BTC_GATE_MIN_DELTA_USD"
+            )
+        if self.btc_gate_max_delta_usd is not None and (
+            not self.btc_gate_max_delta_usd.is_finite()
+            or self.btc_gate_max_delta_usd <= self.btc_gate_min_delta_usd
+            or self.btc_gate_max_delta_usd <= self.btc_gate_window_min_delta_usd
+        ):
+            errors.append(
+                "LIVE_BTC_GATE_MAX_DELTA_USD must be greater than "
+                "LIVE_BTC_GATE_MIN_DELTA_USD and LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD"
+            )
+        if not 1000 <= self.btc_max_price_age_ms <= 30000:
+            errors.append("LIVE_BTC_MAX_PRICE_AGE_MS must be between 1000 and 30000")
         return errors
 
     def paper_trading_active(self) -> bool:
@@ -626,6 +744,13 @@ class LiveConfig:
                 self.critical_frame_coalesce_enabled
             ),
             "critical_frame_max_depth": self.critical_frame_max_depth,
+            "stop_forensic_capture_enabled": self.stop_forensic_capture_enabled,
+            "stop_forensic_queue_capacity": self.stop_forensic_queue_capacity,
+            "stop_forensic_batch_size": self.stop_forensic_batch_size,
+            "stop_forensic_max_ladder_levels": self.stop_forensic_max_ladder_levels,
+            "stop_forensic_ladder_buffer_multiple": str(
+                self.stop_forensic_ladder_buffer_multiple
+            ),
             "exit_forensic_deep_capture_max_vwap": str(
                 self.exit_forensic_deep_capture_max_vwap
             ),
@@ -644,6 +769,17 @@ class LiveConfig:
             "entry_liquidity_deep_capture_max_vwap": str(
                 self.entry_liquidity_deep_capture_max_vwap
             ),
+            "btc_feed_provider": self.btc_feed_provider,
+            "btc_feed_stall_seconds": self.btc_feed_stall_seconds,
+            "btc_open_tick_max_offset_ms": self.btc_open_tick_max_offset_ms,
+            "btc_gate_mode": self.btc_gate_mode,
+            "btc_gate_min_delta_usd": str(self.btc_gate_min_delta_usd),
+            "btc_gate_window_min_delta_usd": str(self.btc_gate_window_min_delta_usd),
+            "btc_gate_max_delta_usd": (
+                str(self.btc_gate_max_delta_usd)
+                if self.btc_gate_max_delta_usd is not None else None
+            ),
+            "btc_max_price_age_ms": self.btc_max_price_age_ms,
             "require_clean_runtime": self.require_clean_runtime,
             "approved_git_sha_configured": bool(self.approved_git_sha),
             "approved_runtime_hash_configured": bool(self.approved_runtime_hash),

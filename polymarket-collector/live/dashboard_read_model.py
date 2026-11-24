@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 from .repository import LiveRepository, row_to_dict
 
 DISPLAY_TIMEZONE = "Asia/Jerusalem"
+# "all" range: everything from before the first live trade up to the end of today.
+ALL_TIME_START_DAY = date(2020, 1, 1)
 VERIFIED = {"VERIFIED", "RECONCILED", "DERIVED_VERIFIED"}
 # Deal count is small (grouped by condition_id, not raw fills) — a generous cap
 # lets the dashboard pull the whole date window in one call and filter/paginate
@@ -133,6 +135,8 @@ def resolve_window(
     elif normalized in {"3d", "7d", "30d"}:
         days = int(normalized[:-1])
         start_day, end_day = today - timedelta(days=days - 1), today + timedelta(days=1)
+    elif normalized == "all":
+        start_day, end_day = ALL_TIME_START_DAY, today + timedelta(days=1)
     elif normalized == "custom":
         if not from_date or not to_date:
             raise DashboardQueryError("custom range requires from_date and to_date")
@@ -146,11 +150,32 @@ def resolve_window(
         end_day = inclusive_end + timedelta(days=1)
     else:
         raise DashboardQueryError("unsupported range")
-    if (end_day - start_day).days > max_days:
+    if normalized != "all" and (end_day - start_day).days > max_days:
         raise DashboardQueryError(f"range exceeds {max_days} days")
     start_local = datetime.combine(start_day, time.min, tzinfo=tz)
     end_local = datetime.combine(end_day, time.min, tzinfo=tz)
     return DateWindow(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), normalized)
+
+
+DEAL_BTC_TEXT_FIELDS = (
+    "btc_open_price_text", "btc_entry_price_text", "btc_entry_directional_delta_usd",
+    "btc_exit_price_text", "btc_exit_directional_delta_usd",
+)
+DEAL_BTC_RAW_FIELDS = (
+    "btc_open_tick_ts_ms", "btc_entry_ts_ms", "btc_entry_age_ms", "btc_gate_reason",
+    "btc_gate_mode", "btc_entry_missing_reason", "btc_exit_ts_ms", "btc_exit_age_ms",
+    "btc_exit_type", "btc_exit_missing_reason",
+)
+
+
+def _deal_btc_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """BTC (Chainlink) reference snapshot of a deal; None-valued before migration."""
+    fields: dict[str, Any] = {
+        name.removesuffix("_text"): number_value(decimal_value(row.get(name)))
+        for name in DEAL_BTC_TEXT_FIELDS
+    }
+    fields.update({name: row.get(name) for name in DEAL_BTC_RAW_FIELDS})
+    return fields
 
 
 class DashboardReadModel:
@@ -478,6 +503,7 @@ class DashboardReadModel:
             "fees_usd": number_value(decimal_value(row.get("total_fees_text"))), "final_reason": row.get("final_reason"),
             "quality": "REAL" if row.get("fee_verification_status") == "VERIFIED" else "PARTIAL", "verified": True,
             "fee_status": row.get("fee_verification_status"), "fee_source": row.get("fee_source"),
+            "btc": _deal_btc_fields(row),
         } for row in rows]
         return {"items": items, "page": page, "page_size": page_size, "total": int(count.get("total") or 0), "quality": "REAL"}
 
@@ -724,6 +750,32 @@ class DashboardReadModel:
             }
         return out
 
+    def _btc_enrichment(self, event_slugs: list[str]) -> dict[str, dict[str, Any]]:
+        """Per-event BTC (Chainlink) reference overlay for the deal table.
+
+        A deal's event_id is the event slug of its external fills. Returns {}
+        until the trader has migrated the BTC deal columns.
+        """
+        slugs = [s for s in dict.fromkeys(event_slugs) if s]
+        if not slugs:
+            return {}
+        columns = {
+            str(row.get("name"))
+            for row in self._all("PRAGMA table_info(live_strategy_deals)")
+        }
+        if "btc_open_price_text" not in columns:
+            return {}
+        placeholders = ",".join("?" for _ in slugs)
+        rows = self._all(
+            f"""
+            SELECT event_id, {",".join(DEAL_BTC_TEXT_FIELDS + DEAL_BTC_RAW_FIELDS)}
+            FROM live_strategy_deals
+            WHERE event_id IN ({placeholders})
+            """,
+            tuple(slugs),
+        )
+        return {str(row.get("event_id")): {"btc": _deal_btc_fields(row)} for row in rows}
+
     def _external_floor(self) -> str:
         override = os.environ.get("EXTERNAL_FILLS_SINCE")
         if override:
@@ -755,6 +807,11 @@ class DashboardReadModel:
                    FROM external_fills
                    WHERE matched_at>=?
                    GROUP BY condition_id
+               ),
+               redemptions AS (
+                   SELECT condition_id, SUM(payout_usd) AS redeemed_usd, COUNT(*) AS redemption_count
+                   FROM external_redemptions
+                   GROUP BY condition_id
                )
                SELECT ef.condition_id AS condition_id,
                       dr.seq AS seq,
@@ -768,12 +825,15 @@ class DashboardReadModel:
                       SUM(CASE WHEN ef.side='BUY'  THEN ef.notional_usd ELSE 0 END) AS buy_notional,
                       SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE 0 END) AS sell_notional,
                       SUM(COALESCE(ef.fee_usd,0)) AS fees_usd,
+                      COALESCE(MAX(red.redeemed_usd),0)     AS redeemed_usd,
+                      COALESCE(MAX(red.redemption_count),0) AS redemption_count,
                       SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE -ef.notional_usd END)
-                          - SUM(COALESCE(ef.fee_usd,0)) AS cash_flow_usd,
+                          - SUM(COALESCE(ef.fee_usd,0)) + COALESCE(MAX(red.redeemed_usd),0) AS cash_flow_usd,
                       GROUP_CONCAT(DISTINCT ef.outcome) AS outcomes,
                       SUM(CASE WHEN ef.fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
                FROM external_fills ef
                JOIN deal_rank dr ON dr.condition_id = ef.condition_id
+               LEFT JOIN redemptions red ON red.condition_id = ef.condition_id
                WHERE ef.matched_at>=? AND ef.matched_at<?
                GROUP BY ef.condition_id, dr.seq
                ORDER BY MAX(ef.matched_at) DESC
@@ -785,12 +845,15 @@ class DashboardReadModel:
         ]
         enrichment = self._exit_audit_enrichment(condition_ids)
         entry_enrichment = self._entry_liquidity_enrichment(condition_ids)
+        btc_enrichment = self._btc_enrichment([row.get("event_slug") for row in rows])
         items = []
         for row in rows:
             buy_size = float(row.get("buy_size") or 0.0)
             sell_size = float(row.get("sell_size") or 0.0)
             net_size = buy_size - sell_size
             fee_gaps = int(row.get("fee_gaps") or 0)
+            redemption_count = int(row.get("redemption_count") or 0)
+            state = "REDEEMED" if redemption_count > 0 else ("CLOSED" if abs(net_size) < 1e-6 else "OPEN")
             item = {
                 "seq": int(row.get("seq") or 0),
                 "deal_key": masked(row.get("condition_id")),
@@ -806,13 +869,15 @@ class DashboardReadModel:
                 "buy_notional_usd": number_value(row.get("buy_notional")),
                 "sell_notional_usd": number_value(row.get("sell_notional")),
                 "fees_usd": number_value(row.get("fees_usd")),
+                "redeemed_usd": number_value(row.get("redeemed_usd")),
                 "cash_flow_usd": number_value(row.get("cash_flow_usd")),
-                "state": "CLOSED" if abs(net_size) < 1e-6 else "OPEN",
+                "state": state,
                 "quality": "REAL" if fee_gaps == 0 else "PARTIAL",
                 "verified": True,
             }
             item.update(enrichment.get(row.get("condition_id"), {}))
             item.update(entry_enrichment.get(row.get("condition_id"), {}))
+            item.update(btc_enrichment.get(row.get("event_slug"), {}))
             items.append(item)
         return {
             "items": items, "page": page, "page_size": page_size,
@@ -828,15 +893,20 @@ class DashboardReadModel:
         if floor:
             start = max(start, floor)
         row = self._one(
-            """WITH deals AS (
-                   SELECT condition_id,
-                          SUM(CASE WHEN side='SELL' THEN notional_usd ELSE -notional_usd END)
-                              - SUM(COALESCE(fee_usd,0)) AS cash_flow_usd,
-                          SUM(COALESCE(fee_usd,0))       AS fees_usd,
-                          SUM(CASE WHEN fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
-                   FROM external_fills
-                   WHERE matched_at>=? AND matched_at<?
-                   GROUP BY condition_id)
+            """WITH redemptions AS (
+                   SELECT condition_id, SUM(payout_usd) AS redeemed_usd
+                   FROM external_redemptions GROUP BY condition_id
+               ),
+               deals AS (
+                   SELECT ef.condition_id,
+                          SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE -ef.notional_usd END)
+                              - SUM(COALESCE(ef.fee_usd,0)) + COALESCE(MAX(red.redeemed_usd),0) AS cash_flow_usd,
+                          SUM(COALESCE(ef.fee_usd,0))       AS fees_usd,
+                          SUM(CASE WHEN ef.fee_usd IS NULL THEN 1 ELSE 0 END) AS fee_gaps
+                   FROM external_fills ef
+                   LEFT JOIN redemptions red ON red.condition_id = ef.condition_id
+                   WHERE ef.matched_at>=? AND ef.matched_at<?
+                   GROUP BY ef.condition_id)
                SELECT COUNT(*) AS deal_count,
                       SUM(CASE WHEN cash_flow_usd>0 THEN 1 ELSE 0 END) AS wins,
                       SUM(CASE WHEN cash_flow_usd<0 THEN 1 ELSE 0 END) AS losses,

@@ -232,6 +232,9 @@ async def startup() -> None:
     if config.user_ws_enabled:
         await services()[7].start(config.user_ws_url)
     await runtime.start_heartbeat()
+    # Chainlink BTC/USD reference (public RTDS). Entry gate input only; the
+    # exit path never reads it.
+    await runtime.start_btc_reference()
     coordinator = PauseRecoveryCoordinator(
         repo,
         strategy_repo,

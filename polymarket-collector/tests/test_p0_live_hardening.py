@@ -65,13 +65,15 @@ class _EntryAdapter(MockTradingAdapter):
         return {"asset_id": token_id, "bids": [], "asks": []}
 
 
-def _entry_case(name, *, response, exit_bid=None, reconciliation=None):
+def _entry_case(name, *, response, exit_bid=None, reconciliation=None, event_id=None):
     temp = tempfile.TemporaryDirectory()
     base = LiveRepository(Path(temp.name) / "live.sqlite3")
     base.migrate()
     repo = StrategyRepository(base)
     repo.migrate()
-    event_id = f"btc-updown-5m-{name}"
+    # A real window with ~90s left: inside the entry window and before the
+    # final-minute cutoff that the pre-submit revalidations re-check.
+    event_id = event_id or f"btc-updown-5m-{int(time.time()) - 210}"
     condition_id = f"cond-{name}"
     token_id = f"tok-{name}"
     base.upsert_market({

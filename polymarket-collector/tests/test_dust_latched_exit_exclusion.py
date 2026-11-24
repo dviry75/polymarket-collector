@@ -307,3 +307,48 @@ def test_mixed_backlog_only_real_exits_reach_tier_zero():
     assert tier_zero == {"open_ss1", "exiting", "recon"}
     # No DUST variant is eligible for the urgent latched-exit path.
     assert not any(name.startswith("dust") for name in tier_zero)
+
+
+# --------------------------------------------------------------------------
+# Test 6 -- terminal claims and DUST never enter the hot supervisor
+# --------------------------------------------------------------------------
+def test_terminal_dust_and_claims_are_excluded_from_hot_exit_supervision():
+    temp, base, repo, runtime, position = _case("terminal-hot-filter")
+    try:
+        _force_state(
+            base,
+            str(position["position_id"]),
+            state="REDEEM_PENDING",
+            stop_stage=0,
+        )
+        dust = _add_position(
+            base,
+            repo,
+            "open-slot-dust",
+            state="DUST",
+            stop_stage=0,
+        )
+        loser = _add_position(
+            base,
+            repo,
+            "resolved-loser",
+            state="RESOLVED_LOSER",
+            stop_stage=0,
+        )
+        asyncio.run(runtime._refresh_hot_state_once())
+
+        calls = []
+
+        async def supervise(candidate, *, rest_allowed):
+            calls.append((candidate["position_id"], rest_allowed))
+
+        runtime._supervise_exit_position = supervise
+        asyncio.run(runtime._drive_latched_exits_once())
+
+        assert calls == []
+        assert runtime._pending_initial_eval == set()
+        assert runtime._exit_tracker.health() == []
+        assert repo.position_for_token(dust["token_id"])["state"] == "DUST"
+        assert repo.position_for_token(loser["token_id"])["state"] == "RESOLVED_LOSER"
+    finally:
+        temp.cleanup()
