@@ -99,6 +99,7 @@ class SessionRateLimiter:
             return True
 
 
+RANGE_PATTERN = "^(today|yesterday|3d|7d|30d|all|custom)$"
 router = APIRouter(prefix="/live/dashboard/v1", tags=["live-dashboard-v1"])
 _model: DashboardReadModel | None = None
 _infrastructure: InfrastructureSampler | None = None
@@ -180,7 +181,7 @@ def _trader_status() -> dict[str, Any] | None:
 
 @router.get("/overview", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def overview(
-    range: str = Query("today", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("today", pattern=RANGE_PATTERN),
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
 ) -> DashboardResponse:
@@ -198,7 +199,7 @@ def equity() -> DashboardResponse:
 
 @router.get("/pnl/summary", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def pnl_summary(
-    range: str = Query("today", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("today", pattern=RANGE_PATTERN),
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> DashboardResponse:
@@ -208,7 +209,7 @@ def pnl_summary(
 
 @router.get("/pnl/timeseries", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def pnl_timeseries(
-    range: str = Query("7d", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("7d", pattern=RANGE_PATTERN),
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> DashboardResponse:
@@ -220,7 +221,7 @@ def pnl_timeseries(
 
 @router.get("/trades", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def trades(
-    range: str = Query("7d", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("7d", pattern=RANGE_PATTERN),
     from_date: str | None = None,
     to_date: str | None = None,
     page: int = Query(1, ge=1, le=1_000_000),
@@ -237,7 +238,7 @@ EXTERNAL_MAX_CUSTOM_DAYS = 3650  # deals are cheap (grouped), so don't artificia
 
 @router.get("/external/deals", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def external_deals(
-    range: str = Query("7d", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("7d", pattern=RANGE_PATTERN),
     from_date: str | None = None,
     to_date: str | None = None,
     page: int = Query(1, ge=1, le=1_000_000),
@@ -251,7 +252,7 @@ def external_deals(
 
 @router.get("/external/summary", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def external_summary(
-    range: str = Query("today", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("today", pattern=RANGE_PATTERN),
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> DashboardResponse:
@@ -312,7 +313,7 @@ def update_notification_preferences(body: NotificationPrefsBody, request: Reques
 
 @router.get("/trade-statistics", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def trade_statistics(
-    range: str = Query("today", pattern="^(today|yesterday|3d|7d|30d|custom)$"),
+    range: str = Query("today", pattern=RANGE_PATTERN),
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> DashboardResponse:
@@ -381,7 +382,7 @@ def session(request: Request) -> DashboardResponse:
 @router.get("/filters", response_model=DashboardResponse, dependencies=[Depends(require_dashboard_session)])
 def filters() -> DashboardResponse:
     return _response({
-        "ranges": ["today", "yesterday", "3d", "7d", "30d", "custom"],
+        "ranges": ["today", "yesterday", "3d", "7d", "30d", "all", "custom"],
         "max_custom_days": 90,
         "timezone": "Asia/Jerusalem",
         "page_sizes": [10, 25, 50, 100],

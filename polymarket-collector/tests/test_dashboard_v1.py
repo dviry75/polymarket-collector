@@ -161,6 +161,10 @@ def test_jerusalem_day_boundaries_cover_dst_and_validate_ranges():
     assert spring.start_utc.astimezone().tzinfo is not None
     custom = resolve_window("custom", from_date="2026-08-01", to_date="2026-08-03")
     assert (custom.end_utc - custom.start_utc).total_seconds() == 3 * 86400
+    everything = resolve_window("all", now=datetime.fromisoformat("2026-08-12T10:00:00+00:00"))
+    assert everything.key == "all"
+    assert everything.start_utc.year <= 2020
+    assert everything.end_utc > datetime.fromisoformat("2026-08-12T10:00:00+00:00")
     try:
         resolve_window("custom", from_date="2026-01-01", to_date="2026-06-01")
         assert False, "range should be bounded"
@@ -188,6 +192,10 @@ def test_dashboard_api_auth_get_only_pagination_and_no_raw_identifiers():
         trades = client.get("/live/dashboard/v1/trades?page=1&page_size=1&range=today")
         assert trades.status_code == 200 and trades.json()["data"]["page_size"] == 1
         assert "remote-order" not in trades.text and "remote-trade" not in trades.text
+        all_trades = client.get("/live/dashboard/v1/trades?page=1&page_size=100&range=all")
+        assert all_trades.status_code == 200 and all_trades.json()["data"]["total"] >= 1
+        for path in ("overview", "external/deals", "external/summary"):
+            assert client.get(f"/live/dashboard/v1/{path}?range=all").status_code == 200, path
         assert client.post("/live/dashboard/v1/overview").status_code == 405
         assert client.get("/live/dashboard/v1/trades?page_size=101").status_code == 422
 

@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 from .repository import LiveRepository, row_to_dict
 
 DISPLAY_TIMEZONE = "Asia/Jerusalem"
+# "all" range: everything from before the first live trade up to the end of today.
+ALL_TIME_START_DAY = date(2020, 1, 1)
 VERIFIED = {"VERIFIED", "RECONCILED", "DERIVED_VERIFIED"}
 # Deal count is small (grouped by condition_id, not raw fills) — a generous cap
 # lets the dashboard pull the whole date window in one call and filter/paginate
@@ -133,6 +135,8 @@ def resolve_window(
     elif normalized in {"3d", "7d", "30d"}:
         days = int(normalized[:-1])
         start_day, end_day = today - timedelta(days=days - 1), today + timedelta(days=1)
+    elif normalized == "all":
+        start_day, end_day = ALL_TIME_START_DAY, today + timedelta(days=1)
     elif normalized == "custom":
         if not from_date or not to_date:
             raise DashboardQueryError("custom range requires from_date and to_date")
@@ -146,7 +150,7 @@ def resolve_window(
         end_day = inclusive_end + timedelta(days=1)
     else:
         raise DashboardQueryError("unsupported range")
-    if (end_day - start_day).days > max_days:
+    if normalized != "all" and (end_day - start_day).days > max_days:
         raise DashboardQueryError(f"range exceeds {max_days} days")
     start_local = datetime.combine(start_day, time.min, tzinfo=tz)
     end_local = datetime.combine(end_day, time.min, tzinfo=tz)
