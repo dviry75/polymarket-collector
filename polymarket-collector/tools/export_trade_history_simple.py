@@ -397,7 +397,8 @@ def _style_header(sheet: Any) -> None:
 
 
 def write_workbook(rows: list[dict[str, Any]], path: Path,
-                   btc_deals: dict[str, dict[str, Any]] | None = None) -> None:
+                   btc_deals: dict[str, dict[str, Any]] | None = None,
+                   deal_items: list[dict[str, Any]] | None = None) -> None:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Trade History"
@@ -449,6 +450,11 @@ def write_workbook(rows: list[dict[str, Any]], path: Path,
                     cell.number_format = deal_formats[column]
         deals_sheet.freeze_panes = "A2"
         deals_sheet.auto_filter.ref = deals_sheet.dimensions
+
+    if deal_items is not None:
+        # The dashboard's deal table, first sheet (live/deal_table_export.py).
+        from live.deal_table_export import add_deal_table_sheet
+        add_deal_table_sheet(workbook, deal_items)
 
     workbook.save(path)
 

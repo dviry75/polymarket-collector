@@ -6,7 +6,9 @@ file into ``/opt/polymarket-btc-live/export-requests/``. Runs in its own systemd
 slice with ``CPUQuota``/``MemoryMax``/``Nice=19`` so it cannot starve the trader;
 latency does not matter (minutes is fine).
 
-- The Excel file is produced by ``tools/export_trade_history_simple.py`` **unchanged**
+- First sheet "עסקאות": the dashboard's deal table one-to-one (same read model,
+  same columns, all deals since cutover) -- ``live/deal_table_export.py``.
+- Then the fill history from ``tools/export_trade_history_simple.py``
   ("Trade History" sheet, one row per fill, chronological, freeze + filters,
   MAKER perspective reconstructed from ``maker_orders``, BTC reference columns,
   plus a "BTC Deals" sheet). No date filter -- full history.
@@ -36,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from live.deal_table_export import load_deal_items  # noqa: E402
 from live.reporting import SMTPSettings  # noqa: E402
 from live.trade_export_queue import RECIPIENTS_FILE, REQUEST_DIR  # noqa: E402
 from tools.export_trade_history_simple import (  # noqa: E402
@@ -105,11 +108,14 @@ def build_workbook(config: dict[str, str]) -> Path:
     data = fetch_data_trades(config)
     log.info("fetched CLOB fills=%d data-api rows=%d", len(clob), len(data))
     rows = build_rows(clob, data, config["proxy_wallet"].lower())
-    btc_deals, btc_status = load_btc_deals(os.environ.get("LIVE_DB_PATH") or DEFAULT_DB_PATH)
+    db_path = os.environ.get("LIVE_DB_PATH") or DEFAULT_DB_PATH
+    btc_deals, btc_status = load_btc_deals(db_path)
     log.info("BTC reference: %s, fills matched=%d", btc_status, attach_btc(rows, btc_deals))
+    deal_items, deal_status = load_deal_items(db_path)
+    log.info("deal table: %s", deal_status)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"polymarket_trade_history_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.xlsx"
-    write_workbook(rows, path, btc_deals)
+    write_workbook(rows, path, btc_deals, deal_items)
     assert_no_secrets(path, config)
     log.info("wrote %s (%d fills)", path, len(rows))
     return path
@@ -125,7 +131,8 @@ def send_mail(settings: SMTPSettings, recipient: str, xlsx: Path, fill_count_hin
     msg["Subject"] = f"Polymarket trade history — full export ({stamp})"
     msg["Message-ID"] = f"<trade-export-{int(datetime.now(timezone.utc).timestamp())}@polymarket-live>"
     body = (
-        "Attached: the complete Polymarket fill history for the proxy wallet, "
+        "Attached: sheet \"עסקאות\" = the dashboard deal table (all deals), "
+        "then the complete Polymarket fill history for the proxy wallet, "
         "one row per fill, no date filter.\n"
         f"Rows: {fill_count_hint}\nGenerated: {stamp}\n"
     )
