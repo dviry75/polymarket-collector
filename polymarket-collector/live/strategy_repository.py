@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -58,6 +60,15 @@ def sanitize(value: Any) -> Any:
 def stable_id(kind: str, identity: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"polymarket-live:{kind}:{identity}"))
 
+
+
+def _event_has_ended(event_id: str, *, now: float | None = None) -> bool:
+    """btc-updown-5m-<start epoch>: the market ends 300 s after its start."""
+    try:
+        start = int(str(event_id).rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return False
+    return (time.time() if now is None else now) >= start + 300
 
 class StrategyRepository:
     def __init__(self, base: LiveRepository):
@@ -3246,7 +3257,9 @@ class StrategyRepository:
         return row is not None
 
     def settled_cash_flow_between(self, start_iso: str, end_iso: str) -> dict[str, Any]:
-        """Cash flow of positions opened in [start, end) whose result is known.
+        """Cash flow of positions opened in [start, end) whose result is known
+        (a held position whose 5-minute market already ended but has no
+        recorded result yet counts as a loss until the result arrives).
 
         Per position, from its own fills: sells - buys - fees, plus $1 per
         share still held when its market resolved for the token bought.
@@ -3256,7 +3269,7 @@ class StrategyRepository:
         with self.base.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT p.position_id, p.token_id, p.state,
+                SELECT p.position_id, p.token_id, p.state, p.event_id,
                        p.remaining_shares_text,
                        m.market_resolved, m.winning_asset_id,
                        i.action, f.shares_text, f.price_text, f.fee_text
@@ -3273,6 +3286,7 @@ class StrategyRepository:
         for row in rows:
             item = positions.setdefault(str(row["position_id"]), {
                 "token_id": str(row["token_id"] or ""),
+                "event_id": str(row["event_id"] or ""),
                 "state": str(row["state"] or "").upper(),
                 "remaining": decimal_value(row["remaining_shares_text"]) or Decimal("0"),
                 "resolved": bool(row["market_resolved"]),
@@ -3299,7 +3313,10 @@ class StrategyRepository:
             elif item["state"] == "RESOLVED_LOSER":
                 resolved = True
             elif held > Decimal("0.01"):
-                continue  # still open: result not known yet
+                if not _event_has_ended(item["event_id"]):
+                    continue  # still open: result not known yet
+                # Market ended, official result not recorded yet: count it as
+                # a loss (no payout) until it is, so the cap is never late.
             settled += 1
             cash_flow += item["cash"]
             if item["cash"] > 0:

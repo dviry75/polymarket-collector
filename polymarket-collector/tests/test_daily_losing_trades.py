@@ -264,3 +264,24 @@ def test_unknown_cap_fails_closed():
         assert runtime._losing_cap_status_ram()["allowed"] is False
     finally:
         temp.cleanup()
+
+
+def test_ended_market_without_a_result_counts_as_a_loss_until_resolved():
+    from live.strategy_repository import _event_has_ended
+    assert _event_has_ended("btc-updown-5m-1000", now=1300)
+    assert not _event_has_ended("btc-updown-5m-1000", now=1299)
+    assert not _event_has_ended("not-an-event", now=10**12)
+    temp, base, runtime = _runtime()
+    try:
+        ended = "btc-updown-5m-1795000000"     # 2026-11-18 ~11:06 UTC, long over
+        running = "btc-updown-5m-9999999700"   # far future: still running
+        _trade(base, ended, "2026-11-18T11:08:00+00:00")
+        _trade(base, running, "2026-11-18T11:09:00+00:00")
+        day = datetime(2026, 11, 18, 20, 0, tzinfo=J)
+        status = runtime.daily_losing_trades_status(day)
+        assert status["losses"] == 1 and Decimal(status["cash_flow_usd"]) < 0
+        base.mark_market_resolved(f"condition-{ended}", f"token-{ended}", "YES")
+        status = runtime.daily_losing_trades_status(day)
+        assert (status["losses"], status["wins"]) == (0, 1)
+    finally:
+        temp.cleanup()

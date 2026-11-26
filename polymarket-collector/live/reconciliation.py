@@ -1207,6 +1207,10 @@ class ReconciliationWorker:
         gaps: list[dict[str, Any]] = []
         repairs: list[dict[str, Any]] = []
         auto_recoverable_gaps = 0
+        # Held positions whose market ended and that Polymarket already marks
+        # redeemable, with shares matching: expected while the authoritative
+        # resolution propagates. Reported, but not a gap (entries stay open).
+        awaiting_resolution: list[dict[str, Any]] = []
         # ENTRY intents deferred this pass because their remote order status
         # is MATCHED/FILLED but no local fill has propagated yet. Populated
         # by the entries loop below; consulted by the remote-positions loop
@@ -1926,7 +1930,8 @@ class ReconciliationWorker:
                         and existing_position is not None
                         and shares == local_remaining
                     )
-                    if changed and not sellability_only_propagation:
+                    share_correction = bool(changed and not sellability_only_propagation)
+                    if share_correction:
                         correction_is_bounded_propagation = bool(
                             existing_position is not None
                             and confirmed_exit_value <= 0
@@ -1952,15 +1957,22 @@ class ReconciliationWorker:
                         if correction_is_bounded_propagation:
                             auto_recoverable_gaps += 1
                     if bool(remote.get("redeemable")):
-                        gaps.append({
+                        item = {
                             "type": "redeemable_position_awaiting_authoritative_resolution",
                             "position_id": position["position_id"],
                             "condition_id": condition_id,
-                        })
-                        # The market ended and Polymarket already marks the
-                        # position redeemable; the authoritative resolution
-                        # arrives within minutes. Transient, not a contradiction.
-                        auto_recoverable_gaps += 1
+                        }
+                        if share_correction:
+                            # Shares disagreed this pass: keep it a gap.
+                            gaps.append(item)
+                            auto_recoverable_gaps += 1
+                        else:
+                            # The market ended and Polymarket already marks the
+                            # position redeemable; the authoritative resolution
+                            # arrives within minutes. Shares match, so nothing
+                            # is uncertain: it must not pause new entries
+                            # (every held trade passes through this state).
+                            awaiting_resolution.append(item)
                 for local in self.strategy_repo.reconciliation_positions():
                     remaining = (
                         decimal_value(
@@ -2122,6 +2134,7 @@ class ReconciliationWorker:
             return {
                 "run_id": run_id, "status": status, "gaps": sanitize(gaps),
                 "repairs": sanitize(repairs),
+                "awaiting_resolution": sanitize(awaiting_resolution),
                 "retry_count": self._consecutive_retries,
                 "retry_after_seconds": round(retry_after_seconds, 3),
                 "published_readiness": readiness_publish_allowed,

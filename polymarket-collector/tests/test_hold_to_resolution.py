@@ -286,15 +286,33 @@ def test_real_share_difference_after_grace_is_still_a_contradiction():
         temp.cleanup()
 
 
-def test_redeemable_before_recorded_resolution_is_auto_recoverable():
+def test_redeemable_awaiting_resolution_does_not_pause_entries():
+    # Every held trade passes through this state for a few minutes after its
+    # market ends: with matching shares it must not block the next entry.
     temp, base, strategy, position = _aged_open_position("redeemable-1", "8.216215")
     try:
         adapter = MockTradingAdapter()
         adapter.positions.append(_remote(position, "8.216215", redeemable=True))
         result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
-        assert [gap["type"] for gap in result["gaps"]] == [
+        assert result["gaps"] == []
+        assert [item["type"] for item in result["awaiting_resolution"]] == [
             "redeemable_position_awaiting_authoritative_resolution"
         ]
-        assert strategy.pause_record()["pause_cause"] == "RECONCILIATION_GAP"
+        assert strategy.pause_record()["pause_entries"] is False
+        assert strategy.position_for_token(position["token_id"])["state"] == "OPEN"
+    finally:
+        temp.cleanup()
+
+
+def test_redeemable_with_a_share_mismatch_is_still_a_gap():
+    temp, base, strategy, position = _aged_open_position("redeemable-2", "8.216215")
+    try:
+        adapter = MockTradingAdapter()
+        adapter.positions.append(_remote(position, "8.2162", redeemable=True))
+        result = asyncio.run(ReconciliationWorker(base, adapter, strategy).run_once("test"))
+        assert "redeemable_position_awaiting_authoritative_resolution" in [
+            gap["type"] for gap in result["gaps"]
+        ]
+        assert strategy.pause_record()["pause_entries"] is True
     finally:
         temp.cleanup()
