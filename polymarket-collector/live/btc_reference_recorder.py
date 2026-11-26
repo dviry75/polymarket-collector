@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import logging
@@ -31,7 +30,6 @@ from .btc_reference_feed import (
     side_outcome_map,
     window_start_from_event_id,
 )
-from .entry_schedule import in_strict_btc_window_ms
 from .order_book import canonical_decimal, decimal_value
 from .strategy import BtcGateConfig, BtcGateDecision, btc_reference_gate
 
@@ -120,13 +118,6 @@ class BtcReferenceRecorder:
             max_delta_usd=getattr(config, "btc_gate_max_delta_usd", None),
             max_price_age_ms=int(getattr(config, "btc_max_price_age_ms", 5000)),
         )
-        # Same gate, stricter minimum, inside the weekday afternoon window.
-        self.window_gate_config = replace(
-            self.gate_config,
-            min_delta_usd=getattr(
-                config, "btc_gate_window_min_delta_usd", Decimal("30")
-            ),
-        )
         self.open_tick_max_offset_ms = int(
             getattr(config, "btc_open_tick_max_offset_ms", 2000)
         )
@@ -177,22 +168,10 @@ class BtcReferenceRecorder:
         mapping = self._side_maps[condition_id] or {}
         return mapping.get(str(side or "").upper())
 
-    def config_for(self, strict_window: bool) -> BtcGateConfig:
-        return self.window_gate_config if strict_window else self.gate_config
-
     def evaluate(self, *, market: dict[str, Any], side: str | None,
-                 token_id: str | None,
-                 strict_window: bool | None = None) -> dict[str, Any]:
-        """Gate verdict plus the BTC values it saw. Memory reads only.
-
-        ``strict_window`` selects the stricter window minimum; the entry path
-        passes the schedule it already decided on so both agree, otherwise
-        it is derived from the gate's own clock.
-        """
+                 token_id: str | None) -> dict[str, Any]:
+        """Gate verdict plus the BTC values it saw. Memory reads only."""
         now = self.now_ms()
-        if strict_window is None:
-            strict_window = in_strict_btc_window_ms(now)
-        gate_config = self.config_for(strict_window)
         event_id = str(market.get("event_id") or "")
         window_start = window_start_from_event_id(event_id)
         side_outcome = self.side_outcome(market, side)
@@ -209,7 +188,7 @@ class BtcReferenceRecorder:
             open_tick.price if open_tick else None,
             current.price if current else None,
             age,
-            gate_config,
+            self.gate_config,
         )
         return {
             "event_id": event_id,
@@ -223,8 +202,6 @@ class BtcReferenceRecorder:
             "age_ms": age,
             "decision": decision,
             "observed_ms": now,
-            "strict_window": strict_window,
-            "min_delta_usd": gate_config.min_delta_usd,
         }
 
     def error_evaluation(self, *, market: dict[str, Any], side: str | None,
@@ -237,8 +214,6 @@ class BtcReferenceRecorder:
             "open": None, "current": None, "twap": None, "age_ms": None,
             "decision": BtcGateDecision(False, "BTC_GATE_ERROR"),
             "observed_ms": self.now_ms(),
-            "strict_window": None,
-            "min_delta_usd": None,
         }
 
     def blocks(self, evaluation: dict[str, Any]) -> bool:
@@ -314,7 +289,6 @@ class BtcReferenceRecorder:
             "window_start": window_start,
             "crossed_ms": None,
             "cross_dir": None,
-            "gate_config": self.config_for(bool(evaluation.get("strict_window"))),
         }
         self.watches_started += 1
 
@@ -328,7 +302,7 @@ class BtcReferenceRecorder:
             open_tick.price if open_tick else None,
             current.price if current else None,
             (now - current.ts_ms) if current is not None else None,
-            watch.get("gate_config") or self.gate_config,
+            self.gate_config,
         )
         if decision.allowed:
             watch["crossed_ms"] = now
@@ -726,9 +700,6 @@ class BtcReferenceRecorder:
         return {
             "gate_mode": self.mode,
             "min_delta_usd": canonical_decimal(self.gate_config.min_delta_usd),
-            "window_min_delta_usd": canonical_decimal(
-                self.window_gate_config.min_delta_usd
-            ),
             "max_delta_usd": _text(self.gate_config.max_delta_usd),
             "max_price_age_ms": self.gate_config.max_price_age_ms,
             "feed": self.provider.health() if self.provider is not None else None,

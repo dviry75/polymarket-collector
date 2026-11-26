@@ -34,19 +34,10 @@ def test_synthetic_hour_duplicate_and_exactly_once(tmp_path):
     assert second["email_status"]=="SENT" and second["email_attempts"]==1 and len(sent)==1
     with sqlite3.connect(path) as conn: assert conn.execute("SELECT count(*) FROM live_hourly_reports").fetchone()[0]==1
 
-def test_inactive_hour_sends_nothing(tmp_path,monkeypatch):
+def test_inactive_hour_sends_nothing(tmp_path):
     path=tmp_path/"db.sqlite"; setup_db(path); sent=[]
     service=ReportingService(path,EmailService(SMTPSettings(sender="x",recipients=("y",)),sent.append)); service.migrate()
-    monkeypatch.setattr("live.reporting.LiveStrategyRuntime.entry_schedule_status",lambda at=None:{"allowed":False})
     assert service.generate_hour(datetime(2026,8,20,12,tzinfo=UTC),datetime(2026,8,20,13,tzinfo=UTC)) is None and sent==[]
-
-def test_strict_btc_window_hour_is_reported(tmp_path):
-    # Thu 2026-08-20 15:00-16:00 Asia/Jerusalem used to close entries; it is
-    # now open with the $30 BTC minimum, so the hour is reported.
-    path=tmp_path/"db.sqlite"; setup_db(path); sent=[]
-    service=ReportingService(path,EmailService(SMTPSettings(sender="x",recipients=("y",)),sent.append)); service.migrate()
-    report=service.generate_hour(datetime(2026,8,20,12,tzinfo=UTC),datetime(2026,8,20,13,tzinfo=UTC))
-    assert report is not None and len(json.loads(report["active_coverage"]))==1 and len(sent)==1
 
 def test_partial_coverage_one_email(tmp_path,monkeypatch):
     path=tmp_path/"db.sqlite"; setup_db(path); sent=[]

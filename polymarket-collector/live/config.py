@@ -173,9 +173,6 @@ class LiveConfig:
     btc_open_tick_max_offset_ms: int = 2000
     btc_gate_mode: str = "observe"
     btc_gate_min_delta_usd: Decimal = Decimal("10")
-    # Stricter minimum inside the weekday 14:00-23:00 Asia/Jerusalem window
-    # (live/entry_schedule.py), which used to close entries entirely.
-    btc_gate_window_min_delta_usd: Decimal = Decimal("30")
     btc_gate_max_delta_usd: Decimal | None = None
     btc_max_price_age_ms: int = 5000
     require_clean_runtime: bool = True
@@ -369,9 +366,6 @@ class LiveConfig:
             ),
             btc_gate_mode=_env("LIVE_BTC_GATE_MODE", "observe").lower(),
             btc_gate_min_delta_usd=_decimal_env("LIVE_BTC_GATE_MIN_DELTA_USD", "10"),
-            btc_gate_window_min_delta_usd=_decimal_env(
-                "LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD", "30"
-            ),
             btc_gate_max_delta_usd=_optional_decimal_env("LIVE_BTC_GATE_MAX_DELTA_USD"),
             btc_max_price_age_ms=int(
                 _env("LIVE_BTC_MAX_PRICE_AGE_MS", "5000") or "5000"
@@ -627,22 +621,13 @@ class LiveConfig:
             errors.append("LIVE_BTC_GATE_MODE must be off, observe or enforce")
         if not self.btc_gate_min_delta_usd.is_finite() or self.btc_gate_min_delta_usd < 0:
             errors.append("LIVE_BTC_GATE_MIN_DELTA_USD must be >= 0")
-        if (
-            not self.btc_gate_window_min_delta_usd.is_finite()
-            or self.btc_gate_window_min_delta_usd < self.btc_gate_min_delta_usd
-        ):
-            errors.append(
-                "LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD must be >= "
-                "LIVE_BTC_GATE_MIN_DELTA_USD"
-            )
         if self.btc_gate_max_delta_usd is not None and (
             not self.btc_gate_max_delta_usd.is_finite()
             or self.btc_gate_max_delta_usd <= self.btc_gate_min_delta_usd
-            or self.btc_gate_max_delta_usd <= self.btc_gate_window_min_delta_usd
         ):
             errors.append(
                 "LIVE_BTC_GATE_MAX_DELTA_USD must be greater than "
-                "LIVE_BTC_GATE_MIN_DELTA_USD and LIVE_BTC_GATE_WINDOW_MIN_DELTA_USD"
+                "LIVE_BTC_GATE_MIN_DELTA_USD"
             )
         if not 1000 <= self.btc_max_price_age_ms <= 30000:
             errors.append("LIVE_BTC_MAX_PRICE_AGE_MS must be between 1000 and 30000")
@@ -774,7 +759,6 @@ class LiveConfig:
             "btc_open_tick_max_offset_ms": self.btc_open_tick_max_offset_ms,
             "btc_gate_mode": self.btc_gate_mode,
             "btc_gate_min_delta_usd": str(self.btc_gate_min_delta_usd),
-            "btc_gate_window_min_delta_usd": str(self.btc_gate_window_min_delta_usd),
             "btc_gate_max_delta_usd": (
                 str(self.btc_gate_max_delta_usd)
                 if self.btc_gate_max_delta_usd is not None else None

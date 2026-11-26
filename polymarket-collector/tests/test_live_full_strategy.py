@@ -1189,48 +1189,48 @@ def test_configured_signer_mismatch_fails_before_network_client_creation():
     assert result["signer"] is None
 
 
-def test_entry_schedule_strict_btc_window_weekdays_14_to_23_jerusalem():
+def test_entry_schedule_blocks_weekdays_14_to_23_jerusalem():
     jerusalem = ZoneInfo("Asia/Jerusalem")
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 13, 59, 59, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 14, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 22, 59, 59, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 23, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 8, 16, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
+    )["allowed"]
 
 
-def test_entry_schedule_strict_window_skips_configured_dates_jerusalem():
+def test_entry_schedule_is_unrestricted_on_configured_dates_jerusalem():
     jerusalem = ZoneInfo("Asia/Jerusalem")
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 21, 14, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 21, 22, 59, 59, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 9, 4, 14, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert not LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 9, 4, 22, 59, 59, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 20, 16, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 24, 16, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    )["allowed"]
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 9, 3, 16, 0, 0, tzinfo=jerusalem)
-    )["btc_strict_window"]
+    )["allowed"]
 
 
 def test_continuous_entry_slot_is_atomic_for_intents_and_positions():
