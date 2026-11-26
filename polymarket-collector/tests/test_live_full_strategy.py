@@ -3745,3 +3745,16 @@ def test_authoritative_resolution_corrects_wrong_redeem_pending_to_loser():
         assert int(corrected["resolved_winner"] or 0) == 0
     finally:
         temp.cleanup()
+
+
+def test_entry_schedule_is_unrestricted_on_2026_11_26_only():
+    jerusalem = ZoneInfo("Asia/Jerusalem")
+    for hour, minute in ((14, 0), (18, 30), (22, 59)):
+        assert LiveStrategyRuntime.entry_schedule_status(
+            datetime(2026, 11, 26, hour, minute, tzinfo=jerusalem)
+        )["allowed"]
+    # The days around it keep the weekday 14:00-23:00 stop.
+    for day in (25, 27):
+        assert not LiveStrategyRuntime.entry_schedule_status(
+            datetime(2026, 11, day, 14, 0, tzinfo=jerusalem)
+        )["allowed"]

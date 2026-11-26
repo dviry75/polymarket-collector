@@ -307,6 +307,7 @@ class LiveStrategyRuntime:
             "2026-08-21",
             "2026-09-04",
             "2026-09-07",
+            "2026-11-26",  # one day without the 14:00-23:00 weekday stop
         }
         unrestricted_date = local.date().isoformat() in unrestricted_dates
         inactive = (
