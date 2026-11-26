@@ -3245,32 +3245,73 @@ class StrategyRepository:
             ).fetchone()
         return row is not None
 
-    def losing_positions_between(self, start_iso: str, end_iso: str) -> int:
-        """Positions opened in [start, end) whose market resolved against them.
+    def settled_cash_flow_between(self, start_iso: str, end_iso: str) -> dict[str, Any]:
+        """Cash flow of positions opened in [start, end) whose result is known.
 
-        A loss is the market's winning token not being the token bought (the
-        dashboard "תוצאת שוק" rule); RESOLVED_LOSER counts even before the
-        market row carries a winner. realized_pnl_text is not used.
+        Per position, from its own fills: sells - buys - fees, plus $1 per
+        share still held when its market resolved for the token bought.
+        A position counts once its market is resolved or nothing is left
+        (fully sold). realized_pnl_text is not used.
         """
         with self.base.connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT COUNT(*) AS losses FROM live_strategy_positions p
+                SELECT p.position_id, p.token_id, p.state,
+                       p.remaining_shares_text,
+                       m.market_resolved, m.winning_asset_id,
+                       i.action, f.shares_text, f.price_text, f.fee_text
+                FROM live_strategy_positions p
+                LEFT JOIN live_markets m ON m.condition_id = p.condition_id
+                JOIN live_strategy_intents i ON i.position_id = p.position_id
+                JOIN live_strategy_fills f ON f.intent_id = i.intent_id
                 WHERE p.created_at >= ? AND p.created_at < ?
-                  AND (
-                    p.state = 'RESOLVED_LOSER'
-                    OR EXISTS (
-                      SELECT 1 FROM live_markets m
-                      WHERE m.condition_id = p.condition_id
-                        AND m.market_resolved = 1
-                        AND COALESCE(m.winning_asset_id, '') <> ''
-                        AND m.winning_asset_id <> p.token_id
-                    )
-                  )
+                  AND COALESCE(f.status, '') <> 'FAILED'
                 """,
                 (start_iso, end_iso),
-            ).fetchone()
-        return int(row["losses"] if row is not None else 0)
+            ).fetchall()
+        positions: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = positions.setdefault(str(row["position_id"]), {
+                "token_id": str(row["token_id"] or ""),
+                "state": str(row["state"] or "").upper(),
+                "remaining": decimal_value(row["remaining_shares_text"]) or Decimal("0"),
+                "resolved": bool(row["market_resolved"]),
+                "winner": str(row["winning_asset_id"] or ""),
+                "bought": Decimal("0"), "sold": Decimal("0"), "cash": Decimal("0"),
+            })
+            shares = decimal_value(row["shares_text"]) or Decimal("0")
+            price = decimal_value(row["price_text"]) or Decimal("0")
+            fee = decimal_value(row["fee_text"]) or Decimal("0")
+            if str(row["action"] or "").upper() == "ENTRY":
+                item["bought"] += shares
+                item["cash"] -= shares * price + fee
+            else:
+                item["sold"] += shares
+                item["cash"] += shares * price - fee
+        cash_flow = Decimal("0")
+        wins = losses = settled = 0
+        for item in positions.values():
+            held = max(Decimal("0"), item["bought"] - item["sold"])
+            resolved = item["resolved"] and bool(item["winner"])
+            if resolved:
+                if item["winner"] == item["token_id"]:
+                    item["cash"] += held
+            elif item["state"] == "RESOLVED_LOSER":
+                resolved = True
+            elif held > Decimal("0.01"):
+                continue  # still open: result not known yet
+            settled += 1
+            cash_flow += item["cash"]
+            if item["cash"] > 0:
+                wins += 1
+            elif item["cash"] < 0:
+                losses += 1
+        return {
+            "cash_flow_usd": cash_flow,
+            "settled_trades": settled,
+            "winning_trades": wins,
+            "losing_trades": losses,
+        }
 
     def exposure(self) -> Decimal:
         total = Decimal("0")

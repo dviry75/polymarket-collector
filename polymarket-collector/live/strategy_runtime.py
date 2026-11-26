@@ -51,6 +51,8 @@ CRITICAL_ALIGNMENT_GRACE_SECONDS = 0.25
 # Losing trades allowed per Jerusalem day (weekday() -> cap): Friday 2.
 DAILY_LOSING_TRADE_LIMITS = {4: 2}
 DEFAULT_DAILY_LOSING_TRADE_LIMIT = 4
+# Cost of one losing trade (an 8-share entry at 0.74 that resolves against us).
+LOSING_TRADE_COST_USD = Decimal("6.08")
 # Jerusalem days with no losing-trade cap (one-off exceptions).
 DAILY_LOSING_TRADE_EXEMPT_DATES = frozenset({"2026-11-26"})
 CRITICAL_ALIGNMENT_POLL_SECONDS = 0.005
@@ -310,33 +312,41 @@ class LiveStrategyRuntime:
 
     @staticmethod
     def daily_losing_trade_limit(day: date) -> int:
-        """Losing trades allowed per Jerusalem day: Friday 2, otherwise 4."""
+        """Losing trades' worth of cash-flow loss allowed per Jerusalem day."""
         return DAILY_LOSING_TRADE_LIMITS.get(day.weekday(), DEFAULT_DAILY_LOSING_TRADE_LIMIT)
 
     def daily_losing_trades_status(self, at: datetime | None = None) -> dict[str, Any]:
-        """Entries stop for the rest of the local day once its losses reach the cap.
+        """Entries stop for the rest of the local day once its cash flow is down
+        by the cost of N losing trades (Friday 2, other days 4; a losing trade
+        costs LOSING_TRADE_COST_USD).
 
-        A loss is a trade opened that day whose market resolved against the
-        token bought. The cap resets at midnight Asia/Jerusalem.
+        Cash flow covers trades opened that day whose result is known, so wins
+        offset losses: 15 wins and 2 losses keep trading. Resets at midnight
+        Asia/Jerusalem.
         """
         tz = ZoneInfo("Asia/Jerusalem")
         local = (at or datetime.now(timezone.utc)).astimezone(tz)
         start = datetime.combine(local.date(), datetime.min.time(), tzinfo=tz)
         end = start + timedelta(days=1)
         limit = self.daily_losing_trade_limit(local.date())
-        losses = self.repo.losing_positions_between(
+        threshold = -(LOSING_TRADE_COST_USD * limit)
+        flow = self.repo.settled_cash_flow_between(
             start.astimezone(timezone.utc).isoformat(),
             end.astimezone(timezone.utc).isoformat(),
         )
+        cash_flow = flow["cash_flow_usd"]
         exempt = local.date().isoformat() in DAILY_LOSING_TRADE_EXEMPT_DATES
-        allowed = exempt or losses < limit
+        allowed = exempt or cash_flow > threshold
         status = {
             "allowed": allowed,
             "exempt": exempt,
             "reason": "ENTRY_ALLOWED" if allowed else "DAILY_LOSING_TRADES_LIMIT",
             "day": local.date().isoformat(),
-            "losses": losses,
             "limit": limit,
+            "threshold_usd": str(threshold),
+            "cash_flow_usd": str(cash_flow.quantize(Decimal("0.01"))),
+            "losses": flow["losing_trades"],
+            "wins": flow["winning_trades"],
         }
         if not allowed:
             noted = getattr(self, "_losing_cap_noted_days", None)
