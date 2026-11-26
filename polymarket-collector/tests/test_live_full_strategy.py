@@ -1203,7 +1203,8 @@ def test_entry_schedule_blocks_weekdays_14_to_23_jerusalem():
     assert LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 3, 23, 0, 0, tzinfo=jerusalem)
     )["allowed"]
-    assert LiveStrategyRuntime.entry_schedule_status(
+    # Saturday is closed all day (weekend), not only 14-23.
+    assert not LiveStrategyRuntime.entry_schedule_status(
         datetime(2026, 8, 8, 16, 0, 0, tzinfo=jerusalem)
     )["allowed"]
 
@@ -3758,3 +3759,34 @@ def test_entry_schedule_is_unrestricted_on_2026_11_26_only():
         assert not LiveStrategyRuntime.entry_schedule_status(
             datetime(2026, 11, day, 14, 0, tzinfo=jerusalem)
         )["allowed"]
+
+
+def test_entry_schedule_closes_friday_to_sunday_and_keeps_mon_thu_hours():
+    jerusalem = ZoneInfo("Asia/Jerusalem")
+    allowed = lambda *args: LiveStrategyRuntime.entry_schedule_status(  # noqa: E731
+        datetime(*args, tzinfo=jerusalem)
+    )["allowed"]
+    # Fri 27/11, Sat 28/11, Sun 29/11 2026: closed around the clock.
+    for day in (27, 28, 29):
+        for hour, minute in ((0, 0), (9, 30), (13, 59), (14, 0), (23, 0), (23, 59)):
+            assert not allowed(2026, 11, day, hour, minute), (day, hour, minute)
+    status = LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 11, 28, 10, 0, tzinfo=jerusalem)
+    )
+    assert status["reason"] == "ENTRY_SCHEDULE_INACTIVE"
+    assert status["inactive_cause"] == "WEEKEND"
+    # Mon 30/11 .. Thu 3/12: open outside 14:00-23:00, closed inside it.
+    for day, month in ((30, 11), (1, 12), (2, 12), (3, 12)):
+        assert allowed(2026, month, day, 0, 0)
+        assert allowed(2026, month, day, 13, 59)
+        assert not allowed(2026, month, day, 14, 0)
+        assert not allowed(2026, month, day, 22, 59)
+        assert allowed(2026, month, day, 23, 0)
+    assert LiveStrategyRuntime.entry_schedule_status(
+        datetime(2026, 12, 1, 15, 0, tzinfo=jerusalem)
+    )["inactive_cause"] == "WEEKDAY_14_23"
+    # Thursday 23:59 open, Friday 00:00 closed.
+    assert allowed(2026, 12, 3, 23, 59)
+    assert not allowed(2026, 12, 4, 0, 0)
+    # An unrestricted date is open all day.
+    assert allowed(2026, 11, 26, 16, 0)

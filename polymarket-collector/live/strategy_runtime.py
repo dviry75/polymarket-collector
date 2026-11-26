@@ -301,6 +301,12 @@ class LiveStrategyRuntime:
 
     @staticmethod
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
+        """Entries: Mon-Thu only, closed 14:00-23:00 (Asia/Jerusalem).
+
+        Friday, Saturday and Sunday are closed all day. A date in
+        ``unrestricted_dates`` is open all day (no weekend, no hour stop).
+        Exits are never affected by the schedule.
+        """
         instant = at or datetime.now(timezone.utc)
         local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
         unrestricted_dates = {
@@ -310,17 +316,23 @@ class LiveStrategyRuntime:
             "2026-11-26",  # one day without the 14:00-23:00 weekday stop
         }
         unrestricted_date = local.date().isoformat() in unrestricted_dates
-        inactive = (
-            local.weekday() < 5
+        # Python weekday(): Mon=0 .. Thu=3, Fri=4, Sat=5, Sun=6.
+        weekend = local.weekday() >= 4 and not unrestricted_date
+        weekday_hours = (
+            local.weekday() <= 3
             and 14 <= local.hour < 23
             and not unrestricted_date
         )
-        return {
+        inactive = weekend or weekday_hours
+        status: dict[str, Any] = {
             "allowed": not inactive,
             "reason": "ENTRY_SCHEDULE_INACTIVE" if inactive else "ENTRY_SCHEDULE_ACTIVE",
             "timezone": "Asia/Jerusalem",
             "local_time": local.isoformat(),
         }
+        if inactive:
+            status["inactive_cause"] = "WEEKEND" if weekend else "WEEKDAY_14_23"
+        return status
 
     def set_market_freshness_provider(
         self, provider: Callable[[str], dict[str, Any]]
