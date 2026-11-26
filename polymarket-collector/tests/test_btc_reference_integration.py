@@ -724,3 +724,76 @@ def test_strict_window_days_match_previous_blackout():
     for day in (23, 24, 25, 26, 27):  # Mon-Fri
         assert in_strict_btc_window(datetime(2026, 11, day, 16, 0, tzinfo=il))
     assert not in_strict_btc_window(datetime(2026, 11, 28, 16, 0, tzinfo=il))  # Sat
+
+
+def test_resolution_exit_without_tick_uses_event_close_twap():
+    import sqlite3
+    from live.dashboard_read_model import DashboardReadModel, resolve_window
+    from scripts.migrate_external_fills import DDL
+    from test_dashboard_v1 import NOW, build_db, seed_verified_lifecycle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        slug = "btc-updown-5m-1786529400"
+        with sqlite3.connect(repo.db_path) as conn:
+            conn.executescript(DDL)
+            conn.execute(
+                "INSERT INTO external_fills(trade_id,condition_id,event_slug,side,price,size,"
+                "notional_usd,fee_usd,matched_at,raw_json,ingested_at)"
+                " VALUES('t1','condition-t1',?,'BUY',0.74,10,7.4,0,'2026-08-12T10:00:03+00:00','{}',"
+                "'2026-08-12T10:00:04+00:00')",
+                (slug,),
+            )
+            conn.execute(
+                "UPDATE live_strategy_deals SET btc_open_price_text='80000',"
+                "btc_exit_type='RESOLUTION',btc_exit_price_text=NULL,"
+                "btc_exit_missing_reason='BTC_CLOSE_PRICE_NO_TICK'"
+            )
+            conn.execute(
+                "INSERT INTO live_btc_event_reference(event_id,window_start,open_twap_text,"
+                "close_twap_text,close_twap_ts_ms,close_price_text,close_tick_ts_ms,"
+                "created_at,updated_at)"
+                " VALUES(?, 1786529400, '80000', '80060.5', 1786529700000, '80071', 1786529700000,"
+                " '2026-08-12T10:00:00+00:00', '2026-08-12T10:05:00+00:00')",
+                (slug,),
+            )
+        model = DashboardReadModel(LiveRepository(repo.db_path, query_only=True))
+        items = {
+            item["event_slug"]: item
+            for item in model.external_deal_history(resolve_window("today", now=NOW))["items"]
+        }
+        btc = items[slug]["btc"]
+        assert btc["btc_exit_type"] == "RESOLUTION"
+        assert btc["btc_exit_price"] == 80060.5          # close TWAP, not the spot 80071
+        assert btc["btc_exit_source"] == "EVENT_CLOSE_TWAP"
+        assert btc["btc_exit_price"] - btc["btc_open_price"] == 60.5
+
+
+def test_resolution_exit_with_recorded_tick_is_unchanged():
+    import sqlite3
+    from live.dashboard_read_model import DashboardReadModel, resolve_window
+    from scripts.migrate_external_fills import DDL
+    from test_dashboard_v1 import NOW, build_db, seed_verified_lifecycle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        slug = "btc-updown-5m-1786529400"
+        with sqlite3.connect(repo.db_path) as conn:
+            conn.executescript(DDL)
+            conn.execute(
+                "INSERT INTO external_fills(trade_id,condition_id,event_slug,side,price,size,"
+                "notional_usd,fee_usd,matched_at,raw_json,ingested_at)"
+                " VALUES('t1','condition-t1',?,'BUY',0.74,10,7.4,0,'2026-08-12T10:00:03+00:00','{}',"
+                "'2026-08-12T10:00:04+00:00')",
+                (slug,),
+            )
+            conn.execute(
+                "UPDATE live_strategy_deals SET btc_open_price_text='80000',"
+                "btc_exit_type='RESOLUTION',btc_exit_price_text='79950'"
+            )
+        model = DashboardReadModel(LiveRepository(repo.db_path, query_only=True))
+        btc = model.external_deal_history(resolve_window("today", now=NOW))["items"][0]["btc"]
+        assert btc["btc_exit_price"] == 79950
+        assert "btc_exit_source" not in btc

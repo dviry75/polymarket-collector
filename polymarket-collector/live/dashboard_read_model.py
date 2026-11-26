@@ -774,7 +774,60 @@ class DashboardReadModel:
             """,
             tuple(slugs),
         )
-        return {str(row.get("event_id")): {"btc": _deal_btc_fields(row)} for row in rows}
+        enrichment = {
+            str(row.get("event_id")): {"btc": _deal_btc_fields(row)} for row in rows
+        }
+        self._fill_resolution_close(enrichment)
+        return enrichment
+
+    def _fill_resolution_close(self, enrichment: dict[str, dict[str, Any]]) -> None:
+        """BTC close of a resolution exit from the per-event reference.
+
+        A resolution exit's BTC point is the event close. The trader takes it
+        from its in-memory tick buffer, which a restart empties
+        (BTC_CLOSE_PRICE_NO_TICK). live_btc_event_reference keeps the close
+        TWAP (what the market settles on, against the open TWAP), so use it
+        when the deal row has no exit price. Directional delta stays as
+        recorded (the side is not known here).
+        """
+        missing = [
+            event_id for event_id, item in enrichment.items()
+            if item["btc"].get("btc_exit_type") == "RESOLUTION"
+            and item["btc"].get("btc_exit_price") is None
+        ]
+        if not missing:
+            return
+        exists = self._all(
+            "SELECT 1 AS ok FROM sqlite_master WHERE type='table' "
+            "AND name='live_btc_event_reference'"
+        )
+        if not exists:
+            return
+        placeholders = ",".join("?" for _ in missing)
+        refs = self._all(
+            f"""
+            SELECT event_id, open_twap_text, close_twap_text, close_twap_ts_ms,
+                   close_price_text, close_tick_ts_ms
+            FROM live_btc_event_reference
+            WHERE event_id IN ({placeholders})
+            """,
+            tuple(missing),
+        )
+        for ref in refs:
+            btc = enrichment[str(ref.get("event_id"))]["btc"]
+            twap = number_value(decimal_value(ref.get("close_twap_text")))
+            spot = number_value(decimal_value(ref.get("close_price_text")))
+            close = twap if twap is not None else spot
+            if close is None:
+                continue
+            btc["btc_exit_price"] = close
+            btc["btc_exit_source"] = (
+                "EVENT_CLOSE_TWAP" if twap is not None else "EVENT_CLOSE_SPOT"
+            )
+            if btc.get("btc_open_price") is None:
+                btc["btc_open_price"] = number_value(
+                    decimal_value(ref.get("open_twap_text"))
+                )
 
     def _market_outcome_enrichment(
         self, condition_ids: list[str]
