@@ -51,6 +51,8 @@ CRITICAL_ALIGNMENT_GRACE_SECONDS = 0.25
 # Losing trades allowed per Jerusalem day (weekday() -> cap): Friday 2.
 DAILY_LOSING_TRADE_LIMITS = {4: 2}
 DEFAULT_DAILY_LOSING_TRADE_LIMIT = 4
+# Jerusalem days with no losing-trade cap (one-off exceptions).
+DAILY_LOSING_TRADE_EXEMPT_DATES = frozenset({"2026-11-26"})
 CRITICAL_ALIGNMENT_POLL_SECONDS = 0.005
 CRITICAL_ALIGNMENT_TRANSIENT_REASONS = {
     "BEST_PRICE_PENDING_DEPTH", "BOOK_NOT_READY", "FRAME_SUPERSEDED",
@@ -326,9 +328,11 @@ class LiveStrategyRuntime:
             start.astimezone(timezone.utc).isoformat(),
             end.astimezone(timezone.utc).isoformat(),
         )
-        allowed = losses < limit
+        exempt = local.date().isoformat() in DAILY_LOSING_TRADE_EXEMPT_DATES
+        allowed = exempt or losses < limit
         status = {
             "allowed": allowed,
+            "exempt": exempt,
             "reason": "ENTRY_ALLOWED" if allowed else "DAILY_LOSING_TRADES_LIMIT",
             "day": local.date().isoformat(),
             "losses": losses,

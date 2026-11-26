@@ -125,3 +125,19 @@ def test_cap_gates_the_decision_and_the_final_check_and_is_reported():
         assert "daily_losing_trades" in runtime.health()
     finally:
         temp.cleanup()
+
+
+def test_exempt_date_has_no_cap():
+    temp, base, strategy, runtime = _runtime()
+    try:
+        for i in range(5):  # Thursday 26/11/2026 local
+            _trade(base, strategy, f"exempt-{i}", f"2026-11-26T0{i}:00:00+00:00", won=False)
+        status = runtime.daily_losing_trades_status(datetime(2026, 11, 26, 23, 30, tzinfo=J))
+        assert (status["losses"], status["exempt"], status["allowed"]) == (5, True, True)
+        # The next day is capped again.
+        _trade(base, strategy, "fri-x", "2026-11-27T06:00:00+00:00", won=False)
+        _trade(base, strategy, "fri-y", "2026-11-27T07:00:00+00:00", won=False)
+        friday = runtime.daily_losing_trades_status(datetime(2026, 11, 27, 12, 0, tzinfo=J))
+        assert (friday["exempt"], friday["allowed"]) == (False, False)
+    finally:
+        temp.cleanup()
