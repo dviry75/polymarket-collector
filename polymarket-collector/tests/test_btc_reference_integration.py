@@ -557,6 +557,32 @@ def test_dashboard_external_deal_table_carries_market_outcome():
         assert items["slug-open"]["market_outcome"] is None  # not resolved yet
 
 
+def test_dashboard_external_deal_splits_buy_and_sell_fees():
+    import sqlite3
+    from live.dashboard_read_model import DashboardReadModel, resolve_window
+    from scripts.migrate_external_fills import DDL
+    from test_dashboard_v1 import NOW, build_db, seed_verified_lifecycle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, _config = build_db(tmp)
+        seed_verified_lifecycle(repo)
+        with sqlite3.connect(repo.db_path) as conn:
+            conn.executescript(DDL)
+            for trade_id, side, price, fee in (("b1", "BUY", 0.74, 0.12), ("s1", "SELL", 0.90, 0.05)):
+                conn.execute(
+                    "INSERT INTO external_fills(trade_id,condition_id,event_slug,side,outcome,price,"
+                    "size,notional_usd,fee_usd,matched_at,raw_json,ingested_at)"
+                    " VALUES(?,'condition-fees','slug-fees',?,'Up',?,10,?,?,'2026-08-12T10:00:03+00:00','{}',"
+                    "'2026-08-12T10:00:04+00:00')",
+                    (trade_id, side, price, price * 10, fee),
+                )
+        model = DashboardReadModel(LiveRepository(repo.db_path, query_only=True))
+        item = model.external_deal_history(resolve_window("today", now=NOW))["items"][0]
+        assert item["buy_fees_usd"] == 0.12
+        assert item["sell_fees_usd"] == 0.05
+        assert abs(item["fees_usd"] - 0.17) < 1e-9
+
+
 def test_gate_error_blocks_in_enforce_only(harness_factory):
     def boom(**_kwargs):
         raise RuntimeError("evaluation bug")

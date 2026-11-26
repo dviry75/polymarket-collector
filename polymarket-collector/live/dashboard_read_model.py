@@ -852,6 +852,8 @@ class DashboardReadModel:
                       SUM(CASE WHEN ef.side='BUY'  THEN ef.notional_usd ELSE 0 END) AS buy_notional,
                       SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE 0 END) AS sell_notional,
                       SUM(COALESCE(ef.fee_usd,0)) AS fees_usd,
+                      SUM(CASE WHEN ef.side='BUY'  THEN COALESCE(ef.fee_usd,0) ELSE 0 END) AS buy_fees_usd,
+                      SUM(CASE WHEN ef.side='SELL' THEN COALESCE(ef.fee_usd,0) ELSE 0 END) AS sell_fees_usd,
                       COALESCE(MAX(red.redeemed_usd),0)     AS redeemed_usd,
                       COALESCE(MAX(red.redemption_count),0) AS redemption_count,
                       SUM(CASE WHEN ef.side='SELL' THEN ef.notional_usd ELSE -ef.notional_usd END)
@@ -897,6 +899,8 @@ class DashboardReadModel:
                 "buy_notional_usd": number_value(row.get("buy_notional")),
                 "sell_notional_usd": number_value(row.get("sell_notional")),
                 "fees_usd": number_value(row.get("fees_usd")),
+                "buy_fees_usd": number_value(row.get("buy_fees_usd")),
+                "sell_fees_usd": number_value(row.get("sell_fees_usd")),
                 "redeemed_usd": number_value(row.get("redeemed_usd")),
                 "cash_flow_usd": number_value(row.get("cash_flow_usd")),
                 "state": state,
