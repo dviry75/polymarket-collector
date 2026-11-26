@@ -282,6 +282,14 @@ class LiveStrategyRuntime:
         self._entry_trigger_log_state: dict[tuple[str, str], str] = {}
 
         self._hot_state_task: asyncio.Task[Any] | None = None
+        # Daily cash-flow cap, kept in RAM. Recomputed off the hot path (in the
+        # hot-state refresh thread) when a trade changes state; entry frames
+        # only read this dict and never open SQLite for it.
+        self._losing_cap: dict[str, Any] = {
+            "allowed": False, "reason": "DAILY_LOSING_TRADES_UNKNOWN", "day": "",
+        }
+        self._losing_cap_signature: Any = None
+        self._losing_cap_computed_monotonic = 0.0
         self._hot_state_refresh_interval_seconds = 0.25
         self._hot_state_max_age_seconds = 1.0
         self.hot_state_refresh_failures = 0
@@ -305,6 +313,16 @@ class LiveStrategyRuntime:
             self._hot_state_refreshed_monotonic = 0.0
             self.hot_state_refresh_failures += 1
 
+        # Startup: compute the cap once before any frame (fail-closed on error;
+        # the hot-state loop retries).
+        try:
+            self._losing_cap = self.daily_losing_trades_status()
+            self._losing_cap_signature = self._losing_cap_signature_of(
+                self._hot_state, self._jerusalem_day()
+            )
+            self._losing_cap_computed_monotonic = time.monotonic()
+        except Exception as exc:
+            self.last_error = f"LOSING_CAP_STARTUP:{type(exc).__name__}:{exc}"[:500]
 
     def _hold_to_resolution(self) -> bool:
         """No TP / STOP / EMERGENCY / invalid-entry exits: hold to resolution."""
@@ -361,6 +379,67 @@ class LiveStrategyRuntime:
                     parameters_json=status,
                 )
         return status
+
+    LOSING_CAP_BACKSTOP_SECONDS = 30.0
+
+    @staticmethod
+    def _jerusalem_day(at: datetime | None = None) -> str:
+        now = at or datetime.now(timezone.utc)
+        return now.astimezone(ZoneInfo("Asia/Jerusalem")).date().isoformat()
+
+    @staticmethod
+    def _losing_cap_signature_of(snapshot: dict[str, Any], day: str) -> Any:
+        """Changes whenever a trade opens, sells or settles (or the day turns)."""
+        positions = (snapshot or {}).get("positions_by_token") or {}
+        return (day, frozenset(
+            (
+                str(position.get("position_id") or ""),
+                str(position.get("state") or ""),
+                str(position.get("remaining_shares_text") or ""),
+            )
+            for items in positions.values() for position in items
+            if isinstance(position, dict)
+        ))
+
+    async def _refresh_losing_cap_if_needed(self, snapshot: dict[str, Any]) -> None:
+        """Recompute the cash-flow cap after a trade changes state.
+
+        Runs in the background hot-state loop, in a worker thread, so the
+        entry path never waits for it. A slow backstop also catches a market
+        that resolved before its position row changed.
+        """
+        day = self._jerusalem_day()
+        signature = self._losing_cap_signature_of(snapshot, day)
+        stale = (
+            time.monotonic() - self._losing_cap_computed_monotonic
+            > self.LOSING_CAP_BACKSTOP_SECONDS
+        )
+        if signature == self._losing_cap_signature and not stale:
+            return
+        try:
+            status = await asyncio.to_thread(self.daily_losing_trades_status)
+        except Exception as exc:
+            self.last_error = f"LOSING_CAP_REFRESH:{type(exc).__name__}:{exc}"[:500]
+            return  # keep the last known value; retried on the next refresh
+        self._losing_cap = status
+        self._losing_cap_signature = signature
+        self._losing_cap_computed_monotonic = time.monotonic()
+
+    def _losing_cap_status_ram(self) -> dict[str, Any]:
+        """Hot-path read of the cap. RAM only, no SQLite.
+
+        Until the first computation it fails closed. A value from a previous
+        Jerusalem day no longer applies: the new day starts with no settled
+        trades, so it is open until the background refresh recomputes it.
+        """
+        cap = getattr(self, "_losing_cap", None) or {
+            "allowed": False, "reason": "DAILY_LOSING_TRADES_UNKNOWN", "day": "",
+        }
+        day = self._jerusalem_day()
+        if cap.get("day") and cap.get("day") != day:
+            return {"allowed": True, "reason": "ENTRY_ALLOWED", "day": day,
+                    "pending_recompute": True}
+        return cap
 
     @staticmethod
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
@@ -586,6 +665,7 @@ class LiveStrategyRuntime:
         # Atomic reference replacement. Readers never see a half-built state.
         self._hot_state = snapshot
         self._hot_state_refreshed_monotonic = time.monotonic()
+        await self._refresh_losing_cap_if_needed(snapshot)
 
         all_positions = [
             position
@@ -1795,7 +1875,7 @@ class LiveStrategyRuntime:
             paused = (
                 ram_state["paused"]
                 or not schedule["allowed"]
-                or not self.daily_losing_trades_status()["allowed"]
+                or not self._losing_cap_status_ram()["allowed"]
                 or (
                     self.config.execution_mode == "REAL_TRADING"
                     and not self.config.continuous_trading_enabled
@@ -2076,9 +2156,9 @@ class LiveStrategyRuntime:
         )
 
         schedule = self.entry_schedule_status()
-        # Losing-trade cap: a DB read, only when an exact 0.74 trigger exists.
+        # Losing-trade cap: RAM read (recomputed in the hot-state refresh).
         losing_cap_blocked = (
-            not self.daily_losing_trades_status()["allowed"]
+            not self._losing_cap_status_ram()["allowed"]
             if has_trigger and schedule["allowed"]
             else False
         )
@@ -3038,7 +3118,7 @@ class LiveStrategyRuntime:
             return
         schedule = self.entry_schedule_status()
         if schedule["allowed"]:
-            losing_cap = self.daily_losing_trades_status()
+            losing_cap = self._losing_cap_status_ram()
             if not losing_cap["allowed"]:
                 schedule = {**schedule, **losing_cap}
         if not schedule["allowed"]:
@@ -5875,7 +5955,7 @@ class LiveStrategyRuntime:
             "last_error": self.last_error,
             "entry_schedule": self.entry_schedule_status(),
             "hold_to_resolution": self._hold_to_resolution(),
-            "daily_losing_trades": self.daily_losing_trades_status(),
+            "daily_losing_trades": self._losing_cap_status_ram(),
             "btc_reference": self._btc.health() if self._btc is not None else None,
             **self.repo.strategy_status(),
         }

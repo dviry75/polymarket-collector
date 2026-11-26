@@ -5,8 +5,9 @@ Wins offset losses (15 wins and 2 losses keep trading). Only trades whose
 result is known count. Resets at midnight Asia/Jerusalem.
 """
 
+import asyncio
 import inspect
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -176,9 +177,90 @@ def test_cap_gates_the_decision_and_the_final_check_and_is_reported():
     assert "or losing_cap_blocked" in process
     assert "if has_trigger and schedule[\"allowed\"]" in process
     source = inspect.getsource(LiveStrategyRuntime)
-    assert source.count("self.daily_losing_trades_status()") >= 4  # decision, log, final, health
+    # decision, log, final check and health read RAM, never SQLite
+    assert source.count("self._losing_cap_status_ram()") >= 4
+    assert "settled_cash_flow_between" not in inspect.getsource(LiveStrategyRuntime._process_event)
     temp, base, runtime = _runtime()
     try:
         assert "daily_losing_trades" in runtime.health()
+    finally:
+        temp.cleanup()
+
+
+# --- hot path: RAM only; recomputed when a trade changes state -------------
+
+def _count_db_reads(runtime):
+    calls = []
+    real = runtime.repo.settled_cash_flow_between
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    runtime.repo.settled_cash_flow_between = counted
+    return calls
+
+
+def _today_utc(minutes_ago):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def test_hot_path_read_never_touches_the_database():
+    temp, _base, runtime = _runtime()
+    try:
+        calls = _count_db_reads(runtime)
+        for _ in range(50):
+            assert runtime._losing_cap_status_ram()["allowed"]
+        runtime.health()
+        assert calls == []
+    finally:
+        temp.cleanup()
+
+
+def test_settled_losses_are_picked_up_by_the_background_refresh():
+    temp, base, runtime = _runtime()
+    try:
+        assert runtime._losing_cap_status_ram()["allowed"]
+        calls = _count_db_reads(runtime)
+        asyncio.run(runtime._refresh_hot_state_once())
+        assert calls == []  # nothing changed: no recompute
+        for i in range(5):  # more than any day's limit
+            _trade(base, f"bg-{i}", _today_utc(30 - i), won=False)
+        asyncio.run(runtime._refresh_hot_state_once())
+        assert len(calls) == 1
+        cap = runtime._losing_cap_status_ram()
+        if not cap.get("exempt"):
+            assert cap["allowed"] is False
+            assert cap["reason"] == "DAILY_LOSING_TRADES_LIMIT"
+    finally:
+        temp.cleanup()
+
+
+def test_backstop_recomputes_without_a_position_change():
+    temp, _base, runtime = _runtime()
+    try:
+        calls = _count_db_reads(runtime)
+        runtime._losing_cap_computed_monotonic -= runtime.LOSING_CAP_BACKSTOP_SECONDS + 1
+        asyncio.run(runtime._refresh_hot_state_once())
+        assert len(calls) == 1
+    finally:
+        temp.cleanup()
+
+
+def test_a_previous_day_block_does_not_carry_over():
+    temp, _base, runtime = _runtime()
+    try:
+        runtime._losing_cap = {"allowed": False, "reason": "DAILY_LOSING_TRADES_LIMIT",
+                               "day": "2000-01-01"}
+        assert runtime._losing_cap_status_ram()["allowed"] is True
+    finally:
+        temp.cleanup()
+
+
+def test_unknown_cap_fails_closed():
+    temp, _base, runtime = _runtime()
+    try:
+        runtime._losing_cap = {"allowed": False, "reason": "DAILY_LOSING_TRADES_UNKNOWN", "day": ""}
+        assert runtime._losing_cap_status_ram()["allowed"] is False
     finally:
         temp.cleanup()
