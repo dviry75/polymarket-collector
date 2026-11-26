@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import logging
@@ -48,6 +48,9 @@ EXIT_SUPERVISION_POSITION_STATES = frozenset({
 EVENT_WINDOW_PATTERN = re.compile(r"-(\d+)m-(\d+)$")
 
 CRITICAL_ALIGNMENT_GRACE_SECONDS = 0.25
+# Losing trades allowed per Jerusalem day (weekday() -> cap): Friday 2.
+DAILY_LOSING_TRADE_LIMITS = {4: 2}
+DEFAULT_DAILY_LOSING_TRADE_LIMIT = 4
 CRITICAL_ALIGNMENT_POLL_SECONDS = 0.005
 CRITICAL_ALIGNMENT_TRANSIENT_REASONS = {
     "BEST_PRICE_PENDING_DEPTH", "BOOK_NOT_READY", "FRAME_SUPERSEDED",
@@ -304,12 +307,55 @@ class LiveStrategyRuntime:
         return bool(getattr(getattr(self, "config", None), "hold_to_resolution", False))
 
     @staticmethod
-    def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
-        """Entries: Mon-Thu only, closed 14:00-23:00 (Asia/Jerusalem).
+    def daily_losing_trade_limit(day: date) -> int:
+        """Losing trades allowed per Jerusalem day: Friday 2, otherwise 4."""
+        return DAILY_LOSING_TRADE_LIMITS.get(day.weekday(), DEFAULT_DAILY_LOSING_TRADE_LIMIT)
 
-        Friday, Saturday and Sunday are closed all day. A date in
+    def daily_losing_trades_status(self, at: datetime | None = None) -> dict[str, Any]:
+        """Entries stop for the rest of the local day once its losses reach the cap.
+
+        A loss is a trade opened that day whose market resolved against the
+        token bought. The cap resets at midnight Asia/Jerusalem.
+        """
+        tz = ZoneInfo("Asia/Jerusalem")
+        local = (at or datetime.now(timezone.utc)).astimezone(tz)
+        start = datetime.combine(local.date(), datetime.min.time(), tzinfo=tz)
+        end = start + timedelta(days=1)
+        limit = self.daily_losing_trade_limit(local.date())
+        losses = self.repo.losing_positions_between(
+            start.astimezone(timezone.utc).isoformat(),
+            end.astimezone(timezone.utc).isoformat(),
+        )
+        allowed = losses < limit
+        status = {
+            "allowed": allowed,
+            "reason": "ENTRY_ALLOWED" if allowed else "DAILY_LOSING_TRADES_LIMIT",
+            "day": local.date().isoformat(),
+            "losses": losses,
+            "limit": limit,
+        }
+        if not allowed:
+            noted = getattr(self, "_losing_cap_noted_days", None)
+            if noted is None:
+                noted = self._losing_cap_noted_days = set()
+            if status["day"] not in noted:
+                noted.add(status["day"])
+                self.repo.timeline(
+                    severity="WARNING", category="DECISION", component="strategy",
+                    source="daily_losing_trades", requested_action="ENTRY",
+                    reason_code="DAILY_LOSING_TRADES_LIMIT", result_status="BLOCKED",
+                    parameters_json=status,
+                )
+        return status
+
+    @staticmethod
+    def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
+        """Entries: Mon-Fri, closed 14:00-23:00 (Asia/Jerusalem).
+
+        Saturday and Sunday are closed all day. A date in
         ``unrestricted_dates`` is open all day (no weekend, no hour stop).
-        Exits are never affected by the schedule.
+        Exits are never affected by the schedule. The daily cap on losing
+        trades is a separate gate (``daily_losing_trades_status``).
         """
         instant = at or datetime.now(timezone.utc)
         local = instant.astimezone(ZoneInfo("Asia/Jerusalem"))
@@ -320,10 +366,10 @@ class LiveStrategyRuntime:
             "2026-11-26",  # one day without the 14:00-23:00 weekday stop
         }
         unrestricted_date = local.date().isoformat() in unrestricted_dates
-        # Python weekday(): Mon=0 .. Thu=3, Fri=4, Sat=5, Sun=6.
-        weekend = local.weekday() >= 4 and not unrestricted_date
+        # Python weekday(): Mon=0 .. Fri=4, Sat=5, Sun=6.
+        weekend = local.weekday() >= 5 and not unrestricted_date
         weekday_hours = (
-            local.weekday() <= 3
+            local.weekday() <= 4
             and 14 <= local.hour < 23
             and not unrestricted_date
         )
@@ -1735,6 +1781,7 @@ class LiveStrategyRuntime:
             paused = (
                 ram_state["paused"]
                 or not schedule["allowed"]
+                or not self.daily_losing_trades_status()["allowed"]
                 or (
                     self.config.execution_mode == "REAL_TRADING"
                     and not self.config.continuous_trading_enabled
@@ -2015,6 +2062,12 @@ class LiveStrategyRuntime:
         )
 
         schedule = self.entry_schedule_status()
+        # Losing-trade cap: a DB read, only when an exact 0.74 trigger exists.
+        losing_cap_blocked = (
+            not self.daily_losing_trades_status()["allowed"]
+            if has_trigger and schedule["allowed"]
+            else False
+        )
         ram_state = self._entry_state_from_ram(event_id)
 
         decision = choose_entry(
@@ -2025,6 +2078,7 @@ class LiveStrategyRuntime:
             paused=(
                 ram_state["paused"]
                 or daily_loss_blocked
+                or losing_cap_blocked
                 or not schedule["allowed"]
                 or (
                     not self.paper_mode()
@@ -2969,6 +3023,10 @@ class LiveStrategyRuntime:
             self._note_entry_liquidity("note_abort", intent_id, reason=reason)
             return
         schedule = self.entry_schedule_status()
+        if schedule["allowed"]:
+            losing_cap = self.daily_losing_trades_status()
+            if not losing_cap["allowed"]:
+                schedule = {**schedule, **losing_cap}
         if not schedule["allowed"]:
             reason = str(schedule["reason"])
             self.repo.update_intent(
@@ -5803,6 +5861,7 @@ class LiveStrategyRuntime:
             "last_error": self.last_error,
             "entry_schedule": self.entry_schedule_status(),
             "hold_to_resolution": self._hold_to_resolution(),
+            "daily_losing_trades": self.daily_losing_trades_status(),
             "btc_reference": self._btc.health() if self._btc is not None else None,
             **self.repo.strategy_status(),
         }

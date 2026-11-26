@@ -3245,6 +3245,33 @@ class StrategyRepository:
             ).fetchone()
         return row is not None
 
+    def losing_positions_between(self, start_iso: str, end_iso: str) -> int:
+        """Positions opened in [start, end) whose market resolved against them.
+
+        A loss is the market's winning token not being the token bought (the
+        dashboard "תוצאת שוק" rule); RESOLVED_LOSER counts even before the
+        market row carries a winner. realized_pnl_text is not used.
+        """
+        with self.base.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS losses FROM live_strategy_positions p
+                WHERE p.created_at >= ? AND p.created_at < ?
+                  AND (
+                    p.state = 'RESOLVED_LOSER'
+                    OR EXISTS (
+                      SELECT 1 FROM live_markets m
+                      WHERE m.condition_id = p.condition_id
+                        AND m.market_resolved = 1
+                        AND COALESCE(m.winning_asset_id, '') <> ''
+                        AND m.winning_asset_id <> p.token_id
+                    )
+                  )
+                """,
+                (start_iso, end_iso),
+            ).fetchone()
+        return int(row["losses"] if row is not None else 0)
+
     def exposure(self) -> Decimal:
         total = Decimal("0")
         for position in self.active_positions():
