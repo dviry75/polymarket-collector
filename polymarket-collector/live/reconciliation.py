@@ -9,7 +9,7 @@ import math
 import random
 import statistics
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from .adapters.base import TradingAdapter
 from .order_book import canonical_decimal, decimal_value
@@ -48,6 +48,8 @@ class TransientAccountModeError(RuntimeError):
 
 INTENT_SUBMISSION_GRACE_SECONDS = 15.0
 AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES = Decimal("0.01")
+# Public positions are reported with 4 decimals; local fills carry 6.
+REMOTE_SHARE_ROUNDING_TOLERANCE = Decimal("0.0001")
 # Order-status can report a terminal MATCHED/FILLED outcome before the
 # trades/positions feeds have propagated the corresponding fill. Treating
 # that as an immediate zero-fill is a false negative, not a safety measure:
@@ -190,8 +192,14 @@ class ReconciliationWorker:
         strategy_repo: StrategyRepository | None = None,
         trade_window: TradeWindowPolicy | None = None,
         fill_drift_lookback_hours: float = 24.0,
+        redemption_activity: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
     ):
         self.repo = repo
+        # Public REDEEM activity for (wallet, condition_id). Winners held to
+        # resolution are redeemed by Polymarket's approved redeemer within
+        # minutes; this proof lets reconciliation close them as REDEEMED
+        # instead of reading the zero balance as a contradiction.
+        self._redemption_activity = redemption_activity
         self.adapter = adapter
         self.strategy_repo = strategy_repo
         self.trade_window = trade_window or TradeWindowPolicy()
@@ -659,6 +667,62 @@ class ReconciliationWorker:
             "evidence": evidence,
         }
 
+    async def _public_redemption_repair(
+        self, local: dict[str, Any], *, wallet: str, actor: str
+    ) -> dict[str, Any] | None:
+        """Close a resolved winner whose tokens were already redeemed on-chain.
+
+        Requires exact public REDEEM proof for this wallet, condition and token
+        covering the local remaining shares; anything else returns None and the
+        caller keeps the fail-closed gap.
+        """
+        lookup = self._redemption_activity
+        if lookup is None or not wallet or self.strategy_repo is None:
+            return None
+        position_id = str(local.get("position_id") or "")
+        condition_id = str(local.get("condition_id") or "")
+        token_id = str(local.get("token_id") or "")
+        remaining = decimal_value(local.get("remaining_shares_text")) or Decimal("0")
+        if not position_id or not condition_id or not token_id or remaining <= 0:
+            return None
+        try:
+            activities = await lookup(wallet, condition_id)
+        except Exception as exc:  # public read failed: stay fail-closed
+            logger.warning("public redemption lookup failed: %s", exc)
+            return None
+        from .trader_commands import select_verified_redemption
+
+        proof = select_verified_redemption(
+            activities,
+            wallet=wallet,
+            condition_id=condition_id,
+            token_id=token_id,
+            remaining_shares=remaining,
+        )
+        if proof is None:
+            return None
+        before_state = str(local.get("state") or "")
+        self.strategy_repo.mark_position_resolved(
+            position_id, winner=True, redeem_pending=True, authoritative=True,
+        )
+        updated = self.strategy_repo.mark_position_redeemed(
+            position_id, str(proof["transactionHash"])
+        )
+        repair = {
+            "type": "resolved_winner_public_redemption",
+            "position_id": position_id,
+            "token_id": token_id,
+            "before_state": before_state,
+            "after_state": updated.get("state"),
+            "redeemed_shares": proof.get("redeemed_shares"),
+            "transaction_hash": proof.get("transactionHash"),
+        }
+        self.repo.audit(
+            actor, "resolved_position_repair", "ok",
+            "RESOLVED_WINNER_PUBLIC_REDEMPTION", repair,
+        )
+        return repair
+
     async def _reconcile_resolved_local_positions(
         self,
         *,
@@ -666,6 +730,7 @@ class ReconciliationWorker:
         gaps: list[dict[str, Any]],
         repairs: list[dict[str, Any]],
         actor: str,
+        wallet: str = "",
     ) -> set[str]:
         """Resolve/repair local rows and return tokens handled by scoped logic."""
         handled_tokens: set[str] = set()
@@ -950,6 +1015,14 @@ class ReconciliationWorker:
             if observations < 2:
                 continue
             if winner:
+                redeemed = await self._public_redemption_repair(
+                    local, wallet=wallet, actor=actor
+                )
+                if redeemed is not None:
+                    repairs.append(redeemed)
+                    handled_tokens.add(token_id)
+                    self._resolved_zero_observations.pop(token_id, None)
+                    continue
                 gaps.append({
                     "type": "resolved_winner_authoritative_zero",
                     "position_id": local["position_id"],
@@ -1325,6 +1398,10 @@ class ReconciliationWorker:
                 gaps=gaps,
                 repairs=repairs,
                 actor=actor,
+                wallet=(
+                    str(identity.get("wallet") or "")
+                    if identity.get("status") == "VERIFIED" else ""
+                ),
             )
 
             if self.strategy_repo:
@@ -1853,8 +1930,15 @@ class ReconciliationWorker:
                         correction_is_bounded_propagation = bool(
                             existing_position is not None
                             and confirmed_exit_value <= 0
-                            and _within_position_propagation_grace(
-                                existing_position.get("created_at")
+                            and (
+                                _within_position_propagation_grace(
+                                    existing_position.get("created_at")
+                                )
+                                # The public positions view rounds shares to 4
+                                # decimals (8.216215 -> 8.2162): a rounding-only
+                                # difference is never a contradiction.
+                                or abs(shares - local_remaining)
+                                <= REMOTE_SHARE_ROUNDING_TOLERANCE
                             )
                             and abs(shares - local_remaining)
                             <= AUTO_RECOVERABLE_POSITION_CORRECTION_MAX_SHARES
@@ -1873,6 +1957,10 @@ class ReconciliationWorker:
                             "position_id": position["position_id"],
                             "condition_id": condition_id,
                         })
+                        # The market ended and Polymarket already marks the
+                        # position redeemable; the authoritative resolution
+                        # arrives within minutes. Transient, not a contradiction.
+                        auto_recoverable_gaps += 1
                 for local in self.strategy_repo.reconciliation_positions():
                     remaining = (
                         decimal_value(

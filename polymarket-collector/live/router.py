@@ -90,6 +90,10 @@ def configure(db_path: Path | str, config: LiveConfig | None = None) -> None:
         _repo, _adapter, _strategy_repo,
         trade_window=TradeWindowPolicy.from_config(_config),
         fill_drift_lookback_hours=_config.trade_fill_drift_lookback_hours,
+        redemption_activity=(
+            None if _config.live_adapter == "mock"
+            else PublicAccountIdentityClient(_config.data_api_host).redemption_activity
+        ),
     )
     _reconciliation_coordinator = ReconciliationCoordinator(
         _reconciliation,
