@@ -299,6 +299,10 @@ class LiveStrategyRuntime:
             self.hot_state_refresh_failures += 1
 
 
+    def _hold_to_resolution(self) -> bool:
+        """No TP / STOP / EMERGENCY / invalid-entry exits: hold to resolution."""
+        return bool(getattr(getattr(self, "config", None), "hold_to_resolution", False))
+
     @staticmethod
     def entry_schedule_status(at: datetime | None = None) -> dict[str, Any]:
         """Entries: Mon-Thu only, closed 14:00-23:00 (Asia/Jerusalem).
@@ -864,6 +868,8 @@ class LiveStrategyRuntime:
         frame_hash: str,
     ) -> bool:
         """Publish one per-position STOP obligation without awaiting anything."""
+        if self._hold_to_resolution():
+            return False
         mailbox = getattr(self, "_stop_obligations", None)
         wakeup = getattr(self, "_stop_obligation_event", None)
         if mailbox is None or wakeup is None:
@@ -1354,12 +1360,15 @@ class LiveStrategyRuntime:
                     previous.get("best_bid")
                 )
 
+                holding = self._hold_to_resolution()
                 stop_now = (
-                    bid_value is not None
+                    not holding
+                    and bid_value is not None
                     and bid_value <= self.policy.stop_price
                 )
                 stop_before = (
-                    previous_bid is not None
+                    not holding
+                    and previous_bid is not None
                     and previous_bid <= self.policy.stop_price
                 )
 
@@ -2641,6 +2650,14 @@ class LiveStrategyRuntime:
 
         # P0-B — invalid entry: the recorded fill price is materially worse
         # than the signal. Latch an aggressive liquidation immediately.
+        if self._hold_to_resolution():
+            # Held to resolution: no invalid-entry liquidation, no STOP latch.
+            # A stop latched before the switch still finishes below.
+            if int(position.get("stop_stage") or 0) >= 1:
+                self._exit_tracker.mark_stop_latched(position_id)
+                self._exit_wakeup.set()
+            return
+
         if str(position.get("entry_policy_status") or "VALID") != "OUTSIDE_POLICY":
             fill_price = decimal_value(position.get("average_entry_price_text"))
             if fill_price is not None and fill_price > 0:
@@ -3607,7 +3624,8 @@ class LiveStrategyRuntime:
         )
         min_sellable = self._min_order(str(position.get("condition_id") or ""))
         if (
-            remaining <= 0
+            self._hold_to_resolution()
+            or remaining <= 0
             or remaining < min_sellable
             or position.get("tp_intent_id")
             or str(position.get("state") or "") != "OPEN"
@@ -4530,6 +4548,7 @@ class LiveStrategyRuntime:
 
             if (
                 not stop_latched
+                and not self._hold_to_resolution()
                 and (event_ready or critical_stop)
                 and bid is not None
                 and bid <= self.policy.stop_price
@@ -5783,6 +5802,7 @@ class LiveStrategyRuntime:
             "hot_state_refresh_failures": self.hot_state_refresh_failures,
             "last_error": self.last_error,
             "entry_schedule": self.entry_schedule_status(),
+            "hold_to_resolution": self._hold_to_resolution(),
             "btc_reference": self._btc.health() if self._btc is not None else None,
             **self.repo.strategy_status(),
         }

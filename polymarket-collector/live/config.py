@@ -89,6 +89,11 @@ class LiveConfig:
     pause_entries_default: bool = True
     canary_armed: bool = False
     continuous_trading_enabled: bool = False
+    # Hold every position to market resolution: no TAKE_PROFIT (0.96), no
+    # STOP_066 / EMERGENCY_060 and no invalid-entry liquidation. The operator
+    # emergency close still works. The dataclass default keeps the historical
+    # exits (tests); from_env defaults to holding (LIVE_HOLD_TO_RESOLUTION).
+    hold_to_resolution: bool = False
     canary_event_limit: int = 1
     default_trade_amount_usd: Decimal = Decimal("8")
     max_trade_amount_usd: Decimal = Decimal("8")
@@ -254,6 +259,7 @@ class LiveConfig:
             pause_entries_default=_bool_env("LIVE_PAUSE_ENTRIES", True),
             canary_armed=_bool_env("LIVE_CANARY_ARMED", False),
             continuous_trading_enabled=_bool_env("LIVE_CONTINUOUS_TRADING_ENABLED", False),
+            hold_to_resolution=_bool_env("LIVE_HOLD_TO_RESOLUTION", True),
             canary_event_limit=int(_env("LIVE_CANARY_EVENT_LIMIT", "1") or "1"),
             default_trade_amount_usd=_decimal_env("LIVE_DEFAULT_TRADE_AMOUNT_USD", "8"),
             max_trade_amount_usd=_decimal_env("LIVE_MAX_TRADE_AMOUNT_USD", "8"),
@@ -680,6 +686,7 @@ class LiveConfig:
             "pause_entries_default": self.pause_entries_default,
             "canary_armed": self.canary_armed,
             "continuous_trading_enabled": self.continuous_trading_enabled,
+            "hold_to_resolution": self.hold_to_resolution,
             "canary_event_limit": self.canary_event_limit,
             "default_trade_amount_usd": str(self.default_trade_amount_usd),
             "max_trade_amount_usd": str(self.max_trade_amount_usd),
